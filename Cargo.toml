@@ -1,0 +1,13 @@
+[package]
+name = "bolt-load"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bolt_load"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+
+[dev-dependencies]
