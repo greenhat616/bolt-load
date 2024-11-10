@@ -1,53 +1,32 @@
-use crate::manager::BoltLoaderTaskManager;
+use crate::manager::BoltLoadTaskManager;
 
-pub enum BoltLoaderState {
-    Idle,
-    Loading,
-    WaitingForMerge,
-    Merging,
-    Failed(String),
-    Finished,
-}
-
-pub enum BoltLoaderMode {
+#[derive(Default)]
+pub enum BoltLoadPreferDownloadMode {
+    /// All tasks should be single thread
     SingleThread,
+    /// All tasks should be multi thread if range stream is available
+    #[default]
     MultiThread,
 }
 
-// The main client
-pub struct BoltLoader {
-    tasks: Vec<BoltLoaderTaskManager>,
-    save_path: String,
-    url: String,
-    state: BoltLoaderState,
-    mode: BoltLoaderMode,
+// TODO: we should implement a life cycle for the client, and provide a client handle to task manager
+/// BotLoaderGlobalConfiguration
+struct BoltLoadConfiguration {
+    prefer_download_mode: BoltLoadPreferDownloadMode,
 }
 
-impl BoltLoader {
-    pub fn new<'a, T>(adaptor: T, mode: BoltLoaderMode, save_path: String, url: String) -> Self
-    where
-        T: crate::adaptor::BoltLoadAdaptor + Sync + 'static,
-    {
-        let tasks = match mode {
-            BoltLoaderMode::SingleThread => {
-                let mut tasks = Vec::new();
-                tasks.push(BoltLoaderTaskManager::new_single(adaptor, &save_path, &url));
-                tasks
-            }
-            BoltLoaderMode::MultiThread => {
-                BoltLoaderTaskManager::new_multi(adaptor, &save_path, &url)
-            }
-        };
+// The main client
+// TODO: use `derive_builder` to build the client
+pub struct BoltLoad {
+    tasks: Vec<BoltLoadTaskManager>,
+    configuration: BoltLoadConfiguration,
+}
 
-        BoltLoader {
-            tasks,
-            save_path,
-            url,
-            state: BoltLoaderState::Idle,
-            mode,
-        }
-    }
+/// a handle to access client context from sub modules
+pub(crate) struct BotLoadHandle {}
 
+
+impl BoltLoad {
     // Start the load from url process
     // Should be powered by a state machine
     pub fn start(&self) {

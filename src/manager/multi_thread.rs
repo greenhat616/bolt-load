@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::BoltLoaderTaskManager;
+use super::BoltLoadTaskManager;
 
 #[async_trait]
 pub trait MultiThreadTask {
@@ -11,7 +11,7 @@ pub trait MultiThreadTask {
 }
 
 #[async_trait]
-impl MultiThreadTask for BoltLoaderTaskManager {
+impl MultiThreadTask for BoltLoadTaskManager {
     async fn load_part(&self, url: &String, start_pos: u64, end_pos: u64) {
         unimplemented!()
     }
