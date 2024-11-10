@@ -1,6 +1,4 @@
-use std::{borrow::Borrow, sync::RwLock};
-
-use crate::manager::BoltLoaderTask;
+use crate::manager::BoltLoaderTaskManager;
 
 pub enum BoltLoaderState {
     Idle,
@@ -18,33 +16,35 @@ pub enum BoltLoaderMode {
 
 // The main client
 pub struct BoltLoader {
-    inner: RwLock<BoltLoaderInner>,
-    client: Box<dyn crate::adaptor::BoltLoadAdaptor + Sync>,
+    tasks: Vec<BoltLoaderTaskManager>,
     save_path: String,
     url: String,
-}
-
-struct BoltLoaderInner {
     state: BoltLoaderState,
     mode: BoltLoaderMode,
-    // The task will be executed according to the mode
-    tasks: Vec<BoltLoaderTask>,
 }
 
 impl BoltLoader {
-    pub fn new<'a, T>(client: T, mode: BoltLoaderMode, save_path: String, url: String) -> Self
+    pub fn new<'a, T>(adaptor: T, mode: BoltLoaderMode, save_path: String, url: String) -> Self
     where
         T: crate::adaptor::BoltLoadAdaptor + Sync + 'static,
     {
-        Self {
-            inner: RwLock::new(BoltLoaderInner {
-                state: BoltLoaderState::Idle,
-                tasks: Vec::new(),
-                mode: mode,
-            }),
-            client: Box::new(client),
+        let tasks = match mode {
+            BoltLoaderMode::SingleThread => {
+                let mut tasks = Vec::new();
+                tasks.push(BoltLoaderTaskManager::new_single(adaptor, &save_path, &url));
+                tasks
+            }
+            BoltLoaderMode::MultiThread => {
+                BoltLoaderTaskManager::new_multi(adaptor, &save_path, &url)
+            }
+        };
+
+        BoltLoader {
+            tasks,
             save_path,
             url,
+            state: BoltLoaderState::Idle,
+            mode,
         }
     }
 
@@ -52,7 +52,7 @@ impl BoltLoader {
     // Should be powered by a state machine
     pub fn start(&self) {
         // Split into load tasks
-        // According to the mode, etc        
+        // According to the mode, etc
         unimplemented!();
     }
 }

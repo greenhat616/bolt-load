@@ -1,10 +1,24 @@
+use crate::client::BoltLoaderMode;
+
 pub mod multi_thread;
 pub mod single_thread;
 
-pub struct BoltLoaderTask {
-    pub url: String,
-    pub save_path: String,
-    pub adaptor: Box<dyn super::adaptor::BoltLoadAdaptor + Sync>,
-    pub start_pos: u64,
-    pub end_pos: u64,
+pub struct BoltLoaderTaskManager {
+    adaptor: Box<dyn super::adaptor::BoltLoadAdaptor + Sync + 'static>,
+}
+
+impl BoltLoaderTaskManager {
+    pub fn new_single<T>(adaptor: T, save_path: &String, url: &String) -> Self
+    where
+        T: super::adaptor::BoltLoadAdaptor + Sync + 'static,
+    {
+        todo!();
+    }
+
+    pub fn new_multi<T>(adaptor: T, save_path: &String, url: &String) -> Vec<Self>
+    where
+        T: super::adaptor::BoltLoadAdaptor + Sync + 'static,
+    {
+        todo!();
+    }
 }
