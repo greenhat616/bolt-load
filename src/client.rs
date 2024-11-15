@@ -1,4 +1,7 @@
-use crate::manager::BoltLoadTaskManager;
+use derive_builder::Builder;
+use futures::Stream;
+
+use crate::{adapter, manager::BoltLoadTaskManager};
 
 #[derive(Default)]
 pub enum BoltLoadPreferDownloadMode {
@@ -17,21 +20,41 @@ struct BoltLoadConfiguration {
 
 // The main client
 // TODO: use `derive_builder` to build the client
+#[derive(Builder)]
+#[builder(pattern = "owned")]
 pub struct BoltLoad {
+    #[builder(setter(skip))]
     tasks: Vec<BoltLoadTaskManager>,
     configuration: BoltLoadConfiguration,
 }
 
 /// a handle to access client context from sub modules
-pub(crate) struct BotLoadHandle {}
-
+pub(crate) struct BoltLoadHandle {}
 
 impl BoltLoad {
     // Start the load from url process
     // Should be powered by a state machine
-    pub fn start(&self) {
+    pub fn start<A, S, T>(&mut self, adapter: A, save_path: &String, url: &String)
+    where
+        A: adapter::BoltLoadAdapter<S, T> + Sync + 'static,
+        S: Stream<Item = T>,
+        T: Send,
+    {
         // Split into load tasks
         // According to the mode, etc
-        unimplemented!();
+        match self.configuration.prefer_download_mode {
+            BoltLoadPreferDownloadMode::SingleThread => {
+                self.tasks = vec![];
+                let task = BoltLoadTaskManager::new_single(adapter, save_path, url);
+                self.tasks.push(task);
+                todo!()
+            }
+            BoltLoadPreferDownloadMode::MultiThread => {
+                self.tasks = vec![];
+                // TODO: do split into multiple tasks
+                
+                todo!()
+            }
+        }
     }
 }

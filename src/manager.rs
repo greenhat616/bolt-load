@@ -3,11 +3,13 @@ use futures::Stream;
 pub mod multi_thread;
 pub mod single_thread;
 
+#[derive(Clone)]
 pub enum BoltLoadDownloadMode {
     SingleThread,
     MultiThread,
 }
 
+#[derive(Clone)]
 pub enum BoltLoadTaskState {
     Idle,
     Loading,
@@ -17,6 +19,7 @@ pub enum BoltLoadTaskState {
     Finished,
 }
 
+// #[derive(Clone)]
 pub struct BoltLoadTaskManager {
     adapter: Box<
         dyn super::adapter::BoltLoadAdapter<Box<dyn Stream<Item = Vec<u8>>>, Vec<u8>>
@@ -30,7 +33,7 @@ pub struct BoltLoadTaskManager {
 }
 
 impl BoltLoadTaskManager {
-    pub fn new_single<S, A, T>(adaptor: A, save_path: &String, url: &String) -> Self
+    pub fn new_single<S, A, T>(adapter: A, save_path: &String, url: &String) -> Self
     where
         A: super::adapter::BoltLoadAdapter<S, T> + Sync + 'static,
         S: Stream<Item = T>,
@@ -39,7 +42,7 @@ impl BoltLoadTaskManager {
         todo!();
     }
 
-    pub fn new_multi<S, A, T>(adaptor: A, save_path: &String, url: &String) -> Vec<Self>
+    pub fn new_multi<S, A, T>(adapter: A, save_path: &String, url: &String) -> Vec<Self>
     where
         A: super::adapter::BoltLoadAdapter<S, T> + Sync + 'static,
         S: Stream<Item = T>,
