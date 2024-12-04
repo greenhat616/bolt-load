@@ -17,6 +17,7 @@ derive_builder = "0.20.2"
 futures = "0.3"
 url = "2.5"
 bytes = "1.9"
+async-lock = "3.4.0"                                                   # for cross runtime async lock
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
 
 [dev-dependencies]
