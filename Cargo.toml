@@ -1,7 +1,11 @@
 [package]
 name = "bolt-load"
-version = "0.1.0"
 edition = "2021"
+version = "0.1.0"
+
+[features]
+default = ["reqwest"]
+reqwest = ["dep:reqwest"]
 
 [lib]
 name = "bolt_load"
@@ -11,5 +15,8 @@ path = "src/lib.rs"
 async-trait = "0.1"
 derive_builder = "0.20.2"
 futures = "0.3"
+url = "2.5"
+bytes = "1.9"
+reqwest = { version = "0.12", optional = true, features = ["stream"] }
 
 [dev-dependencies]
