@@ -3,12 +3,13 @@ use std::{pin::Pin, sync::Arc};
 use super::{AnyStream, BoltLoadAdapter};
 use async_trait::async_trait;
 use futures::Stream;
+use reqwest::header::{ACCEPT_RANGES, CONTENT_RANGE, RANGE};
 use url::Url;
 
 #[derive(Clone)]
 pub struct ReqwestAdapter {
     client: reqwest::Client,
-    url: Url,
+    target: (reqwest::Method, Url),
     head_response: Arc<async_lock::Mutex<Option<reqwest::Response>>>,
     before_request:
         Arc<Option<Box<dyn Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + Sync>>>,
@@ -17,7 +18,7 @@ pub struct ReqwestAdapter {
 impl ReqwestAdapter {
     async fn perform_head(&self) -> Result<reqwest::Response, std::io::Error> {
         let response = self
-            .apply_before_request(self.client.head(self.url.clone()))
+            .apply_before_request(self.client.head(self.target.1.clone()))
             .send()
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
@@ -86,21 +87,21 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .as_ref()
             .unwrap()
             .headers()
-            .get("Accept-Ranges")
+            .get(ACCEPT_RANGES)
             .is_some_and(|v| v != "none");
         // try to send a real range request to test
         if !is_range_supported {
             is_range_supported = self
                 .apply_before_request(
                     self.client
-                        .get(self.url.clone())
-                        .header("Range", "bytes=0-8"),
+                        .request(self.target.0.clone(), self.target.1.clone())
+                        .header(RANGE, "bytes=0-8"),
                 )
                 .send()
                 .await
                 .and_then(|res| res.error_for_status())
                 .and_then(|res| {
-                    Ok(res.headers().get("Content-Range").is_some()
+                    Ok(res.headers().get(CONTENT_RANGE).is_some()
                         && res.content_length().unwrap_or(0) > 1)
                 })
                 .unwrap_or_default();
@@ -110,7 +111,10 @@ impl BoltLoadAdapter for ReqwestAdapter {
 
     async fn full_stream(&self) -> std::io::Result<Self::Stream> {
         let response = self
-            .apply_before_request(self.client.get(self.url.clone()))
+            .apply_before_request(
+                self.client
+                    .request(self.target.0.clone(), self.target.1.clone()),
+            )
             .send()
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
@@ -124,8 +128,8 @@ impl BoltLoadAdapter for ReqwestAdapter {
         let response = self
             .apply_before_request(
                 self.client
-                    .get(self.url.clone())
-                    .header("Range", format!("bytes={}-{}", start, end - 1)),
+                    .request(self.target.0.clone(), self.target.1.clone())
+                    .header(RANGE, format!("bytes={}-{}", start, end - 1)),
             )
             .send()
             .await
