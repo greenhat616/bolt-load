@@ -12,6 +12,7 @@ name = "bolt_load"
 path = "src/lib.rs"
 
 [dependencies]
+log = "0.4"
 async-trait = "0.1"
 derive_builder = "0.20.2"
 futures = "0.3"
@@ -21,3 +22,17 @@ async-lock = "3.4.0"                                                   # for cro
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
 
 [dev-dependencies]
+pretty_assertions = "1.4.1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+anyhow = "1.0"
+
+# for generate a random file
+tempfile = "3.14.0"
+rand = "0.8"
+
+# for http server test
+axum = "0.7"
+axum-extra = { version = "0.9.6", features = ["typed-header"] }
+axum-range = "0.4.0"
+portpicker = "0.1.1"
