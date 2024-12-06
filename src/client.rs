@@ -1,7 +1,10 @@
 use derive_builder::Builder;
 use futures::Stream;
 
-use crate::{adapter, manager::BoltLoadTaskManager};
+use crate::{
+    adapter::{self, AnyStream},
+    manager::BoltLoadTaskManager,
+};
 
 #[derive(Default)]
 pub enum BoltLoadPreferDownloadMode {
@@ -36,7 +39,11 @@ impl BoltLoad {
     // Should be powered by a state machine
     pub fn start<A, S, T>(&mut self, adapter: A, save_path: &String, url: &String)
     where
-        A: adapter::BoltLoadAdapter + Sync + 'static,
+        A: adapter::BoltLoadAdapter<
+                Item = Result<bytes::Bytes, std::io::Error>,
+                Stream = AnyStream<std::io::Result<bytes::Bytes>>,
+            > + Sync
+            + 'static,
         S: Stream<Item = T>,
         T: Send,
     {

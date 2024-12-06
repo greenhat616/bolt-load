@@ -1,5 +1,7 @@
 use futures::Stream;
 
+use crate::adapter::AnyStream;
+
 pub mod multi_thread;
 pub mod single_thread;
 
@@ -23,8 +25,8 @@ pub enum BoltLoadTaskState {
 pub struct BoltLoadTaskManager {
     adapter: Box<
         dyn super::adapter::BoltLoadAdapter<
-                Stream = Box<dyn Stream<Item = Vec<u8>>>,
-                Item = Vec<u8>,
+                Item = std::io::Result<bytes::Bytes>,
+                Stream = AnyStream<std::io::Result<bytes::Bytes>>,
             > + Sync
             + 'static,
     >,
@@ -37,19 +39,36 @@ pub struct BoltLoadTaskManager {
 impl BoltLoadTaskManager {
     pub fn new_single<S, A, T>(adapter: A, save_path: &String, url: &String) -> Self
     where
-        A: super::adapter::BoltLoadAdapter + Sync + 'static,
+        A: super::adapter::BoltLoadAdapter<
+                Item = Result<bytes::Bytes, std::io::Error>,
+                Stream = AnyStream<std::io::Result<bytes::Bytes>>,
+            > + Sync
+            + 'static,
         S: Stream<Item = T>,
         T: Send,
     {
-        todo!();
+        let adapter = Box::new(adapter);
+        BoltLoadTaskManager {
+            adapter,
+            mode: BoltLoadDownloadMode::SingleThread,
+            save_path: save_path.clone(),
+            url: url.clone(),
+            state: BoltLoadTaskState::Idle,
+        }
     }
 
     pub fn new_multi<S, A, T>(adapter: A, save_path: &String, url: &String) -> Vec<Self>
     where
-        A: super::adapter::BoltLoadAdapter + Sync + 'static,
+        A: super::adapter::BoltLoadAdapter<
+                Item = Result<bytes::Bytes, std::io::Error>,
+                Stream = AnyStream<std::io::Result<bytes::Bytes>>,
+            > + Sync
+            + 'static,
         S: Stream<Item = T>,
         T: Send,
     {
-        todo!();
+        let adapter = Box::new(adapter);
+        // Split into load tasks
+        todo!()
     }
 }
