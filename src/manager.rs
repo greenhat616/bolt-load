@@ -22,8 +22,10 @@ pub enum BoltLoadTaskState {
 // #[derive(Clone)]
 pub struct BoltLoadTaskManager {
     adapter: Box<
-        dyn super::adapter::BoltLoadAdapter<Box<dyn Stream<Item = Vec<u8>>>, Vec<u8>>
-            + Sync
+        dyn super::adapter::BoltLoadAdapter<
+                Stream = Box<dyn Stream<Item = Vec<u8>>>,
+                Item = Vec<u8>,
+            > + Sync
             + 'static,
     >,
     mode: BoltLoadDownloadMode,
@@ -35,7 +37,7 @@ pub struct BoltLoadTaskManager {
 impl BoltLoadTaskManager {
     pub fn new_single<S, A, T>(adapter: A, save_path: &String, url: &String) -> Self
     where
-        A: super::adapter::BoltLoadAdapter<S, T> + Sync + 'static,
+        A: super::adapter::BoltLoadAdapter + Sync + 'static,
         S: Stream<Item = T>,
         T: Send,
     {
@@ -44,7 +46,7 @@ impl BoltLoadTaskManager {
 
     pub fn new_multi<S, A, T>(adapter: A, save_path: &String, url: &String) -> Vec<Self>
     where
-        A: super::adapter::BoltLoadAdapter<S, T> + Sync + 'static,
+        A: super::adapter::BoltLoadAdapter + Sync + 'static,
         S: Stream<Item = T>,
         T: Send,
     {

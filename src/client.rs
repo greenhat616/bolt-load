@@ -36,7 +36,7 @@ impl BoltLoad {
     // Should be powered by a state machine
     pub fn start<A, S, T>(&mut self, adapter: A, save_path: &String, url: &String)
     where
-        A: adapter::BoltLoadAdapter<S, T> + Sync + 'static,
+        A: adapter::BoltLoadAdapter + Sync + 'static,
         S: Stream<Item = T>,
         T: Send,
     {
@@ -45,14 +45,14 @@ impl BoltLoad {
         match self.configuration.prefer_download_mode {
             BoltLoadPreferDownloadMode::SingleThread => {
                 self.tasks = vec![];
-                let task = BoltLoadTaskManager::new_single(adapter, save_path, url);
+                let task = BoltLoadTaskManager::new_single::<S, A, T>(adapter, save_path, url);
                 self.tasks.push(task);
                 todo!()
             }
             BoltLoadPreferDownloadMode::MultiThread => {
                 self.tasks = vec![];
                 // TODO: do split into multiple tasks
-                
+
                 todo!()
             }
         }
