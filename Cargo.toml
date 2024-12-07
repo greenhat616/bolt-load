@@ -5,7 +5,8 @@ version = "0.1.0"
 
 [features]
 default = ["reqwest"]
-reqwest = ["dep:reqwest"]
+http = ["dep:headers", "dep:regex", "dep:language-tags", "dep:percent-encoding", "dep:http"]
+reqwest = ["dep:reqwest", "http"]
 
 [lib]
 name = "bolt_load"
@@ -14,12 +15,20 @@ path = "src/lib.rs"
 [dependencies]
 log = "0.4"
 async-trait = "0.1"
-derive_builder = "0.20.2"
+derive_builder = "0.20"
 futures = "0.3"
-url = "2.5"
-bytes = "1.9"
-async-lock = "3.4.0"                                                   # for cross runtime async lock
+url = "2"
+bytes = "1"
+async-lock = "3"        # for cross runtime async lock
+
+# for http content-disposition parsing
+http = { version = "1", optional = true }
+regex = { version = "1", optional = true }
+language-tags = { version = "0.3", optional = true }
+percent-encoding = { version = "2.3", optional = true }
+
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
+headers = { version = "0.4", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

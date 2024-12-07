@@ -3,7 +3,8 @@ use std::{pin::Pin, sync::Arc};
 use super::{AnyStream, BoltLoadAdapter};
 use async_trait::async_trait;
 use futures::Stream;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use headers::{ContentDisposition, Header};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use url::Url;
 
 type BeforeRequestFn =
@@ -107,6 +108,20 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .unwrap_or_default())
     }
 
+    async fn suggest_filename(&self) -> Option<String> {
+        let mut head = self.head_response.lock().await;
+        if head.is_none() {
+            *head = Some(self.perform_head().await.ok()?);
+        }
+
+        head.as_ref()
+            .unwrap()
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|v| crate::utils::http::ContentDisposition::from_raw(v).ok())
+            .and_then(|d| d.get_filename().map(String::from))
+    }
+
     async fn is_range_stream_available(&self) -> bool {
         let mut response = self.head_response.lock().await;
         if response.is_none() {
@@ -194,6 +209,15 @@ mod test {
         let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
         assert_eq!(adapter.get_content_size().await.unwrap(), 1040384);
+    }
+
+    #[test(tokio::test)]
+    async fn test_suggest_filename() {
+        let (port, _) = super::super::tests::create_http_server().await.unwrap();
+        let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
+        let client = reqwest::Client::new();
+        let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
+        assert_eq!(adapter.suggest_filename().await, Some("test.txt".to_owned()));
     }
 
     #[test(tokio::test)]

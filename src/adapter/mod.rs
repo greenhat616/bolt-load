@@ -14,6 +14,12 @@ pub trait BoltLoadAdapter: Send + Sync {
     async fn is_range_stream_available(&self) -> bool {
         false
     }
+
+    /// Suggest a filename from the adapter
+    async fn suggest_filename(&self) -> Option<String> {
+        None
+    }
+
     /// Get the content size of the adapter
     async fn get_content_size(&self) -> std::io::Result<u64>;
 
@@ -106,13 +112,11 @@ mod tests {
                     ];
                     (headers, body).into_response()
                 }
-                Err(e) => {
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        e.to_string().into_response(),
-                    )
-                        .into_response()
-                }
+                Err(e) => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().into_response(),
+                )
+                    .into_response(),
             }
         }
 
