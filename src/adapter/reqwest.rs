@@ -3,16 +3,34 @@ use std::{pin::Pin, sync::Arc};
 use super::{AnyStream, BoltLoadAdapter};
 use async_trait::async_trait;
 use futures::Stream;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_RANGE, RANGE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use url::Url;
 
+type BeforeRequestFn =
+    Box<dyn Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + Sync>;
+
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ReqwestAdapter {
     client: reqwest::Client,
     target: (reqwest::Method, Url),
     head_response: Arc<async_lock::Mutex<Option<reqwest::Response>>>,
-    before_request:
-        Arc<Option<Box<dyn Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + Sync>>>,
+    before_request: Arc<Option<BeforeRequestFn>>,
+}
+
+pub trait IntoReqwestAdapter {
+    fn into_reqwest_adapter(self, target: (reqwest::Method, Url)) -> ReqwestAdapter;
+}
+
+impl IntoReqwestAdapter for reqwest::Client {
+    fn into_reqwest_adapter(self, target: (reqwest::Method, Url)) -> ReqwestAdapter {
+        ReqwestAdapter {
+            client: self,
+            target,
+            head_response: Arc::new(async_lock::Mutex::new(None)),
+            before_request: Arc::new(None),
+        }
+    }
 }
 
 impl ReqwestAdapter {
@@ -71,7 +89,22 @@ impl BoltLoadAdapter for ReqwestAdapter {
         if response.is_none() {
             *response = Some(self.perform_head().await?);
         }
-        Ok(response.as_ref().unwrap().content_length().unwrap_or(0))
+        Ok(response
+            .as_ref()
+            .unwrap()
+            .content_length()
+            .and_then(|len| if len > 0 { Some(len) } else { None })
+            // fallback to just parse the CONTENT_LENGTH header
+            .or_else(|| {
+                response
+                    .as_ref()
+                    .unwrap()
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or_default())
     }
 
     async fn is_range_stream_available(&self) -> bool {
@@ -100,9 +133,9 @@ impl BoltLoadAdapter for ReqwestAdapter {
                 .send()
                 .await
                 .and_then(|res| res.error_for_status())
-                .and_then(|res| {
-                    Ok(res.headers().get(CONTENT_RANGE).is_some()
-                        && res.content_length().unwrap_or(0) > 1)
+                .map(|res| {
+                    res.headers().get(CONTENT_RANGE).is_some()
+                        && res.content_length().unwrap_or(0) > 1
                 })
                 .unwrap_or_default();
         }
@@ -138,5 +171,76 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let stream = ReqwestStream(Box::new(response.bytes_stream()));
         Ok(Box::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use futures::StreamExt;
+    use pretty_assertions::assert_eq;
+    use test_log::test;
+
+    #[test(tokio::test)]
+    async fn test_get_content_size() {
+        let (port, _) = super::super::tests::create_http_server().await.unwrap();
+        let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
+        let client = reqwest::Client::new();
+        let adapter = client
+            .clone()
+            .into_reqwest_adapter((reqwest::Method::GET, url));
+        assert_eq!(adapter.get_content_size().await.unwrap(), 1040384);
+
+        let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
+        let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
+        assert_eq!(adapter.get_content_size().await.unwrap(), 1040384);
+    }
+
+    #[test(tokio::test)]
+    async fn test_is_range_stream_available() {
+        let (port, _) = super::super::tests::create_http_server().await.unwrap();
+        let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
+        let client = reqwest::Client::new();
+        let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
+        assert!(
+            adapter.is_range_stream_available().await,
+            "range stream should be available"
+        );
+
+        let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
+        let client = reqwest::Client::new();
+        let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
+        assert!(
+            !adapter.is_range_stream_available().await,
+            "range stream should not be available"
+        );
+    }
+
+    #[test(tokio::test)]
+    async fn test_full_stream() {
+        let (port, _) = super::super::tests::create_http_server().await.unwrap();
+        let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
+        let client = reqwest::Client::new();
+        let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
+        let mut stream = adapter.full_stream().await.unwrap();
+        let mut bytes = bytes::BytesMut::new();
+        while let Some(item) = stream.next().await {
+            bytes.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(bytes.len(), 1040384);
+    }
+
+    #[test(tokio::test)]
+    async fn test_range_stream() {
+        let (port, _) = super::super::tests::create_http_server().await.unwrap();
+        let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
+        let client = reqwest::Client::new();
+        let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
+        let mut stream = adapter.range_stream(0, 100).await.unwrap();
+        let mut bytes = bytes::BytesMut::new();
+        while let Some(item) = stream.next().await {
+            bytes.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(bytes.len(), 100);
     }
 }

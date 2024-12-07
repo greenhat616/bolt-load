@@ -26,6 +26,7 @@ pretty_assertions = "1.4.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1.0"
+test-log = "0.2"
 
 # for generate a random file
 tempfile = "3.14.0"

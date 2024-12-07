@@ -48,7 +48,7 @@ mod tests {
     use tempfile::tempfile;
     use tokio::{io::AsyncSeekExt, net::TcpListener};
 
-    fn create_random_file(size: usize) -> anyhow::Result<std::fs::File> {
+    pub fn create_random_file(size: usize) -> anyhow::Result<std::fs::File> {
         let mut file = tempfile()?;
         let mut writer = BufWriter::new(file.try_clone()?);
         let mut rng = rand::thread_rng();
@@ -68,7 +68,7 @@ mod tests {
     #[derive(Clone)]
     struct FileHolder(Arc<tokio::sync::Mutex<tokio::fs::File>>);
 
-    async fn create_http_server() -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+    pub async fn create_http_server() -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
         use axum::extract::State;
         use axum_extra::TypedHeader;
 
@@ -87,6 +87,7 @@ mod tests {
             let mut file = holder.0.lock().await;
             match file.seek(std::io::SeekFrom::Start(0)).await {
                 Ok(_) => {
+                    let file_size = file.metadata().await.unwrap().len();
                     let reader = tokio_util::io::ReaderStream::new(file.try_clone().await.unwrap());
                     let body = axum::body::Body::from_stream(reader);
                     let headers = [
@@ -95,18 +96,22 @@ mod tests {
                             "text/plain; charset=utf-8",
                         ),
                         (
+                            axum::http::header::CONTENT_LENGTH,
+                            &format!("{}", file_size),
+                        ),
+                        (
                             axum::http::header::CONTENT_DISPOSITION,
                             "attachment; filename=\"test.txt\"",
                         ),
                     ];
-                    return (headers, body).into_response();
+                    (headers, body).into_response()
                 }
                 Err(e) => {
-                    return (
+                    (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         e.to_string().into_response(),
                     )
-                        .into_response();
+                        .into_response()
                 }
             }
         }
