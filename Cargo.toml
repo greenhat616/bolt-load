@@ -5,7 +5,13 @@ version = "0.1.0"
 
 [features]
 default = ["reqwest"]
-http = ["dep:headers", "dep:regex", "dep:language-tags", "dep:percent-encoding", "dep:http"]
+http = [
+    "dep:headers",
+    "dep:regex",
+    "dep:language-tags",
+    "dep:percent-encoding",
+    "dep:http",
+]
 reqwest = ["dep:reqwest", "http"]
 
 [lib]
@@ -20,15 +26,18 @@ futures = "0.3"
 url = "2"
 bytes = "1"
 async-lock = "3"        # for cross runtime async lock
+ranges = "0.4.0"        # for range set operation
 
 # for http content-disposition parsing
 http = { version = "1", optional = true }
 regex = { version = "1", optional = true }
 language-tags = { version = "0.3", optional = true }
 percent-encoding = { version = "2.3", optional = true }
-
-reqwest = { version = "0.12", optional = true, features = ["stream"] }
+# for http headers
 headers = { version = "0.4", optional = true }
+# for reqwest adapter
+reqwest = { version = "0.12", optional = true, features = ["stream"] }
+
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

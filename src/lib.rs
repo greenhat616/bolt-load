@@ -1,4 +1,4 @@
 pub mod adapter;
-pub mod manager;
 pub mod client;
+pub mod manager;
 mod utils;

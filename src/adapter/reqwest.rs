@@ -3,7 +3,6 @@ use std::{pin::Pin, sync::Arc};
 use super::{AnyStream, BoltLoadAdapter};
 use async_trait::async_trait;
 use futures::Stream;
-use headers::{ContentDisposition, Header};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use url::Url;
 
@@ -136,7 +135,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .unwrap()
             .headers()
             .get(ACCEPT_RANGES)
-            .is_some_and(|v| v != "none");
+            .is_some_and(|v| v == "bytes");
         // try to send a real range request to test
         if !is_range_supported {
             is_range_supported = self
@@ -217,7 +216,10 @@ mod test {
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
         let client = reqwest::Client::new();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
-        assert_eq!(adapter.suggest_filename().await, Some("test.txt".to_owned()));
+        assert_eq!(
+            adapter.suggest_filename().await,
+            Some("test.txt".to_owned())
+        );
     }
 
     #[test(tokio::test)]

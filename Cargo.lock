@@ -272,6 +272,7 @@ dependencies = [
  "portpicker",
  "pretty_assertions",
  "rand",
+ "ranges",
  "regex",
  "reqwest",
  "tempfile",
@@ -1383,6 +1384,12 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom",
 ]
+
+[[package]]
+name = "ranges"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "350932f7e8b2d0333d2537f42671a837473576c00e128fbee84c819ea08783b5"
 
 [[package]]
 name = "redox_syscall"
