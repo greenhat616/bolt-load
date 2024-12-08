@@ -1,14 +1,28 @@
-mod chunks;
 mod multi_thread;
+mod planner;
 mod single_thread;
 
-pub use chunks::*;
 pub use multi_thread::*;
+pub use planner::*;
 pub use single_thread::*;
 
 use futures::Stream;
 
 use crate::adapter::AnyStream;
+
+pub type TaskId = usize;
+
+/// the main progress of the download
+pub struct Progress {
+    /// the total size of the content
+    /// possible None if the total size is unknown
+    /// It requires the single-thread task can finished until the stream is None
+    pub total: Option<u64>,
+
+    /// the current downloaded size
+    pub current: u64,
+}
+
 #[derive(Clone)]
 pub enum BoltLoadDownloadMode {
     SingleThread,
