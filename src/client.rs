@@ -22,7 +22,6 @@ struct BoltLoadConfiguration {
 }
 
 // The main client
-// TODO: use `derive_builder` to build the client
 #[derive(Builder)]
 #[builder(pattern = "owned")]
 pub struct BoltLoad {
@@ -54,14 +53,12 @@ impl BoltLoad {
                 self.tasks = vec![];
                 let task = BoltLoadTaskManager::new_single::<S, A, T>(adapter, save_path, url);
                 self.tasks.push(task);
-                todo!()
             }
             BoltLoadPreferDownloadMode::MultiThread => {
-                self.tasks = vec![];
-                // TODO: do split into multiple tasks
-
-                todo!()
+                self.tasks = BoltLoadTaskManager::new_multi::<S, A, T>(adapter, save_path, url);
             }
         }
+        // TODO: tell the tasks to start
+        todo!()
     }
 }

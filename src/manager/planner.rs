@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     ops::{Bound, Range, RangeBounds},
 };
 
@@ -19,6 +20,8 @@ pub struct ChunkPlanner {
     pub total: u64,
     /// the minimal size of the chunk
     pub min_chunk_size: u64,
+    /// the maximal count of the chunks
+    pub max_chunk_count: Option<NonZeroUsize>,
     /// hold occupied chunks
     chunks: HashMap<GenericRange<u64>, TaskId>,
 }
@@ -29,7 +32,13 @@ impl ChunkPlanner {
             total,
             chunks: HashMap::new(),
             min_chunk_size: DEFAULT_MIN_CHUNK_SIZE,
+            max_chunk_count: None,
         }
+    }
+
+    /// get the current chunks count
+    pub fn get_chunks_count(&self) -> usize {
+        self.chunks.keys().len()
     }
 
     /// check whether the range is occupied
@@ -55,6 +64,11 @@ impl ChunkPlanner {
 
     /// add the chunk
     pub fn add_chunk(&mut self, range: Range<u64>, id: usize) -> bool {
+        if let Some(max_chunk_count) = self.max_chunk_count {
+            if self.get_chunks_count() >= max_chunk_count.get() {
+                return false;
+            }
+        }
         if !self.check_range(range.clone()) {
             return false;
         }
@@ -107,6 +121,11 @@ impl ChunkPlanner {
     /// add a chunk by the length,
     /// it will arrange the chunk to the available range with the smallest start
     pub fn add_chunk_by_length(&mut self, length: u64, id: usize) -> Option<Range<u64>> {
+        if let Some(max_chunk_count) = self.max_chunk_count {
+            if self.get_chunks_count() >= max_chunk_count.get() {
+                return None;
+            }
+        }
         self.try_arrange_chunk_by_length(length).inspect(|range| {
             self.add_chunk(range.clone(), id);
         })
@@ -154,6 +173,24 @@ impl ChunkPlanner {
             }
         }
         (None, None)
+    }
+
+    /// Split the range into multiple chunks
+    pub fn split_chunks(&mut self) {
+        let range = GenericRange::from(0..self.total);
+        let start = unwrap_range_start_bound(range.start_bound());
+        let end = unwrap_range_end_bound(range.end_bound());
+        let mut chunks_count: usize = ((end - start) / self.min_chunk_size) as usize;
+        if let Some(max_chunk_count) = self.max_chunk_count {
+            chunks_count = std::cmp::min(chunks_count, max_chunk_count.get());
+        }
+        for i in 0..chunks_count {
+            let key = i;
+            let i = i as u64;
+            let chunk_range =
+                *start + i * self.min_chunk_size..*start + (i + 1) * self.min_chunk_size;
+            self.add_chunk(chunk_range, key);
+        }
     }
 }
 
@@ -212,5 +249,17 @@ mod tests {
         assert!(chunk_planner.add_chunk(30..40, 1));
         let available_chunks = chunk_planner.get_available_ranges();
         assert_eq!(available_chunks, vec![0..30, 40..50, 55..100]);
+    }
+
+    #[test]
+    fn test_split_chunks() {
+        let mut chunk_planner = ChunkPlanner::new(1024 * 1024 * 100);
+        chunk_planner.split_chunks();
+        assert_eq!(chunk_planner.get_chunks_count(), 100);
+
+        let mut chunk_planner = ChunkPlanner::new(1024 * 1024 * 100);
+        chunk_planner.max_chunk_count = NonZeroUsize::new(50);
+        chunk_planner.split_chunks();
+        assert_eq!(chunk_planner.get_chunks_count(), 50);
     }
 }
