@@ -2,6 +2,8 @@ mod multi_thread;
 mod planner;
 mod single_thread;
 
+use std::ops::Range;
+
 pub use multi_thread::*;
 pub use planner::*;
 pub use single_thread::*;
@@ -11,6 +13,11 @@ use futures::Stream;
 use crate::adapter::AnyStream;
 
 pub type TaskId = usize;
+
+/// messages for manager -> runner
+pub enum ManagerMessages {
+    ResizeChunk(TaskId, Range<u64>),
+}
 
 /// the main progress of the download
 pub struct Progress {
