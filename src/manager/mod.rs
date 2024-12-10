@@ -15,8 +15,9 @@ use crate::adapter::AnyStream;
 pub type TaskId = usize;
 
 /// messages for manager -> runner
-pub enum ManagerMessages {
-    ResizeChunk(TaskId, Range<u64>),
+pub struct ManagerMessages(TaskId, ManagerMessagesVariant);
+pub enum ManagerMessagesVariant {
+    ResizeEnd(Range<u64>),
 }
 
 /// the main progress of the download
