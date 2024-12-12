@@ -4,7 +4,7 @@ edition = "2021"
 version = "0.1.0"
 
 [features]
-default = ["reqwest"]
+default = ["reqwest", "tokio"]
 http = [
     "dep:headers",
     "dep:regex",
@@ -14,20 +14,27 @@ http = [
 ]
 reqwest = ["dep:reqwest", "http"]
 
+# runtime group
+tokio = ["dep:tokio"]
+smol = ["dep:smol", "dep:async-broadcast"]
+async-std = ["dep:async-std"]
+
 [lib]
 name = "bolt_load"
 path = "src/lib.rs"
 
 [dependencies]
 log = "0.4"
+thiserror = "2"
 async-trait = "0.1"
 derive_builder = "0.20"
 futures = "0.3"
 url = "2"
 bytes = "1"
-async-lock = "3"        # for cross runtime async lock
-ranges = "0.4.0"        # for range set operation
-async-channel = "2.3.1" # for async channel
+async-lock = "3"                                    # for cross runtime async lock
+ranges = "0.4"                                      # for range set operation
+async-channel = "2"                                 # for async channel
+oneshot = { version = "0.1", features = ["async"] }
 
 # for http content-disposition parsing
 http = { version = "1", optional = true }
@@ -39,6 +46,14 @@ headers = { version = "0.4", optional = true }
 # for reqwest adapter
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
 
+# runtime group
+tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+
+smol = { version = "2", optional = true }
+async-broadcast = { version = "0.7", optional = true }
+
+
+async-std = { version = "1", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
