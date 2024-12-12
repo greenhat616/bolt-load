@@ -2,7 +2,7 @@
 //! It is used to maintain the progress of the download, and the ranges of the chunks
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     ops::{Bound, Range, RangeBounds},
 };
@@ -24,6 +24,8 @@ pub struct ChunkPlanner {
     pub max_chunk_count: Option<NonZeroUsize>,
     /// hold occupied chunks
     chunks: HashMap<GenericRange<u64>, TaskId>,
+    /// hold the task ids, to check whether the task id is duplicate
+    task_ids: HashSet<TaskId>,
 }
 
 impl ChunkPlanner {
@@ -33,6 +35,7 @@ impl ChunkPlanner {
             chunks: HashMap::new(),
             min_chunk_size: DEFAULT_MIN_CHUNK_SIZE,
             max_chunk_count: None,
+            task_ids: HashSet::new(),
         }
     }
 
@@ -43,6 +46,9 @@ impl ChunkPlanner {
 
     /// check whether the range is occupied
     pub fn check_range(&self, range: Range<u64>) -> bool {
+        if range.end == range.start {
+            return false;
+        }
         let range = GenericRange::from(range);
         if self.chunks.contains_key(&range) {
             return false;
@@ -64,6 +70,9 @@ impl ChunkPlanner {
 
     /// add the chunk
     pub fn add_chunk(&mut self, range: Range<u64>, id: usize) -> bool {
+        if self.task_ids.contains(&id) {
+            return false;
+        }
         if let Some(max_chunk_count) = self.max_chunk_count {
             if self.get_chunks_count() >= max_chunk_count.get() {
                 return false;
@@ -73,13 +82,18 @@ impl ChunkPlanner {
             return false;
         }
         self.chunks.insert(range.into(), id);
+        self.task_ids.insert(id);
         true
     }
 
     /// remove the chunk
     pub fn remove_chunk(&mut self, range: Range<u64>) -> bool {
         let range = GenericRange::from(range);
-        self.chunks.remove(&range).is_some()
+        if let Some(id) = self.chunks.remove(&range) {
+            self.task_ids.remove(&id);
+            return true;
+        }
+        false
     }
 
     /// get the occupied ranges
@@ -138,12 +152,29 @@ impl ChunkPlanner {
         downloaded_range: &[Range<u64>],
         plan_size: u64,
     ) -> (Option<TaskId>, Option<Range<u64>>) {
+        let downloaded_ranges =
+            Ranges::from_iter(downloaded_range.iter().cloned().map(GenericRange::from));
+        // boundary check, the downloaded range should smaller or equal to the occupied range
+        for range in downloaded_ranges.as_slice() {
+            if self
+                .chunks
+                .iter()
+                .any(|(k, _)| *range - *k != OperationResult::Empty)
+            {
+                log::warn!(
+                    "the downloaded range is out of the occupied range, {:?} - {:?}",
+                    range,
+                    self.chunks
+                );
+                return (None, None);
+            }
+        }
+
         let range = self.try_arrange_chunk_by_length(plan_size);
         if let Some(range) = range {
             return (None, Some(range));
         };
-        let downloaded_ranges =
-            Ranges::from_iter(downloaded_range.iter().cloned().map(GenericRange::from));
+
         let full_range = Ranges::from(GenericRange::from(0..self.total));
         let available_ranges = full_range - downloaded_ranges;
         // find the first available range, that can be used to arrange the chunk
@@ -227,6 +258,7 @@ mod tests {
     fn test_add_chunk() {
         let mut chunk_planner = ChunkPlanner::new(100);
         assert!(chunk_planner.add_chunk(50..55, 0));
+        assert!(!chunk_planner.add_chunk(60..70, 0));
         assert!(chunk_planner.add_chunk(30..40, 1));
         assert!(!chunk_planner.add_chunk(50..60, 2));
         assert!(!chunk_planner.add_chunk(30..40, 3));
@@ -261,5 +293,121 @@ mod tests {
         chunk_planner.max_chunk_count = NonZeroUsize::new(50);
         chunk_planner.split_chunks();
         assert_eq!(chunk_planner.get_chunks_count(), 50);
+    }
+
+    #[test]
+    fn test_try_arrange_chunk_by_length() {
+        let mut chunk_planner = ChunkPlanner::new(100);
+        // Test with empty chunks
+        assert_eq!(chunk_planner.try_arrange_chunk_by_length(20), Some(0..20));
+
+        // Add some chunks and test
+        assert!(chunk_planner.add_chunk(0..30, 0));
+        assert_eq!(chunk_planner.try_arrange_chunk_by_length(20), Some(30..50));
+
+        // Test when there's not enough space
+        assert!(chunk_planner.add_chunk(30..90, 1));
+        assert_eq!(chunk_planner.try_arrange_chunk_by_length(20), None);
+
+        // Test with exact remaining space
+        assert_eq!(chunk_planner.try_arrange_chunk_by_length(10), Some(90..100));
+    }
+
+    #[test]
+    fn test_add_chunk_by_length() {
+        let mut chunk_planner = ChunkPlanner::new(100);
+        chunk_planner.max_chunk_count = NonZeroUsize::new(2);
+
+        // Test normal addition
+        assert_eq!(chunk_planner.add_chunk_by_length(20, 0), Some(0..20));
+        assert_eq!(chunk_planner.add_chunk_by_length(30, 1), Some(20..50));
+
+        // Test when max chunk count is reached
+        assert_eq!(chunk_planner.add_chunk_by_length(10, 2), None);
+
+        // Test when no suitable space is available
+        let mut full_planner = ChunkPlanner::new(50);
+        assert!(full_planner.add_chunk(0..50, 0));
+        assert_eq!(full_planner.add_chunk_by_length(10, 1), None);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn test_find_or_evict_chunk_range() {
+        let mut chunk_planner = ChunkPlanner::new(100);
+        chunk_planner.min_chunk_size = 10;
+
+        // Test with empty downloaded ranges
+        let downloaded: Vec<Range<u64>> = vec![];
+        let (task_id, range) = chunk_planner.find_or_evict_chunk_range(&downloaded, 20);
+        assert_eq!(task_id, None);
+        assert_eq!(range, Some(0..20));
+
+        // Test with some downloaded ranges and occupied chunks, and the chunk is not full
+        assert!(chunk_planner.add_chunk(0..30, 1));
+        let downloaded = &[0..10];
+        let (task_id, range) = chunk_planner.find_or_evict_chunk_range(downloaded, 20);
+        assert_eq!(task_id, None);
+        assert_eq!(range, Some(30..50));
+
+        // Test when downloaded range is out of the occupied range
+        let downloaded = &[0..90];
+        let (task_id, range) = chunk_planner.find_or_evict_chunk_range(downloaded, 20);
+        assert_eq!(task_id, None);
+        assert_eq!(range, None);
+
+        // Test when the chunk is full, and the downloaded range is smaller than the chunk - min_chunk_size
+        let mut chunk_planner = ChunkPlanner::new(100);
+        chunk_planner.min_chunk_size = 10;
+        assert!(chunk_planner.add_chunk(0..90, 1));
+        let downloaded = &[0..20];
+        let (task_id, range) = chunk_planner.find_or_evict_chunk_range(downloaded, 40);
+        assert_eq!(task_id, Some(1));
+        assert_eq!(range, Some(20..60));
+
+        // Test when the chunk is full, and the downloaded range is larger than the chunk - min_chunk_size
+        let mut chunk_planner = ChunkPlanner::new(100);
+        chunk_planner.min_chunk_size = 40;
+        assert!(chunk_planner.add_chunk(0..100, 1));
+        let downloaded = &[0..20];
+        let (task_id, range) = chunk_planner.find_or_evict_chunk_range(downloaded, 40);
+        assert_eq!(task_id, Some(1));
+        assert_eq!(range, Some(20..100));
+    }
+
+    #[test]
+    fn test_max_chunk_count_limit() {
+        let mut chunk_planner = ChunkPlanner::new(100);
+        chunk_planner.max_chunk_count = NonZeroUsize::new(2);
+
+        // Test adding chunks up to limit
+        assert!(chunk_planner.add_chunk(0..20, 0));
+        assert!(chunk_planner.add_chunk(30..50, 1));
+
+        // Test adding beyond limit
+        assert!(!chunk_planner.add_chunk(60..80, 2));
+
+        // Test after removing a chunk
+        assert!(chunk_planner.remove_chunk(0..20));
+        assert!(chunk_planner.add_chunk(60..80, 2));
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        let mut chunk_planner = ChunkPlanner::new(100);
+
+        // Test zero-length chunk
+        assert!(!chunk_planner.add_chunk(50..50, 0));
+
+        // Test chunk beyond total size
+        assert!(!chunk_planner.add_chunk(90..110, 0));
+
+        // Test overlapping chunks
+        assert!(chunk_planner.add_chunk(10..30, 0));
+        assert!(!chunk_planner.add_chunk(20..40, 1));
+        assert!(!chunk_planner.add_chunk(0..20, 1));
+
+        // Test exact size chunk at the end
+        assert!(chunk_planner.add_chunk(90..100, 1));
     }
 }
