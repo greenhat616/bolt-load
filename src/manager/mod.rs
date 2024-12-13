@@ -15,9 +15,11 @@ use crate::adapter::AnyStream;
 pub type TaskId = usize;
 
 /// messages for manager -> runner
-pub struct ManagerMessages(pub TaskId, pub ManagerMessagesVariant);
+pub struct ManagerMessage(pub TaskId, pub ManagerMessagesVariant);
 pub enum ManagerMessagesVariant {
-    ResizeEnd(Range<u64>),
+    /// resize the total size of the task
+    ResizeTotal(u64),
+    Cancel,
 }
 
 /// the main progress of the download
