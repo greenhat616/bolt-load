@@ -15,7 +15,7 @@ use crate::adapter::AnyStream;
 pub type TaskId = usize;
 
 /// messages for manager -> runner
-pub struct ManagerMessages(TaskId, ManagerMessagesVariant);
+pub struct ManagerMessages(pub TaskId, pub ManagerMessagesVariant);
 pub enum ManagerMessagesVariant {
     ResizeEnd(Range<u64>),
 }
