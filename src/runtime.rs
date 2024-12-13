@@ -1,18 +1,20 @@
 #![allow(dead_code)]
+#[cfg(feature = "smol")]
 use smol::future::FutureExt;
 use std::time::Duration;
 
 /// Runtime is a wrapper around the different runtime libraries.
 /// It is used to hold by bolt-load client, and run different manager and its tasks.
 // TODO: support?
-pub enum Runtime<'a> {
+pub enum Runtime {
     #[cfg(feature = "tokio")]
     Tokio(TokioRuntime),
     #[cfg(feature = "smol")]
-    Smol(smol::Executor<'a>),
+    Smol(SmolRuntime),
 }
 
-impl Runtime<'_> {
+impl Runtime {
+    #[cfg(feature = "tokio")]
     /// Create a new tokio runtime.
     /// If the current thread already has a tokio runtime, it will be used.
     pub fn new_tokio_rt() -> Self {
@@ -21,8 +23,10 @@ impl Runtime<'_> {
         ))
     }
 
+    #[cfg(feature = "smol")]
     pub fn new_smol_rt() -> Self {
-        Self::Smol(smol::Executor::new())
+        let available_threads = std::thread::available_parallelism().unwrap();
+        Self::Smol(SmolRuntime::build_with_threads(available_threads.get()))
     }
 }
 
@@ -113,6 +117,7 @@ impl SmolRuntime {
     }
 }
 
+#[cfg(feature = "smol")]
 impl Drop for SmolRuntime {
     fn drop(&mut self) {
         self.shutdown();
