@@ -161,8 +161,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
                         return Err(UnretryableError::Other(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             e.to_string(),
-                        ))
-                        .into());
+                        )));
                     }
                     StreamError::Unretryable(e) => {
                         return Err(e);
@@ -221,8 +220,8 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .send()
             .await?
             .error_for_status()?;
-        let stream = ReqwestStream(Box::new(response.bytes_stream()));
-        Ok(Box::new(stream))
+        let stream = ReqwestStream(Box::pin(response.bytes_stream()));
+        Ok(Box::pin(stream))
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<Self::Stream, StreamError> {
@@ -235,8 +234,8 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .send()
             .await?
             .error_for_status()?;
-        let stream = ReqwestStream(Box::new(response.bytes_stream()));
-        Ok(Box::new(stream))
+        let stream = ReqwestStream(Box::pin(response.bytes_stream()));
+        Ok(Box::pin(stream))
     }
 }
 

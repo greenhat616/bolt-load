@@ -8,7 +8,10 @@ use futures::FutureExt;
 use futures::StreamExt;
 
 /// messages for runner -> manager
+#[derive(Debug)]
 pub struct TaskMessage(pub TaskId, pub TaskMessageKind);
+
+#[derive(Debug)]
 pub enum TaskMessageKind {
     /// The task is started
     Started,
@@ -19,6 +22,7 @@ pub enum TaskMessageKind {
 }
 
 /// The reason why the task is stopped
+#[derive(Debug)]
 pub enum StoppedReason {
     /// The task is finished
     Finished,
@@ -131,9 +135,7 @@ impl TaskRunner {
                 TaskRunError::Failed(failed_kind) => {
                     let _ = self
                         .notify
-                        .send(TaskMessageKind::Stopped(StoppedReason::Failed(
-                            failed_kind,
-                        )))
+                        .send(TaskMessageKind::Stopped(StoppedReason::Failed(failed_kind)))
                         .await;
                 }
             },
@@ -146,9 +148,9 @@ impl TaskRunner {
         self.notify
             .send(TaskMessageKind::Started)
             .await
-            .unwrap();
+            .map_err(|_| TaskRunError::Failed(TaskFailedKind::ChannelClosed))?;
 
-        let (shutdown_tx, shutdown_rx) = async_channel::bounded(1);
+        let (shutdown_tx, shutdown_rx) = async_channel::unbounded();
         self.shutdown_signal = Some(shutdown_tx.clone());
 
         loop {
@@ -173,7 +175,8 @@ impl TaskRunner {
                         }
                         // In this case, the control signal is closed, which means the client or manager is released
                         // We should just call the shutdown function
-                        Err(_) => {
+                        Err(e) => {
+                            log::debug!("control signal is closed, shutdown the task runner: {:?}", e);
                             let _ = shutdown_tx
                                 .send(Err(TaskFailedKind::ChannelClosed.into()))
                                 .await;
@@ -215,6 +218,7 @@ impl TaskRunner {
                             return Err(err);
                         }
                         Err(_) => {
+                            log::debug!("shutdown signal is closed, shutdown the task runner");
                             return Err(TaskFailedKind::ChannelClosed.into());
                         }
                     }
@@ -249,5 +253,317 @@ impl TaskRunner {
             .take()
             .unwrap()
             .try_send(Err(TaskRunError::Cancelled));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::adapter::{StreamError, UnretryableError};
+
+    use super::*;
+    use async_stream::stream;
+    use pretty_assertions::assert_eq;
+    use std::time::Duration;
+    use test_log::test;
+    use tokio::time::sleep;
+
+    #[test(tokio::test)]
+    async fn test_normal_download() {
+        let (_control_tx, control_rx) = async_channel::unbounded();
+
+        // Create a stream that emits 3 chunks
+        let test_stream = stream! {
+            for i in 0..3 {
+                yield Ok(Bytes::from(vec![i as u8; 10]));
+            }
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(
+            Some(30), // Total size: 3 chunks * 10 bytes
+            Box::pin(test_stream),
+            1,
+            control_rx,
+        );
+
+        // Spawn the runner
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        // Collect all messages
+        let mut downloaded_size = 0;
+        let mut started = false;
+        let mut finished = false;
+
+        while let Ok(msg) = msg_rx.recv().await {
+            log::debug!("msg: {:?}", msg);
+            match msg {
+                TaskMessage(_, TaskMessageKind::Started) => {
+                    started = true;
+                }
+                TaskMessage(_, TaskMessageKind::Downloaded(bytes)) => {
+                    downloaded_size += bytes.len();
+                }
+                TaskMessage(_, TaskMessageKind::Stopped(StoppedReason::Finished)) => {
+                    finished = true;
+                    break;
+                }
+                _ => panic!("Unexpected message"),
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(started);
+        assert!(finished);
+        assert_eq!(downloaded_size, 30);
+    }
+
+    #[test(tokio::test)]
+    async fn test_cancel_download() {
+        let (control_tx, control_rx) = async_channel::unbounded();
+
+        // Create an infinite stream that we'll cancel
+        let test_stream = stream! {
+            loop {
+                sleep(Duration::from_millis(10)).await;
+                yield Ok(Bytes::from(vec![1; 10]));
+            }
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(None, Box::pin(test_stream), 1, control_rx);
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        // Wait for the Started message
+        let mut started = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(_, TaskMessageKind::Started) = msg {
+                started = true;
+                break;
+            }
+        }
+
+        // Send cancel signal
+        control_tx
+            .send(ManagerMessage(1, ManagerMessagesVariant::Cancel))
+            .await
+            .unwrap();
+
+        // Wait for cancelled message
+        let mut cancelled = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(_, TaskMessageKind::Stopped(StoppedReason::Cancelled)) = msg {
+                cancelled = true;
+                break;
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(started);
+        assert!(cancelled);
+    }
+
+    #[test(tokio::test)]
+    async fn test_network_error() {
+        let (_control_tx, control_rx) = async_channel::unbounded();
+
+        // Create a stream that yields an error
+        let test_stream = stream! {
+            yield Ok(Bytes::from(vec![1; 10]));
+            yield Err(StreamError::Unretryable(UnretryableError::Other(
+                std::io::Error::new(std::io::ErrorKind::Other, "Network error"),
+            )));
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(Some(20), Box::pin(test_stream), 1, control_rx);
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut got_error = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(
+                _,
+                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::NetworkError(_))),
+            ) = msg
+            {
+                got_error = true;
+                break;
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(got_error);
+    }
+
+    #[test(tokio::test)]
+    async fn test_empty_stream() {
+        let (_control_tx, control_rx) = async_channel::unbounded();
+
+        // Create an empty stream
+        let test_stream = stream! {
+            yield Ok(Bytes::from(vec![]));
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(None, Box::pin(test_stream), 1, control_rx);
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut got_empty_error = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            log::error!("msg: {:?}", msg);
+            if let TaskMessage(
+                _,
+                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Empty)),
+            ) = msg
+            {
+                got_empty_error = true;
+                break;
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(got_empty_error);
+    }
+
+    #[test(tokio::test)]
+    // TODO: add a test for the resize small, and implement the logic
+    async fn test_resize_total() {
+        let (control_tx, control_rx) = async_channel::unbounded();
+
+        // Create a stream with known size
+        let test_stream = stream! {
+            yield Ok(Bytes::from(vec![1; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![2; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![3; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![4; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![5; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![6; 10]));
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(
+            Some(10), // Initially wrong size
+            Box::pin(test_stream),
+            1,
+            control_rx,
+        );
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        // Send resize message after start
+        let mut started = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(_, TaskMessageKind::Started) = msg {
+                started = true;
+                control_tx
+                    .send(ManagerMessage(1, ManagerMessagesVariant::ResizeTotal(60)))
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+
+        let mut finished = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(_, TaskMessageKind::Stopped(StoppedReason::Finished)) = msg {
+                finished = true;
+                break;
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(started);
+        assert!(finished);
+    }
+
+    #[test(tokio::test)]
+    async fn test_size_mismatch() {
+        let (_control_tx, control_rx) = async_channel::unbounded();
+
+        // Create a stream that produces more data than expected
+        let test_stream = stream! {
+            yield Ok(Bytes::from(vec![1; 10]));
+            yield Ok(Bytes::from(vec![2; 10]));
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(
+            Some(10), // Expect only 10 bytes but will receive 20
+            Box::pin(test_stream),
+            1,
+            control_rx,
+        );
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut got_size_mismatch = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(
+                _,
+                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Other(_))),
+            ) = msg
+            {
+                got_size_mismatch = true;
+                break;
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(got_size_mismatch);
+    }
+
+    #[test(tokio::test)]
+    async fn test_channel_closed() {
+        let (control_tx, control_rx) = async_channel::unbounded();
+
+        // Create a stream that will never complete
+        let test_stream = stream! {
+            loop {
+                sleep(Duration::from_millis(10)).await;
+                yield Ok(Bytes::from(vec![1; 10]));
+            }
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(None, Box::pin(test_stream), 1, control_rx);
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        // Wait for start then drop the control channel
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(_, TaskMessageKind::Started) = msg {
+                drop(control_tx);
+                break;
+            }
+        }
+
+        let mut got_channel_closed = false;
+        while let Ok(msg) = msg_rx.recv().await {
+            if let TaskMessage(
+                _,
+                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::ChannelClosed)),
+            ) = msg
+            {
+                got_channel_closed = true;
+                break;
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(got_channel_closed);
     }
 }

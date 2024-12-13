@@ -56,18 +56,21 @@ async-broadcast = { version = "0.7", optional = true }
 async-std = { version = "1", optional = true }
 
 [dev-dependencies]
-pretty_assertions = "1.4.1"
+pretty_assertions = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-anyhow = "1.0"
+anyhow = "1"
 test-log = "0.2"
 
+# for stream test
+async-stream = "0.3"
+
 # for generate a random file
-tempfile = "3.14.0"
+tempfile = "3"
 rand = "0.8"
 
 # for http server test
 axum = "0.7"
-axum-extra = { version = "0.9.6", features = ["typed-header"] }
-axum-range = "0.4.0"
-portpicker = "0.1.1"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+axum-range = "0.4"
+portpicker = "0.1"

@@ -1,3 +1,5 @@
+use std::pin::Pin;
+
 use async_trait::async_trait;
 use futures::Stream;
 
@@ -70,7 +72,7 @@ pub enum StreamError {
     Unretryable(#[from] UnretryableError),
 }
 
-pub type AnyStream<T> = Box<dyn Stream<Item = T> + Unpin + Send>;
+pub type AnyStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 pub type AnyBytesStream = AnyStream<Result<bytes::Bytes, StreamError>>;
 
 // TODO: maybe the chunk should be zero copy
