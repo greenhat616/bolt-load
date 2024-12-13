@@ -1,5 +1,5 @@
 use crate::{
-    adapter::AnyStream,
+    adapter::AnyBytesStream,
     manager::{ManagerMessage, ManagerMessagesVariant, TaskId},
 };
 use async_channel::{Receiver, Sender};
@@ -18,22 +18,33 @@ pub enum TaskMessageKind {
     Downloaded(Bytes),
 }
 
+/// The reason why the task is stopped
 pub enum StoppedReason {
+    /// The task is finished
     Finished,
+    /// The task is failed
     Failed(TaskFailedKind),
+    /// The task is cancelled
     Cancelled,
 }
 
+/// The kind of the task failed
 #[derive(Debug)]
 pub enum TaskFailedKind {
+    /// The task is timeout, only happen when a stream is not sent in a period
     Timeout,
+    /// The task is empty
     Empty,
+    /// The channel is closed
     ChannelClosed,
+    /// The network error
     NetworkError(String),
+    /// The other error
     Other(String),
 }
 
 #[derive(Clone)]
+/// a wrapper of the task message sender
 struct TaskMessageSender(TaskId, Sender<TaskMessage>);
 
 impl TaskMessageSender {
@@ -50,12 +61,12 @@ impl TaskMessageSender {
 }
 
 #[derive(Debug)]
-enum TaskRunnerRunError {
+enum TaskRunError {
     Cancelled,
     Failed(TaskFailedKind),
 }
 
-impl From<TaskFailedKind> for TaskRunnerRunError {
+impl From<TaskFailedKind> for TaskRunError {
     fn from(value: TaskFailedKind) -> Self {
         Self::Failed(value)
     }
@@ -69,19 +80,19 @@ pub struct TaskRunner {
     /// the downloaded size
     downloaded: u64,
     /// the adapter of the task
-    stream: AnyStream<std::io::Result<bytes::Bytes>>,
+    stream: AnyBytesStream,
     /// the receiver of the manager messages
     control_signal: Receiver<ManagerMessage>,
     /// the sender of the task messages
     notify: TaskMessageSender,
     /// the sender of the shutdown signal
-    shutdown_signal: Option<Sender<Result<(), TaskRunnerRunError>>>,
+    shutdown_signal: Option<Sender<Result<(), TaskRunError>>>,
 }
 
 impl TaskRunner {
     pub fn new(
         total: Option<u64>,
-        stream: AnyStream<std::io::Result<bytes::Bytes>>,
+        stream: AnyBytesStream,
         task_id: TaskId,
         receiver: Receiver<ManagerMessage>,
     ) -> (Self, Receiver<TaskMessage>) {
@@ -111,13 +122,13 @@ impl TaskRunner {
                     .await;
             }
             Err(err) => match err {
-                TaskRunnerRunError::Cancelled => {
+                TaskRunError::Cancelled => {
                     let _ = self
                         .notify
                         .send(TaskMessageKind::Stopped(StoppedReason::Cancelled))
                         .await;
                 }
-                TaskRunnerRunError::Failed(failed_kind) => {
+                TaskRunError::Failed(failed_kind) => {
                     let _ = self
                         .notify
                         .send(TaskMessageKind::Stopped(StoppedReason::Failed(
@@ -131,7 +142,7 @@ impl TaskRunner {
 
     /// The inner logic of the task runner
     /// Just wrap a Result<(), TaskFailedKind> to return the error kind
-    async fn run_inner(&mut self) -> Result<(), TaskRunnerRunError> {
+    async fn run_inner(&mut self) -> Result<(), TaskRunError> {
         self.notify
             .send(TaskMessageKind::Started)
             .await
@@ -156,7 +167,7 @@ impl TaskRunner {
                                     self.total = Some(total);
                                 }
                                 ManagerMessagesVariant::Cancel => {
-                                    return Err(TaskRunnerRunError::Cancelled);
+                                    return Err(TaskRunError::Cancelled);
                                 }
                             }
                         }
@@ -237,6 +248,6 @@ impl TaskRunner {
             .shutdown_signal
             .take()
             .unwrap()
-            .try_send(Err(TaskRunnerRunError::Cancelled));
+            .try_send(Err(TaskRunError::Cancelled));
     }
 }

@@ -15,29 +15,63 @@ pub trait BoltLoadAdapter: Send + Sync {
         false
     }
 
-    /// Suggest a filename from the adapter
-    async fn suggest_filename(&self) -> Option<String> {
-        None
-    }
-
-    /// Get the content size of the adapter
-    async fn get_content_size(&self) -> std::io::Result<u64>;
+    /// Perform a meta request to the adapter
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError>;
 
     /// Get a full content stream from the adapter
-    async fn full_stream(&self) -> std::io::Result<Self::Stream>;
+    async fn full_stream(&self) -> Result<Self::Stream, StreamError>;
 
     /// Get a range content stream from the adapter
     /// Note: the range is followed as [start, end)
     #[allow(unused_variables)]
-    async fn range_stream(&self, start: u64, end: u64) -> std::io::Result<Self::Stream> {
-        Err(std::io::Error::new(
+    async fn range_stream(&self, start: u64, end: u64) -> Result<Self::Stream, StreamError> {
+        Err(UnretryableError::Other(std::io::Error::new(
             std::io::ErrorKind::Other,
             "Range stream is not supported",
         ))
+        .into())
     }
 }
 
+pub struct BoltLoadAdapterMeta {
+    /// the content size
+    pub content_size: u64,
+    /// suggested filename
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RetryableError {
+    #[error(transparent)]
+    Other(#[from] std::io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnretryableError {
+    #[error("access denied: {0}")]
+    Forbidden(String),
+    #[error("resource not found")]
+    NotFound,
+    #[error("internal error: {0}")]
+    /// The error is internal. such as a http request, we do not retrieve the meta, and we call the range stream directly
+    Internal(String),
+    #[error(transparent)]
+    Other(#[from] std::io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+/// The error type for the adapter stream
+pub enum StreamError {
+    #[error(transparent)]
+    /// The error is retryable
+    Retryable(#[from] RetryableError),
+    #[error(transparent)]
+    /// The error is unretryable
+    Unretryable(#[from] UnretryableError),
+}
+
 pub type AnyStream<T> = Box<dyn Stream<Item = T> + Unpin + Send>;
+pub type AnyBytesStream = AnyStream<Result<bytes::Bytes, StreamError>>;
 
 // TODO: maybe the chunk should be zero copy
 // pub trait BoltLoaderAdapterAnyStream =

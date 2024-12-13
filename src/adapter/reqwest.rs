@@ -1,6 +1,9 @@
 use std::{pin::Pin, sync::Arc};
 
-use super::{AnyStream, BoltLoadAdapter};
+use super::{
+    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError, StreamError,
+    UnretryableError,
+};
 use async_trait::async_trait;
 use futures::Stream;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
@@ -33,16 +36,59 @@ impl IntoReqwestAdapter for reqwest::Client {
     }
 }
 
+impl From<reqwest::Error> for StreamError {
+    fn from(e: reqwest::Error) -> Self {
+        if let Some(status_code) = e.status() {
+            if status_code.is_client_error() {
+                match status_code {
+                    reqwest::StatusCode::NOT_FOUND => {
+                        return UnretryableError::Other(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            e.to_string(),
+                        ))
+                        .into()
+                    }
+                    reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
+                        return UnretryableError::Other(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            e.to_string(),
+                        ))
+                        .into()
+                    }
+                    _ => {
+                        return RetryableError::Other(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))
+                        .into()
+                    }
+                }
+            }
+        }
+        if e.is_builder() || e.is_body() {
+            return UnretryableError::Other(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+            .into();
+        }
+
+        // fallback to other errors
+        RetryableError::Other(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+        .into()
+    }
+}
+
 impl ReqwestAdapter {
-    async fn perform_head(&self) -> Result<reqwest::Response, std::io::Error> {
+    async fn perform_head(&self) -> Result<reqwest::Response, StreamError> {
         let response = self
             .apply_before_request(self.client.head(self.target.1.clone()))
             .send()
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        response
-            .error_for_status()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            .await?;
+        Ok(response.error_for_status()?)
     }
 
     pub fn before_request(
@@ -60,45 +106,14 @@ impl ReqwestAdapter {
             builder
         }
     }
-}
 
-struct ReqwestStream(AnyStream<Result<bytes::Bytes, reqwest::Error>>);
-
-impl Stream for ReqwestStream {
-    type Item = std::io::Result<bytes::Bytes>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().0).poll_next(cx).map(|opt| {
-            opt.map(|res| {
-                res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })
-        })
-    }
-}
-
-#[async_trait]
-impl BoltLoadAdapter for ReqwestAdapter {
-    type Item = std::io::Result<bytes::Bytes>;
-    type Stream = AnyStream<Self::Item>;
-
-    async fn get_content_size(&self) -> std::io::Result<u64> {
-        let mut response = self.head_response.lock().await;
-        if response.is_none() {
-            *response = Some(self.perform_head().await?);
-        }
+    fn get_content_size(&self, response: &reqwest::Response) -> std::io::Result<u64> {
         Ok(response
-            .as_ref()
-            .unwrap()
             .content_length()
             .and_then(|len| if len > 0 { Some(len) } else { None })
             // fallback to just parse the CONTENT_LENGTH header
             .or_else(|| {
                 response
-                    .as_ref()
-                    .unwrap()
                     .headers()
                     .get(CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
@@ -107,18 +122,59 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .unwrap_or_default())
     }
 
-    async fn suggest_filename(&self) -> Option<String> {
-        let mut head = self.head_response.lock().await;
-        if head.is_none() {
-            *head = Some(self.perform_head().await.ok()?);
-        }
-
-        head.as_ref()
-            .unwrap()
+    async fn suggest_filename(&self, response: &reqwest::Response) -> Option<String> {
+        response
             .headers()
             .get(CONTENT_DISPOSITION)
             .and_then(|v| crate::utils::http::ContentDisposition::from_raw(v).ok())
             .and_then(|d| d.get_filename().map(String::from))
+    }
+}
+
+struct ReqwestStream(AnyStream<Result<bytes::Bytes, reqwest::Error>>);
+
+impl Stream for ReqwestStream {
+    type Item = Result<bytes::Bytes, super::StreamError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().0)
+            .poll_next(cx)
+            .map(|opt| opt.map(|res| res.map_err(StreamError::from)))
+    }
+}
+
+#[async_trait]
+impl BoltLoadAdapter for ReqwestAdapter {
+    type Item = Result<bytes::Bytes, StreamError>;
+    type Stream = AnyBytesStream;
+
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
+        let mut response = self.head_response.lock().await;
+        if response.is_none() {
+            match self.perform_head().await {
+                Ok(res) => *response = Some(res),
+                Err(e) => match e {
+                    StreamError::Retryable(e) => {
+                        return Err(UnretryableError::Other(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))
+                        .into());
+                    }
+                    StreamError::Unretryable(e) => {
+                        return Err(e);
+                    }
+                },
+            }
+        }
+
+        Ok(BoltLoadAdapterMeta {
+            content_size: self.get_content_size(response.as_ref().unwrap())?,
+            filename: self.suggest_filename(response.as_ref().unwrap()).await,
+        })
     }
 
     async fn is_range_stream_available(&self) -> bool {
@@ -156,22 +212,20 @@ impl BoltLoadAdapter for ReqwestAdapter {
         is_range_supported
     }
 
-    async fn full_stream(&self) -> std::io::Result<Self::Stream> {
+    async fn full_stream(&self) -> Result<Self::Stream, StreamError> {
         let response = self
             .apply_before_request(
                 self.client
                     .request(self.target.0.clone(), self.target.1.clone()),
             )
             .send()
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-            .error_for_status()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .await?
+            .error_for_status()?;
         let stream = ReqwestStream(Box::new(response.bytes_stream()));
         Ok(Box::new(stream))
     }
 
-    async fn range_stream(&self, start: u64, end: u64) -> std::io::Result<Self::Stream> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<Self::Stream, StreamError> {
         let response = self
             .apply_before_request(
                 self.client
@@ -179,10 +233,8 @@ impl BoltLoadAdapter for ReqwestAdapter {
                     .header(RANGE, format!("bytes={}-{}", start, end - 1)),
             )
             .send()
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-            .error_for_status()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .await?
+            .error_for_status()?;
         let stream = ReqwestStream(Box::new(response.bytes_stream()));
         Ok(Box::new(stream))
     }
@@ -203,11 +255,11 @@ mod test {
         let adapter = client
             .clone()
             .into_reqwest_adapter((reqwest::Method::GET, url));
-        assert_eq!(adapter.get_content_size().await.unwrap(), 1040384);
+        assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
 
         let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
-        assert_eq!(adapter.get_content_size().await.unwrap(), 1040384);
+        assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
     }
 
     #[test(tokio::test)]
@@ -217,7 +269,7 @@ mod test {
         let client = reqwest::Client::new();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
         assert_eq!(
-            adapter.suggest_filename().await,
+            adapter.retrieve_meta().await.unwrap().filename,
             Some("test.txt".to_owned())
         );
     }
