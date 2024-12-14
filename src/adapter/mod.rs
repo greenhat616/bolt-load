@@ -6,6 +6,9 @@ use futures::Stream;
 #[cfg(feature = "reqwest")]
 mod reqwest;
 
+#[cfg(feature = "ureq")]
+mod ureq;
+
 #[async_trait]
 pub trait BoltLoadAdapter: Send + Sync {
     type Item: Send + Sync;
@@ -51,7 +54,7 @@ pub enum RetryableError {
 #[derive(Debug, thiserror::Error)]
 pub enum UnretryableError {
     #[error("access denied: {0}")]
-    Forbidden(String),
+    Unauthorized(String),
     #[error("resource not found")]
     NotFound,
     #[error("internal error: {0}")]
@@ -70,6 +73,17 @@ pub enum StreamError {
     #[error(transparent)]
     /// The error is unretryable
     Unretryable(#[from] UnretryableError),
+}
+
+impl From<StreamError> for UnretryableError {
+    fn from(e: StreamError) -> Self {
+        match e {
+            StreamError::Retryable(e) => match e {
+                RetryableError::Other(e) => UnretryableError::Other(e),
+            },
+            StreamError::Unretryable(e) => e,
+        }
+    }
 }
 
 pub type AnyStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;

@@ -12,7 +12,10 @@ http = [
     "dep:percent-encoding",
     "dep:http",
 ]
+blocking = ["dep:blocking"]
+# adapter group
 reqwest = ["dep:reqwest", "http"]
+ureq = ["dep:ureq", "blocking", "http"]
 
 # runtime group
 tokio = ["dep:tokio"]
@@ -34,6 +37,7 @@ bytes = "1"
 async-lock = "3"                                    # for cross runtime async lock
 ranges = "0.4"                                      # for range set operation
 async-channel = "2"                                 # for async channel
+blocking = { version = "1", optional = true }       # convert blocking io to async
 oneshot = { version = "0.1", features = ["async"] }
 
 # for http content-disposition parsing
@@ -45,6 +49,8 @@ percent-encoding = { version = "2.3", optional = true }
 headers = { version = "0.4", optional = true }
 # for reqwest adapter
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
+# for ureq adapter
+ureq = { version = "2", optional = true }
 
 # runtime group
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
