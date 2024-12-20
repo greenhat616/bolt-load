@@ -10,7 +10,7 @@ pub use single_thread::*;
 
 use futures::Stream;
 
-use crate::adapter::AnyStream;
+use crate::adapter::{AnyAdapter, AnyStream};
 
 pub type TaskId = usize;
 

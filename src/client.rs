@@ -6,6 +6,12 @@ use crate::{
     manager::BoltLoadTaskManager,
 };
 
+pub enum DownloadSource {
+    Adapter(adapter::AnyAdapter),
+    // TODO: add abstract trait for self managed task, such as a bittorrent task
+    SelfManaged,
+}
+
 #[derive(Default)]
 pub enum BoltLoadPreferDownloadMode {
     /// All tasks should be single thread

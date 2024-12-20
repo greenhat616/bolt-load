@@ -88,6 +88,9 @@ impl From<StreamError> for UnretryableError {
 
 pub type AnyStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 pub type AnyBytesStream = AnyStream<Result<bytes::Bytes, StreamError>>;
+pub type AnyAdapter = Box<
+    dyn BoltLoadAdapter<Item = Result<bytes::Bytes, StreamError>, Stream = AnyBytesStream> + Send,
+>;
 
 // TODO: maybe the chunk should be zero copy
 // pub trait BoltLoaderAdapterAnyStream =
