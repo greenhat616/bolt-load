@@ -10,7 +10,14 @@ pub use single_thread::*;
 
 use futures::Stream;
 
-use crate::adapter::AnyStream;
+use crate::{
+    adapter::AnyStream,
+    runner::TaskRunner,
+    strategy::{Strategy, StrategyAction},
+};
+
+// TODO: change this constant
+const MININUM_THREAD: usize = 2;
 
 pub type TaskId = usize;
 
@@ -60,12 +67,11 @@ pub struct BoltLoadTaskManager {
     >,
     mode: BoltLoadDownloadMode,
     save_path: String,
-    url: String,
     state: BoltLoadTaskState,
 }
 
 impl BoltLoadTaskManager {
-    pub fn new_single<S, A, T>(adapter: A, save_path: &String, url: &String) -> Self
+    pub fn new_single<S, A, T>(adapter: A, save_path: &String) -> Self
     where
         A: super::adapter::BoltLoadAdapter<
                 Item = Result<bytes::Bytes, std::io::Error>,
@@ -80,12 +86,11 @@ impl BoltLoadTaskManager {
             adapter,
             mode: BoltLoadDownloadMode::SingleThread,
             save_path: save_path.clone(),
-            url: url.clone(),
             state: BoltLoadTaskState::Idle,
         }
     }
 
-    pub fn new_multi<S, A, T>(adapter: A, save_path: &String, url: &String) -> Vec<Self>
+    pub async fn new_multi<S, A, T, Y>(adapter: A, save_path: &String) -> Vec<Self>
     where
         A: super::adapter::BoltLoadAdapter<
                 Item = Result<bytes::Bytes, std::io::Error>,
@@ -94,9 +99,51 @@ impl BoltLoadTaskManager {
             + 'static,
         S: Stream<Item = T>,
         T: Send,
+        Y: Strategy,
     {
         let adapter = Box::new(adapter);
         // Split into load tasks
+
+        // Retrive metadatas
+        let Ok(metadata) = adapter.retrieve_meta().await else {
+            todo!()
+        };
+        // Init chunk planners
+        let mut planner = ChunkPlanner::new(metadata.content_size);
+
+        // Init manager with minimum thread
+        let mut task_managers = Vec::<Self>::new();
+
+        // for _ in 0..MININUM_THREAD {
+        //     let task_manager = BoltLoadTaskManager {
+        //         adapter,
+        //         mode: BoltLoadDownloadMode::MultiThread,
+        //         save_path: save_path.clone(),
+        //         state: BoltLoadTaskState::Idle,
+        //     };
+        //     task_managers.push(task_manager);
+        // }
+
+        loop {
+            // let actions = Y::step();
+            // for action in actions {
+            //     match action {
+            //         StrategyAction::ChangeMaxThread(_) => todo!(),
+            //         StrategyAction::SplitAllTask => todo!(),
+            //         StrategyAction::SplitGivenTask(_) => todo!(),
+            //     }
+            // }
+        }
         todo!()
+    }
+}
+
+impl PartialEq for BoltLoadDownloadMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (BoltLoadDownloadMode::SingleThread, BoltLoadDownloadMode::SingleThread) => true,
+            (BoltLoadDownloadMode::MultiThread, BoltLoadDownloadMode::MultiThread) => true,
+            _ => false,
+        }
     }
 }

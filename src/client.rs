@@ -3,7 +3,7 @@ use futures::Stream;
 
 use crate::{
     adapter::{self, AnyStream},
-    manager::BoltLoadTaskManager,
+    manager::BoltLoadTaskManager, strategy::Strategy,
 };
 
 #[derive(Default)]
@@ -36,7 +36,7 @@ pub(crate) struct BoltLoadHandle {}
 impl BoltLoad {
     // Start the load from url process
     // Should be powered by a state machine
-    pub fn start<A, S, T>(&mut self, adapter: A, save_path: &String, url: &String)
+    pub async fn start<A, S, T, Y>(&mut self, adapter: A, save_path: &String)
     where
         A: adapter::BoltLoadAdapter<
                 Item = Result<bytes::Bytes, std::io::Error>,
@@ -45,17 +45,18 @@ impl BoltLoad {
             + 'static,
         S: Stream<Item = T>,
         T: Send,
+        Y: Strategy
     {
         // Split into load tasks
         // According to the mode, etc
         match self.configuration.prefer_download_mode {
             BoltLoadPreferDownloadMode::SingleThread => {
                 self.tasks = vec![];
-                let task = BoltLoadTaskManager::new_single::<S, A, T>(adapter, save_path, url);
+                let task = BoltLoadTaskManager::new_single::<S, A, T>(adapter, save_path);
                 self.tasks.push(task);
             }
             BoltLoadPreferDownloadMode::MultiThread => {
-                self.tasks = BoltLoadTaskManager::new_multi::<S, A, T>(adapter, save_path, url);
+                self.tasks = BoltLoadTaskManager::new_multi::<S, A, T, Y>(adapter, save_path).await;
             }
         }
         // TODO: tell the tasks to start
