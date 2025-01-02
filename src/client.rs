@@ -3,7 +3,8 @@ use futures::Stream;
 
 use crate::{
     adapter::{self, AnyStream},
-    manager::BoltLoadTaskManager, strategy::Strategy,
+    manager::BoltLoadTaskManager,
+    strategy::Strategy,
 };
 
 pub enum DownloadSource {
@@ -12,7 +13,7 @@ pub enum DownloadSource {
     SelfManaged,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub enum BoltLoadPreferDownloadMode {
     /// All tasks should be single thread
     SingleThread,
@@ -51,20 +52,20 @@ impl BoltLoad {
             + 'static,
         S: Stream<Item = T>,
         T: Send,
-        Y: Strategy
+        Y: Strategy,
     {
         // Split into load tasks
         // According to the mode, etc
-        match self.configuration.prefer_download_mode {
-            BoltLoadPreferDownloadMode::SingleThread => {
-                self.tasks = vec![];
-                let task = BoltLoadTaskManager::new_single::<S, A, T>(adapter, save_path);
-                self.tasks.push(task);
-            }
-            BoltLoadPreferDownloadMode::MultiThread => {
-                self.tasks = BoltLoadTaskManager::new_multi::<S, A, T, Y>(adapter, save_path).await;
-            }
-        }
+        self.tasks = vec![];
+        let Ok(task) = BoltLoadTaskManager::new::<S, A, T, Y>(
+            adapter,
+            save_path,
+            self.configuration.prefer_download_mode,
+        ).await else {
+            // TODO: Change to custom error types
+            return;
+        };
+        self.tasks.push(task);
         // TODO: tell the tasks to start
         todo!()
     }

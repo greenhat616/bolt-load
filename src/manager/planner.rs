@@ -206,23 +206,6 @@ impl ChunkPlanner {
         (None, None)
     }
 
-    /// Split the range into multiple chunks
-    pub fn split_chunks(&mut self) {
-        let range = GenericRange::from(0..self.total);
-        let start = unwrap_range_start_bound(range.start_bound());
-        let end = unwrap_range_end_bound(range.end_bound());
-        let mut chunks_count: usize = ((end - start) / self.min_chunk_size) as usize;
-        if let Some(max_chunk_count) = self.max_chunk_count {
-            chunks_count = std::cmp::min(chunks_count, max_chunk_count.get());
-        }
-        for i in 0..chunks_count {
-            let key = i;
-            let i = i as u64;
-            let chunk_range =
-                *start + i * self.min_chunk_size..*start + (i + 1) * self.min_chunk_size;
-            self.add_chunk(chunk_range, key);
-        }
-    }
 }
 
 /// It is safe to convert the generic range to the std range, because the normal range in Rust is [start, end)

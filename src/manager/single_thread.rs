@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 
-use super::BoltLoadTaskManager;
 
 #[async_trait]
 pub trait SingleThreadTask {
@@ -9,18 +8,3 @@ pub trait SingleThreadTask {
     async fn run(&self);
 }
 
-#[async_trait]
-impl SingleThreadTask for BoltLoadTaskManager {
-    async fn load(&self, url: &String) {
-        unimplemented!()
-    }
-
-    async fn save(&self, save_path: &String) {
-        unimplemented!()
-    }
-
-    async fn run(&self) {
-        // Simply do fetch and save, ignore the start_pos and end_pos
-        unimplemented!()
-    }
-}

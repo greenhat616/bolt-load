@@ -2,8 +2,7 @@ mod multi_thread;
 mod planner;
 mod single_thread;
 
-use std::ops::Range;
-
+use async_channel::{Receiver, Sender};
 pub use multi_thread::*;
 pub use planner::*;
 pub use single_thread::*;
@@ -11,13 +10,11 @@ pub use single_thread::*;
 use futures::Stream;
 
 use crate::{
-    adapter::AnyStream,
+    adapter::{AnyStream, BoltLoadAdapterMeta},
+    client::BoltLoadPreferDownloadMode,
     runner::TaskRunner,
     strategy::{Strategy, StrategyAction},
 };
-
-// TODO: change this constant
-const MININUM_THREAD: usize = 2;
 
 pub type TaskId = usize;
 
@@ -68,29 +65,17 @@ pub struct BoltLoadTaskManager {
     mode: BoltLoadDownloadMode,
     save_path: String,
     state: BoltLoadTaskState,
+    meta: Option<BoltLoadAdapterMeta>,
+    runners: Vec<TaskRunner>,
+    channel: Option<(Sender<ManagerMessage>, Receiver<ManagerMessage>)>,
 }
 
 impl BoltLoadTaskManager {
-    pub fn new_single<S, A, T>(adapter: A, save_path: &String) -> Self
-    where
-        A: super::adapter::BoltLoadAdapter<
-                Item = Result<bytes::Bytes, std::io::Error>,
-                Stream = AnyStream<std::io::Result<bytes::Bytes>>,
-            > + Sync
-            + 'static,
-        S: Stream<Item = T>,
-        T: Send,
-    {
-        let adapter = Box::new(adapter);
-        BoltLoadTaskManager {
-            adapter,
-            mode: BoltLoadDownloadMode::SingleThread,
-            save_path: save_path.clone(),
-            state: BoltLoadTaskState::Idle,
-        }
-    }
-
-    pub async fn new_multi<S, A, T, Y>(adapter: A, save_path: &String) -> Vec<Self>
+    pub async fn new<S, A, T, Y>(
+        adapter: A,
+        save_path: &String,
+        preffered_mode: BoltLoadPreferDownloadMode,
+    ) -> Result<Self, String>
     where
         A: super::adapter::BoltLoadAdapter<
                 Item = Result<bytes::Bytes, std::io::Error>,
@@ -102,39 +87,56 @@ impl BoltLoadTaskManager {
         Y: Strategy,
     {
         let adapter = Box::new(adapter);
-        // Split into load tasks
-
-        // Retrive metadatas
         let Ok(metadata) = adapter.retrieve_meta().await else {
-            todo!()
+            // TODO: Change to custom error types
+            return Err("Failed to retrieve metadata".to_string());
         };
-        // Init chunk planners
-        let mut planner = ChunkPlanner::new(metadata.content_size);
 
-        // Init manager with minimum thread
-        let mut task_managers = Vec::<Self>::new();
+        let channel = async_channel::unbounded::<ManagerMessage>();
 
-        // for _ in 0..MININUM_THREAD {
-        //     let task_manager = BoltLoadTaskManager {
-        //         adapter,
-        //         mode: BoltLoadDownloadMode::MultiThread,
-        //         save_path: save_path.clone(),
-        //         state: BoltLoadTaskState::Idle,
-        //     };
-        //     task_managers.push(task_manager);
-        // }
-
-        loop {
-            // let actions = Y::step();
-            // for action in actions {
-            //     match action {
-            //         StrategyAction::ChangeMaxThread(_) => todo!(),
-            //         StrategyAction::SplitAllTask => todo!(),
-            //         StrategyAction::SplitGivenTask(_) => todo!(),
-            //     }
-            // }
+        let final_mode = match preffered_mode {
+            BoltLoadPreferDownloadMode::SingleThread => BoltLoadDownloadMode::SingleThread,
+            BoltLoadPreferDownloadMode::MultiThread => {
+                if adapter.is_range_stream_available().await && metadata.content_size > 0 {
+                    BoltLoadDownloadMode::MultiThread
+                } else {
+                    BoltLoadDownloadMode::SingleThread
+                }
+            }
+        };
+        match final_mode {
+            BoltLoadDownloadMode::SingleThread => {
+                let manager = Self {
+                    adapter,
+                    mode: BoltLoadDownloadMode::SingleThread,
+                    save_path: save_path.clone(),
+                    state: BoltLoadTaskState::Idle,
+                    meta: Some(metadata),
+                    runners: vec![],
+                    channel: Some(channel),
+                };
+                Ok(manager)
+            }
+            BoltLoadDownloadMode::MultiThread => {
+                let manager = Self {
+                    adapter,
+                    mode: BoltLoadDownloadMode::MultiThread,
+                    save_path: save_path.clone(),
+                    state: BoltLoadTaskState::Idle,
+                    meta: Some(metadata),
+                    runners: vec![],
+                    channel: Some(channel),
+                };
+                Ok(manager)
+            }
         }
-        todo!()
+    }
+
+    pub async fn run(&mut self) -> Result<(), String> {
+        match self.mode {
+            BoltLoadDownloadMode::SingleThread => todo!(),
+            BoltLoadDownloadMode::MultiThread => self.run_multi().await,
+        }
     }
 }
 
