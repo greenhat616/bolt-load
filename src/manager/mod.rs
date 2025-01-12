@@ -1,25 +1,27 @@
-mod multi_thread;
-mod planner;
-mod single_thread;
-
 use async_channel::{Receiver, Sender};
-pub use multi_thread::*;
-pub use planner::*;
-pub use single_thread::*;
-
 use futures::Stream;
+use std::path::PathBuf;
 
 use crate::{
-    adapter::{AnyStream, BoltLoadAdapterMeta},
-    client::BoltLoadPreferDownloadMode,
+    adapter::{AnyAdapter, AnyStream, BoltLoadAdapterMeta},
     runner::TaskRunner,
     strategy::{Strategy, StrategyAction},
 };
 
-pub type TaskId = usize;
+mod builder;
+mod multi_thread;
+mod planner;
+mod single_thread;
+
+pub use builder::*;
+pub use multi_thread::*;
+pub use planner::*;
+pub use single_thread::*;
+
+pub type RunnerId = usize;
 
 /// messages for manager -> runner
-pub struct ManagerMessage(pub TaskId, pub ManagerMessagesVariant);
+pub struct ManagerMessage(pub RunnerId, pub ManagerMessagesVariant);
 pub enum ManagerMessagesVariant {
     /// resize the total size of the task
     ResizeTotal(u64),
@@ -37,115 +39,65 @@ pub struct Progress {
     pub current: u64,
 }
 
-#[derive(Clone)]
-pub enum BoltLoadDownloadMode {
-    SingleThread,
-    MultiThread,
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum DownloadMode {
+    /// the download mode of single-thread download,
+    /// Just use one runner task to fetch the content.
+    Singleton,
+    /// the download mode of concurrent download
+    /// Due to we use multiple async tasks to download the content,
+    /// and the async tasks is M:N thread model,
+    /// so the download mode is concurrent, not called multi-thread.
+    /// Because possible some runtime support single-thread async mode.
+    #[default]
+    Concurrent,
 }
 
-#[derive(Clone)]
-pub enum BoltLoadTaskState {
+#[derive(Clone, Default)]
+pub enum TaskManagerState {
+    #[default]
+    /// the task is idle, the initial state
     Idle,
-    Loading,
-    WaitingForMerge,
-    Merging,
+    /// the task is allocating the file size for the temp file
+    Allocating,
+    /// the task is downloading the content
+    Downloading,
+    /// the task is finishing, do some cleanup work.
+    /// Such as rename the file to the final name.
+    Finishing,
+    /// the task is failed with the error
     Failed(String),
+    /// the task is finished
     Finished,
 }
 
 // #[derive(Clone)]
-pub struct BoltLoadTaskManager {
-    adapter: Box<
-        dyn super::adapter::BoltLoadAdapter<
-                Item = std::io::Result<bytes::Bytes>,
-                Stream = AnyStream<std::io::Result<bytes::Bytes>>,
-            > + Sync
-            + 'static,
-    >,
-    mode: BoltLoadDownloadMode,
-    save_path: String,
-    state: BoltLoadTaskState,
-    meta: Option<BoltLoadAdapterMeta>,
+#[non_exhaustive]
+pub struct TaskManager {
+    /// the inner adapter of this task
+    // TODO: support persistent adapter
+    adapter: AnyAdapter,
+    /// the current mode of this task
+    // TODO: maybe we should introduce a `prefer_mode` to indicate the preferred mode of this task.
+    // TODO: support resumable download
+    mode: DownloadMode,
+    /// the save path of this task
+    save_path: PathBuf,
+    /// the current state of this task
+    state: TaskManagerState,
+    /// the meta of this task
+    meta: BoltLoadAdapterMeta,
+    /// the runners of this task
     runners: Vec<TaskRunner>,
-    channel: Option<(Sender<ManagerMessage>, Receiver<ManagerMessage>)>,
+    /// a channel between manager and runners
+    channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
 }
 
-impl BoltLoadTaskManager {
-    pub async fn new<S, A, T, Y>(
-        adapter: A,
-        save_path: &String,
-        preffered_mode: BoltLoadPreferDownloadMode,
-    ) -> Result<Self, String>
-    where
-        A: super::adapter::BoltLoadAdapter<
-                Item = Result<bytes::Bytes, std::io::Error>,
-                Stream = AnyStream<std::io::Result<bytes::Bytes>>,
-            > + Sync
-            + 'static,
-        S: Stream<Item = T>,
-        T: Send,
-        Y: Strategy,
-    {
-        let adapter = Box::new(adapter);
-        let Ok(metadata) = adapter.retrieve_meta().await else {
-            // TODO: Change to custom error types
-            return Err("Failed to retrieve metadata".to_string());
-        };
-
-        let channel = async_channel::unbounded::<ManagerMessage>();
-
-        let final_mode = match preffered_mode {
-            BoltLoadPreferDownloadMode::SingleThread => BoltLoadDownloadMode::SingleThread,
-            BoltLoadPreferDownloadMode::MultiThread => {
-                if adapter.is_range_stream_available().await && metadata.content_size > 0 {
-                    BoltLoadDownloadMode::MultiThread
-                } else {
-                    BoltLoadDownloadMode::SingleThread
-                }
-            }
-        };
-        match final_mode {
-            BoltLoadDownloadMode::SingleThread => {
-                let manager = Self {
-                    adapter,
-                    mode: BoltLoadDownloadMode::SingleThread,
-                    save_path: save_path.clone(),
-                    state: BoltLoadTaskState::Idle,
-                    meta: Some(metadata),
-                    runners: vec![],
-                    channel: Some(channel),
-                };
-                Ok(manager)
-            }
-            BoltLoadDownloadMode::MultiThread => {
-                let manager = Self {
-                    adapter,
-                    mode: BoltLoadDownloadMode::MultiThread,
-                    save_path: save_path.clone(),
-                    state: BoltLoadTaskState::Idle,
-                    meta: Some(metadata),
-                    runners: vec![],
-                    channel: Some(channel),
-                };
-                Ok(manager)
-            }
-        }
-    }
-
+impl TaskManager {
     pub async fn run(&mut self) -> Result<(), String> {
         match self.mode {
-            BoltLoadDownloadMode::SingleThread => todo!(),
-            BoltLoadDownloadMode::MultiThread => self.run_multi().await,
-        }
-    }
-}
-
-impl PartialEq for BoltLoadDownloadMode {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (BoltLoadDownloadMode::SingleThread, BoltLoadDownloadMode::SingleThread) => true,
-            (BoltLoadDownloadMode::MultiThread, BoltLoadDownloadMode::MultiThread) => true,
-            _ => false,
+            DownloadMode::Singleton => todo!(),
+            DownloadMode::Concurrent => todo!(),
         }
     }
 }

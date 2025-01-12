@@ -1,8 +1,7 @@
 use crate::utils::{http::ContentDisposition, reader::CrossRuntimeStream};
 use blocking::unblock;
 use futures::Stream;
-use std::convert::AsRef;
-use std::sync::Arc;
+use std::{convert::AsRef, sync::Arc};
 use ureq::{Agent, Request};
 
 use super::{

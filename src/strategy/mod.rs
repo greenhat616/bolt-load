@@ -1,4 +1,4 @@
-use crate::manager::BoltLoadTaskManager;
+use crate::manager::TaskManager;
 
 pub enum StrategyAction {
     ChangeMaxThread(usize),
@@ -9,5 +9,5 @@ pub enum StrategyAction {
 }
 
 pub trait Strategy {
-    fn step(manager: &BoltLoadTaskManager) -> Vec<StrategyAction>;
+    fn step(manager: &TaskManager) -> Vec<StrategyAction>;
 }

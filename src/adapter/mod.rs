@@ -38,6 +38,7 @@ pub trait BoltLoadAdapter: Send + Sync {
     }
 }
 
+#[derive(Debug)]
 pub struct BoltLoadAdapterMeta {
     /// the content size
     pub content_size: u64,
@@ -67,11 +68,12 @@ pub enum UnretryableError {
 #[derive(Debug, thiserror::Error)]
 /// The error type for the adapter stream
 pub enum StreamError {
-    #[error(transparent)]
     /// The error is retryable
-    Retryable(#[from] RetryableError),
     #[error(transparent)]
+    Retryable(#[from] RetryableError),
+
     /// The error is unretryable
+    #[error(transparent)]
     Unretryable(#[from] UnretryableError),
 }
 

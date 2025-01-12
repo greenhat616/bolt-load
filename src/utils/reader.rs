@@ -1,9 +1,11 @@
 use blocking::Unblock;
 use bytes::Bytes;
 use futures::{AsyncRead, Stream};
-use std::io::Read;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    io::Read,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 pub struct CrossRuntimeStream {
     pub(crate) reader: Unblock<Box<dyn Read + Send>>,

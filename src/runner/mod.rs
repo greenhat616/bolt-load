@@ -1,15 +1,14 @@
 use crate::{
     adapter::AnyBytesStream,
-    manager::{ManagerMessage, ManagerMessagesVariant, TaskId},
+    manager::{ManagerMessage, ManagerMessagesVariant, RunnerId},
 };
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
-use futures::FutureExt;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 
 /// messages for runner -> manager
 #[derive(Debug)]
-pub struct TaskMessage(pub TaskId, pub TaskMessageKind);
+pub struct TaskMessage(pub RunnerId, pub TaskMessageKind);
 
 #[derive(Debug)]
 pub enum TaskMessageKind {
@@ -49,10 +48,10 @@ pub enum TaskFailedKind {
 
 #[derive(Clone)]
 /// a wrapper of the task message sender
-struct TaskMessageSender(TaskId, Sender<TaskMessage>);
+struct TaskMessageSender(RunnerId, Sender<TaskMessage>);
 
 impl TaskMessageSender {
-    pub fn new(task_id: TaskId, sender: Sender<TaskMessage>) -> Self {
+    pub fn new(task_id: RunnerId, sender: Sender<TaskMessage>) -> Self {
         Self(task_id, sender)
     }
 
@@ -97,7 +96,7 @@ impl TaskRunner {
     pub fn new(
         total: Option<u64>,
         stream: AnyBytesStream,
-        task_id: TaskId,
+        task_id: RunnerId,
         receiver: Receiver<ManagerMessage>,
     ) -> (Self, Receiver<TaskMessage>) {
         let (tx, rx) = async_channel::unbounded();
@@ -231,9 +230,9 @@ impl TaskRunner {
             Some(total) if total == self.downloaded => {}
             Some(total) => {
                 let msg = format!(
-                    "runner: downloaded content is not match the total size, total: {}, downloaded: {}",
-                    total,
-                    self.downloaded
+                    "runner: downloaded content is not match the total size, total: {}, \
+                     downloaded: {}",
+                    total, self.downloaded
                 );
                 log::warn!("{}", msg);
                 return Err(TaskFailedKind::Other(msg).into());
