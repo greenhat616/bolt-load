@@ -8,10 +8,10 @@ use futures::{FutureExt, StreamExt};
 
 /// messages for runner -> manager
 #[derive(Debug)]
-pub struct TaskMessage(pub RunnerId, pub TaskMessageKind);
+pub struct RunnerMessage(pub RunnerId, pub RunnerMessageKind);
 
 #[derive(Debug)]
-pub enum TaskMessageKind {
+pub enum RunnerMessageKind {
     /// The task is started
     Started,
     /// Stopped with message
@@ -48,18 +48,18 @@ pub enum TaskFailedKind {
 
 #[derive(Clone)]
 /// a wrapper of the task message sender
-struct TaskMessageSender(RunnerId, Sender<TaskMessage>);
+struct RunnerMessageSender(RunnerId, Sender<RunnerMessage>);
 
-impl TaskMessageSender {
-    pub fn new(task_id: RunnerId, sender: Sender<TaskMessage>) -> Self {
+impl RunnerMessageSender {
+    pub fn new(task_id: RunnerId, sender: Sender<RunnerMessage>) -> Self {
         Self(task_id, sender)
     }
 
     pub async fn send(
         &self,
-        message: TaskMessageKind,
-    ) -> Result<(), async_channel::SendError<TaskMessage>> {
-        self.1.send(TaskMessage(self.0, message)).await
+        message: RunnerMessageKind,
+    ) -> Result<(), async_channel::SendError<RunnerMessage>> {
+        self.1.send(RunnerMessage(self.0, message)).await
     }
 }
 
@@ -87,7 +87,7 @@ pub struct TaskRunner {
     /// the receiver of the manager messages
     control_signal: Receiver<ManagerMessage>,
     /// the sender of the task messages
-    notify: TaskMessageSender,
+    notify: RunnerMessageSender,
     /// the sender of the shutdown signal
     shutdown_signal: Option<Sender<Result<(), TaskRunError>>>,
 }
@@ -98,14 +98,14 @@ impl TaskRunner {
         stream: AnyBytesStream,
         task_id: RunnerId,
         receiver: Receiver<ManagerMessage>,
-    ) -> (Self, Receiver<TaskMessage>) {
+    ) -> (Self, Receiver<RunnerMessage>) {
         let (tx, rx) = async_channel::unbounded();
         (
             TaskRunner {
                 total,
                 downloaded: 0,
                 stream,
-                notify: TaskMessageSender::new(task_id, tx),
+                notify: RunnerMessageSender::new(task_id, tx),
                 control_signal: receiver,
                 shutdown_signal: None,
             },
@@ -121,20 +121,22 @@ impl TaskRunner {
             Ok(_) => {
                 let _ = self
                     .notify
-                    .send(TaskMessageKind::Stopped(StoppedReason::Finished))
+                    .send(RunnerMessageKind::Stopped(StoppedReason::Finished))
                     .await;
             }
             Err(err) => match err {
                 TaskRunError::Cancelled => {
                     let _ = self
                         .notify
-                        .send(TaskMessageKind::Stopped(StoppedReason::Cancelled))
+                        .send(RunnerMessageKind::Stopped(StoppedReason::Cancelled))
                         .await;
                 }
                 TaskRunError::Failed(failed_kind) => {
                     let _ = self
                         .notify
-                        .send(TaskMessageKind::Stopped(StoppedReason::Failed(failed_kind)))
+                        .send(RunnerMessageKind::Stopped(StoppedReason::Failed(
+                            failed_kind,
+                        )))
                         .await;
                 }
             },
@@ -145,7 +147,7 @@ impl TaskRunner {
     /// Just wrap a Result<(), TaskFailedKind> to return the error kind
     async fn run_inner(&mut self) -> Result<(), TaskRunError> {
         self.notify
-            .send(TaskMessageKind::Started)
+            .send(RunnerMessageKind::Started)
             .await
             .map_err(|_| TaskRunError::Failed(TaskFailedKind::ChannelClosed))?;
 
@@ -188,7 +190,7 @@ impl TaskRunner {
                             Ok(item) => {
                                 self.downloaded += item.len() as u64;
                                 self.notify
-                                    .send(TaskMessageKind::Downloaded(item))
+                                    .send(RunnerMessageKind::Downloaded(item))
                                     .await
                                     .map_err(|_| TaskFailedKind::ChannelClosed)?;
                             }
@@ -297,13 +299,13 @@ mod tests {
         while let Ok(msg) = msg_rx.recv().await {
             log::debug!("msg: {:?}", msg);
             match msg {
-                TaskMessage(_, TaskMessageKind::Started) => {
+                RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
                 }
-                TaskMessage(_, TaskMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
                     downloaded_size += bytes.len();
                 }
-                TaskMessage(_, TaskMessageKind::Stopped(StoppedReason::Finished)) => {
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
                     finished = true;
                     break;
                 }
@@ -338,7 +340,7 @@ mod tests {
         // Wait for the Started message
         let mut started = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(_, TaskMessageKind::Started) = msg {
+            if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
                 started = true;
                 break;
             }
@@ -353,7 +355,7 @@ mod tests {
         // Wait for cancelled message
         let mut cancelled = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(_, TaskMessageKind::Stopped(StoppedReason::Cancelled)) = msg {
+            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Cancelled)) = msg {
                 cancelled = true;
                 break;
             }
@@ -384,9 +386,9 @@ mod tests {
 
         let mut got_error = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(
+            if let RunnerMessage(
                 _,
-                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::NetworkError(_))),
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::NetworkError(_))),
             ) = msg
             {
                 got_error = true;
@@ -416,9 +418,9 @@ mod tests {
         let mut got_empty_error = false;
         while let Ok(msg) = msg_rx.recv().await {
             log::error!("msg: {:?}", msg);
-            if let TaskMessage(
+            if let RunnerMessage(
                 _,
-                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Empty)),
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Empty)),
             ) = msg
             {
                 got_empty_error = true;
@@ -464,7 +466,7 @@ mod tests {
         // Send resize message after start
         let mut started = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(_, TaskMessageKind::Started) = msg {
+            if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
                 started = true;
                 control_tx
                     .send(ManagerMessage(1, ManagerMessagesVariant::ResizeTotal(60)))
@@ -476,7 +478,7 @@ mod tests {
 
         let mut finished = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(_, TaskMessageKind::Stopped(StoppedReason::Finished)) = msg {
+            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) = msg {
                 finished = true;
                 break;
             }
@@ -510,9 +512,9 @@ mod tests {
 
         let mut got_size_mismatch = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(
+            if let RunnerMessage(
                 _,
-                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Other(_))),
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Other(_))),
             ) = msg
             {
                 got_size_mismatch = true;
@@ -544,7 +546,7 @@ mod tests {
 
         // Wait for start then drop the control channel
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(_, TaskMessageKind::Started) = msg {
+            if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
                 drop(control_tx);
                 break;
             }
@@ -552,9 +554,9 @@ mod tests {
 
         let mut got_channel_closed = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let TaskMessage(
+            if let RunnerMessage(
                 _,
-                TaskMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::ChannelClosed)),
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::ChannelClosed)),
             ) = msg
             {
                 got_channel_closed = true;

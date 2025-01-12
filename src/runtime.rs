@@ -80,7 +80,7 @@ impl SmolRuntime {
                 }
 
                 let timer = async move {
-                    smol::Timer::after(Duration::from_millis(100)).await;
+                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
                 };
 
                 smol::future::block_on(executor.run(executor.tick().or(timer)));
@@ -172,9 +172,10 @@ impl<T: Send + 'static> JoinHandle<T> {
 
 #[cfg(test)]
 mod tests {
-    
-    
-    
+    #[cfg(feature = "smol")]
+    use super::SmolRuntime;
+    #[cfg(feature = "smol")]
+    use std::time::Duration;
 
     #[test]
     #[cfg(feature = "smol")]

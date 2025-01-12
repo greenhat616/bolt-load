@@ -1,4 +1,5 @@
 use async_channel::{Receiver, Sender};
+use futures::FutureExt;
 use std::path::PathBuf;
 
 use crate::{
@@ -9,6 +10,7 @@ use crate::{
 mod builder;
 mod multi_thread;
 mod planner;
+mod runner_notification;
 mod single_thread;
 
 pub use builder::*;
@@ -63,11 +65,29 @@ pub enum TaskManagerState {
     /// Such as rename the file to the final name.
     Finishing,
     /// the task is failed with the error
-    Failed(String),
+    Failed(TaskManagerFailedError),
     /// the task is finished
     Finished,
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum TaskManagerFailedError {
+    /// the task is cancelled
+    #[error("the task is cancelled")]
+    Cancelled,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum TaskManagerCommandError {}
+
+type CommandResult<T> = Result<T, TaskManagerCommandError>;
+type CommandResponse<T> = oneshot::Sender<CommandResult<T>>;
+
+pub enum TaskManagerCommand {
+    Cancel(CommandResponse<()>),
+}
+
+// #[derive(Clone)]
 // #[derive(Clone)]
 #[non_exhaustive]
 pub struct TaskManager {
@@ -86,15 +106,55 @@ pub struct TaskManager {
     meta: BoltLoadAdapterMeta,
     /// the runners of this task
     runners: Vec<TaskRunner>,
-    /// a channel between manager and runners
-    channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
+
+    /// a control channel between manager and runners
+    runner_control_channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
+    /// the command channel
+    cmd_rx: Receiver<TaskManagerCommand>,
 }
 
 impl TaskManager {
-    pub async fn run(&mut self) -> Result<(), String> {
-        match self.mode {
-            DownloadMode::Singleton => todo!(),
-            DownloadMode::Concurrent => todo!(),
-        }
+    fn dispatch_state(&mut self, state: TaskManagerState) {
+        self.state = state;
+    }
+
+    /// check if the task is finished or failed
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self.state,
+            TaskManagerState::Finished | TaskManagerState::Failed(_)
+        )
+    }
+
+    /// the main loop of the task manager
+    /// This function should be called in a async spawn.
+    pub async fn run(&mut self) {
+        // let handle_runner_msg = async {
+        //     while let Ok(msg) = self.runner_control_channel.1.recv().await {
+        //         match msg {
+        //             ManagerMessage(_, ManagerMessagesVariant::Cancel) => {
+        //                 self.dispatch_state(TaskManagerState::Failed(
+        //                     TaskManagerFailedError::Cancelled,
+        //                 ));
+        //             }
+        //         }
+        //     }
+        // }
+        // .fuse();
+
+        // let handle_cmd = async {
+        //     while let Ok(cmd) = self.cmd_rx.recv().await {
+        //         match cmd {
+        //             TaskManagerCommand::Cancel(res) => {
+        //                 self.dispatch_state(TaskManagerState::Failed(
+        //                     TaskManagerFailedError::Cancelled,
+        //                 ));
+        //                 res.send(Ok(()));
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // }
+        // .fuse();
     }
 }

@@ -1,8 +1,8 @@
-use async_channel::unbounded;
+use async_channel::{unbounded, Sender};
 use async_lock::OnceCell;
 use std::path::PathBuf;
 
-use super::{DownloadMode, TaskManager, TaskManagerState};
+use super::{DownloadMode, TaskManager, TaskManagerCommand, TaskManagerState};
 use crate::adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError};
 
 pub struct TaskManagerBuilder {
@@ -94,7 +94,9 @@ impl TaskManagerBuilder {
         Ok(())
     }
 
-    pub async fn build(mut self) -> Result<TaskManager, TaskManagerBuildError> {
+    pub async fn build(
+        mut self,
+    ) -> Result<(TaskManager, Sender<TaskManagerCommand>), TaskManagerBuildError> {
         let _ = self.retrieve_meta().await?;
         self.validate()?;
         let adapter = self.adapter.take().unwrap();
@@ -109,15 +111,19 @@ impl TaskManagerBuilder {
         } else {
             DownloadMode::Singleton
         };
-
-        Ok(TaskManager {
-            adapter,
-            mode,
-            save_path: self.save_path.unwrap(),
-            state: TaskManagerState::default(),
-            meta: self.meta.take().unwrap(),
-            runners: vec![],
-            channel: unbounded(),
-        })
+        let (cmd_tx, cmd_rx) = unbounded();
+        Ok((
+            TaskManager {
+                adapter,
+                mode,
+                save_path: self.save_path.unwrap(),
+                state: TaskManagerState::default(),
+                meta: self.meta.take().unwrap(),
+                runners: vec![],
+                runner_control_channel: unbounded(),
+                cmd_rx,
+            },
+            cmd_tx,
+        ))
     }
 }
