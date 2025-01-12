@@ -1,22 +1,25 @@
 use async_channel::{Receiver, Sender};
-use futures::{FutureExt, StreamExt};
-use std::path::PathBuf;
+use async_fs::File;
+use bytes::Bytes;
+use futures::{AsyncSeekExt, AsyncWriteExt, FutureExt, StreamExt};
+use std::{io::SeekFrom, path::PathBuf};
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
-    runner::{RunnerMessage, TaskRunner},
+    runner::{RunnerMessage, RunnerMessageKind},
+    runtime::Runtime,
 };
 
 mod builder;
-mod multi_thread;
-mod planner;
 mod runner_notification;
-mod single_thread;
+mod strategy;
+mod task;
 
 pub use builder::*;
-pub use planner::*;
-use runner_notification::RunnerNotification;
-pub use single_thread::*;
+
+use runner_notification::*;
+use strategy::*;
+use task::*;
 
 pub type RunnerId = usize;
 
@@ -92,6 +95,8 @@ pub enum TaskManagerCommand {
 // #[derive(Clone)]
 #[non_exhaustive]
 pub struct TaskManager<'a> {
+    /// the async runtime passed from the client
+    runtime: Runtime,
     /// the inner adapter of this task
     // TODO: support persistent adapter
     adapter: AnyAdapter,
@@ -101,15 +106,19 @@ pub struct TaskManager<'a> {
     mode: DownloadMode,
     /// the save path of this task
     save_path: PathBuf,
+    /// the file handle of this task
+    file_handle: File,
     /// the current state of this task
     state: TaskManagerState,
     /// the meta of this task
     meta: BoltLoadAdapterMeta,
-    /// the runners of this task
-    runners: Vec<TaskRunner>,
+
+    /// the task of this manager
+    // TODO: dynamic switch the task mode, for the future, possible resume after a long time period
+    task: Task,
 
     /// a control channel between manager and runners
-    runner_control_channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
+    control_channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
     /// the notification channel for the runners
     runners_notification: RunnerNotification<'a, RunnerMessage>,
     /// the command channel
@@ -121,20 +130,62 @@ impl TaskManager<'_> {
         self.state = state;
     }
 
+    /// pre-allocate the file size for the temp file
+    async fn allocate_file_size(&mut self) -> Result<(), std::io::Error> {
+        if self.meta.content_size > 0 {
+            self.file_handle.set_len(self.meta.content_size).await?;
+        }
+        Ok(())
+    }
+
+    /// write the chunk to the file by the runner position
+    /// and notify the state to the chunk planner
+    async fn write_chunk(
+        &mut self,
+        runner_id: RunnerId,
+        chunk: Bytes,
+    ) -> Result<(), std::io::Error> {
+        match self.task.get_runner_pos(runner_id) {
+            Some(pos) => {
+                self.file_handle.seek(SeekFrom::Start(pos)).await?;
+                self.file_handle.write_all(&chunk).await?;
+            }
+            None => {
+                self.file_handle.write_all(&chunk).await?;
+            }
+        }
+        todo!("notify the state to the chunk planner");
+    }
+
+    fn handle_runner_message(&mut self, msg: RunnerMessage) {
+        let runner_id = msg.0;
+        let kind = msg.1;
+        match kind {
+            RunnerMessageKind::Started => {
+                log::trace!("Runner {} started", runner_id);
+            }
+            RunnerMessageKind::Stopped(reason) => {
+                log::trace!("Runner {} stopped with reason: {:?}", runner_id, reason);
+            }
+            RunnerMessageKind::Downloaded(data) => {
+                log::trace!("Runner {} downloaded {} bytes", runner_id, data.len());
+                todo!("write the data to the file")
+            }
+        }
+    }
+
+    fn handle_cmd(&mut self, cmd: TaskManagerCommand) -> bool {
+        todo!()
+    }
+}
+
+impl TaskManager<'_> {
     /// check if the task is finished or failed
     pub fn is_finished(&self) -> bool {
         matches!(
             self.state,
             TaskManagerState::Finished | TaskManagerState::Failed(_)
         )
-    }
-
-    fn handle_runner_message(&mut self, msg: RunnerMessage) {
-        todo!()
-    }
-
-    fn handle_cmd(&mut self, cmd: TaskManagerCommand) -> bool {
-        todo!()
     }
 
     /// cancel the task, and do the cleanup work

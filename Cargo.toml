@@ -33,9 +33,11 @@ async-trait = "0.1"
 futures = "0.3"
 url = "2"
 bytes = "1"
+tempfile = "3"
 async-lock = "3"                                    # for cross runtime async lock
 ranges = "0.4"                                      # for range set operation
 async-channel = "2"                                 # for async channel
+async-fs = "2"                                      # for async file operation
 blocking = { version = "1", optional = true }       # convert blocking io to async
 oneshot = { version = "0.1", features = ["async"] }
 
@@ -71,7 +73,6 @@ test-log = "0.2"
 async-stream = "0.3"
 
 # for generate a random file
-tempfile = "3"
 rand = "0.8"
 
 # for http server test

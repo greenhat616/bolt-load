@@ -4,7 +4,6 @@ pub mod client;
 pub mod manager;
 pub mod runner;
 mod runtime;
-pub mod strategy;
 mod utils;
 
 pub use builder::*;

@@ -466,6 +466,7 @@ dependencies = [
  "anyhow",
  "async-broadcast",
  "async-channel 2.3.1",
+ "async-fs",
  "async-lock",
  "async-std",
  "async-stream",

@@ -1,18 +1,25 @@
 use async_channel::{unbounded, Sender};
+use async_fs::OpenOptions;
 use async_lock::OnceCell;
 use std::path::PathBuf;
 
 use super::{
-    runner_notification::RunnerNotification, DownloadMode, TaskManager, TaskManagerCommand,
+    runner_notification::RunnerNotification, DownloadMode, Task, TaskManager, TaskManagerCommand,
     TaskManagerState,
 };
-use crate::adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError};
+use crate::{
+    adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
+    runtime::Runtime,
+};
 
 pub struct TaskManagerBuilder {
+    runtime: Option<Runtime>,
     meta: OnceCell<BoltLoadAdapterMeta>,
     adapter: Option<AnyAdapter>,
     prefer_mode: Option<DownloadMode>,
     save_path: Option<PathBuf>,
+    /// a directory to save the file, It is used to save the file, prefer the filename retrieved from the adapter
+    save_dir: Option<PathBuf>,
 }
 
 impl Default for TaskManagerBuilder {
@@ -22,6 +29,8 @@ impl Default for TaskManagerBuilder {
             adapter: None,
             prefer_mode: None,
             save_path: None,
+            save_dir: None,
+            runtime: None,
         }
     }
 }
@@ -33,6 +42,8 @@ pub enum TaskManagerBuildError {
     #[error(transparent)]
     /// The error is unretryable, just returned by the adapter
     UnretryableError(#[from] UnretryableError),
+    #[error(transparent)]
+    IOError(#[from] std::io::Error),
 }
 
 async fn try_get_or_init_meta<'a>(
@@ -58,7 +69,14 @@ impl TaskManagerBuilder {
 
         if self.save_path.is_none() {
             if let Some(ref filename) = meta.filename {
-                self.save_path = Some(PathBuf::from(filename));
+                if let Some(ref save_dir) = self.save_dir {
+                    self.save_path = Some(save_dir.join(filename));
+                } else {
+                    log::warn!(
+                        "save dir is not set, the retrieved filename will not be automatically \
+                         set."
+                    );
+                }
             }
         }
 
@@ -84,15 +102,29 @@ impl TaskManagerBuilder {
     }
 
     fn validate(&self) -> Result<(), TaskManagerBuildError> {
+        if self.runtime.is_none() {
+            return Err(TaskManagerBuildError::FieldValidationFailed(
+                "runtime is not set".to_string(),
+            ));
+        }
         if self.adapter.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
                 "adapter is not set".to_string(),
             ));
         }
-        if self.save_path.is_none() {
-            return Err(TaskManagerBuildError::FieldValidationFailed(
-                "save path is not set".to_string(),
-            ));
+        match self.save_path {
+            Some(ref path) => {
+                if path.file_name().is_none() {
+                    return Err(TaskManagerBuildError::FieldValidationFailed(
+                        "save path must have a filename".to_string(),
+                    ));
+                }
+            }
+            None => {
+                return Err(TaskManagerBuildError::FieldValidationFailed(
+                    "save path is not set".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -102,7 +134,10 @@ impl TaskManagerBuilder {
     ) -> Result<(TaskManager<'a>, Sender<TaskManagerCommand>), TaskManagerBuildError> {
         let _ = self.retrieve_meta().await?;
         self.validate()?;
+
         let adapter = self.adapter.take().unwrap();
+        let runtime = self.runtime.take().unwrap();
+
         // TODO: support dynamic check while manager support resumable or persistent
         let mode = if self
             .prefer_mode
@@ -114,18 +149,36 @@ impl TaskManagerBuilder {
         } else {
             DownloadMode::Singleton
         };
+
+        // prepare the file handle
+        let save_path = self.save_path.unwrap();
+        let mut temp_path = save_path.clone();
+        if let Some(filename) = temp_path.file_name() {
+            let mut file_name = filename.to_os_string();
+            file_name.push(".partial");
+            temp_path.set_file_name(file_name);
+        }
+        let file_handle = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(temp_path)
+            .await?;
+
         let (cmd_tx, cmd_rx) = unbounded();
+
         Ok((
             TaskManager {
                 adapter,
                 mode,
-                save_path: self.save_path.unwrap(),
+                save_path,
                 state: TaskManagerState::default(),
                 meta: self.meta.take().unwrap(),
-                runners: vec![],
-                runner_control_channel: unbounded(),
+                control_channel: unbounded(),
                 runners_notification: RunnerNotification::default(),
                 cmd_rx,
+                file_handle,
+                runtime: runtime.clone(),
+                task: Task::new(mode, runtime),
             },
             cmd_tx,
         ))

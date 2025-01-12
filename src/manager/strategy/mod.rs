@@ -1,4 +1,13 @@
+mod chunk;
+
+pub use chunk::*;
+
 use crate::manager::TaskManager;
+
+pub(crate) struct StrategyManager {
+    pub chunk_planner: ChunkPlanner,
+    // TODO: add concurrency control
+}
 
 pub enum StrategyAction {
     ChangeMaxThread(usize),
