@@ -2,7 +2,10 @@ use async_channel::{unbounded, Sender};
 use async_lock::OnceCell;
 use std::path::PathBuf;
 
-use super::{DownloadMode, TaskManager, TaskManagerCommand, TaskManagerState};
+use super::{
+    runner_notification::RunnerNotification, DownloadMode, TaskManager, TaskManagerCommand,
+    TaskManagerState,
+};
 use crate::adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError};
 
 pub struct TaskManagerBuilder {
@@ -94,9 +97,9 @@ impl TaskManagerBuilder {
         Ok(())
     }
 
-    pub async fn build(
+    pub async fn build<'a>(
         mut self,
-    ) -> Result<(TaskManager, Sender<TaskManagerCommand>), TaskManagerBuildError> {
+    ) -> Result<(TaskManager<'a>, Sender<TaskManagerCommand>), TaskManagerBuildError> {
         let _ = self.retrieve_meta().await?;
         self.validate()?;
         let adapter = self.adapter.take().unwrap();
@@ -121,6 +124,7 @@ impl TaskManagerBuilder {
                 meta: self.meta.take().unwrap(),
                 runners: vec![],
                 runner_control_channel: unbounded(),
+                runners_notification: RunnerNotification::default(),
                 cmd_rx,
             },
             cmd_tx,

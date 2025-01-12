@@ -5,13 +5,13 @@ use std::{
 
 use async_channel::Receiver;
 use futures::{
-    stream::{BoxStream, SelectAll},
+    stream::{BoxStream, FusedStream, SelectAll},
     Stream, StreamExt,
 };
 
 use super::RunnerId;
 
-struct RunnerNotification<'a, T>
+pub struct RunnerNotification<'a, T>
 where
     T: Send + 'a,
 {
@@ -66,6 +66,15 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         this.stream.poll_next_unpin(cx)
+    }
+}
+
+impl<'a, T> FusedStream for RunnerNotification<'a, T>
+where
+    T: Send + 'a,
+{
+    fn is_terminated(&self) -> bool {
+        self.stream.is_terminated()
     }
 }
 

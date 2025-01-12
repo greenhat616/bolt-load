@@ -5,11 +5,10 @@ pub struct BoltLoadBuilder {
     configuration: Option<BoltLoadConfiguration>,
 }
 
-
 impl BoltLoadBuilder {
     pub fn build(self) -> BoltLoad {
         BoltLoad {
-            tasks: vec![],
+            tasks: Default::default(),
             configuration: self.configuration.unwrap_or_default(),
         }
     }

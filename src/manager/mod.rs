@@ -1,10 +1,10 @@
 use async_channel::{Receiver, Sender};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use std::path::PathBuf;
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
-    runner::TaskRunner,
+    runner::{RunnerMessage, TaskRunner},
 };
 
 mod builder;
@@ -15,6 +15,7 @@ mod single_thread;
 
 pub use builder::*;
 pub use planner::*;
+use runner_notification::RunnerNotification;
 pub use single_thread::*;
 
 pub type RunnerId = usize;
@@ -90,7 +91,7 @@ pub enum TaskManagerCommand {
 // #[derive(Clone)]
 // #[derive(Clone)]
 #[non_exhaustive]
-pub struct TaskManager {
+pub struct TaskManager<'a> {
     /// the inner adapter of this task
     // TODO: support persistent adapter
     adapter: AnyAdapter,
@@ -109,11 +110,13 @@ pub struct TaskManager {
 
     /// a control channel between manager and runners
     runner_control_channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
+    /// the notification channel for the runners
+    runners_notification: RunnerNotification<'a, RunnerMessage>,
     /// the command channel
     cmd_rx: Receiver<TaskManagerCommand>,
 }
 
-impl TaskManager {
+impl TaskManager<'_> {
     fn dispatch_state(&mut self, state: TaskManagerState) {
         self.state = state;
     }
@@ -126,35 +129,50 @@ impl TaskManager {
         )
     }
 
+    fn handle_runner_message(&mut self, msg: RunnerMessage) {
+        todo!()
+    }
+
+    fn handle_cmd(&mut self, cmd: TaskManagerCommand) -> bool {
+        todo!()
+    }
+
+    /// cancel the task, and do the cleanup work
+    pub fn cancel(&mut self) {
+        self.dispatch_state(TaskManagerState::Failed(TaskManagerFailedError::Cancelled));
+        todo!()
+    }
+
     /// the main loop of the task manager
     /// This function should be called in a async spawn.
     pub async fn run(&mut self) {
-        // let handle_runner_msg = async {
-        //     while let Ok(msg) = self.runner_control_channel.1.recv().await {
-        //         match msg {
-        //             ManagerMessage(_, ManagerMessagesVariant::Cancel) => {
-        //                 self.dispatch_state(TaskManagerState::Failed(
-        //                     TaskManagerFailedError::Cancelled,
-        //                 ));
-        //             }
-        //         }
-        //     }
-        // }
-        // .fuse();
-
-        // let handle_cmd = async {
-        //     while let Ok(cmd) = self.cmd_rx.recv().await {
-        //         match cmd {
-        //             TaskManagerCommand::Cancel(res) => {
-        //                 self.dispatch_state(TaskManagerState::Failed(
-        //                     TaskManagerFailedError::Cancelled,
-        //                 ));
-        //                 res.send(Ok(()));
-        //                 break;
-        //             }
-        //         }
-        //     }
-        // }
-        // .fuse();
+        loop {
+            let cmd = self.cmd_rx.recv().fuse();
+            let notification = self.runners_notification.next().fuse();
+            futures::pin_mut!(cmd, notification);
+            // It is necessary to use select_biased to ensure the notification is always processed first
+            futures::select_biased! {
+                notification = notification => {
+                    if let Some(msg) = notification {
+                        self.handle_runner_message(msg);
+                    }
+                }
+                cmd = cmd => {
+                    let flag = match cmd {
+                        Ok(cmd) => {
+                            self.handle_cmd(cmd)
+                        }
+                        // Only the cmd is closed, so let's cancel the task immediately
+                        Err(_) => {
+                            self.cancel();
+                            true
+                        }
+                    };
+                    if flag {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }

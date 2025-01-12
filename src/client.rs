@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
+use async_channel::Sender;
 
 use crate::{
     adapter::{self},
-    manager::{DownloadMode, TaskManager},
+    manager::{DownloadMode, TaskManagerCommand},
 };
 
 pub enum DownloadSource {
@@ -17,10 +20,13 @@ pub struct BoltLoadConfiguration {
     prefer_download_mode: DownloadMode,
 }
 
+type TaskId = u64;
 // The main client
 #[non_exhaustive]
 pub struct BoltLoad {
-    pub(crate) tasks: Vec<TaskManager>,
+    // TODO: use a enum to represent the manager or channel
+    // TODO: rethink how to share the state of the task manager, when we impl the persistent
+    pub(crate) tasks: HashMap<TaskId, Sender<TaskManagerCommand>>,
     pub(crate) configuration: BoltLoadConfiguration,
 }
 
