@@ -5,6 +5,7 @@ use smol::future::FutureExt;
 /// Runtime is a wrapper around the different runtime libraries.
 /// It is used to hold by bolt-load client, and run different manager and its tasks.
 // TODO: support?
+#[derive(Clone)]
 pub enum Runtime {
     #[cfg(feature = "tokio")]
     Tokio(TokioRuntime),
@@ -36,6 +37,16 @@ pub enum TokioRuntime {
 }
 
 #[cfg(feature = "tokio")]
+impl Clone for TokioRuntime {
+    fn clone(&self) -> Self {
+        match self {
+            TokioRuntime::Runtime(rt) => TokioRuntime::Handle(rt.handle().clone()),
+            TokioRuntime::Handle(handle) => TokioRuntime::Handle(handle.clone()),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl TokioRuntime {
     pub fn new() -> Self {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -54,6 +65,7 @@ impl TokioRuntime {
 #[cfg(feature = "smol")]
 /// SmolRuntime is a dead simple runtime for smol.
 /// It is used to run tasks via by `bolt-load` client.
+#[derive(Clone)]
 pub struct SmolRuntime {
     executor: std::sync::Arc<smol::Executor<'static>>,
     shutdown_signal: async_broadcast::Sender<()>,
