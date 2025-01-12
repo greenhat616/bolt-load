@@ -104,12 +104,10 @@ impl TaskManagerBuilder {
             .is_some_and(|m| m == DownloadMode::Singleton)
         {
             DownloadMode::Singleton
+        } else if adapter.is_range_stream_available().await {
+            DownloadMode::Concurrent
         } else {
-            if adapter.is_range_stream_available().await {
-                DownloadMode::Concurrent
-            } else {
-                DownloadMode::Singleton
-            }
+            DownloadMode::Singleton
         };
 
         Ok(TaskManager {

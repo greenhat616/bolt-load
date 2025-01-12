@@ -1,9 +1,7 @@
-use futures::Stream;
 
 use crate::{
-    adapter::{self, AnyStream},
+    adapter::{self},
     manager::{DownloadMode, TaskManager},
-    strategy::Strategy,
 };
 
 pub enum DownloadSource {

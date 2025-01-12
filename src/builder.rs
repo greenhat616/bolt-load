@@ -1,16 +1,10 @@
 use super::{BoltLoad, BoltLoadConfiguration};
 
+#[derive(Default)]
 pub struct BoltLoadBuilder {
     configuration: Option<BoltLoadConfiguration>,
 }
 
-impl Default for BoltLoadBuilder {
-    fn default() -> Self {
-        Self {
-            configuration: None,
-        }
-    }
-}
 
 impl BoltLoadBuilder {
     pub fn build(self) -> BoltLoad {

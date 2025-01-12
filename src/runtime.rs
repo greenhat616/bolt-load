@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 #[cfg(feature = "smol")]
 use smol::future::FutureExt;
-use std::time::Duration;
 
 /// Runtime is a wrapper around the different runtime libraries.
 /// It is used to hold by bolt-load client, and run different manager and its tasks.
@@ -173,9 +172,9 @@ impl<T: Send + 'static> JoinHandle<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-    use test_log::test;
+    
+    
+    
 
     #[test]
     #[cfg(feature = "smol")]

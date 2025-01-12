@@ -1,11 +1,9 @@
 use async_channel::{Receiver, Sender};
-use futures::Stream;
 use std::path::PathBuf;
 
 use crate::{
-    adapter::{AnyAdapter, AnyStream, BoltLoadAdapterMeta},
+    adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runner::TaskRunner,
-    strategy::{Strategy, StrategyAction},
 };
 
 mod builder;
@@ -14,7 +12,6 @@ mod planner;
 mod single_thread;
 
 pub use builder::*;
-pub use multi_thread::*;
 pub use planner::*;
 pub use single_thread::*;
 
