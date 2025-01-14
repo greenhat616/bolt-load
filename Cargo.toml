@@ -78,5 +78,5 @@ rand = "0.8"
 # for http server test
 axum = "0.7"
 axum-extra = { version = "0.9", features = ["typed-header"] }
-axum-range = "0.4"
+axum-range = "0.5"
 portpicker = "0.1"
