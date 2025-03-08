@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, ops::Range};
 
-use crate::runner::TaskRunner;
+use crate::{manager::strategy::StrategyManager, runner::TaskRunner};
 
-use super::{RunnerId, StrategyManager};
+use super::RunnerId;
 
 pub struct RunnerChunks {
     map: BTreeMap<RunnerId, Vec<Range<u64>>>,

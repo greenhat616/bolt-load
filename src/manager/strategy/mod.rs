@@ -1,6 +1,8 @@
 mod chunk;
+mod dynamic_strategy;
 
 pub use chunk::*;
+pub use dynamic_strategy::*;
 
 use crate::manager::TaskManager;
 
@@ -18,5 +20,5 @@ pub enum StrategyAction {
 }
 
 pub trait Strategy {
-    fn step(manager: &TaskManager) -> Vec<StrategyAction>;
+    fn step(&mut self, manager: &TaskManager) -> Vec<StrategyAction>;
 }

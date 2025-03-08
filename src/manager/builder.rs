@@ -1,7 +1,7 @@
 use async_channel::{unbounded, Sender};
 use async_fs::OpenOptions;
 use async_lock::OnceCell;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use super::{
     runner_notification::RunnerNotification, DownloadMode, Task, TaskManager, TaskManagerCommand,
@@ -179,6 +179,9 @@ impl TaskManagerBuilder {
                 file_handle,
                 runtime: runtime.clone(),
                 task: Task::new(mode, runtime),
+                runners: HashMap::new(),
+                runner_progress: HashMap::new(),
+                runner_speed: HashMap::new(),
             },
             cmd_tx,
         ))

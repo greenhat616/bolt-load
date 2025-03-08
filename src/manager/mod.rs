@@ -2,11 +2,11 @@ use async_channel::{Receiver, Sender};
 use async_fs::File;
 use bytes::Bytes;
 use futures::{AsyncSeekExt, AsyncWriteExt, FutureExt, StreamExt};
-use std::{io::SeekFrom, path::PathBuf};
+use std::{collections::HashMap, io::SeekFrom, path::PathBuf, time::Instant};
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
-    runner::{RunnerMessage, RunnerMessageKind},
+    runner::{RunnerMessage, RunnerMessageKind, TaskRunner},
     runtime::Runtime,
 };
 
@@ -123,6 +123,12 @@ pub struct TaskManager<'a> {
     runners_notification: RunnerNotification<'a, RunnerMessage>,
     /// the command channel
     cmd_rx: Receiver<TaskManagerCommand>,
+
+    /// task runners
+    runners: HashMap<RunnerId, TaskRunner>,
+    /// download progress of each runner
+    runner_progress: HashMap<RunnerId, (u64, Instant)>,
+    runner_speed: HashMap<RunnerId, f64>,
 }
 
 impl TaskManager<'_> {
@@ -169,6 +175,17 @@ impl TaskManager<'_> {
             }
             RunnerMessageKind::Downloaded(data) => {
                 log::trace!("Runner {} downloaded {} bytes", runner_id, data.len());
+                let progress_entry = self
+                    .runner_progress
+                    .entry(runner_id)
+                    .or_insert((0, Instant::now()));
+                let speed_entry = self.runner_speed.entry(runner_id).or_insert(0.0);
+                // calc download speed
+                *speed_entry += ((data.len() as u64 - progress_entry.0) as f64)
+                    / (progress_entry.1.elapsed().as_secs_f64());
+
+                progress_entry.0 += data.len() as u64;
+                progress_entry.1 = Instant::now();
                 todo!("write the data to the file")
             }
         }
@@ -176,6 +193,22 @@ impl TaskManager<'_> {
 
     fn handle_cmd(&mut self, cmd: TaskManagerCommand) -> bool {
         todo!()
+    }
+
+    fn get_total_download_speed(&self) -> f64 {
+        self.runner_speed.values().sum::<f64>()
+    }
+
+    fn get_average_download_speed(&self) -> f64 {
+        self.runner_speed.values().sum::<f64>() / self.runner_speed.len() as f64
+    }
+
+    fn get_runner_count(&self) -> usize {
+        self.runners.len()
+    }
+
+    fn get_longest_runner(&self) -> RunnerId {
+        todo!("return the runner id of the one with most undownloaded data")
     }
 }
 
