@@ -171,7 +171,7 @@ impl TaskManagerBuilder {
                 adapter,
                 mode,
                 save_path,
-                state: TaskManagerState::default(),
+                state_control: TaskManagerState::default(),
                 meta: self.meta.take().unwrap(),
                 control_channel: unbounded(),
                 runners_notification: RunnerNotification::default(),

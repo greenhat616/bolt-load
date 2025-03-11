@@ -79,6 +79,9 @@ pub enum TaskManagerFailedError {
     /// the task is cancelled
     #[error("the task is cancelled")]
     Cancelled,
+    /// the task is failed to allocate the file size
+    #[error("failed to allocate the file size: {0}")]
+    AllocateError(String),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -89,6 +92,27 @@ type CommandResponse<T> = oneshot::Sender<CommandResult<T>>;
 
 pub enum TaskManagerCommand {
     Cancel(CommandResponse<()>),
+}
+
+#[derive(Default)]
+struct TaskManagerStateControl(Option<(TaskManagerState, async_channel::Sender<TaskManagerState>)>);
+
+impl TaskManagerStateControl {
+    pub fn new(state: TaskManagerState, sender: Sender<TaskManagerState>) -> Self {
+        Self(Some((state, sender)))
+    }
+
+    pub async fn dispatch(
+        &mut self,
+        state: TaskManagerState,
+    ) -> Result<(), async_channel::SendError<TaskManagerState>> {
+        let Some((manager_state, sender)) = self.0.as_mut() else {
+            unreachable!("we should init the state control first");
+        };
+        *manager_state = state.clone();
+        sender.send(state).await?;
+        Ok(())
+    }
 }
 
 // #[derive(Clone)]
@@ -108,8 +132,7 @@ pub struct TaskManager<'a> {
     save_path: PathBuf,
     /// the file handle of this task
     file_handle: File,
-    /// the current state of this task
-    state: TaskManagerState,
+    state_control: TaskManagerStateControl,
     /// the meta of this task
     meta: BoltLoadAdapterMeta,
 
@@ -131,9 +154,49 @@ pub struct TaskManager<'a> {
     runner_speed: HashMap<RunnerId, f64>,
 }
 
+/// fast fail the call, and dispatch the state to the state control
+macro_rules! fast_fail_call {
+    ($self:expr, $fut:expr) => {
+        match $fut.await {
+            Ok(v) => v,
+            Err(e) => {
+                $self
+                    .state_control
+                    .dispatch(TaskManagerState::Failed(e.into()))
+                    .await;
+                return;
+            }
+        }
+    };
+}
+
 impl TaskManager<'_> {
-    fn dispatch_state(&mut self, state: TaskManagerState) {
-        self.state = state;
+    async fn handle_state_change(&mut self, state: TaskManagerState) {
+        match state {
+            TaskManagerState::Idle => {
+                self.state_control.dispatch(state).await;
+            }
+            TaskManagerState::Allocating => {
+                fast_fail_call!(self, async {
+                    self.allocate_file_size()
+                        .await
+                        .map_err(|e| TaskManagerFailedError::AllocateError(e.to_string()))
+                });
+                self.state_control
+                    .dispatch(TaskManagerState::Downloading)
+                    .await;
+            }
+            TaskManagerState::Downloading => {
+                // TODO: spawn runners and dynamic change the state
+                todo!()
+            }
+            TaskManagerState::Finishing => {
+                self.state_control
+                    .dispatch(TaskManagerState::Finished)
+                    .await;
+            }
+            _ => (),
+        }
     }
 
     /// pre-allocate the file size for the temp file
@@ -163,9 +226,7 @@ impl TaskManager<'_> {
         todo!("notify the state to the chunk planner");
     }
 
-    fn handle_runner_message(&mut self, msg: RunnerMessage) {
-        let runner_id = msg.0;
-        let kind = msg.1;
+    fn handle_runner_message(&mut self, RunnerMessage(runner_id, kind): RunnerMessage) {
         match kind {
             RunnerMessageKind::Started => {
                 log::trace!("Runner {} started", runner_id);
@@ -216,24 +277,39 @@ impl TaskManager<'_> {
     /// check if the task is finished or failed
     pub fn is_finished(&self) -> bool {
         matches!(
-            self.state,
-            TaskManagerState::Finished | TaskManagerState::Failed(_)
+            self.state_control,
+            TaskManagerStateControl(Some((
+                TaskManagerState::Finished | TaskManagerState::Failed(_),
+                _
+            )))
         )
     }
 
+    /// check if the task is initialized
+    pub fn is_initialized(&self) -> bool {
+        self.state_control.0.is_some()
+    }
+
     /// cancel the task, and do the cleanup work
-    pub fn cancel(&mut self) {
-        self.dispatch_state(TaskManagerState::Failed(TaskManagerFailedError::Cancelled));
+    pub async fn cancel(&mut self) {
+        self.state_control
+            .dispatch(TaskManagerState::Failed(TaskManagerFailedError::Cancelled))
+            .await;
         todo!()
     }
 
     /// the main loop of the task manager
     /// This function should be called in a async spawn.
     pub async fn run(&mut self) {
+        let (state_sender, state_receiver) = async_channel::bounded(2);
+        state_sender.send(TaskManagerState::Idle).await.unwrap();
+        self.state_control = TaskManagerStateControl::new(TaskManagerState::Idle, state_sender);
+
         loop {
             let cmd = self.cmd_rx.recv().fuse();
             let notification = self.runners_notification.next().fuse();
-            futures::pin_mut!(cmd, notification);
+            let state = state_receiver.recv().fuse();
+            futures::pin_mut!(cmd, notification, state);
             // It is necessary to use select_biased to ensure the notification is always processed first
             futures::select_biased! {
                 notification = notification => {
@@ -254,6 +330,17 @@ impl TaskManager<'_> {
                     };
                     if flag {
                         break;
+                    }
+                }
+                state = state => {
+                    match state {
+                        Ok(state) => {
+                            self.handle_state_change(state).await;
+                        }
+                        Err(_) => {
+                            log::error!("failed to receive the state from the channel");
+                            break;
+                        }
                     }
                 }
             }
