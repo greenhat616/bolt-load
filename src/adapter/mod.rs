@@ -112,7 +112,7 @@ mod tests {
     pub fn create_random_file(size: usize) -> anyhow::Result<std::fs::File> {
         let mut file = tempfile()?;
         let mut writer = BufWriter::new(file.try_clone()?);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut buffer = [0; 1024];
         let mut remaining_size = size;
         while remaining_size > 0 {

@@ -73,10 +73,10 @@ test-log = "0.2"
 async-stream = "0.3"
 
 # for generate a random file
-rand = "0.8"
+rand = "0.9"
 
 # for http server test
-axum = "0.7"
-axum-extra = { version = "0.9", features = ["typed-header"] }
-axum-range = "0.4"
+axum = "0.8.1"
+axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-range = "0.5"
 portpicker = "0.1"
