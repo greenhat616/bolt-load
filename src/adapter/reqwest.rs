@@ -46,21 +46,21 @@ impl From<reqwest::Error> for StreamError {
                             std::io::ErrorKind::NotFound,
                             e.to_string(),
                         ))
-                        .into()
+                        .into();
                     }
                     reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
                         return UnretryableError::Other(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
                             e.to_string(),
                         ))
-                        .into()
+                        .into();
                     }
                     _ => {
                         return RetryableError::Other(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             e.to_string(),
                         ))
-                        .into()
+                        .into();
                     }
                 }
             }
@@ -100,10 +100,9 @@ impl ReqwestAdapter {
 
     #[inline]
     fn apply_before_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(f) = self.before_request.as_ref() {
-            f(builder)
-        } else {
-            builder
+        match self.before_request.as_ref() {
+            Some(f) => f(builder),
+            _ => builder,
         }
     }
 

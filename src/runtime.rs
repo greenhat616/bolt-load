@@ -49,15 +49,14 @@ impl Clone for TokioRuntime {
 #[cfg(feature = "tokio")]
 impl TokioRuntime {
     pub fn new() -> Self {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            Self::Handle(handle)
-        } else {
-            Self::Runtime(
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Self::Handle(handle),
+            _ => Self::Runtime(
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
                     .unwrap(),
-            )
+            ),
         }
     }
 }
@@ -86,16 +85,18 @@ impl SmolRuntime {
             log::debug!("spawn thread {} for smol runtime executor", i);
             let executor = executor.clone();
             let mut shutdown_signal = shutdown_rx.clone();
-            std::thread::spawn(move || loop {
-                if shutdown_signal.try_recv().is_ok() {
-                    break;
+            std::thread::spawn(move || {
+                loop {
+                    if shutdown_signal.try_recv().is_ok() {
+                        break;
+                    }
+
+                    let timer = async move {
+                        smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                    };
+
+                    smol::future::block_on(executor.run(executor.tick().or(timer)));
                 }
-
-                let timer = async move {
-                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
-                };
-
-                smol::future::block_on(executor.run(executor.tick().or(timer)));
             });
         }
         Self {

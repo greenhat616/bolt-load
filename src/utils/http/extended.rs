@@ -94,7 +94,7 @@ pub fn parse_extended_value(val: &str) -> std::io::Result<ExtendedValue> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "charset is missing",
-            ))
+            ));
         }
         Some(n) => FromStr::from_str(n).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "charset is invalid")
@@ -107,7 +107,7 @@ pub fn parse_extended_value(val: &str) -> std::io::Result<ExtendedValue> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "language tag is missing",
-            ))
+            ));
         }
         Some("") => None,
         Some(s) => match s.parse() {
@@ -116,7 +116,7 @@ pub fn parse_extended_value(val: &str) -> std::io::Result<ExtendedValue> {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "language tag is invalid",
-                ))
+                ));
             }
         },
     };
@@ -127,7 +127,7 @@ pub fn parse_extended_value(val: &str) -> std::io::Result<ExtendedValue> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "value is missing",
-            ))
+            ));
         }
         Some(v) => percent_encoding::percent_decode(v.as_bytes()).collect(),
     };

@@ -5,8 +5,8 @@ use std::{
 
 use async_channel::Receiver;
 use futures::{
-    stream::{BoxStream, FusedStream, SelectAll},
     Stream, StreamExt,
+    stream::{BoxStream, FusedStream, SelectAll},
 };
 
 use super::RunnerId;

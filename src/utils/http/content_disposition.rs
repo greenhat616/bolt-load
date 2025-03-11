@@ -174,7 +174,7 @@ impl DispositionParam {
     #[inline]
     pub fn as_unknown<T: AsRef<str>>(&self, name: T) -> Option<&str> {
         match self {
-            DispositionParam::Unknown(ref ext_name, ref value)
+            DispositionParam::Unknown(ext_name, value)
                 if ext_name.eq_ignore_ascii_case(name.as_ref()) =>
             {
                 Some(value.as_str())
@@ -188,7 +188,7 @@ impl DispositionParam {
     #[inline]
     pub fn as_unknown_ext<T: AsRef<str>>(&self, name: T) -> Option<&ExtendedValue> {
         match self {
-            DispositionParam::UnknownExt(ref ext_name, ref value)
+            DispositionParam::UnknownExt(ext_name, value)
                 if ext_name.eq_ignore_ascii_case(name.as_ref()) =>
             {
                 Some(value)
@@ -460,7 +460,7 @@ impl fmt::Display for DispositionType {
             DispositionType::Inline => write!(f, "inline"),
             DispositionType::Attachment => write!(f, "attachment"),
             DispositionType::FormData => write!(f, "form-data"),
-            DispositionType::Ext(ref s) => write!(f, "{}", s),
+            DispositionType::Ext(s) => write!(f, "{}", s),
         }
     }
 }
@@ -506,24 +506,24 @@ impl fmt::Display for DispositionParam {
             LazyLock::new(|| Regex::new("[\x00-\x08\x10-\x1F\x7F\"\\\\]").unwrap());
 
         match self {
-            DispositionParam::Name(ref value) => write!(f, "name={}", value),
+            DispositionParam::Name(value) => write!(f, "name={}", value),
 
-            DispositionParam::Filename(ref value) => {
+            DispositionParam::Filename(value) => {
                 write!(f, "filename=\"{}\"", RE.replace_all(value, "\\$0").as_ref())
             }
 
-            DispositionParam::Unknown(ref name, ref value) => write!(
+            DispositionParam::Unknown(name, value) => write!(
                 f,
                 "{}=\"{}\"",
                 name,
                 &RE.replace_all(value, "\\$0").as_ref()
             ),
 
-            DispositionParam::FilenameExt(ref ext_value) => {
+            DispositionParam::FilenameExt(ext_value) => {
                 write!(f, "filename*={}", ext_value)
             }
 
-            DispositionParam::UnknownExt(ref name, ref ext_value) => {
+            DispositionParam::UnknownExt(name, ext_value) => {
                 write!(f, "{}*={}", name, ext_value)
             }
         }
@@ -849,11 +849,13 @@ mod tests {
         assert!(ContentDisposition::from_raw(&a).is_err());
 
         let a = HeaderValue::from_static("inline; filename=\"\"");
-        assert!(ContentDisposition::from_raw(&a)
-            .expect("parse cd")
-            .get_filename()
-            .expect("filename")
-            .is_empty());
+        assert!(
+            ContentDisposition::from_raw(&a)
+                .expect("parse cd")
+                .get_filename()
+                .expect("filename")
+                .is_empty()
+        );
     }
 
     #[test]

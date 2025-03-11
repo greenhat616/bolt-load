@@ -1,11 +1,11 @@
-use async_channel::{unbounded, Sender};
+use async_channel::{Sender, unbounded};
 use async_fs::OpenOptions;
 use async_lock::OnceCell;
 use std::{collections::HashMap, path::PathBuf};
 
 use super::{
-    runner_notification::RunnerNotification, DownloadMode, Task, TaskManager, TaskManagerCommand,
-    TaskManagerState,
+    DownloadMode, Task, TaskManager, TaskManagerCommand, TaskManagerState,
+    runner_notification::RunnerNotification,
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
