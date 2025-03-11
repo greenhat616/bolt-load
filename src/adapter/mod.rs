@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, stream::BoxStream};
 
 #[cfg(feature = "reqwest")]
 mod reqwest;
@@ -88,8 +88,8 @@ impl From<StreamError> for UnretryableError {
     }
 }
 
-pub type AnyStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
-pub type AnyBytesStream = AnyStream<Result<bytes::Bytes, StreamError>>;
+pub type AnyStream<'a, T> = BoxStream<'a, T>;
+pub type AnyBytesStream = AnyStream<'static, Result<bytes::Bytes, StreamError>>;
 pub type AnyAdapter = Box<
     dyn BoltLoadAdapter<Item = Result<bytes::Bytes, StreamError>, Stream = AnyBytesStream> + Send,
 >;

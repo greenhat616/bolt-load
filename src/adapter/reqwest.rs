@@ -130,9 +130,9 @@ impl ReqwestAdapter {
     }
 }
 
-struct ReqwestStream(AnyStream<Result<bytes::Bytes, reqwest::Error>>);
+struct ReqwestStream<'a>(AnyStream<'a, Result<bytes::Bytes, reqwest::Error>>);
 
-impl Stream for ReqwestStream {
+impl<'a> Stream for ReqwestStream<'a> {
     type Item = Result<bytes::Bytes, super::StreamError>;
 
     fn poll_next(
