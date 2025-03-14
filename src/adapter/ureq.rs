@@ -142,6 +142,9 @@ impl Stream for UreqStream {
 
 #[async_trait::async_trait]
 impl BoltLoadAdapter for UreqAdapter {
+    type Item = Result<bytes::Bytes, StreamError>;
+    type Stream = AnyBytesStream;
+
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
         let response = self.perform_head().await?;
         let content_size = self.get_content_size(&response);
@@ -152,7 +155,7 @@ impl BoltLoadAdapter for UreqAdapter {
         })
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
+    async fn full_stream(&self) -> Result<Self::Stream, StreamError> {
         let request =
             self.apply_before_request(self.agent.request_url(&self.target.0, &self.target.1));
         let call = self.call.clone();
@@ -165,7 +168,7 @@ impl BoltLoadAdapter for UreqAdapter {
         Ok(Box::pin(ureq_stream))
     }
 
-    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<Self::Stream, StreamError> {
         let request =
             self.apply_before_request(self.agent.request_url(&self.target.0, &self.target.1).set(
                 http::header::RANGE.as_str(),

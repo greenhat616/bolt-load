@@ -56,7 +56,7 @@ headers = { version = "0.4", optional = true }
 # for reqwest adapter
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
 # for ureq adapter
-ureq = { version = "3", optional = true }
+ureq = { version = "2", optional = true }
 
 # runtime group
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
