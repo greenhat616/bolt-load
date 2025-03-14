@@ -11,9 +11,6 @@ mod ureq;
 
 #[async_trait]
 pub trait BoltLoadAdapter: Send + Sync {
-    type Item: Send + Sync;
-    type Stream: Stream<Item = Self::Item> + Unpin + Send;
-
     /// Check if the adapter supports range stream
     /// For compatibility, error should be returned as false.
     async fn is_range_stream_available(&self) -> bool {
@@ -24,12 +21,12 @@ pub trait BoltLoadAdapter: Send + Sync {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError>;
 
     /// Get a full content stream from the adapter
-    async fn full_stream(&self) -> Result<Self::Stream, StreamError>;
+    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError>;
 
     /// Get a range content stream from the adapter
     /// Note: the range is followed as [start, end)
     #[allow(unused_variables)]
-    async fn range_stream(&self, start: u64, end: u64) -> Result<Self::Stream, StreamError> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
         Err(UnretryableError::Other(std::io::Error::new(
             std::io::ErrorKind::Other,
             "Range stream is not supported",
@@ -41,7 +38,7 @@ pub trait BoltLoadAdapter: Send + Sync {
 #[derive(Debug)]
 pub struct BoltLoadAdapterMeta {
     /// the content size
-    pub content_size: Option<u64>,
+    pub content_size: u64,
     /// suggested filename
     pub filename: Option<String>,
 }
@@ -90,9 +87,7 @@ impl From<StreamError> for UnretryableError {
 
 pub type AnyStream<'a, T> = BoxStream<'a, T>;
 pub type AnyBytesStream = AnyStream<'static, Result<bytes::Bytes, StreamError>>;
-pub type AnyAdapter = Box<
-    dyn BoltLoadAdapter<Item = Result<bytes::Bytes, StreamError>, Stream = AnyBytesStream> + Send,
->;
+pub type AnyAdapter = Box<dyn BoltLoadAdapter + Send>;
 
 // TODO: maybe the chunk should be zero copy
 // pub trait BoltLoaderAdapterAnyStream =

@@ -147,9 +147,6 @@ impl<'a> Stream for ReqwestStream<'a> {
 
 #[async_trait]
 impl BoltLoadAdapter for ReqwestAdapter {
-    type Item = Result<bytes::Bytes, StreamError>;
-    type Stream = AnyBytesStream;
-
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
         let mut response = self.head_response.lock().await;
         if response.is_none() {
@@ -210,7 +207,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
         is_range_supported
     }
 
-    async fn full_stream(&self) -> Result<Self::Stream, StreamError> {
+    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
         let response = self
             .apply_before_request(
                 self.client
@@ -223,7 +220,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
         Ok(Box::pin(stream))
     }
 
-    async fn range_stream(&self, start: u64, end: u64) -> Result<Self::Stream, StreamError> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
         let response = self
             .apply_before_request(
                 self.client

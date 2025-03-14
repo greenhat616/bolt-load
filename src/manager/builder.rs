@@ -5,7 +5,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use super::{
     DownloadMode, TaskImpl, TaskManager, TaskManagerCommand, TaskManagerState,
-    runner_notification::RunnerNotification,
+    TaskManagerStateControl, runner_notification::RunnerNotification,
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
@@ -171,14 +171,14 @@ impl TaskManagerBuilder {
                 adapter,
                 mode,
                 save_path,
-                state_control: TaskManagerState::default(),
+                state_control: TaskManagerStateControl::default(),
                 meta: self.meta.take().unwrap(),
                 control_channel: unbounded(),
                 runners_notification: RunnerNotification::default(),
                 cmd_rx,
                 file_handle,
                 runtime: runtime.clone(),
-                task: TaskImpl::new(mode, runtime),
+                task: None,
                 runners: HashMap::new(),
                 runner_progress: HashMap::new(),
                 runner_speed: HashMap::new(),
