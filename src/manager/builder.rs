@@ -1,6 +1,8 @@
 use async_channel::{Sender, unbounded};
 use async_fs::OpenOptions;
 use async_lock::OnceCell;
+use futures::FutureExt;
+use smol_cancellation_token::CancellationToken;
 use std::{collections::HashMap, path::PathBuf};
 
 use super::{
@@ -13,6 +15,7 @@ use crate::{
 };
 
 pub struct TaskManagerBuilder {
+    cancel_token: Option<CancellationToken>,
     runtime: Option<Runtime>,
     meta: OnceCell<BoltLoadAdapterMeta>,
     adapter: Option<AnyAdapter>,
@@ -31,6 +34,7 @@ impl Default for TaskManagerBuilder {
             save_path: None,
             save_dir: None,
             runtime: None,
+            cancel_token: None,
         }
     }
 }
@@ -89,6 +93,12 @@ impl TaskManagerBuilder {
         self
     }
 
+    /// set the cancel token
+    pub fn cancel_token(mut self, cancel_token: CancellationToken) -> Self {
+        self.cancel_token = Some(cancel_token);
+        self
+    }
+
     /// set the prefer mode
     pub fn prefer_mode(mut self, mode: DownloadMode) -> Self {
         self.prefer_mode = Some(mode);
@@ -132,6 +142,14 @@ impl TaskManagerBuilder {
     pub async fn build<'a>(
         mut self,
     ) -> Result<(TaskManager<'a>, Sender<TaskManagerCommand>), TaskManagerBuildError> {
+        if self.cancel_token.is_none() {
+            return Err(TaskManagerBuildError::FieldValidationFailed(
+                "cancel token is not set".to_string(),
+            ));
+        }
+        let cancel_token = self.cancel_token.take().unwrap();
+
+        // retrieve the meta
         let _ = self.retrieve_meta().await?;
         self.validate()?;
 
@@ -158,11 +176,6 @@ impl TaskManagerBuilder {
             file_name.push(".partial");
             temp_path.set_file_name(file_name);
         }
-        let file_handle = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(temp_path)
-            .await?;
 
         let (cmd_tx, cmd_rx) = unbounded();
 
@@ -176,9 +189,10 @@ impl TaskManagerBuilder {
                 control_channel: unbounded(),
                 runners_notification: RunnerNotification::default(),
                 cmd_rx,
-                file_handle,
+                tmp_path: temp_path,
                 runtime: runtime.clone(),
-                task: None,
+                task: TaskImpl::new(mode, runtime),
+                cancel_token,
                 runners: HashMap::new(),
                 runner_progress: HashMap::new(),
                 runner_speed: HashMap::new(),

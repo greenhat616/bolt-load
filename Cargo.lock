@@ -501,6 +501,7 @@ dependencies = [
  "regex",
  "reqwest",
  "smol",
+ "smol-cancellation-token",
  "tempfile",
  "test-log",
  "thiserror",
@@ -2039,6 +2040,16 @@ dependencies = [
  "async-process",
  "blocking",
  "futures-lite",
+]
+
+[[package]]
+name = "smol-cancellation-token"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38bb106a42411e08468d888c344279147c887acb7f33ba6e0aaeda228c90cf8f"
+dependencies = [
+ "event-listener 5.4.0",
+ "pin-project-lite",
 ]
 
 [[package]]

@@ -1,12 +1,13 @@
 use async_channel::{Receiver, Sender};
-use async_fs::File;
+use async_fs::{File, OpenOptions};
 use bytes::Bytes;
 use futures::{AsyncSeekExt, AsyncWriteExt, FutureExt, StreamExt};
-use std::{collections::HashMap, io::SeekFrom, path::PathBuf, time::Instant};
+use smol_cancellation_token::CancellationToken;
+use std::{collections::HashMap, io::SeekFrom, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
-    runner::{RunnerMessage, RunnerMessageKind, TaskRunner},
+    runner::{RunnerMessage, RunnerMessageKind, TaskFailedKind, TaskRunner},
     runtime::Runtime,
 };
 
@@ -28,7 +29,6 @@ pub struct ManagerMessage(pub RunnerId, pub ManagerMessagesVariant);
 pub enum ManagerMessagesVariant {
     /// resize the total size of the task
     ResizeTotal(u64),
-    Cancel,
 }
 
 pub type DownloadedChunks = Vec<Chunk>;
@@ -41,7 +41,7 @@ pub struct Progress {
     pub total: Option<u64>,
 
     /// the current downloaded size
-    pub current: u64,
+    pub downloaded: u64,
 
     /// the downloaded chunks,
     /// for the single-thread task, it is the downloaded chunk
@@ -89,6 +89,9 @@ pub enum TaskManagerFailedError {
     /// the task is failed to allocate the file size
     #[error("failed to allocate the file size: {0}")]
     AllocateError(String),
+    /// the task is stopped
+    #[error("the task is stopped: {0:?}")]
+    Stopped(String),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -139,15 +142,16 @@ pub struct TaskManager<'a> {
     mode: DownloadMode,
     /// the save path of this task
     save_path: PathBuf,
-    /// the file handle of this task
-    file_handle: File,
+    /// the tmp path of this task
+    tmp_path: PathBuf,
     state_control: TaskManagerStateControl,
     /// the meta of this task
     meta: BoltLoadAdapterMeta,
 
     /// the task of this manager
     // TODO: dynamic switch the task mode, for the future, possible resume after a long time period
-    task: Option<TaskImpl>,
+    cancel_token: CancellationToken,
+    task: TaskImpl,
 
     /// a control channel between manager and runners
     control_channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
@@ -196,8 +200,16 @@ impl TaskManager<'_> {
                     .await;
             }
             TaskManagerState::Downloading => {
-                // TODO: spawn runners and dynamic change the state
-                todo!()
+                fast_fail_call!(self, async {
+                    self.task
+                        .start(
+                            &self.adapter,
+                            self.cancel_token.child_token(),
+                        )
+                        .await
+                        .map_err(|e| TaskManagerFailedError::Stopped(e.to_string()))?;
+                    Ok::<(), TaskManagerFailedError>(())
+                });
             }
             TaskManagerState::Finishing => {
                 self.state_control
@@ -211,16 +223,13 @@ impl TaskManager<'_> {
     /// pre-allocate the file size for the temp file
     async fn allocate_file_size(&mut self) -> Result<(), std::io::Error> {
         if self.meta.content_size > 0 {
-            self.file_handle.set_len(self.meta.content_size).await?;
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&self.tmp_path)
+                .await?;
+            file.set_len(self.meta.content_size).await?;
         }
-        Ok(())
-    }
-
-    /// write the chunk to the file by the runner position
-    /// and notify the state to the chunk planner
-    async fn write_chunk(&mut self, pos: u64, chunk: Bytes) -> Result<(), std::io::Error> {
-        self.file_handle.seek(SeekFrom::Start(pos)).await?;
-        self.file_handle.write_all(&chunk).await?;
         Ok(())
     }
 
@@ -303,10 +312,13 @@ impl TaskManager<'_> {
         state_sender.send(TaskManagerState::Idle).await.unwrap();
         self.state_control = TaskManagerStateControl::new(TaskManagerState::Idle, state_sender);
 
+        let mut state_future = futures::future::ready(()).boxed().fuse();
+
         loop {
             let cmd = self.cmd_rx.recv().fuse();
             let notification = self.runners_notification.next().fuse();
             let state = state_receiver.recv().fuse();
+
             futures::pin_mut!(cmd, notification, state);
             // It is necessary to use select_biased to ensure the notification is always processed first
             futures::select_biased! {
@@ -333,7 +345,7 @@ impl TaskManager<'_> {
                 state = state => {
                     match state {
                         Ok(state) => {
-                            self.handle_state_change(state).await;
+                            state_future = self.handle_state_change(state).boxed().fuse();
                         }
                         Err(_) => {
                             log::error!("failed to receive the state from the channel");
@@ -341,6 +353,8 @@ impl TaskManager<'_> {
                         }
                     }
                 }
+                // poll the state future
+                _ = &mut state_future => (),
             }
         }
     }

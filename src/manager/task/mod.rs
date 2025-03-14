@@ -1,13 +1,15 @@
-use std::pin::Pin;
+use bytes::Bytes;
+use smol_cancellation_token::CancellationToken;
+
+use std::{pin::Pin, rc::Rc};
 
 use crate::{
-    adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
+    adapter::{AnyAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError},
+    runner::TaskFailedKind,
     runtime::Runtime,
 };
 
 use super::{DownloadMode, Progress, RunnerId, strategy::Chunk};
-
-use bytes::Bytes;
 
 mod concurrent_task;
 mod singleton_task;
@@ -15,6 +17,7 @@ mod singleton_task;
 pub use concurrent_task::*;
 pub use singleton_task::*;
 
+#[enum_dispatch::enum_dispatch]
 pub enum TaskImpl {
     Singleton(SingletonTask),
     Concurrent(ConcurrentTask),
@@ -25,12 +28,14 @@ pub enum TaskError {
     #[error("retrieve meta failed: {0}")]
     RetrieveMetaFailed(UnretryableError),
     #[error("failed to fetch stream failed: {0}")]
-    StreamFailed(UnretryableError),
+    StreamFailed(StreamError),
+    #[error("task failed: {0:?}")]
+    Failed(TaskFailedKind),
+    #[error("failed to write chunk: {0}")]
+    WriteChunkFailed(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, TaskError>;
-/// the future of the task, should be polled by the Manager
-type TaskFuture = Pin<Box<dyn Future<Output = Result<()>>>>;
 
 /// The abstract trait of the task
 ///
@@ -38,17 +43,19 @@ type TaskFuture = Pin<Box<dyn Future<Output = Result<()>>>>;
 ///
 /// It should be execute at the same task of the `TaskManager`,
 /// so we do not have the `Send` and `Sync` for this async fn trait
+#[enum_dispatch::enum_dispatch(TaskImpl)]
 pub(super) trait Task {
-    async fn start(&mut self, adapter: &AnyAdapter) -> Result<TaskFuture>;
+    async fn start(
+        &mut self,
+        adapter: &AnyAdapter,
+        cancel_token: CancellationToken,
+    ) -> Result<()>;
     async fn stop(&mut self) -> Result<()>;
     fn inspect_progress(&self) -> Progress;
 }
 
 impl TaskImpl {
-    pub fn new<T>(mode: DownloadMode, rt: Runtime, on_chunk_downloaded: T) -> Self
-    where
-        T: Fn(Chunk, Bytes),
-    {
+    pub fn new(mode: DownloadMode, rt: Runtime) -> Self {
         todo!()
     }
 

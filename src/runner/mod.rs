@@ -1,10 +1,15 @@
 use crate::{
     adapter::AnyBytesStream,
     manager::{ManagerMessage, ManagerMessagesVariant, RunnerId},
+    utils::ShutdownGuardExt,
 };
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
+use smol_cancellation_token::CancellationToken;
+
+mod guard;
+pub use guard::*;
 
 /// messages for runner -> manager
 #[derive(Debug)]
@@ -27,13 +32,13 @@ pub enum StoppedReason {
     Finished,
     /// The task is failed
     Failed(TaskFailedKind),
-    /// The task is cancelled
-    Cancelled,
 }
 
 /// The kind of the task failed
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TaskFailedKind {
+    /// The task is cancelled
+    Cancelled,
     /// The task is timeout, only happen when a stream is not sent in a period
     Timeout,
     /// The task is empty
@@ -88,16 +93,19 @@ pub struct TaskRunner {
     control_signal: Receiver<ManagerMessage>,
     /// the sender of the task messages
     notify: RunnerMessageSender,
-    /// the sender of the shutdown signal
-    shutdown_signal: Option<Sender<Result<(), TaskRunError>>>,
+    /// the cancel token
+    cancel_token: CancellationToken,
+    /// the shutdown signal, used for ensure the task runner is stopped
+    shutdown_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl TaskRunner {
     pub fn new(
         total: Option<u64>,
         stream: AnyBytesStream,
-        task_id: RunnerId,
+        runner_id: RunnerId,
         receiver: Receiver<ManagerMessage>,
+        cancel_token: CancellationToken,
     ) -> (Self, Receiver<RunnerMessage>) {
         let (tx, rx) = async_channel::unbounded();
         (
@@ -105,9 +113,10 @@ impl TaskRunner {
                 total,
                 downloaded: 0,
                 stream,
-                notify: RunnerMessageSender::new(task_id, tx),
+                notify: RunnerMessageSender::new(runner_id, tx),
                 control_signal: receiver,
-                shutdown_signal: None,
+                cancel_token,
+                shutdown_rx: None,
             },
             rx,
         )
@@ -128,7 +137,9 @@ impl TaskRunner {
                 TaskRunError::Cancelled => {
                     let _ = self
                         .notify
-                        .send(RunnerMessageKind::Stopped(StoppedReason::Cancelled))
+                        .send(RunnerMessageKind::Stopped(StoppedReason::Failed(
+                            TaskFailedKind::Cancelled,
+                        )))
                         .await;
                 }
                 TaskRunError::Failed(failed_kind) => {
@@ -151,42 +162,31 @@ impl TaskRunner {
             .await
             .map_err(|_| TaskRunError::Failed(TaskFailedKind::ChannelClosed))?;
 
-        let (shutdown_tx, shutdown_rx) = async_channel::unbounded();
-        self.shutdown_signal = Some(shutdown_tx.clone());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let _guard = shutdown_tx.shutdown_guard();
+        self.shutdown_rx = Some(shutdown_rx);
+        let result = loop {
+            let control_signal = self.control_signal.recv().fuse();
+            let download = self.stream.next().fuse();
+            let cancelled = self.cancel_token.cancelled().fuse();
 
-        loop {
-            let control_signal = async { self.control_signal.recv().await }.fuse();
-            let download = async { self.stream.next().await }.fuse();
-            let shutdown_signal = async { shutdown_rx.recv().await }.fuse();
-
-            futures::pin_mut!(control_signal, download, shutdown_signal);
+            futures::pin_mut!(control_signal, download, cancelled);
             futures::select! {
                 signal = control_signal => {
-                    match signal {
-                        Ok(signal) => {
-                            let ManagerMessage(_, variant) = signal;
-                            match variant {
-                                ManagerMessagesVariant::ResizeTotal(total) => {
-                                    self.total = Some(total);
-                                }
-                                ManagerMessagesVariant::Cancel => {
-                                    return Err(TaskRunError::Cancelled);
-                                }
+                    // Task layer owned the cancel token guard, ensure cancel token when manager is dropping
+                    if let Ok(signal) = signal {
+                        let ManagerMessage(_, variant) = signal;
+                        match variant {
+                            ManagerMessagesVariant::ResizeTotal(total) => {
+                                self.total = Some(total);
                             }
-                        }
-                        // In this case, the control signal is closed, which means the client or manager is released
-                        // We should just call the shutdown function
-                        Err(e) => {
-                            log::debug!("control signal is closed, shutdown the task runner: {:?}", e);
-                            let _ = shutdown_tx
-                                .send(Err(TaskFailedKind::ChannelClosed.into()))
-                                .await;
                         }
                     }
                 }
                 item = download => match item {
                     Some(item) => {
                         match item {
+                            // TODO: check boundary after
                             Ok(item) => {
                                 self.downloaded += item.len() as u64;
                                 self.notify
@@ -198,34 +198,20 @@ impl TaskRunner {
                             // First, we have to clarify whether this error is recoverable
                             // If it is, we can retry it
                             // If it is not, we should just return the error, and terminate the task
-                            Err(err) => {
-                                let _ = shutdown_tx
-                                    .send(Err(TaskFailedKind::NetworkError(err.to_string()).into()))
-                                    .await;
-                            }
+                            Err(err) => break Err(TaskFailedKind::NetworkError(err.to_string()).into()),
                         }
                     },
                     // In this case, the download is closed, which means the stream is finished
                     None => {
-                        let _ = shutdown_tx.send(Ok(())).await;
+                        break Ok(());
                     }
                 },
-                signal = shutdown_signal => {
-                    match signal {
-                        Ok(Ok(())) => {
-                            break;
-                        }
-                        Ok(Err(err)) => {
-                            return Err(err);
-                        }
-                        Err(_) => {
-                            log::debug!("shutdown signal is closed, shutdown the task runner");
-                            return Err(TaskFailedKind::ChannelClosed.into());
-                        }
-                    }
+                _ = cancelled => {
+                    break Err(TaskRunError::Cancelled);
                 }
             }
-        }
+        };
+        result?;
 
         // TODO: handle the error
         match self.total {
@@ -247,13 +233,12 @@ impl TaskRunner {
         Ok(())
     }
 
-    /// Shutdown the current task runner gracefully
-    pub fn shutdown(&mut self) {
-        let _ = self
-            .shutdown_signal
-            .take()
-            .unwrap()
-            .try_send(Err(TaskRunError::Cancelled));
+    /// Cancel the current task runner,
+    pub async fn cancel(&mut self) {
+        self.cancel_token.cancel();
+        if let Some(shutdown_rx) = self.shutdown_rx.take() {
+            let _ = shutdown_rx.await;
+        }
     }
 }
 
@@ -271,6 +256,7 @@ mod tests {
     #[test(tokio::test)]
     async fn test_normal_download() {
         let (_control_tx, control_rx) = async_channel::unbounded();
+        let token = CancellationToken::new();
 
         // Create a stream that emits 3 chunks
         let test_stream = stream! {
@@ -284,6 +270,7 @@ mod tests {
             Box::pin(test_stream),
             1,
             control_rx,
+            token,
         );
 
         // Spawn the runner
@@ -322,6 +309,7 @@ mod tests {
     #[test(tokio::test)]
     async fn test_cancel_download() {
         let (control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
 
         // Create an infinite stream that we'll cancel
         let test_stream = stream! {
@@ -331,7 +319,13 @@ mod tests {
             }
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(None, Box::pin(test_stream), 1, control_rx);
+        let (mut runner, msg_rx) = TaskRunner::new(
+            None,
+            Box::pin(test_stream),
+            1,
+            control_rx,
+            cancel_token.clone(),
+        );
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
@@ -347,15 +341,16 @@ mod tests {
         }
 
         // Send cancel signal
-        control_tx
-            .send(ManagerMessage(1, ManagerMessagesVariant::Cancel))
-            .await
-            .unwrap();
+        cancel_token.cancel();
 
         // Wait for cancelled message
         let mut cancelled = false;
         while let Ok(msg) = msg_rx.recv().await {
-            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Cancelled)) = msg {
+            if let RunnerMessage(
+                _,
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Cancelled)),
+            ) = msg
+            {
                 cancelled = true;
                 break;
             }
@@ -369,7 +364,7 @@ mod tests {
     #[test(tokio::test)]
     async fn test_network_error() {
         let (_control_tx, control_rx) = async_channel::unbounded();
-
+        let cancel_token = CancellationToken::new();
         // Create a stream that yields an error
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
@@ -378,7 +373,13 @@ mod tests {
             )));
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(Some(20), Box::pin(test_stream), 1, control_rx);
+        let (mut runner, msg_rx) = TaskRunner::new(
+            Some(20),
+            Box::pin(test_stream),
+            1,
+            control_rx,
+            cancel_token.clone(),
+        );
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
@@ -403,13 +404,19 @@ mod tests {
     #[test(tokio::test)]
     async fn test_empty_stream() {
         let (_control_tx, control_rx) = async_channel::unbounded();
-
+        let cancel_token = CancellationToken::new();
         // Create an empty stream
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![]));
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(None, Box::pin(test_stream), 1, control_rx);
+        let (mut runner, msg_rx) = TaskRunner::new(
+            None,
+            Box::pin(test_stream),
+            1,
+            control_rx,
+            cancel_token.clone(),
+        );
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
@@ -436,7 +443,7 @@ mod tests {
     // TODO: add a test for the resize small, and implement the logic
     async fn test_resize_total() {
         let (control_tx, control_rx) = async_channel::unbounded();
-
+        let cancel_token = CancellationToken::new();
         // Create a stream with known size
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
@@ -457,6 +464,7 @@ mod tests {
             Box::pin(test_stream),
             1,
             control_rx,
+            cancel_token.clone(),
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -492,6 +500,7 @@ mod tests {
     #[test(tokio::test)]
     async fn test_size_mismatch() {
         let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
 
         // Create a stream that produces more data than expected
         let test_stream = stream! {
@@ -504,6 +513,7 @@ mod tests {
             Box::pin(test_stream),
             1,
             control_rx,
+            cancel_token.clone(),
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -529,6 +539,7 @@ mod tests {
     #[test(tokio::test)]
     async fn test_channel_closed() {
         let (control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
 
         // Create a stream that will never complete
         let test_stream = stream! {
@@ -538,7 +549,13 @@ mod tests {
             }
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(None, Box::pin(test_stream), 1, control_rx);
+        let (mut runner, msg_rx) = TaskRunner::new(
+            None,
+            Box::pin(test_stream),
+            1,
+            control_rx,
+            cancel_token.clone(),
+        );
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
