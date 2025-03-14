@@ -31,7 +31,9 @@ pub enum ManagerMessagesVariant {
     Cancel,
 }
 
-/// the main progress of the download
+pub type DownloadedChunks = Vec<Chunk>;
+
+/// the progress of the download task
 pub struct Progress {
     /// the total size of the content
     /// possible None if the total size is unknown
@@ -40,6 +42,11 @@ pub struct Progress {
 
     /// the current downloaded size
     pub current: u64,
+
+    /// the downloaded chunks,
+    /// for the single-thread task, it is the downloaded chunk
+    /// for the concurrent task, it is the downloaded chunks
+    pub downloaded_chunks: DownloadedChunks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -92,6 +99,8 @@ type CommandResponse<T> = oneshot::Sender<CommandResult<T>>;
 
 pub enum TaskManagerCommand {
     Cancel(CommandResponse<()>),
+    // Pause(CommandResponse<()>),
+    // Resume(CommandResponse<()>),
 }
 
 #[derive(Default)]
@@ -138,7 +147,7 @@ pub struct TaskManager<'a> {
 
     /// the task of this manager
     // TODO: dynamic switch the task mode, for the future, possible resume after a long time period
-    task: Task,
+    task: Option<TaskImpl>,
 
     /// a control channel between manager and runners
     control_channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
@@ -209,21 +218,10 @@ impl TaskManager<'_> {
 
     /// write the chunk to the file by the runner position
     /// and notify the state to the chunk planner
-    async fn write_chunk(
-        &mut self,
-        runner_id: RunnerId,
-        chunk: Bytes,
-    ) -> Result<(), std::io::Error> {
-        match self.task.get_runner_pos(runner_id) {
-            Some(pos) => {
-                self.file_handle.seek(SeekFrom::Start(pos)).await?;
-                self.file_handle.write_all(&chunk).await?;
-            }
-            None => {
-                self.file_handle.write_all(&chunk).await?;
-            }
-        }
-        todo!("notify the state to the chunk planner");
+    async fn write_chunk(&mut self, pos: u64, chunk: Bytes) -> Result<(), std::io::Error> {
+        self.file_handle.seek(SeekFrom::Start(pos)).await?;
+        self.file_handle.write_all(&chunk).await?;
+        Ok(())
     }
 
     fn handle_runner_message(&mut self, RunnerMessage(runner_id, kind): RunnerMessage) {

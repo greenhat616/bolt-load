@@ -4,7 +4,7 @@ use async_lock::OnceCell;
 use std::{collections::HashMap, path::PathBuf};
 
 use super::{
-    DownloadMode, Task, TaskManager, TaskManagerCommand, TaskManagerState,
+    DownloadMode, TaskImpl, TaskManager, TaskManagerCommand, TaskManagerState,
     runner_notification::RunnerNotification,
 };
 use crate::{
@@ -178,7 +178,7 @@ impl TaskManagerBuilder {
                 cmd_rx,
                 file_handle,
                 runtime: runtime.clone(),
-                task: Task::new(mode, runtime),
+                task: TaskImpl::new(mode, runtime),
                 runners: HashMap::new(),
                 runner_progress: HashMap::new(),
                 runner_speed: HashMap::new(),

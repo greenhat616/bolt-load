@@ -41,7 +41,7 @@ pub trait BoltLoadAdapter: Send + Sync {
 #[derive(Debug)]
 pub struct BoltLoadAdapterMeta {
     /// the content size
-    pub content_size: u64,
+    pub content_size: Option<u64>,
     /// suggested filename
     pub filename: Option<String>,
 }

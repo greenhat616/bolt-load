@@ -13,6 +13,8 @@ use crate::manager::RunnerId;
 
 pub const DEFAULT_MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 
+pub type Chunk = Range<u64>;
+
 /// the chunks of the downloads, only used in multi-thread mode
 /// It should be hold by the task manager, and should not be cloned
 pub struct ChunkPlanner {

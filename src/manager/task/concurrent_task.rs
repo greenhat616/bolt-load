@@ -1,3 +1,6 @@
+/// start with 4 runners, and then try to use 8 threads if needed
+const INITIAL_TASK_RUNNER_COUNT: usize = 4;
+
 use std::{collections::BTreeMap, ops::Range};
 
 use crate::{manager::strategy::StrategyManager, runner::TaskRunner};

@@ -2,6 +2,7 @@
 name = "bolt-load"
 edition = "2024"
 version = "0.1.0"
+rust-version = "1.85.0" # the first version that supports 2024 edition
 
 [features]
 default = ["reqwest", "tokio"]
@@ -33,14 +34,17 @@ async-trait = "0.1"
 futures = "0.3"
 url = "2"
 bytes = "1"
+enum_dispatch = "0.3"
 tempfile = "3"
-async-lock = "3"                              # for cross runtime async lock
-ranges = "0.4"                                # for range set operation
-async-channel = "2"                           # for async channel
-async-fs = "2"                                # for async file operation
-blocking = { version = "1", optional = true } # convert blocking io to async
+backon = "1"                                           # for retry strategy
+oneshot = { version = "0.1", features = ["async"] }    # for cross runtime oneshot
+async-lock = "3"                                       # for cross runtime async lock
+ranges = "0.4"                                         # for range set operation
+async-channel = "2"                                    # for async channel
+async-broadcast = { version = "0.7", optional = true }
+async-fs = "2"                                         # for async file operation
+blocking = { version = "1", optional = true }          # convert blocking io to async
 
-oneshot = { version = "0.1", features = ["async"] }
 
 # for http content-disposition parsing
 http = { version = "1", optional = true }
@@ -56,12 +60,8 @@ ureq = { version = "3", optional = true }
 
 # runtime group
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
-
-smol = { version = "2", optional = true }
-async-broadcast = { version = "0.7", optional = true }
-
-
 async-std = { version = "1", optional = true }
+smol = { version = "2", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
