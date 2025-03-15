@@ -1,8 +1,7 @@
 [package]
 name = "bolt-load"
-edition = "2024"
+edition = "2021"
 version = "0.1.0"
-rust-version = "1.85.0" # the first version that supports 2024 edition
 
 [features]
 default = ["reqwest", "tokio"]
@@ -34,18 +33,13 @@ async-trait = "0.1"
 futures = "0.3"
 url = "2"
 bytes = "1"
-enum_dispatch = "0.3"
 tempfile = "3"
-smol-cancellation-token = "0.1"
-backon = "1"                                           # for retry strategy
-oneshot = { version = "0.1", features = ["async"] }    # for cross runtime oneshot
-async-lock = "3"                                       # for cross runtime async lock
-ranges = "0.4"                                         # for range set operation
-async-channel = "2"                                    # for async channel
-async-broadcast = { version = "0.7", optional = true }
-async-fs = "2"                                         # for async file operation
-blocking = { version = "1", optional = true }          # convert blocking io to async
-
+async-lock = "3"                                    # for cross runtime async lock
+ranges = "0.4"                                      # for range set operation
+async-channel = "2"                                 # for async channel
+async-fs = "2"                                      # for async file operation
+blocking = { version = "1", optional = true }       # convert blocking io to async
+oneshot = { version = "0.1", features = ["async"] }
 
 # for http content-disposition parsing
 http = { version = "1", optional = true }
@@ -57,12 +51,16 @@ headers = { version = "0.4", optional = true }
 # for reqwest adapter
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
 # for ureq adapter
-ureq = { version = "2", optional = true }
+ureq = { version = "3", optional = true }
 
 # runtime group
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
-async-std = { version = "1", optional = true }
+
 smol = { version = "2", optional = true }
+async-broadcast = { version = "0.7", optional = true }
+
+
+async-std = { version = "1", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
@@ -75,10 +73,10 @@ test-log = "0.2"
 async-stream = "0.3"
 
 # for generate a random file
-rand = "0.9"
+rand = "0.8"
 
 # for http server test
-axum = "0.8.1"
-axum-extra = { version = "0.10", features = ["typed-header"] }
-axum-range = "0.5"
+axum = "0.7"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+axum-range = "0.4"
 portpicker = "0.1"
