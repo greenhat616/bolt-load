@@ -184,36 +184,38 @@ macro_rules! fast_fail_call {
 }
 
 impl TaskManager<'_> {
-    async fn handle_state_change(&mut self, state: TaskManagerState) {
-        match state {
-            TaskManagerState::Idle => {
-                self.state_control.dispatch(state).await;
+    async fn handle_state_change(&mut self, rx: Receiver<TaskManagerState>) {
+        while let Ok(state) = rx.recv().await {
+            match state {
+                TaskManagerState::Idle => {
+                    self.state_control.dispatch(state).await;
+                }
+                TaskManagerState::Allocating => {
+                    fast_fail_call!(self, async {
+                        self.allocate_file_size()
+                            .await
+                            .map_err(|e| TaskManagerFailedError::AllocateError(e.to_string()))
+                    });
+                    self.state_control
+                        .dispatch(TaskManagerState::Downloading)
+                        .await;
+                }
+                TaskManagerState::Downloading => {
+                    fast_fail_call!(self, async {
+                        self.task
+                            .start(&self.adapter, self.cancel_token.child_token())
+                            .await
+                            .map_err(|e| TaskManagerFailedError::Stopped(e.to_string()))?;
+                        Ok::<(), TaskManagerFailedError>(())
+                    });
+                }
+                TaskManagerState::Finishing => {
+                    self.state_control
+                        .dispatch(TaskManagerState::Finished)
+                        .await;
+                }
+                _ => (),
             }
-            TaskManagerState::Allocating => {
-                fast_fail_call!(self, async {
-                    self.allocate_file_size()
-                        .await
-                        .map_err(|e| TaskManagerFailedError::AllocateError(e.to_string()))
-                });
-                self.state_control
-                    .dispatch(TaskManagerState::Downloading)
-                    .await;
-            }
-            TaskManagerState::Downloading => {
-                fast_fail_call!(self, async {
-                    self.task
-                        .start(&self.adapter, self.cancel_token.child_token())
-                        .await
-                        .map_err(|e| TaskManagerFailedError::Stopped(e.to_string()))?;
-                    Ok::<(), TaskManagerFailedError>(())
-                });
-            }
-            TaskManagerState::Finishing => {
-                self.state_control
-                    .dispatch(TaskManagerState::Finished)
-                    .await;
-            }
-            _ => (),
         }
     }
 
@@ -309,21 +311,14 @@ impl TaskManager<'_> {
         state_sender.send(TaskManagerState::Idle).await.unwrap();
         self.state_control = TaskManagerStateControl::new(TaskManagerState::Idle, state_sender);
 
-        let mut state_future = futures::future::ready(()).boxed().fuse();
+        let state_dispatcher = self.handle_state_change(state_receiver);
+        let mut downloading_dispatcher = None;
 
         loop {
             let cmd = self.cmd_rx.recv().fuse();
-            let notification = self.runners_notification.next().fuse();
             let state = state_receiver.recv().fuse();
-
-            futures::pin_mut!(cmd, notification, state);
-            // It is necessary to use select_biased to ensure the notification is always processed first
-            futures::select_biased! {
-                notification = notification => {
-                    if let Some(msg) = notification {
-                        self.handle_runner_message(msg);
-                    }
-                }
+            futures::pin_mut!(cmd, state);
+            futures::select! {
                 cmd = cmd => {
                     let flag = match cmd {
                         Ok(cmd) => {

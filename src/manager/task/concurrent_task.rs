@@ -29,14 +29,11 @@ pub struct ConcurrentTask {
 }
 
 impl Task for ConcurrentTask {
-    async fn start<Fut>(
+    async fn start(
         &mut self,
         adapter: &AnyAdapter,
         cancel_token: CancellationToken,
-        on_chunk_downloaded: Box<dyn Fn(u64, Bytes) -> Fut>,
     ) -> Result<()>
-    where
-        Fut: Future<Output = ()> + Send,
     {
         todo!()
     }
