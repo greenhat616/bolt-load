@@ -31,7 +31,7 @@ path = "src/lib.rs"
 log = "0.4"
 thiserror = "2"
 async-trait = "0.1"
-futures = "0.3"
+futures = { version = "0.3" }
 url = "2"
 bytes = "1"
 enum_dispatch = "0.3"

@@ -6,7 +6,7 @@ use std::{pin::Pin, rc::Rc};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError},
     runner::TaskFailedKind,
-    runtime::{Runtime, JoinHandle},
+    runtime::{ThreadedRuntimeImpl, JoinHandle},
 };
 
 use super::{DownloadMode, Progress, RunnerId, strategy::Chunk};
@@ -51,7 +51,7 @@ pub(super) trait Task {
 }
 
 impl TaskImpl {
-    pub fn new(mode: DownloadMode, rt: Runtime) -> Self {
+    pub fn new(mode: DownloadMode, rt: ThreadedRuntimeImpl) -> Self {
         todo!()
     }
 

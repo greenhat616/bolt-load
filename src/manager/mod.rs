@@ -8,7 +8,7 @@ use std::{collections::HashMap, io::SeekFrom, path::PathBuf, rc::Rc, sync::Arc, 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runner::{RunnerMessage, RunnerMessageKind, TaskFailedKind, TaskRunner},
-    runtime::Runtime,
+    runtime::ThreadedRuntimeImpl,
 };
 
 mod builder;
@@ -132,7 +132,7 @@ impl TaskManagerStateControl {
 #[non_exhaustive]
 pub struct TaskManager<'a> {
     /// the async runtime passed from the client
-    runtime: Runtime,
+    runtime: ThreadedRuntimeImpl,
     /// the inner adapter of this task
     // TODO: support persistent adapter
     adapter: AnyAdapter,

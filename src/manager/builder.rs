@@ -11,12 +11,12 @@ use super::{
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
-    runtime::Runtime,
+    runtime::ThreadedRuntimeImpl,
 };
 
 pub struct TaskManagerBuilder {
     cancel_token: Option<CancellationToken>,
-    runtime: Option<Runtime>,
+    runtime: Option<ThreadedRuntimeImpl>,
     meta: OnceCell<BoltLoadAdapterMeta>,
     adapter: Option<AnyAdapter>,
     prefer_mode: Option<DownloadMode>,
