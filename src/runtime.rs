@@ -298,7 +298,7 @@ impl LocalSpawn for LocalTokioRuntime {
         // This is should be used only in local-set async context.
         assert!(tokio::runtime::Handle::try_current().is_ok());
         assert!(IN_TOKIO_LOCAL_CONTEXT.get(), "not in local context");
-        tokio::task::spawn_local(async { IN_TOKIO_LOCAL_CONTEXT.scope(true, future) });
+        tokio::task::spawn_local(async { IN_TOKIO_LOCAL_CONTEXT.scope(true, future).await });
         Ok(())
     }
 }
