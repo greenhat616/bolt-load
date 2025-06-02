@@ -1,32 +1,78 @@
-use std::{io::SeekFrom, path::PathBuf};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
 use crate::{
     adapter::AnyAdapter,
-    manager::{Progress, RunnerId},
+    manager::RunnerId,
     runner::{TaskRunner, TaskRunnerGuard},
     utils::ShutdownGuardExt,
 };
 use async_fs::OpenOptions;
-use futures::{AsyncSeekExt, AsyncWriteExt, FutureExt};
+use futures::{AsyncWriteExt, FutureExt};
 use smol_cancellation_token::CancellationToken;
+use statig::prelude::*;
 
-use super::{Result, Task, TaskError};
+use super::{Result, TaskError};
 use crate::runner::{RunnerMessage, RunnerMessageKind, StoppedReason};
 
 /// Singleton task should only have one runner, so we use a static id for the runner
 const STATIC_RUNNER_ID: RunnerId = 0;
 
-pub struct SingletonTask {
+struct SingletonTaskInner {
     total: Option<u64>,
     downloaded: u64,
     instance: Option<(TaskRunnerGuard, oneshot::Receiver<()>)>,
     tmp_path: PathBuf,
+    adapter: Option<Arc<AnyAdapter>>,
 }
 
-impl Task for SingletonTask {
-    async fn start(&mut self, adapter: &AnyAdapter, cancel_token: CancellationToken) -> Result<()> {
+#[derive(Clone)]
+struct RunningPayload {
+    adapter: Arc<AnyAdapter>,
+    cancel_token: CancellationToken,
+}
+
+enum Event {
+    Run(RunningPayload),
+    Stop(StoppedReason),
+    /// Step the state machine to get the next state
+    Step,
+}
+
+struct Context {
+    poll: VecDeque<()>,
+}
+
+#[state_machine(initial = "State::stopped(None)")]
+#[allow(unused_variables)]
+impl SingletonTaskInner {
+    #[state]
+    fn stopped(
+        &mut self,
+        context: &mut Context,
+        reason: &mut Option<Result<()>>,
+        event: &Event,
+    ) -> Response<State> {
+        match event {
+            Event::Run(payload) => {
+                context.poll.push_back(());
+                self.adapter = Some(payload.adapter.clone());
+                Transition(State::initializing(payload.cancel_token.clone()))
+            }
+            _ => Super,
+        }
+    }
+
+    #[superstate]
+    fn running(event: &Event) -> Response<State> {
+        Super
+    }
+
+    async fn retrieve_meta(&mut self) -> Result<()> {
         // TODO: use backon to retry
-        let meta = adapter
+        let meta = self
+            .adapter
+            .as_ref()
+            .unwrap()
             .retrieve_meta()
             .await
             .map_err(TaskError::RetrieveMetaFailed)?;
@@ -37,7 +83,45 @@ impl Task for SingletonTask {
         };
         self.total = total;
         self.downloaded = 0;
-        let stream = adapter
+        Ok(())
+    }
+
+    #[state(superstate = "running")]
+    async fn initializing(
+        &mut self,
+        cancel_token: &mut CancellationToken,
+        context: &mut Context,
+        event: &Event,
+    ) -> Response<State> {
+        match event {
+            Event::Step => {
+                let task = async {
+                    match self.retrieve_meta().await {
+                        Ok(()) => Transition(State::downloading(cancel_token.clone())),
+                        Err(e) => Transition(State::stopped(Some(Err(e)))),
+                    }
+                }
+                .fuse();
+                futures::pin_mut!(task);
+
+                futures::select_biased! {
+                    res = task => { res },
+                    _ = cancel_token.cancelled().fuse() => {
+                        Transition(State::stopped(Some(Err(TaskError::Failed(
+                            crate::runner::TaskFailedKind::Cancelled,
+                        )))))
+                    }
+                }
+            }
+            _ => Super,
+        }
+    }
+
+    async fn download(&mut self, cancel_token: &mut CancellationToken) -> Result<()> {
+        let stream = self
+            .adapter
+            .as_ref()
+            .unwrap()
             .full_stream()
             .await
             .map_err(TaskError::StreamFailed)?;
@@ -54,7 +138,7 @@ impl Task for SingletonTask {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _shutdown_guard = shutdown_tx.shutdown_guard();
         let (mut runner, runner_rx) = TaskRunner::new(
-            total,
+            self.total,
             stream,
             STATIC_RUNNER_ID,
             control_rx,
@@ -75,7 +159,12 @@ impl Task for SingletonTask {
                             match kind {
                                 RunnerMessageKind::Stopped(reason) => {
                                     match reason {
-                                        StoppedReason::Finished => return Ok(()),
+                                        StoppedReason::Finished => {
+                                            if let Err(e) = file.flush().await {
+                                                log::error!("failed to flush file: {:?}", e);
+                                            }
+                                            break;
+                                        }
                                         StoppedReason::Failed(kind) => {
                                             return Err(TaskError::Failed(kind))
                                         }
@@ -83,9 +172,6 @@ impl Task for SingletonTask {
                                 }
                                 RunnerMessageKind::Downloaded(chunk) => {
                                     self.downloaded += chunk.len() as u64;
-                                    file.seek(SeekFrom::Start(self.downloaded))
-                                        .await
-                                        .map_err(TaskError::WriteChunkFailed)?;
                                     file.write_all(&chunk)
                                         .await
                                         .map_err(TaskError::WriteChunkFailed)?;
@@ -100,23 +186,27 @@ impl Task for SingletonTask {
                 }
             }
         }
-    }
 
-    async fn stop(&mut self) -> Result<()> {
-        if let Some((guard, cancel_rx)) = self.instance.take() {
-            guard.cancel();
-            let _ = cancel_rx.await;
+        if let Err(e) = file.flush().await {
+            log::warn!("failed to flush file: {:?}", e);
         }
+
         Ok(())
     }
 
-    fn inspect_progress(&self) -> Progress {
-        let total = self.total;
-
-        Progress {
-            total,
-            downloaded: self.downloaded,
-            downloaded_chunks: vec![0..self.downloaded],
+    #[state(superstate = "running")]
+    async fn downloading(
+        &mut self,
+        cancel_token: &mut CancellationToken,
+        context: &mut Context,
+        event: &Event,
+    ) -> Response<State> {
+        match event {
+            Event::Step => match self.download(cancel_token).await {
+                Ok(()) => Transition(State::stopped(Some(Ok(())))),
+                Err(e) => Transition(State::stopped(Some(Err(e)))),
+            },
+            _ => Super,
         }
     }
 }

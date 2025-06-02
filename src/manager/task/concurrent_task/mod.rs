@@ -29,15 +29,3 @@ pub struct ConcurrentTask {
     /// It is None if the task is in single-thread/singleton mode
     downloaded_chunks: Vec<Range<u64>>,
 }
-
-impl Task for ConcurrentTask {
-    async fn start(&mut self, adapter: &AnyAdapter, cancel_token: CancellationToken) -> Result<()> {
-        todo!()
-    }
-    async fn stop(&mut self) -> Result<()> {
-        todo!()
-    }
-    fn inspect_progress(&self) -> Progress {
-        todo!()
-    }
-}

@@ -23,6 +23,15 @@ pub enum TaskImpl {
     Concurrent(ConcurrentTask),
 }
 
+pub enum TaskControlCommand {
+    Stop,
+}
+
+pub enum OwnedTask {
+    Task(TaskImpl),
+    Handle(JoinHandle<Result<()>>, async_channel::Sender<TaskControlCommand>),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TaskError {
     #[error("retrieve meta failed: {0}")]
@@ -45,7 +54,8 @@ type Result<T> = std::result::Result<T, TaskError>;
 /// so we do not have the `Send` and `Sync` for this async fn trait
 #[enum_dispatch::enum_dispatch(TaskImpl)]
 pub(super) trait Task {
-    async fn start(
+    /// Run the task as background task
+    async fn run(
         &self,
         adapter: &AnyAdapter,
         cancel_token: CancellationToken,

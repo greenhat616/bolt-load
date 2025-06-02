@@ -203,7 +203,7 @@ impl TaskManager<'_> {
                 TaskManagerState::Downloading => {
                     fast_fail_call!(self, async {
                         self.task
-                            .start(&self.adapter, self.cancel_token.child_token())
+                            .run(&self.adapter, self.cancel_token.child_token())
                             .await
                             .map_err(|e| TaskManagerFailedError::Stopped(e.to_string()))?;
                         Ok::<(), TaskManagerFailedError>(())

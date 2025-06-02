@@ -37,6 +37,8 @@ bytes = "1"
 enum_dispatch = "0.3"
 tempfile = "3"
 smol-cancellation-token = "0.1"
+statig = { version ="0.3", features = ["async"]}
+memmap2 = "0.9" # for better random range write for files if machine is available
 backon = "1"                                           # for retry strategy
 oneshot = { version = "0.1", features = ["async"] }    # for cross runtime oneshot
 async-lock = "3"                                       # for cross runtime async lock

@@ -26,7 +26,7 @@ pub enum RunnerMessageKind {
 }
 
 /// The reason why the task is stopped
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StoppedReason {
     /// The task is finished
     Finished,
