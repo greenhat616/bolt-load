@@ -1,13 +1,17 @@
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{cell::Cell, collections::VecDeque, path::PathBuf, sync::Arc};
 
 use crate::{
     adapter::AnyAdapter,
-    manager::RunnerId,
+    manager::{
+        Progress, RunnerId, Task,
+        task::{TaskControl, TaskEvent},
+    },
     runner::{TaskRunner, TaskRunnerGuard},
+    runtime::ThreadedRuntimeImpl,
     utils::ShutdownGuardExt,
 };
 use async_fs::OpenOptions;
-use futures::{AsyncWriteExt, FutureExt};
+use futures::{AsyncWriteExt, FutureExt, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
 
@@ -17,12 +21,93 @@ use crate::runner::{RunnerMessage, RunnerMessageKind, StoppedReason};
 /// Singleton task should only have one runner, so we use a static id for the runner
 const STATIC_RUNNER_ID: RunnerId = 0;
 
+pub struct SingletonTask {
+    rt: ThreadedRuntimeImpl,
+    task: Option<TaskControl>,
+    progress: Progress,
+}
+
+impl Task for SingletonTask {
+    async fn run(
+        &mut self,
+        adapter: Arc<AnyAdapter>,
+        event_tx: async_channel::Sender<TaskEvent>,
+        path: PathBuf,
+        cancel_token: CancellationToken,
+    ) -> Result<()> {
+        let token = cancel_token.clone();
+        let rt = self.rt.clone();
+        let handle = self
+            .rt
+            .spawn_with_handle(async move {
+                let mut context = Context::default();
+                let mut state_machine = SingletonTaskInner::new(path, event_tx, rt)
+                    .uninitialized_state_machine()
+                    .init_with_context(&mut context)
+                    .await;
+
+                state_machine
+                    .handle_with_context(
+                        &Event::Run(RunningPayload {
+                            adapter,
+                            cancel_token,
+                        }),
+                        &mut context,
+                    )
+                    .await;
+
+                while let Some(_) = context.poll.pop_front() {
+                    state_machine
+                        .handle_with_context(&Event::Step, &mut context)
+                        .await;
+                }
+            })
+            .expect("Runtime is dropped");
+        self.task = Some(TaskControl::new(token, handle));
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        if let Some(mut task) = self.task.take() {
+            task.stop().await;
+        }
+        Ok(())
+    }
+
+    async fn wait(&mut self) -> Result<()> {
+        if let Some(mut task) = self.task.take() {
+            task.wait().await;
+        }
+        Ok(())
+    }
+}
+
 struct SingletonTaskInner {
     total: Option<u64>,
     downloaded: u64,
     instance: Option<(TaskRunnerGuard, oneshot::Receiver<()>)>,
-    tmp_path: PathBuf,
+    path: PathBuf,
     adapter: Option<Arc<AnyAdapter>>,
+    event_tx: async_channel::Sender<TaskEvent>,
+    rt: ThreadedRuntimeImpl,
+}
+
+impl SingletonTaskInner {
+    fn new(
+        path: PathBuf,
+        event_tx: async_channel::Sender<TaskEvent>,
+        rt: ThreadedRuntimeImpl,
+    ) -> Self {
+        Self {
+            total: None,
+            downloaded: 0,
+            instance: None,
+            path,
+            adapter: None,
+            event_tx,
+            rt,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -38,18 +123,22 @@ enum Event {
     Step,
 }
 
+#[derive(Default)]
 struct Context {
     poll: VecDeque<()>,
 }
 
-#[state_machine(initial = "State::stopped(None)")]
+#[state_machine(
+    initial = "State::stopped(Cell::new(None))",
+    on_transition = "Self::on_transition"
+)]
 #[allow(unused_variables)]
 impl SingletonTaskInner {
     #[state]
     fn stopped(
         &mut self,
         context: &mut Context,
-        reason: &mut Option<Result<()>>,
+        reason: &mut Cell<Option<Result<()>>>,
         event: &Event,
     ) -> Response<State> {
         match event {
@@ -98,7 +187,7 @@ impl SingletonTaskInner {
                 let task = async {
                     match self.retrieve_meta().await {
                         Ok(()) => Transition(State::downloading(cancel_token.clone())),
-                        Err(e) => Transition(State::stopped(Some(Err(e)))),
+                        Err(e) => Transition(State::stopped(Cell::new(Some(Err(e))))),
                     }
                 }
                 .fuse();
@@ -107,9 +196,9 @@ impl SingletonTaskInner {
                 futures::select_biased! {
                     res = task => { res },
                     _ = cancel_token.cancelled().fuse() => {
-                        Transition(State::stopped(Some(Err(TaskError::Failed(
+                        Transition(State::stopped(Cell::new(Some(Err(TaskError::Failed(
                             crate::runner::TaskFailedKind::Cancelled,
-                        )))))
+                        ))))))
                     }
                 }
             }
@@ -129,9 +218,15 @@ impl SingletonTaskInner {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&self.tmp_path)
+            .open(&self.path)
             .await
             .map_err(TaskError::WriteChunkFailed)?;
+
+        if let Some(total) = self.total {
+            file.set_len(total)
+                .await
+                .map_err(TaskError::WriteChunkFailed)?;
+        }
 
         let (control_tx, control_rx) = async_channel::unbounded();
         let guard = TaskRunnerGuard::new(STATIC_RUNNER_ID, cancel_token.clone(), control_tx);
@@ -175,6 +270,15 @@ impl SingletonTaskInner {
                                     file.write_all(&chunk)
                                         .await
                                         .map_err(TaskError::WriteChunkFailed)?;
+                                    let progress = Progress {
+                                        total: self.total,
+                                        downloaded: self.downloaded,
+                                        downloaded_chunks: vec![0..self.downloaded],
+                                    };
+                                    let tx = self.event_tx.clone();
+                                    self.rt.spawn(async move {
+                                        tx.send(TaskEvent::Downloading(progress)).await;
+                                    });
                                 }
                                 _ => {}
                             }
@@ -203,10 +307,52 @@ impl SingletonTaskInner {
     ) -> Response<State> {
         match event {
             Event::Step => match self.download(cancel_token).await {
-                Ok(()) => Transition(State::stopped(Some(Ok(())))),
-                Err(e) => Transition(State::stopped(Some(Err(e)))),
+                Ok(()) => Transition(State::stopped(Cell::new(Some(Ok(()))))),
+                Err(e) => Transition(State::stopped(Cell::new(Some(Err(e))))),
             },
             _ => Super,
+        }
+    }
+
+    fn on_transition(&mut self, source: &State, target: &State) {
+        match target {
+            State::Stopped { reason } => match reason.take() {
+                Some(Ok(())) => {
+                    let progress = Progress {
+                        total: Some(self.total.unwrap_or(self.downloaded)),
+                        downloaded: self.downloaded,
+                        downloaded_chunks: vec![0..self.downloaded],
+                    };
+                    let tx = self.event_tx.clone();
+                    self.rt.spawn(async move {
+                        tx.send(TaskEvent::Finished(progress)).await;
+                    });
+                }
+                Some(Err(e)) => {
+                    let tx = self.event_tx.clone();
+                    self.rt.spawn(async move {
+                        tx.send(TaskEvent::Failed(e)).await;
+                    });
+                }
+                None => unreachable!(),
+            },
+            State::Initializing { .. } => {
+                let tx = self.event_tx.clone();
+                self.rt.spawn(async move {
+                    tx.send(TaskEvent::Initializing).await;
+                });
+            }
+            State::Downloading { .. } => {
+                let progress = Progress {
+                    total: self.total,
+                    downloaded: self.downloaded,
+                    downloaded_chunks: vec![0..self.downloaded],
+                };
+                let tx = self.event_tx.clone();
+                self.rt.spawn(async move {
+                    tx.send(TaskEvent::Downloading(progress)).await;
+                });
+            }
         }
     }
 }

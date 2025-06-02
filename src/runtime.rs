@@ -37,6 +37,18 @@ impl ThreadedRuntimeImpl {
     }
 }
 
+impl Spawn for ThreadedRuntimeImpl {
+    fn spawn_obj(&self, future: futures::future::FutureObj<'static, ()>) -> Result<(), SpawnError> {
+        match self {
+            #[cfg(feature = "tokio")]
+            ThreadedRuntimeImpl::Tokio(rt) => rt.spawn_obj(future),
+            #[cfg(feature = "smol")]
+            ThreadedRuntimeImpl::Smol(rt) => rt.spawn_obj(future),
+            ThreadedRuntimeImpl::Other(rt) => rt.spawn_obj(future),
+        }
+    }
+}
+
 #[cfg(feature = "smol")]
 /// SmolRuntime is a dead simple runtime for smol.
 /// It is used to run tasks via by `bolt-load` client.
@@ -134,28 +146,11 @@ where
     }
 }
 
-pub enum JoinHandle<T: Send + 'static> {
-    #[cfg(feature = "tokio")]
-    Tokio(tokio::task::JoinHandle<T>),
-    #[cfg(feature = "smol")]
-    Smol(SmolJoinHandle<T>),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum JoinError {
-    #[cfg(feature = "tokio")]
-    #[error(transparent)]
-    Tokio(#[from] tokio::task::JoinError),
-}
-
-impl<T: Send + 'static> JoinHandle<T> {
-    pub async fn join(self) -> Result<T, JoinError> {
-        match self {
-            #[cfg(feature = "tokio")]
-            JoinHandle::Tokio(handle) => Ok(handle.await?),
-            #[cfg(feature = "smol")]
-            JoinHandle::Smol(handle) => Ok(handle.join().await),
-        }
+#[cfg(feature = "smol")]
+impl Spawn for SmolThreadedRuntime {
+    fn spawn_obj(&self, future: futures::future::FutureObj<'static, ()>) -> Result<(), SpawnError> {
+        self.executor.spawn(future);
+        Ok(())
     }
 }
 

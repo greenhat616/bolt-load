@@ -1,12 +1,13 @@
 use bytes::Bytes;
+use futures::future::RemoteHandle;
 use smol_cancellation_token::CancellationToken;
 
-use std::{pin::Pin, rc::Rc};
+use std::path::PathBuf;
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError},
     runner::TaskFailedKind,
-    runtime::{JoinHandle, ThreadedRuntimeImpl},
+    runtime::ThreadedRuntimeImpl,
 };
 
 use super::{DownloadMode, Progress, RunnerId, strategy::Chunk};
@@ -17,19 +18,50 @@ mod singleton_task;
 pub use concurrent_task::*;
 pub use singleton_task::*;
 
+/// The event of the task
+///
+/// It is used to push event to the manager or client
+#[derive(Debug)]
+pub enum TaskEvent {
+    /// Initializing the task, including preallocating the file and retrieve the meta
+    Initializing,
+    /// Downloading the file
+    Downloading(Progress),
+    /// Failed to download the file
+    Failed(TaskError),
+    /// Finished downloading the file
+    Finished(Progress),
+}
+
+struct TaskControl {
+    token: CancellationToken,
+    handle: Option<RemoteHandle<()>>,
+}
+
+impl TaskControl {
+    pub fn new(token: CancellationToken, handle: RemoteHandle<()>) -> Self {
+        Self {
+            token,
+            handle: Some(handle),
+        }
+    }
+
+    pub async fn wait(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.await;
+        }
+    }
+
+    pub async fn stop(&mut self) {
+        self.token.cancel();
+        self.wait().await;
+    }
+}
+
 #[enum_dispatch::enum_dispatch]
 pub enum TaskImpl {
     Singleton(SingletonTask),
     Concurrent(ConcurrentTask),
-}
-
-pub enum TaskControlCommand {
-    Stop,
-}
-
-pub enum OwnedTask {
-    Task(TaskImpl),
-    Handle(JoinHandle<Result<()>>, async_channel::Sender<TaskControlCommand>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,7 +76,7 @@ pub enum TaskError {
     WriteChunkFailed(std::io::Error),
 }
 
-type Result<T> = std::result::Result<T, TaskError>;
+type Result<T, E = TaskError> = std::result::Result<T, E>;
 
 /// The abstract trait of the task
 ///
@@ -54,14 +86,16 @@ type Result<T> = std::result::Result<T, TaskError>;
 /// so we do not have the `Send` and `Sync` for this async fn trait
 #[enum_dispatch::enum_dispatch(TaskImpl)]
 pub(super) trait Task {
-    /// Run the task as background task
-    async fn run(
-        &self,
-        adapter: &AnyAdapter,
+    fn run(
+        &mut self,
+        adapter: Arc<AnyAdapter>,
+        path: PathBuf,
+        event_tx: async_channel::Sender<TaskEvent>,
         cancel_token: CancellationToken,
-    ) -> Result<JoinHandle<Result<()>>>;
-    async fn stop(&self) -> Result<()>;
-    fn inspect_progress(&self) -> Progress;
+    ) -> Result<()>;
+    /// Wait for the task to finish
+    async fn wait(&mut self) -> Result<()>;
+    async fn stop(&mut self) -> Result<()>;
 }
 
 impl TaskImpl {

@@ -34,6 +34,7 @@ pub enum ManagerMessagesVariant {
 pub type DownloadedChunks = Vec<Chunk>;
 
 /// the progress of the download task
+#[derive(Debug, Clone)]
 pub struct Progress {
     /// the total size of the content
     /// possible None if the total size is unknown
