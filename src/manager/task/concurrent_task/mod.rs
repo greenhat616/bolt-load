@@ -11,6 +11,8 @@ use crate::{
 
 use super::{Result, Task};
 
+mod file;
+
 /// start with 4 runners, and then try to use 8 threads if needed
 const INITIAL_TASK_RUNNER_COUNT: usize = 4;
 
@@ -29,12 +31,7 @@ pub struct ConcurrentTask {
 }
 
 impl Task for ConcurrentTask {
-    async fn start(
-        &mut self,
-        adapter: &AnyAdapter,
-        cancel_token: CancellationToken,
-    ) -> Result<()>
-    {
+    async fn start(&mut self, adapter: &AnyAdapter, cancel_token: CancellationToken) -> Result<()> {
         todo!()
     }
     async fn stop(&mut self) -> Result<()> {

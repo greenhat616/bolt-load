@@ -6,7 +6,7 @@ use std::{pin::Pin, rc::Rc};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError},
     runner::TaskFailedKind,
-    runtime::{ThreadedRuntimeImpl, JoinHandle},
+    runtime::{JoinHandle, ThreadedRuntimeImpl},
 };
 
 use super::{DownloadMode, Progress, RunnerId, strategy::Chunk};
@@ -45,8 +45,12 @@ type Result<T> = std::result::Result<T, TaskError>;
 /// so we do not have the `Send` and `Sync` for this async fn trait
 #[enum_dispatch::enum_dispatch(TaskImpl)]
 pub(super) trait Task {
-    async fn start(&mut self, adapter: &AnyAdapter, cancel_token: CancellationToken) -> Result<JoinHandle<Result<()>>>;
-    async fn stop(&mut self) -> Result<()>;
+    async fn start(
+        &self,
+        adapter: &AnyAdapter,
+        cancel_token: CancellationToken,
+    ) -> Result<JoinHandle<Result<()>>>;
+    async fn stop(&self) -> Result<()>;
     fn inspect_progress(&self) -> Progress;
 }
 
