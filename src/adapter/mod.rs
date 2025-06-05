@@ -58,6 +58,9 @@ pub enum UnretryableError {
     #[error("internal error: {0}")]
     /// The error is internal. such as a http request, we do not retrieve the meta, and we call the range stream directly
     Internal(String),
+
+    #[error("should fallback to singleton task, reason: {0}")]
+    FallbackToSingleton(String),
     #[error("task cancelled")]
     Cancelled,
     #[error(transparent)]

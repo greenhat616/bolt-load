@@ -36,11 +36,16 @@ impl Payload {
     }
 }
 
-pub struct FileWriterGuard {
+pub struct FileWriterGuard(
+    std::thread::JoinHandle<Result<(), std::io::Error>>,
+    FileWriterControl,
+);
+
+pub struct FileWriterControl {
     tx: Sender<Payload>,
 }
 
-impl FileWriterGuard {
+impl FileWriterControl {
     pub fn new(tx: Sender<Payload>) -> Self {
         Self { tx }
     }
@@ -82,12 +87,7 @@ impl FileWriter {
         Ok(())
     }
 
-    pub fn start(
-        self,
-    ) -> (
-        std::thread::JoinHandle<Result<(), std::io::Error>>,
-        FileWriterGuard,
-    ) {
+    pub fn start(self) -> FileWriterGuard {
         let (tx, rx) = async_channel::bounded(FILE_WRITER_QUEUE_SIZE);
         let handle = std::thread::spawn(move || {
             let meta = std::fs::metadata(&self.path)?;
@@ -108,7 +108,7 @@ impl FileWriter {
 
             Ok(())
         });
-        (handle, FileWriterGuard::new(tx))
+        FileWriterGuard(handle, FileWriterControl::new(tx))
     }
 }
 
@@ -121,7 +121,7 @@ mod tests {
         let tmp_file = tempfile::tempdir().unwrap();
         let file_path = tmp_file.path().join("test.txt");
         let file_writer = FileWriter::new(&file_path);
-        let (handle, guard) = file_writer.start();
+        let FileWriterGuard(handle, guard) = file_writer.start();
         handle.join().unwrap().unwrap();
 
         let bytes = Bytes::from_static(b"Hello, world!");

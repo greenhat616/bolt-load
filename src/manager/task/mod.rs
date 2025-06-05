@@ -1,8 +1,7 @@
-use bytes::Bytes;
 use futures::future::RemoteHandle;
 use smol_cancellation_token::CancellationToken;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError},
@@ -10,13 +9,28 @@ use crate::{
     runtime::ThreadedRuntimeImpl,
 };
 
-use super::{DownloadMode, Progress, RunnerId, strategy::Chunk};
+use super::{DownloadMode, Progress, RunnerId};
 
 mod concurrent_task;
+mod sampler;
 mod singleton_task;
 
 pub use concurrent_task::*;
 pub use singleton_task::*;
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProgressWithSpeed {
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    progress: Progress,
+    speed: f64,
+}
+
+impl ProgressWithSpeed {
+    pub fn new(progress: Progress, speed: f64) -> Self {
+        Self { progress, speed }
+    }
+}
 
 /// The event of the task
 ///
@@ -26,7 +40,7 @@ pub enum TaskEvent {
     /// Initializing the task, including preallocating the file and retrieve the meta
     Initializing,
     /// Downloading the file
-    Downloading(Progress),
+    Downloading(ProgressWithSpeed),
     /// Failed to download the file
     Failed(TaskError),
     /// Finished downloading the file
@@ -77,6 +91,12 @@ pub enum TaskError {
 }
 
 type Result<T, E = TaskError> = std::result::Result<T, E>;
+
+#[derive(Clone)]
+struct RunningPayload {
+    adapter: Arc<AnyAdapter>,
+    cancel_token: CancellationToken,
+}
 
 /// The abstract trait of the task
 ///

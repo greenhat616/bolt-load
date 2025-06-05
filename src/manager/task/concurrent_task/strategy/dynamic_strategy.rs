@@ -1,7 +1,3 @@
-use std::result;
-
-use crate::manager::TaskManager;
-
 use super::{Strategy, StrategyAction};
 
 enum DynamicPlannerStage {
@@ -9,7 +5,7 @@ enum DynamicPlannerStage {
     Normal,
 }
 
-struct DynamicStrategy {
+pub struct DynamicStrategy {
     threashold1: f64,
     threashold2: f64,
     max_thread: usize,
@@ -18,7 +14,7 @@ struct DynamicStrategy {
 }
 
 impl DynamicStrategy {
-    fn new(threashold1: Option<f64>, threashold2: Option<f64>, max_thread: Option<usize>) -> Self {
+    pub fn new(threashold1: Option<f64>, threashold2: Option<f64>, max_thread: Option<usize>) -> Self {
         Self {
             threashold1: threashold1.unwrap_or(10.0),
             // 1MB/s minimum speed threashold
@@ -30,10 +26,19 @@ impl DynamicStrategy {
     }
 }
 
+struct DynamicStrategyContext {
+    total_download_speed: f64,
+    average_download_speed: f64,
+    runner_count: usize,
+    longest_runner: usize,
+}
+
 impl Strategy for DynamicStrategy {
-    fn step(&mut self, manager: &TaskManager) -> Vec<StrategyAction> {
+    type Context = DynamicStrategyContext;
+
+    fn step(&mut self, context: &Self::Context) -> Vec<StrategyAction> {
         let mut result = Vec::new();
-        let total_download_speed = manager.get_total_download_speed();
+        let total_download_speed = context.total_download_speed;
         while result.is_empty() {
             match self.current_stage {
                 DynamicPlannerStage::QuickStart => {
@@ -48,13 +53,12 @@ impl Strategy for DynamicStrategy {
                 }
                 DynamicPlannerStage::Normal => {
                     if (total_download_speed
-                        - (self.previous_total_download_speed
-                            + manager.get_average_download_speed()))
-                    .abs()
+                        - (self.previous_total_download_speed + context.average_download_speed))
+                        .abs()
                         > self.threashold2
-                        && manager.get_runner_count() < self.max_thread
+                        && context.runner_count < self.max_thread
                     {
-                        result.push(StrategyAction::SplitGivenTask(manager.get_longest_runner()));
+                        result.push(StrategyAction::SplitGivenTask(context.longest_runner));
                         self.previous_total_download_speed = total_download_speed;
                     } else {
                         self.previous_total_download_speed = total_download_speed;

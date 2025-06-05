@@ -5,7 +5,7 @@ version = "0.1.0"
 rust-version = "1.85.0" # the first version that supports 2024 edition
 
 [features]
-default = ["reqwest", "tokio"]
+default = ["reqwest", "tokio", "serde"]
 http = [
     "dep:headers",
     "dep:regex",
@@ -17,6 +17,8 @@ blocking = ["dep:blocking"]
 # adapter group
 reqwest = ["dep:reqwest", "http"]
 ureq = ["dep:ureq", "blocking", "http"]
+
+serde = ["dep:serde"]
 
 # runtime group
 tokio = ["dep:tokio"]
@@ -31,14 +33,14 @@ path = "src/lib.rs"
 log = "0.4"
 thiserror = "2"
 async-trait = "0.1"
-futures = { version = "0.3" }
+futures = { version = "0.3" } 
 url = "2"
 bytes = "1"
 enum_dispatch = "0.3"
 tempfile = "3"
 smol-cancellation-token = "0.1"
-statig = { version ="0.3", features = ["async"]}
-memmap2 = "0.9" # for better random range write for files if machine is available
+statig = { version ="0.3", features = ["async"] }
+memmap2 = "0.9"                                        # for better random range write for files if machine is available
 backon = "1"                                           # for retry strategy
 oneshot = { version = "0.1", features = ["async"] }    # for cross runtime oneshot
 async-lock = "3"                                       # for cross runtime async lock
@@ -46,8 +48,10 @@ ranges = "0.4"                                         # for range set operation
 async-channel = "2"                                    # for async channel
 async-broadcast = { version = "0.7", optional = true }
 async-fs = "2"                                         # for async file operation
+async-io = "2" #                                       # for async timer
 blocking = { version = "1", optional = true }          # convert blocking io to async
 
+serde = { version = "1", features = ["derive"], optional = true }
 
 # for http content-disposition parsing
 http = { version = "1", optional = true }

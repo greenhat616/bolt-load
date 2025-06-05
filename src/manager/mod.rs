@@ -3,7 +3,9 @@ use async_fs::{File, OpenOptions};
 use bytes::Bytes;
 use futures::{AsyncSeekExt, AsyncWriteExt, FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
-use std::{collections::HashMap, io::SeekFrom, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap, io::SeekFrom, ops::Range, path::PathBuf, rc::Rc, sync::Arc, time::Instant,
+};
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
@@ -13,13 +15,11 @@ use crate::{
 
 mod builder;
 mod runner_notification;
-mod strategy;
 mod task;
 
 pub use builder::*;
 
 use runner_notification::*;
-use strategy::*;
 use task::*;
 
 pub type RunnerId = usize;
@@ -31,10 +31,11 @@ pub enum ManagerMessagesVariant {
     ResizeTotal(u64),
 }
 
-pub type DownloadedChunks = Vec<Chunk>;
+pub type DownloadedChunks = Vec<Range<u64>>;
 
 /// the progress of the download task
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Progress {
     /// the total size of the content
     /// possible None if the total size is unknown
