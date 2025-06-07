@@ -1,5 +1,5 @@
 use crate::{
-    adapter::AnyBytesStream,
+    adapter::{AnyBytesStream, StreamError},
     manager::{ManagerMessage, ManagerMessagesVariant, RunnerId},
     utils::ShutdownGuardExt,
 };
@@ -120,6 +120,39 @@ impl TaskRunner {
             },
             rx,
         )
+    }
+
+    pub async fn new_with_async_and_callback(
+        total: Option<u64>,
+        stream: impl Future<Output = Result<AnyBytesStream, StreamError>>,
+        runner_id: RunnerId,
+        receiver: Receiver<ManagerMessage>,
+        cancel_token: CancellationToken,
+        on_channel_created: impl FnOnce(Receiver<RunnerMessage>),
+    ) -> Option<Self> {
+        let (tx, rx) = async_channel::unbounded();
+        on_channel_created(rx);
+        let stream = match stream.await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let _ = tx.send(RunnerMessage(
+                    runner_id,
+                    RunnerMessageKind::Stopped(StoppedReason::Failed(
+                        TaskFailedKind::NetworkError(e.to_string()),
+                    )),
+                ));
+                return None;
+            }
+        };
+        Some(TaskRunner {
+            total,
+            downloaded: 0,
+            stream,
+            notify: RunnerMessageSender::new(runner_id, tx),
+            control_signal: receiver,
+            cancel_token,
+            shutdown_rx: None,
+        })
     }
 
     /// run the task runner

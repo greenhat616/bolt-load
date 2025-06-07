@@ -28,19 +28,20 @@ pub enum FileWriterError {
 
 type PayloadResult = Result<(), std::io::Error>;
 
-pub struct Payload(Range<usize>, Bytes, oneshot::Sender<PayloadResult>);
+pub struct Payload(Range<u64>, Bytes, oneshot::Sender<PayloadResult>);
 
 impl Payload {
-    pub fn new(range: Range<usize>, data: Bytes, tx: oneshot::Sender<PayloadResult>) -> Self {
+    pub fn new(range: Range<u64>, data: Bytes, tx: oneshot::Sender<PayloadResult>) -> Self {
         Self(range, data, tx)
     }
 }
 
 pub struct FileWriterGuard(
-    std::thread::JoinHandle<Result<(), std::io::Error>>,
-    FileWriterControl,
+    pub std::thread::JoinHandle<Result<(), std::io::Error>>,
+    pub FileWriterControl,
 );
 
+#[derive(Debug, Clone)]
 pub struct FileWriterControl {
     tx: Sender<Payload>,
 }
@@ -55,7 +56,7 @@ impl FileWriterControl {
     /// # Errors
     ///
     /// This function will return an error if the channel is closed or the oneshot channel is dropped.
-    pub async fn write(&self, range: Range<usize>, data: Bytes) -> Result<(), FileWriterError> {
+    pub async fn write(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Payload::new(range, data, tx))
@@ -67,38 +68,48 @@ impl FileWriterControl {
 }
 
 pub struct FileWriter {
+    total: u64,
     path: PathBuf,
 }
 
 impl FileWriter {
-    pub fn new(path: impl AsRef<Path>) -> Self {
+    pub fn new(path: impl AsRef<Path>, total: u64) -> Self {
         Self {
+            total,
             path: path.as_ref().to_path_buf(),
         }
     }
 
     fn handle_seek_write(
         file: &mut std::fs::File,
-        range: Range<usize>,
+        range: Range<u64>,
         data: Bytes,
     ) -> Result<(), std::io::Error> {
-        file.seek(std::io::SeekFrom::Start(range.start as u64))?;
+        file.seek(std::io::SeekFrom::Start(range.start))?;
         file.write_all(&data)?;
         Ok(())
     }
 
     pub fn start(self) -> FileWriterGuard {
         let (tx, rx) = async_channel::bounded(FILE_WRITER_QUEUE_SIZE);
+        let total = self.total;
         let handle = std::thread::spawn(move || {
             let meta = std::fs::metadata(&self.path)?;
             let mut file = OpenOptions::new().write(true).open(&self.path)?;
+            if meta.len() != total {
+                file.set_len(total)?;
+            }
+
             // In 32-bit machine, the pointer size is 4 bytes, some large file may exceed the pointer size
             // so we use the seek write to write the file
             if meta.len() <= isize::MAX as u64 {
                 let mut mmap = unsafe { MmapMut::map_mut(&file)? };
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
-                    mmap[range.clone()].copy_from_slice(&data);
-                    let _ = tx.send(mmap.flush_async_range(range.start, range.end - range.start));
+                    mmap[range.start as usize..range.end as usize].copy_from_slice(&data);
+                    let _ = tx.send(mmap.flush_async_range(
+                        range.start as usize,
+                        range.end as usize - range.start as usize,
+                    ));
                 }
             } else {
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
@@ -126,7 +137,10 @@ mod tests {
 
         let bytes = Bytes::from_static(b"Hello, world!");
         let bytes_len = bytes.len();
-        guard.write(0..bytes_len, bytes.clone()).await.unwrap();
+        guard
+            .write(0..bytes_len as u64, bytes.clone())
+            .await
+            .unwrap();
 
         let file = OpenOptions::new().read(true).open(&file_path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };

@@ -12,8 +12,11 @@ use crate::{
 use super::{DownloadMode, Progress, RunnerId};
 
 mod concurrent_task;
+mod id;
 mod sampler;
 mod singleton_task;
+
+use id::Generator;
 
 pub use concurrent_task::*;
 pub use singleton_task::*;

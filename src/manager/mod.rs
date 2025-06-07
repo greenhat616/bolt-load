@@ -34,7 +34,7 @@ pub enum ManagerMessagesVariant {
 pub type DownloadedChunks = Vec<Range<u64>>;
 
 /// the progress of the download task
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Progress {
     /// the total size of the content

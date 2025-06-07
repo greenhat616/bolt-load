@@ -25,7 +25,7 @@ pub struct ChunkPlanner {
     /// the maximal count of the chunks
     pub max_chunk_count: Option<NonZeroUsize>,
     /// hold occupied chunks
-    chunks: HashMap<GenericRange<u64>, RunnerId>,
+    chunks: HashMap<GenericRange<u64>, Option<RunnerId>>,
     /// hold the task ids, to check whether the task id is duplicate
     task_ids: HashSet<RunnerId>,
 }
@@ -71,9 +71,11 @@ impl ChunkPlanner {
     }
 
     /// add the chunk
-    pub fn add_chunk(&mut self, range: Range<u64>, id: usize) -> bool {
-        if self.task_ids.contains(&id) {
-            return false;
+    pub fn add_chunk(&mut self, range: Range<u64>, id: Option<RunnerId>) -> bool {
+        if let Some(id) = id {
+            if self.task_ids.contains(&id) {
+                return false;
+            }
         }
         if let Some(max_chunk_count) = self.max_chunk_count {
             if self.get_chunks_count() >= max_chunk_count.get() {
@@ -84,7 +86,9 @@ impl ChunkPlanner {
             return false;
         }
         self.chunks.insert(range.into(), id);
-        self.task_ids.insert(id);
+        if let Some(id) = id {
+            self.task_ids.insert(id);
+        }
         true
     }
 
@@ -92,7 +96,9 @@ impl ChunkPlanner {
     pub fn remove_chunk(&mut self, range: Range<u64>) -> bool {
         let range = GenericRange::from(range);
         if let Some(id) = self.chunks.remove(&range) {
-            self.task_ids.remove(&id);
+            if let Some(id) = id {
+                self.task_ids.remove(&id);
+            }
             return true;
         }
         false
@@ -134,6 +140,13 @@ impl ChunkPlanner {
         None
     }
 
+    /// Get chunks map range
+    pub fn iter_chunks(&self) -> impl Iterator<Item = (Range<u64>, Option<RunnerId>)> {
+        self.chunks
+            .iter()
+            .map(|(r, id)| (convert_generic_range_to_std_range(r), *id))
+    }
+
     /// add a chunk by the length,
     /// it will arrange the chunk to the available range with the smallest start
     pub fn add_chunk_by_length(&mut self, length: u64, id: usize) -> Option<Range<u64>> {
@@ -143,7 +156,7 @@ impl ChunkPlanner {
             }
         }
         self.try_arrange_chunk_by_length(length).inspect(|range| {
-            self.add_chunk(range.clone(), id);
+            self.add_chunk(range.clone(), Some(id));
         })
     }
 
@@ -190,8 +203,10 @@ impl ChunkPlanner {
                 let task_id = self
                     .chunks
                     .iter()
+                    .filter(|(_, id)| id.is_some())
                     .find(|(k, _)| k.intersect(*range) != OperationResult::Empty)
                     .map(|(_, id)| *id)
+                    .flatten()
                     .unwrap();
 
                 // Determine the range to return
@@ -241,18 +256,18 @@ mod tests {
     #[test]
     fn test_add_chunk() {
         let mut chunk_planner = ChunkPlanner::new(100);
-        assert!(chunk_planner.add_chunk(50..55, 0));
-        assert!(!chunk_planner.add_chunk(60..70, 0));
-        assert!(chunk_planner.add_chunk(30..40, 1));
-        assert!(!chunk_planner.add_chunk(50..60, 2));
-        assert!(!chunk_planner.add_chunk(30..40, 3));
+        assert!(chunk_planner.add_chunk(50..55, Some(0)));
+        assert!(!chunk_planner.add_chunk(60..70, Some(0)));
+        assert!(chunk_planner.add_chunk(30..40, Some(1)));
+        assert!(!chunk_planner.add_chunk(50..60, Some(2)));
+        assert!(!chunk_planner.add_chunk(30..40, Some(3)));
         assert_eq!(chunk_planner.get_occupied_ranges(), vec![30..40, 50..55]);
     }
 
     #[test]
     fn test_remove_chunk() {
         let mut chunk_planner = ChunkPlanner::new(100);
-        assert!(chunk_planner.add_chunk(50..55, 0));
+        assert!(chunk_planner.add_chunk(50..55, Some(0)));
         assert!(chunk_planner.remove_chunk(50..55));
         assert!(!chunk_planner.remove_chunk(50..55));
         assert_eq!(chunk_planner.get_occupied_ranges(), vec![]);
@@ -261,8 +276,8 @@ mod tests {
     #[test]
     fn test_get_available_ranges() {
         let mut chunk_planner = ChunkPlanner::new(100);
-        assert!(chunk_planner.add_chunk(50..55, 0));
-        assert!(chunk_planner.add_chunk(30..40, 1));
+        assert!(chunk_planner.add_chunk(50..55, Some(0)));
+        assert!(chunk_planner.add_chunk(30..40, Some(1)));
         let available_chunks = chunk_planner.get_available_ranges();
         assert_eq!(available_chunks, vec![0..30, 40..50, 55..100]);
     }
@@ -286,11 +301,11 @@ mod tests {
         assert_eq!(chunk_planner.try_arrange_chunk_by_length(20), Some(0..20));
 
         // Add some chunks and test
-        assert!(chunk_planner.add_chunk(0..30, 0));
+        assert!(chunk_planner.add_chunk(0..30, Some(0)));
         assert_eq!(chunk_planner.try_arrange_chunk_by_length(20), Some(30..50));
 
         // Test when there's not enough space
-        assert!(chunk_planner.add_chunk(30..90, 1));
+        assert!(chunk_planner.add_chunk(30..90, Some(1)));
         assert_eq!(chunk_planner.try_arrange_chunk_by_length(20), None);
 
         // Test with exact remaining space
@@ -311,7 +326,7 @@ mod tests {
 
         // Test when no suitable space is available
         let mut full_planner = ChunkPlanner::new(50);
-        assert!(full_planner.add_chunk(0..50, 0));
+        assert!(full_planner.add_chunk(0..50, Some(0)));
         assert_eq!(full_planner.add_chunk_by_length(10, 1), None);
     }
 
@@ -328,7 +343,7 @@ mod tests {
         assert_eq!(range, Some(0..20));
 
         // Test with some downloaded ranges and occupied chunks, and the chunk is not full
-        assert!(chunk_planner.add_chunk(0..30, 1));
+        assert!(chunk_planner.add_chunk(0..30, Some(1)));
         let downloaded = &[0..10];
         let (task_id, range) = chunk_planner.find_or_evict_chunk_range(downloaded, 20);
         assert_eq!(task_id, None);
@@ -343,7 +358,7 @@ mod tests {
         // Test when the chunk is full, and the downloaded range is smaller than the chunk - min_chunk_size
         let mut chunk_planner = ChunkPlanner::new(100);
         chunk_planner.min_chunk_size = 10;
-        assert!(chunk_planner.add_chunk(0..90, 1));
+        assert!(chunk_planner.add_chunk(0..90, Some(1)));
         let downloaded = &[0..20];
         let (task_id, range) = chunk_planner.find_or_evict_chunk_range(downloaded, 40);
         assert_eq!(task_id, Some(1));
@@ -352,7 +367,7 @@ mod tests {
         // Test when the chunk is full, and the downloaded range is larger than the chunk - min_chunk_size
         let mut chunk_planner = ChunkPlanner::new(100);
         chunk_planner.min_chunk_size = 40;
-        assert!(chunk_planner.add_chunk(0..100, 1));
+        assert!(chunk_planner.add_chunk(0..100, Some(1)));
         let downloaded = &[0..20];
         let (task_id, range) = chunk_planner.find_or_evict_chunk_range(downloaded, 40);
         assert_eq!(task_id, Some(1));
@@ -365,15 +380,15 @@ mod tests {
         chunk_planner.max_chunk_count = NonZeroUsize::new(2);
 
         // Test adding chunks up to limit
-        assert!(chunk_planner.add_chunk(0..20, 0));
-        assert!(chunk_planner.add_chunk(30..50, 1));
+        assert!(chunk_planner.add_chunk(0..20, Some(0)));
+        assert!(chunk_planner.add_chunk(30..50, Some(1)));
 
         // Test adding beyond limit
-        assert!(!chunk_planner.add_chunk(60..80, 2));
+        assert!(!chunk_planner.add_chunk(60..80, Some(2)));
 
         // Test after removing a chunk
         assert!(chunk_planner.remove_chunk(0..20));
-        assert!(chunk_planner.add_chunk(60..80, 2));
+        assert!(chunk_planner.add_chunk(60..80, Some(2)));
     }
 
     #[test]
@@ -381,17 +396,17 @@ mod tests {
         let mut chunk_planner = ChunkPlanner::new(100);
 
         // Test zero-length chunk
-        assert!(!chunk_planner.add_chunk(50..50, 0));
+        assert!(!chunk_planner.add_chunk(50..50, Some(0)));
 
         // Test chunk beyond total size
-        assert!(!chunk_planner.add_chunk(90..110, 0));
+        assert!(!chunk_planner.add_chunk(90..110, Some(0)));
 
         // Test overlapping chunks
-        assert!(chunk_planner.add_chunk(10..30, 0));
-        assert!(!chunk_planner.add_chunk(20..40, 1));
-        assert!(!chunk_planner.add_chunk(0..20, 1));
+        assert!(chunk_planner.add_chunk(10..30, Some(0)));
+        assert!(!chunk_planner.add_chunk(20..40, Some(1)));
+        assert!(!chunk_planner.add_chunk(0..20, Some(1)));
 
         // Test exact size chunk at the end
-        assert!(chunk_planner.add_chunk(90..100, 1));
+        assert!(chunk_planner.add_chunk(90..100, Some(1)));
     }
 }
