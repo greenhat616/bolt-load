@@ -6,7 +6,7 @@ use smol_cancellation_token::CancellationToken;
 use std::{collections::HashMap, path::PathBuf};
 
 use super::{
-    DownloadMode, TaskImpl, TaskManager, TaskManagerCommand, TaskManagerState,
+    DownloadMode, TaskImpl, TaskManager, TaskManagerCommand, TaskState,
     TaskManagerStateControl, runner_notification::RunnerNotification,
 };
 use crate::{

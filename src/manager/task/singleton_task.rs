@@ -154,12 +154,12 @@ impl SingletonTaskInner {
             .write(true)
             .open(&self.path)
             .await
-            .map_err(TaskError::WriteChunkFailed)?;
+            .map_err(|e| TaskError::new_write_chunk_failed(e))?;
 
         if let Some(total) = self.total {
             file.set_len(total)
                 .await
-                .map_err(TaskError::WriteChunkFailed)?;
+                .map_err(|e| TaskError::new_write_chunk_failed(e))?;
         }
 
         let (control_tx, control_rx) = async_channel::unbounded();
@@ -210,7 +210,7 @@ impl SingletonTaskInner {
                                     self.downloaded += chunk.len() as u64;
                                     file.write_all(&chunk)
                                         .await
-                                        .map_err(TaskError::WriteChunkFailed)?;
+                                        .map_err(|e| TaskError::new_write_chunk_failed(e))?;
                                     let progress = Progress {
                                         total: self.total,
                                         downloaded: self.downloaded,

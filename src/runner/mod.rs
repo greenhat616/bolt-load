@@ -45,8 +45,7 @@ pub enum TaskFailedKind {
     Empty,
     /// The channel is closed
     ChannelClosed,
-    /// The network error
-    NetworkError(String),
+    StreamError(StreamError),
     /// The other error
     Other(String),
 }
@@ -137,9 +136,9 @@ impl TaskRunner {
             Err(e) => {
                 let _ = tx.send(RunnerMessage(
                     runner_id,
-                    RunnerMessageKind::Stopped(StoppedReason::Failed(
-                        TaskFailedKind::NetworkError(e.to_string()),
-                    )),
+                    RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(
+                        e,
+                    ))),
                 ));
                 return None;
             }
@@ -231,7 +230,7 @@ impl TaskRunner {
                             // First, we have to clarify whether this error is recoverable
                             // If it is, we can retry it
                             // If it is not, we should just return the error, and terminate the task
-                            Err(err) => break Err(TaskFailedKind::NetworkError(err.to_string()).into()),
+                            Err(err) => break Err(TaskFailedKind::StreamError(err).into()),
                         }
                     },
                     // In this case, the download is closed, which means the stream is finished
@@ -282,7 +281,7 @@ mod tests {
     use super::*;
     use async_stream::stream;
     use pretty_assertions::assert_eq;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
     use test_log::test;
     use tokio::time::sleep;
 
@@ -402,7 +401,7 @@ mod tests {
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
             yield Err(StreamError::Unretryable(UnretryableError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, "Network error"),
+                Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "Network error")),
             )));
         };
 
@@ -422,7 +421,7 @@ mod tests {
         while let Ok(msg) = msg_rx.recv().await {
             if let RunnerMessage(
                 _,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::NetworkError(_))),
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_))),
             ) = msg
             {
                 got_error = true;

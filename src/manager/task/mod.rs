@@ -81,16 +81,40 @@ pub enum TaskImpl {
     Concurrent(ConcurrentTask),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Clone)]
 pub enum TaskError {
     #[error("retrieve meta failed: {0}")]
     RetrieveMetaFailed(UnretryableError),
+    #[error("failed to allocate file size: {0}")]
+    AllocateFileSizeFailed(Arc<std::io::Error>),
     #[error("failed to fetch stream failed: {0}")]
     StreamFailed(StreamError),
     #[error("task failed: {0:?}")]
     Failed(TaskFailedKind),
     #[error("failed to write chunk: {0}")]
-    WriteChunkFailed(std::io::Error),
+    WriteChunkFailed(Arc<std::io::Error>),
+}
+
+impl TaskError {
+    pub fn new_retrieve_meta_failed(e: UnretryableError) -> Self {
+        Self::RetrieveMetaFailed(e)
+    }
+
+    pub fn new_stream_failed(e: StreamError) -> Self {
+        Self::StreamFailed(e)
+    }
+
+    pub fn new_failed(e: TaskFailedKind) -> Self {
+        Self::Failed(e)
+    }
+
+    pub fn new_write_chunk_failed(e: std::io::Error) -> Self {
+        Self::WriteChunkFailed(Arc::new(e))
+    }
+
+    pub fn new_allocate_file_size_failed(e: std::io::Error) -> Self {
+        Self::AllocateFileSizeFailed(Arc::new(e))
+    }
 }
 
 type Result<T, E = TaskError> = std::result::Result<T, E>;

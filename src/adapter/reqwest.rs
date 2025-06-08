@@ -42,21 +42,30 @@ impl From<reqwest::Error> for StreamError {
             if status_code.is_client_error() {
                 match status_code {
                     reqwest::StatusCode::NOT_FOUND => {
-                        return UnretryableError::Io(std::io::Error::new(
+                        return UnretryableError::new_io_error(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             e.to_string(),
                         ))
                         .into();
                     }
                     reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
-                        return UnretryableError::Io(std::io::Error::new(
+                        return UnretryableError::new_io_error(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
                             e.to_string(),
                         ))
                         .into();
                     }
+                    reqwest::StatusCode::TOO_MANY_REQUESTS
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                        return UnretryableError::new_exceeded_request_limits(format!(
+                            "HTTP Status Code: {} {}",
+                            status_code,
+                            status_code.canonical_reason().unwrap_or("unknown")
+                        ))
+                        .into();
+                    }
                     _ => {
-                        return RetryableError::Io(std::io::Error::new(
+                        return RetryableError::new_io_error(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             e.to_string(),
                         ))
@@ -66,7 +75,7 @@ impl From<reqwest::Error> for StreamError {
             }
         }
         if e.is_builder() || e.is_body() {
-            return UnretryableError::Io(std::io::Error::new(
+            return UnretryableError::new_io_error(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 e.to_string(),
             ))
@@ -74,7 +83,7 @@ impl From<reqwest::Error> for StreamError {
         }
 
         // fallback to other errors
-        RetryableError::Io(std::io::Error::new(
+        RetryableError::new_io_error(std::io::Error::new(
             std::io::ErrorKind::Other,
             e.to_string(),
         ))
@@ -154,10 +163,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
                 Ok(res) => *response = Some(res),
                 Err(e) => match e {
                     StreamError::Retryable(e) => {
-                        return Err(UnretryableError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )));
+                        return Err(UnretryableError::from_retryable_error(e));
                     }
                     StreamError::Unretryable(e) => {
                         return Err(e);

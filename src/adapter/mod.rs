@@ -27,7 +27,7 @@ pub trait BoltLoadAdapter: Send + Sync {
     /// Note: the range is followed as [start, end)
     #[allow(unused_variables)]
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
-        Err(UnretryableError::Io(std::io::Error::new(
+        Err(UnretryableError::new_io_error(std::io::Error::new(
             std::io::ErrorKind::Other,
             "Range stream is not supported",
         ))
@@ -47,6 +47,12 @@ pub struct BoltLoadAdapterMeta {
 pub enum RetryableError {
     #[error(transparent)]
     Io(#[from] Arc<std::io::Error>),
+}
+
+impl RetryableError {
+    pub fn new_io_error(e: std::io::Error) -> Self {
+        Self::Io(Arc::new(e))
+    }
 }
 
 impl From<std::io::Error> for RetryableError {
@@ -71,6 +77,22 @@ pub enum UnretryableError {
     Cancelled,
     #[error(transparent)]
     Io(#[from] Arc<std::io::Error>),
+}
+
+impl UnretryableError {
+    pub fn new_io_error(e: std::io::Error) -> Self {
+        Self::Io(Arc::new(e))
+    }
+
+    pub fn new_exceeded_request_limits(s: impl AsRef<str>) -> Self {
+        Self::ExceededRequestLimits(s.as_ref().to_string())
+    }
+
+    pub fn from_retryable_error(e: RetryableError) -> Self {
+        match e {
+            RetryableError::Io(e) => Self::Io(e),
+        }
+    }
 }
 
 impl From<std::io::Error> for UnretryableError {

@@ -41,21 +41,26 @@ impl IntoUreqAdapter for ureq::Agent {
 impl From<ureq::Error> for StreamError {
     fn from(e: ureq::Error) -> Self {
         match e {
-            ureq::Error::Transport(_) => StreamError::Retryable(RetryableError::Io(
+            ureq::Error::Transport(_) => StreamError::Retryable(RetryableError::new_io_error(
                 std::io::Error::new(std::io::ErrorKind::NetworkDown, e.to_string()),
             )),
             ureq::Error::Status(404, _) => StreamError::Unretryable(UnretryableError::NotFound),
             ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => StreamError::Unretryable(
                 UnretryableError::Unauthorized(format!("http status code: {}", 401)),
             ),
+            ureq::Error::Status(503, _) | ureq::Error::Status(429, _) => StreamError::Unretryable(
+                UnretryableError::new_exceeded_request_limits(format!("http status code: {}", 503)),
+            ),
             ureq::Error::Status(status, _) if status < 500 => {
-                StreamError::Unretryable(UnretryableError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("http client error, status code: {}", status),
-                )))
+                StreamError::Unretryable(UnretryableError::from_retryable_error(
+                    RetryableError::new_io_error(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("http client error, status code: {}", status),
+                    )),
+                ))
             }
             ureq::Error::Status(status, _) => {
-                StreamError::Retryable(RetryableError::Io(std::io::Error::new(
+                StreamError::Retryable(RetryableError::new_io_error(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("http status code: {}", status),
                 )))
@@ -136,7 +141,7 @@ impl Stream for UreqStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.get_mut().0)
             .poll_next(cx)
-            .map_err(|e| UnretryableError::Io(e).into())
+            .map_err(|e| UnretryableError::new_io_error(e).into())
     }
 }
 

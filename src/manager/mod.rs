@@ -66,21 +66,18 @@ pub enum DownloadMode {
 }
 
 #[derive(Clone, Default)]
-pub enum TaskManagerState {
+pub enum TaskState {
     #[default]
     /// the task is idle, the initial state
     Idle,
-    /// the task is allocating the file size for the temp file
-    Allocating,
+    /// the task is initializing the task
+    Initializing,
     /// the task is downloading the content
     Downloading,
-    /// the task is finishing, do some cleanup work.
-    /// Such as rename the file to the final name.
-    Finishing,
-    /// the task is failed with the error
-    Failed(TaskManagerFailedError),
     /// the task is finished
     Finished,
+    /// the task is failed with the error
+    Failed(TaskManagerFailedError),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -93,7 +90,7 @@ pub enum TaskManagerFailedError {
     AllocateError(String),
     /// the task is stopped
     #[error("the task is stopped: {0:?}")]
-    Stopped(String),
+    Stopped(TaskError),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -109,17 +106,17 @@ pub enum TaskManagerCommand {
 }
 
 #[derive(Default)]
-struct TaskManagerStateControl(Option<(TaskManagerState, async_channel::Sender<TaskManagerState>)>);
+struct TaskManagerStateControl(Option<(TaskState, async_channel::Sender<TaskState>)>);
 
 impl TaskManagerStateControl {
-    pub fn new(state: TaskManagerState, sender: Sender<TaskManagerState>) -> Self {
+    pub fn new(state: TaskState, sender: Sender<TaskState>) -> Self {
         Self(Some((state, sender)))
     }
 
     pub async fn dispatch(
         &mut self,
-        state: TaskManagerState,
-    ) -> Result<(), async_channel::SendError<TaskManagerState>> {
+        state: TaskState,
+    ) -> Result<(), async_channel::SendError<TaskState>> {
         let Some((manager_state, sender)) = self.0.as_mut() else {
             unreachable!("we should init the state control first");
         };
@@ -146,139 +143,21 @@ pub struct TaskManager<'a> {
     save_path: PathBuf,
     /// the tmp path of this task
     tmp_path: PathBuf,
-    state_control: TaskManagerStateControl,
+    task_state: TaskState,
     /// the meta of this task
     meta: BoltLoadAdapterMeta,
 
-    /// the task of this manager
-    // TODO: dynamic switch the task mode, for the future, possible resume after a long time period
     cancel_token: CancellationToken,
     task: TaskImpl,
 
-    /// a control channel between manager and runners
-    control_channel: (Sender<ManagerMessage>, Receiver<ManagerMessage>),
-    /// the notification channel for the runners
-    runners_notification: RunnerNotification<'a, RunnerMessage>,
-    /// the command channel
-    cmd_rx: Receiver<TaskManagerCommand>,
-
-    /// task runners
-    runners: HashMap<RunnerId, TaskRunner>,
-    /// download progress of each runner
-    runner_progress: HashMap<RunnerId, (u64, Instant)>,
-    runner_speed: HashMap<RunnerId, f64>,
 }
 
 /// fast fail the call, and dispatch the state to the state control
-macro_rules! fast_fail_call {
-    ($self:expr, $fut:expr) => {
-        match $fut.await {
-            Ok(v) => v,
-            Err(e) => {
-                $self
-                    .state_control
-                    .dispatch(TaskManagerState::Failed(e.into()))
-                    .await;
-                return;
-            }
-        }
-    };
-}
+
 
 impl TaskManager<'_> {
-    async fn handle_state_change(&mut self, rx: Receiver<TaskManagerState>) {
-        while let Ok(state) = rx.recv().await {
-            match state {
-                TaskManagerState::Idle => {
-                    self.state_control.dispatch(state).await;
-                }
-                TaskManagerState::Allocating => {
-                    fast_fail_call!(self, async {
-                        self.allocate_file_size()
-                            .await
-                            .map_err(|e| TaskManagerFailedError::AllocateError(e.to_string()))
-                    });
-                    self.state_control
-                        .dispatch(TaskManagerState::Downloading)
-                        .await;
-                }
-                TaskManagerState::Downloading => {
-                    fast_fail_call!(self, async {
-                        self.task
-                            .run(&self.adapter, self.cancel_token.child_token())
-                            .await
-                            .map_err(|e| TaskManagerFailedError::Stopped(e.to_string()))?;
-                        Ok::<(), TaskManagerFailedError>(())
-                    });
-                }
-                TaskManagerState::Finishing => {
-                    self.state_control
-                        .dispatch(TaskManagerState::Finished)
-                        .await;
-                }
-                _ => (),
-            }
-        }
-    }
 
-    /// pre-allocate the file size for the temp file
-    async fn allocate_file_size(&mut self) -> Result<(), std::io::Error> {
-        if self.meta.content_size > 0 {
-            let file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&self.tmp_path)
-                .await?;
-            file.set_len(self.meta.content_size).await?;
-        }
-        Ok(())
-    }
 
-    fn handle_runner_message(&mut self, RunnerMessage(runner_id, kind): RunnerMessage) {
-        match kind {
-            RunnerMessageKind::Started => {
-                log::trace!("Runner {} started", runner_id);
-            }
-            RunnerMessageKind::Stopped(reason) => {
-                log::trace!("Runner {} stopped with reason: {:?}", runner_id, reason);
-            }
-            RunnerMessageKind::Downloaded(data) => {
-                log::trace!("Runner {} downloaded {} bytes", runner_id, data.len());
-                let progress_entry = self
-                    .runner_progress
-                    .entry(runner_id)
-                    .or_insert((0, Instant::now()));
-                let speed_entry = self.runner_speed.entry(runner_id).or_insert(0.0);
-                // calc download speed
-                *speed_entry += ((data.len() as u64 - progress_entry.0) as f64)
-                    / (progress_entry.1.elapsed().as_secs_f64());
-
-                progress_entry.0 += data.len() as u64;
-                progress_entry.1 = Instant::now();
-                todo!("write the data to the file")
-            }
-        }
-    }
-
-    fn handle_cmd(&mut self, cmd: TaskManagerCommand) -> bool {
-        todo!()
-    }
-
-    fn get_total_download_speed(&self) -> f64 {
-        self.runner_speed.values().sum::<f64>()
-    }
-
-    fn get_average_download_speed(&self) -> f64 {
-        self.runner_speed.values().sum::<f64>() / self.runner_speed.len() as f64
-    }
-
-    fn get_runner_count(&self) -> usize {
-        self.runners.len()
-    }
-
-    fn get_longest_runner(&self) -> RunnerId {
-        todo!("return the runner id of the one with most undownloaded data")
-    }
 }
 
 impl TaskManager<'_> {
@@ -287,7 +166,7 @@ impl TaskManager<'_> {
         matches!(
             self.state_control,
             TaskManagerStateControl(Some((
-                TaskManagerState::Finished | TaskManagerState::Failed(_),
+                TaskState::Finished | TaskState::Failed(_),
                 _
             )))
         )
@@ -301,7 +180,7 @@ impl TaskManager<'_> {
     /// cancel the task, and do the cleanup work
     pub async fn cancel(&mut self) {
         self.state_control
-            .dispatch(TaskManagerState::Failed(TaskManagerFailedError::Cancelled))
+            .dispatch(TaskState::Failed(TaskManagerFailedError::Cancelled))
             .await;
         todo!()
     }
@@ -310,8 +189,8 @@ impl TaskManager<'_> {
     /// This function should be called in a async spawn.
     pub async fn run(&mut self) {
         let (state_sender, state_receiver) = async_channel::bounded(2);
-        state_sender.send(TaskManagerState::Idle).await.unwrap();
-        self.state_control = TaskManagerStateControl::new(TaskManagerState::Idle, state_sender);
+        state_sender.send(TaskState::Idle).await.unwrap();
+        self.state_control = TaskManagerStateControl::new(TaskState::Idle, state_sender);
 
         let state_dispatcher = self.handle_state_change(state_receiver);
         let mut downloading_dispatcher = None;
