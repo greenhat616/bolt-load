@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    cell::Cell,
     collections::{HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
@@ -617,7 +616,7 @@ impl ConcurrentTaskInner {
 }
 
 #[state_machine(
-    initial = "State::stopped(Cell::new(None))",
+    initial = "State::stopped(None)",
     on_transition = "Self::on_transition"
 )]
 impl ConcurrentTaskInner {
@@ -625,7 +624,7 @@ impl ConcurrentTaskInner {
     fn stopped(
         &mut self,
         context: &mut Context,
-        reason: &mut Cell<Option<Result<()>>>,
+        reason: &mut Option<Result<()>>,
         event: &Event,
     ) -> Response<State> {
         match event {
@@ -657,7 +656,7 @@ impl ConcurrentTaskInner {
                             context.poll.push_back(());
                             Transition(State::downloading(cancel_token.clone()))
                         }
-                        Err(e) => Transition(State::stopped(Cell::new(Some(Err(e))))),
+                        Err(e) => Transition(State::stopped(Some(Err(e)))),
                     }
                 }
                 .fuse();
@@ -665,9 +664,9 @@ impl ConcurrentTaskInner {
                 futures::pin_mut!(task, cancel);
                 futures::select_biased! {
                     _ = cancel => {
-                        Transition(State::stopped(Cell::new(Some(Err(
+                        Transition(State::stopped(Some(Err(
                             TaskError::Failed(TaskFailedKind::Cancelled),
-                        )))))
+                        ))))
                     }
                     res = task => { res }
                 }
@@ -686,8 +685,8 @@ impl ConcurrentTaskInner {
             Event::Step => {
                 let task = async {
                     match self.download(cancel_token).await {
-                        Ok(_) => Transition(State::stopped(Cell::new(None))),
-                        Err(e) => Transition(State::stopped(Cell::new(Some(Err(e))))),
+                        Ok(_) => Transition(State::stopped(None)),
+                        Err(e) => Transition(State::stopped(Some(Err(e)))),
                     }
                 }
                 .fuse();
@@ -695,9 +694,9 @@ impl ConcurrentTaskInner {
                 futures::pin_mut!(task, cancel);
                 futures::select_biased! {
                     _ = cancel => {
-                        Transition(State::stopped(Cell::new(Some(Err(
+                        Transition(State::stopped(Some(Err(
                             TaskError::Failed(TaskFailedKind::Cancelled),
-                        )))))
+                        ))))
                     }
                     res = task => { res }
                 }
@@ -706,9 +705,9 @@ impl ConcurrentTaskInner {
         }
     }
 
-    fn on_transition(&mut self, source: &State, target: &State) {
+    fn on_transition(&mut self, _source: &State, target: &State) {
         match target {
-            State::Stopped { reason } => match reason.take() {
+            State::Stopped { reason } => match reason.clone() {
                 Some(Ok(())) => {
                     let tx = self.event_tx.clone();
                     let progress = self.progress.clone();

@@ -1,4 +1,4 @@
-use std::{cell::Cell, collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
 use super::{
     Result, TaskError,
@@ -21,7 +21,7 @@ use futures::{AsyncWriteExt, FutureExt, StreamExt, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
 
-/// Singleton task should only have one runner, so we use a static id for the runner
+/// Singleton task only have one runner, so we use a static id for the runner
 const STATIC_RUNNER_ID: RunnerId = 0;
 
 pub struct SingletonTask {
@@ -256,7 +256,7 @@ struct Context {
 }
 
 #[state_machine(
-    initial = "State::stopped(Cell::new(None))",
+    initial = "State::stopped(None)",
     on_transition = "Self::on_transition"
 )]
 #[allow(unused_variables)]
@@ -265,7 +265,7 @@ impl SingletonTaskInner {
     fn stopped(
         &mut self,
         context: &mut Context,
-        reason: &mut Cell<Option<Result<()>>>,
+        reason: &mut Option<Result<()>>,
         event: &Event,
     ) -> Response<State> {
         match event {
@@ -298,7 +298,7 @@ impl SingletonTaskInner {
                             context.poll.push_back(());
                             Transition(State::downloading(cancel_token.clone()))
                         }
-                        Err(e) => Transition(State::stopped(Cell::new(Some(Err(e))))),
+                        Err(e) => Transition(State::stopped(Some(Err(e)))),
                     }
                 }
                 .fuse();
@@ -306,9 +306,9 @@ impl SingletonTaskInner {
 
                 futures::select_biased! {
                     _ = cancel_token.cancelled().fuse() => {
-                        Transition(State::stopped(Cell::new(Some(Err(TaskError::Failed(
+                        Transition(State::stopped(Some(Err(TaskError::Failed(
                             crate::runner::TaskFailedKind::Cancelled,
-                        ))))))
+                        )))))
                     }
                     res = task => { res },
                 }
@@ -326,16 +326,16 @@ impl SingletonTaskInner {
     ) -> Response<State> {
         match event {
             Event::Step => match self.download(cancel_token).await {
-                Ok(()) => Transition(State::stopped(Cell::new(Some(Ok(()))))),
-                Err(e) => Transition(State::stopped(Cell::new(Some(Err(e))))),
+                Ok(()) => Transition(State::stopped(Some(Ok(())))),
+                Err(e) => Transition(State::stopped(Some(Err(e)))),
             },
             _ => Super,
         }
     }
 
-    fn on_transition(&mut self, source: &State, target: &State) {
+    fn on_transition(&mut self, _source: &State, target: &State) {
         match target {
-            State::Stopped { reason } => match reason.take() {
+            State::Stopped { reason } => match reason.clone() {
                 Some(Ok(())) => {
                     let progress = Progress {
                         total: Some(self.total.unwrap_or(self.downloaded)),
