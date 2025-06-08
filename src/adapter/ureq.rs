@@ -41,7 +41,7 @@ impl IntoUreqAdapter for ureq::Agent {
 impl From<ureq::Error> for StreamError {
     fn from(e: ureq::Error) -> Self {
         match e {
-            ureq::Error::Transport(_) => StreamError::Retryable(RetryableError::Other(
+            ureq::Error::Transport(_) => StreamError::Retryable(RetryableError::Io(
                 std::io::Error::new(std::io::ErrorKind::NetworkDown, e.to_string()),
             )),
             ureq::Error::Status(404, _) => StreamError::Unretryable(UnretryableError::NotFound),
@@ -49,13 +49,13 @@ impl From<ureq::Error> for StreamError {
                 UnretryableError::Unauthorized(format!("http status code: {}", 401)),
             ),
             ureq::Error::Status(status, _) if status < 500 => {
-                StreamError::Unretryable(UnretryableError::Other(std::io::Error::new(
+                StreamError::Unretryable(UnretryableError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("http client error, status code: {}", status),
                 )))
             }
             ureq::Error::Status(status, _) => {
-                StreamError::Retryable(RetryableError::Other(std::io::Error::new(
+                StreamError::Retryable(RetryableError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("http status code: {}", status),
                 )))
@@ -136,7 +136,7 @@ impl Stream for UreqStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.get_mut().0)
             .poll_next(cx)
-            .map_err(|e| UnretryableError::Other(e).into())
+            .map_err(|e| UnretryableError::Io(e).into())
     }
 }
 

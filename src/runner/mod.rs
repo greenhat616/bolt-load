@@ -401,7 +401,7 @@ mod tests {
         // Create a stream that yields an error
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
-            yield Err(StreamError::Unretryable(UnretryableError::Other(
+            yield Err(StreamError::Unretryable(UnretryableError::Io(
                 std::io::Error::new(std::io::ErrorKind::Other, "Network error"),
             )));
         };

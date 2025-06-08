@@ -180,7 +180,7 @@ impl ConcurrentTaskInner {
             .map_err(TaskError::RetrieveMetaFailed)?;
         let total = if meta.content_size == 0 {
             return Err(TaskError::RetrieveMetaFailed(
-                UnretryableError::FallbackToSingleton(
+                UnretryableError::ExceededRequestLimits(
                     "content size is 0; concurrent task does not support 0-size file".to_string(),
                 ),
             ));

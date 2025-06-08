@@ -1,7 +1,7 @@
-use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::{Stream, stream::BoxStream};
+use futures::stream::BoxStream;
 
 #[cfg(feature = "reqwest")]
 mod reqwest;
@@ -27,7 +27,7 @@ pub trait BoltLoadAdapter: Send + Sync {
     /// Note: the range is followed as [start, end)
     #[allow(unused_variables)]
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
-        Err(UnretryableError::Other(std::io::Error::new(
+        Err(UnretryableError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             "Range stream is not supported",
         ))
@@ -43,13 +43,19 @@ pub struct BoltLoadAdapterMeta {
     pub filename: Option<String>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Clone)]
 pub enum RetryableError {
     #[error(transparent)]
-    Other(#[from] std::io::Error),
+    Io(#[from] Arc<std::io::Error>),
 }
 
-#[derive(Debug, thiserror::Error)]
+impl From<std::io::Error> for RetryableError {
+    fn from(e: std::io::Error) -> Self {
+        RetryableError::Io(Arc::new(e))
+    }
+}
+
+#[derive(Debug, thiserror::Error, Clone)]
 pub enum UnretryableError {
     #[error("access denied: {0}")]
     Unauthorized(String),
@@ -59,15 +65,21 @@ pub enum UnretryableError {
     /// The error is internal. such as a http request, we do not retrieve the meta, and we call the range stream directly
     Internal(String),
 
-    #[error("should fallback to singleton task, reason: {0}")]
-    FallbackToSingleton(String),
+    #[error("exceeded request limits, reason: {0}")]
+    ExceededRequestLimits(String),
     #[error("task cancelled")]
     Cancelled,
     #[error(transparent)]
-    Other(#[from] std::io::Error),
+    Io(#[from] Arc<std::io::Error>),
 }
 
-#[derive(Debug, thiserror::Error)]
+impl From<std::io::Error> for UnretryableError {
+    fn from(e: std::io::Error) -> Self {
+        UnretryableError::Io(Arc::new(e))
+    }
+}
+
+#[derive(Debug, thiserror::Error, Clone)]
 /// The error type for the adapter stream
 pub enum StreamError {
     /// The error is retryable
@@ -83,7 +95,7 @@ impl From<StreamError> for UnretryableError {
     fn from(e: StreamError) -> Self {
         match e {
             StreamError::Retryable(e) => match e {
-                RetryableError::Other(e) => UnretryableError::Other(e),
+                RetryableError::Io(e) => UnretryableError::Io(e),
             },
             StreamError::Unretryable(e) => e,
         }

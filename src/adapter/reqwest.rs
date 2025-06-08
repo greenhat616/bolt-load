@@ -42,21 +42,21 @@ impl From<reqwest::Error> for StreamError {
             if status_code.is_client_error() {
                 match status_code {
                     reqwest::StatusCode::NOT_FOUND => {
-                        return UnretryableError::Other(std::io::Error::new(
+                        return UnretryableError::Io(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             e.to_string(),
                         ))
                         .into();
                     }
                     reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
-                        return UnretryableError::Other(std::io::Error::new(
+                        return UnretryableError::Io(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
                             e.to_string(),
                         ))
                         .into();
                     }
                     _ => {
-                        return RetryableError::Other(std::io::Error::new(
+                        return RetryableError::Io(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             e.to_string(),
                         ))
@@ -66,7 +66,7 @@ impl From<reqwest::Error> for StreamError {
             }
         }
         if e.is_builder() || e.is_body() {
-            return UnretryableError::Other(std::io::Error::new(
+            return UnretryableError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 e.to_string(),
             ))
@@ -74,7 +74,7 @@ impl From<reqwest::Error> for StreamError {
         }
 
         // fallback to other errors
-        RetryableError::Other(std::io::Error::new(
+        RetryableError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             e.to_string(),
         ))
@@ -154,7 +154,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
                 Ok(res) => *response = Some(res),
                 Err(e) => match e {
                     StreamError::Retryable(e) => {
-                        return Err(UnretryableError::Other(std::io::Error::new(
+                        return Err(UnretryableError::Io(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             e.to_string(),
                         )));
