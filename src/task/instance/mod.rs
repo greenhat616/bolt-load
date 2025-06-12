@@ -38,7 +38,7 @@ impl ProgressWithSpeed {
 /// The event of the task
 ///
 /// It is used to push event to the manager or client
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TaskEvent {
     /// Initializing the task, including preallocating the file and retrieve the meta
     Initializing,
@@ -75,18 +75,19 @@ impl TaskControl {
     }
 }
 
+// TODO: maybe we can share the same state machine for both task impl?
 #[enum_dispatch::enum_dispatch]
-pub enum TaskImpl {
+pub enum TaskInstanceImpl {
     Singleton(SingletonTask),
     Concurrent(ConcurrentTask),
 }
 
 #[derive(Debug, thiserror::Error, Clone)]
-pub enum TaskError {
+pub enum TaskInstanceError {
     #[error("retrieve meta failed: {0}")]
     RetrieveMetaFailed(UnretryableError),
     #[error("failed to allocate file size: {0}")]
-    AllocateFileSizeFailed(Arc<std::io::Error>),
+    AllocateFileSpaceFailed(Arc<std::io::Error>),
     #[error("failed to fetch stream failed: {0}")]
     StreamFailed(StreamError),
     #[error("task failed: {0:?}")]
@@ -95,7 +96,7 @@ pub enum TaskError {
     WriteChunkFailed(Arc<std::io::Error>),
 }
 
-impl TaskError {
+impl TaskInstanceError {
     pub fn new_retrieve_meta_failed(e: UnretryableError) -> Self {
         Self::RetrieveMetaFailed(e)
     }
@@ -113,11 +114,11 @@ impl TaskError {
     }
 
     pub fn new_allocate_file_size_failed(e: std::io::Error) -> Self {
-        Self::AllocateFileSizeFailed(Arc::new(e))
+        Self::AllocateFileSpaceFailed(Arc::new(e))
     }
 }
 
-type Result<T, E = TaskError> = std::result::Result<T, E>;
+type Result<T, E = TaskInstanceError> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 struct RunningPayload {
@@ -131,8 +132,8 @@ struct RunningPayload {
 ///
 /// It should be execute at the same task of the `TaskManager`,
 /// so we do not have the `Send` and `Sync` for this async fn trait
-#[enum_dispatch::enum_dispatch(TaskImpl)]
-pub(super) trait Task {
+#[enum_dispatch::enum_dispatch(TaskInstanceImpl)]
+pub(in crate::task) trait TaskInstance {
     fn run(
         &mut self,
         adapter: Arc<AnyAdapter>,
@@ -145,7 +146,7 @@ pub(super) trait Task {
     async fn stop(&mut self) -> Result<()>;
 }
 
-impl TaskImpl {
+impl TaskInstanceImpl {
     pub fn new(mode: DownloadMode, rt: ThreadedRuntimeImpl) -> Self {
         todo!()
     }

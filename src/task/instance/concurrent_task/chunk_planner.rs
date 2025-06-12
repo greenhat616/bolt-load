@@ -9,7 +9,7 @@ use std::{
 
 use ranges::{GenericRange, OperationResult, Ranges};
 
-use crate::manager::RunnerId;
+use crate::task::RunnerId;
 
 pub const DEFAULT_MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 

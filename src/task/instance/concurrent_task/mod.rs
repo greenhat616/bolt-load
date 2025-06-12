@@ -16,19 +16,19 @@ use statig::{Response::*, prelude::*};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
-    manager::{
-        ManagerMessage, ManagerMessagesVariant, Progress, RunnerId,
-        runner_notification::RunnerNotification,
-        task::{
-            ProgressWithSpeed, RunningPayload, TaskControl, TaskError, TaskEvent,
-            sampler::{SAMPLE_INTERVAL, Sampler},
-        },
-    },
     runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskFailedKind, TaskRunner},
     runtime::ThreadedRuntimeImpl,
+    task::{
+        ManagerMessage, ManagerMessagesVariant, Progress, RunnerId,
+        instance::{
+            ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent, TaskInstanceError,
+            sampler::{SAMPLE_INTERVAL, Sampler},
+        },
+        runner_notification::RunnerNotification,
+    },
 };
 
-use super::{Generator, Result, Task};
+use super::{Generator, Result, TaskInstance};
 
 mod chunk_planner;
 mod file;
@@ -49,7 +49,7 @@ pub struct ConcurrentTask {
     progress: Progress,
 }
 
-impl Task for ConcurrentTask {
+impl TaskInstance for ConcurrentTask {
     fn run(
         &mut self,
         adapter: Arc<AnyAdapter>,
@@ -176,9 +176,9 @@ impl ConcurrentTaskInner {
             .unwrap()
             .retrieve_meta()
             .await
-            .map_err(TaskError::RetrieveMetaFailed)?;
+            .map_err(TaskInstanceError::RetrieveMetaFailed)?;
         let total = if meta.content_size == 0 {
-            return Err(TaskError::RetrieveMetaFailed(
+            return Err(TaskInstanceError::RetrieveMetaFailed(
                 UnretryableError::ExceededRequestLimits(
                     "content size is 0; concurrent task does not support 0-size file".to_string(),
                 ),
@@ -239,10 +239,10 @@ impl ConcurrentTaskInner {
                 };
                 runner.run().await;
             })
-            .map_err(|e| TaskError::Failed(TaskFailedKind::Other(e.to_string())))?;
+            .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
         let rx = rx
             .await
-            .map_err(|_| TaskError::Failed(TaskFailedKind::Cancelled))?;
+            .map_err(|_| TaskInstanceError::Failed(TaskFailedKind::Cancelled))?;
         Ok((rx, handle))
     }
 
@@ -350,7 +350,7 @@ impl ConcurrentTaskInner {
                             .await
                             .expect("Runner maybe corrupt?");
                         if let RunnerMessageKind::Stopped(StoppedReason::Failed(kind)) = msg {
-                            return Err(TaskError::Failed(kind));
+                            return Err(TaskInstanceError::Failed(kind));
                         }
                     }
                     StrategyAction::SplitGivenTask(task_id) => {
@@ -483,7 +483,9 @@ impl ConcurrentTaskInner {
                     file_writer_control
                         .write(previous_downloaded_pos..state.chunk.downloaded.end, bytes)
                         .await
-                        .map_err(|e| TaskError::Failed(TaskFailedKind::Other(e.to_string())))?;
+                        .map_err(|e| {
+                            TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string()))
+                        })?;
                 }
             }
             RunnerMessageKind::Started => {
@@ -610,7 +612,7 @@ impl ConcurrentTaskInner {
         // TODO: send a flush all message to file writer
         async_fs::rename(&tmp_path, &self.path)
             .await
-            .map_err(|e| TaskError::Failed(TaskFailedKind::Other(e.to_string())))?;
+            .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
         Ok(())
     }
 }
@@ -665,7 +667,7 @@ impl ConcurrentTaskInner {
                 futures::select_biased! {
                     _ = cancel => {
                         Transition(State::stopped(Some(Err(
-                            TaskError::Failed(TaskFailedKind::Cancelled),
+                            TaskInstanceError::Failed(TaskFailedKind::Cancelled),
                         ))))
                     }
                     res = task => { res }
@@ -695,7 +697,7 @@ impl ConcurrentTaskInner {
                 futures::select_biased! {
                     _ = cancel => {
                         Transition(State::stopped(Some(Err(
-                            TaskError::Failed(TaskFailedKind::Cancelled),
+                            TaskInstanceError::Failed(TaskFailedKind::Cancelled),
                         ))))
                     }
                     res = task => { res }

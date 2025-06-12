@@ -1,7 +1,7 @@
 pub mod adapter;
 mod builder;
 pub mod client;
-pub mod manager;
+pub mod task;
 pub mod runner;
 mod runtime;
 mod utils;

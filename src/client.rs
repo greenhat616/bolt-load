@@ -4,7 +4,7 @@ use async_channel::Sender;
 
 use crate::{
     adapter::{self},
-    manager::{DownloadMode, TaskManagerCommand},
+    task::{DownloadMode, TaskCommand},
 };
 
 pub enum DownloadSource {
@@ -26,7 +26,7 @@ type TaskId = u64;
 pub struct BoltLoad {
     // TODO: use a enum to represent the manager or channel
     // TODO: rethink how to share the state of the task manager, when we impl the persistent
-    pub(crate) tasks: HashMap<TaskId, Sender<TaskManagerCommand>>,
+    pub(crate) tasks: HashMap<TaskId, Sender<TaskCommand>>,
     pub(crate) configuration: BoltLoadConfiguration,
 }
 

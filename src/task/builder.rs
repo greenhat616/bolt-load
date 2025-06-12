@@ -6,15 +6,16 @@ use smol_cancellation_token::CancellationToken;
 use std::{collections::HashMap, path::PathBuf};
 
 use super::{
-    DownloadMode, TaskImpl, TaskManager, TaskManagerCommand, TaskState,
-    TaskManagerStateControl, runner_notification::RunnerNotification,
+    DownloadMode, Task, TaskInstanceImpl, TaskCommand, TaskStateControl, TaskState,
+    runner_notification::RunnerNotification,
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
     runtime::ThreadedRuntimeImpl,
 };
 
-pub struct TaskManagerBuilder {
+#[non_exhaustive]
+pub struct TaskBuilder {
     cancel_token: Option<CancellationToken>,
     runtime: Option<ThreadedRuntimeImpl>,
     meta: OnceCell<BoltLoadAdapterMeta>,
@@ -25,7 +26,7 @@ pub struct TaskManagerBuilder {
     save_dir: Option<PathBuf>,
 }
 
-impl Default for TaskManagerBuilder {
+impl Default for TaskBuilder {
     fn default() -> Self {
         Self {
             meta: OnceCell::new(),
@@ -60,7 +61,7 @@ async fn try_get_or_init_meta<'a>(
     Ok(meta)
 }
 
-impl TaskManagerBuilder {
+impl TaskBuilder {
     /// You can call this method to get the meta before build the task manager
     pub async fn retrieve_meta(&mut self) -> Result<&BoltLoadAdapterMeta, TaskManagerBuildError> {
         if self.adapter.is_none() {
@@ -141,7 +142,7 @@ impl TaskManagerBuilder {
 
     pub async fn build<'a>(
         mut self,
-    ) -> Result<(TaskManager<'a>, Sender<TaskManagerCommand>), TaskManagerBuildError> {
+    ) -> Result<(Task<'a>, Sender<TaskCommand>), TaskManagerBuildError> {
         if self.cancel_token.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
                 "cancel token is not set".to_string(),
@@ -180,18 +181,18 @@ impl TaskManagerBuilder {
         let (cmd_tx, cmd_rx) = unbounded();
 
         Ok((
-            TaskManager {
+            Task {
                 adapter,
                 mode,
                 save_path,
-                state_control: TaskManagerStateControl::default(),
+                state_control: TaskStateControl::default(),
                 meta: self.meta.take().unwrap(),
                 control_channel: unbounded(),
                 runners_notification: RunnerNotification::default(),
                 cmd_rx,
                 tmp_path: temp_path,
-                runtime: runtime.clone(),
-                task: TaskImpl::new(mode, runtime),
+                rt: runtime.clone(),
+                task: TaskInstanceImpl::new(mode, runtime),
                 cancel_token,
                 runners: HashMap::new(),
                 runner_progress: HashMap::new(),

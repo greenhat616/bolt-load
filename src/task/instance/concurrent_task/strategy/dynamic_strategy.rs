@@ -1,4 +1,4 @@
-use crate::manager::task::concurrent_task::DEFAULT_MAX_CONCURRENCY;
+use crate::task::task::concurrent_task::DEFAULT_MAX_CONCURRENCY;
 
 use super::{Strategy, StrategyAction};
 

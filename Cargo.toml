@@ -37,6 +37,7 @@ futures = { version = "0.3" }
 url = "2"
 bytes = "1"
 enum_dispatch = "0.3"
+atomic_enum = "0.3"
 tempfile = "3"
 smol-cancellation-token = "0.1"
 statig = { version ="0.3", features = ["async"] }

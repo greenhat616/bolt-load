@@ -4,7 +4,13 @@ use bytes::Bytes;
 use futures::{AsyncSeekExt, AsyncWriteExt, FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
 use std::{
-    collections::HashMap, io::SeekFrom, ops::Range, path::PathBuf, rc::Rc, sync::Arc, time::Instant,
+    collections::HashMap,
+    io::SeekFrom,
+    ops::Range,
+    path::PathBuf,
+    rc::Rc,
+    sync::{Arc, Mutex, atomic::Ordering},
+    time::Instant,
 };
 
 use crate::{
@@ -14,13 +20,13 @@ use crate::{
 };
 
 mod builder;
+mod instance;
 mod runner_notification;
-mod task;
 
 pub use builder::*;
 
+use instance::*;
 use runner_notification::*;
-use task::*;
 
 pub type RunnerId = usize;
 
@@ -65,7 +71,8 @@ pub enum DownloadMode {
     Concurrent,
 }
 
-#[derive(Clone, Default)]
+#[atomic_enum::atomic_enum]
+#[derive(Default, PartialEq)]
 pub enum TaskState {
     #[default]
     /// the task is idle, the initial state
@@ -77,38 +84,35 @@ pub enum TaskState {
     /// the task is finished
     Finished,
     /// the task is failed with the error
-    Failed(TaskManagerFailedError),
+    Failed,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum TaskManagerFailedError {
+pub enum TaskFailedError {
     /// the task is cancelled
     #[error("the task is cancelled")]
     Cancelled,
-    /// the task is failed to allocate the file size
-    #[error("failed to allocate the file size: {0}")]
-    AllocateError(String),
     /// the task is stopped
     #[error("the task is stopped: {0:?}")]
     Stopped(TaskError),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum TaskManagerCommandError {}
+pub enum TaskCommandError {}
 
-type CommandResult<T> = Result<T, TaskManagerCommandError>;
+type CommandResult<T> = Result<T, TaskCommandError>;
 type CommandResponse<T> = oneshot::Sender<CommandResult<T>>;
 
-pub enum TaskManagerCommand {
+pub enum TaskCommand {
     Cancel(CommandResponse<()>),
     // Pause(CommandResponse<()>),
     // Resume(CommandResponse<()>),
 }
 
 #[derive(Default)]
-struct TaskManagerStateControl(Option<(TaskState, async_channel::Sender<TaskState>)>);
+struct TaskStateControl(Option<(TaskState, async_channel::Sender<TaskState>)>);
 
-impl TaskManagerStateControl {
+impl TaskStateControl {
     pub fn new(state: TaskState, sender: Sender<TaskState>) -> Self {
         Self(Some((state, sender)))
     }
@@ -129,9 +133,9 @@ impl TaskManagerStateControl {
 // #[derive(Clone)]
 // #[derive(Clone)]
 #[non_exhaustive]
-pub struct TaskManager<'a> {
+pub struct Task {
     /// the async runtime passed from the client
-    runtime: ThreadedRuntimeImpl,
+    rt: ThreadedRuntimeImpl,
     /// the inner adapter of this task
     // TODO: support persistent adapter
     adapter: AnyAdapter,
@@ -143,92 +147,69 @@ pub struct TaskManager<'a> {
     save_path: PathBuf,
     /// the tmp path of this task
     tmp_path: PathBuf,
-    task_state: TaskState,
+
     /// the meta of this task
     meta: BoltLoadAdapterMeta,
 
     cancel_token: CancellationToken,
-    task: TaskImpl,
 
+    on_task_state_changed: Arc<Vec<Box<dyn Fn(TaskEvent)>>>,
+    task: TaskInstanceImpl,
+    task_state: Arc<AtomicTaskState>,
+    last_error: Arc<Mutex<Option<TaskError>>>,
 }
 
-/// fast fail the call, and dispatch the state to the state control
+struct EventDispatcher(Vec<Box<dyn Fn(TaskEvent)>>);
 
+impl EventDispatcher {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
 
-impl TaskManager<'_> {
+    pub fn add_callback(&mut self, callback: Box<dyn Fn(TaskEvent)>) {
+        self.0.push(callback);
+    }
 
-
+    pub fn dispatch(&self, event: TaskEvent) {
+        for callback in self.0.iter() {
+            callback(event.clone());
+        }
+    }
 }
 
-impl TaskManager<'_> {
+pub struct SpawnedTask {
+    on_task_state_changed: Arc<EventDispatcher>,
+    task_state: Arc<AtomicTaskState>,
+    last_error: Arc<Mutex<Option<TaskError>>>,
+    cancel_token: CancellationToken,
+    task: TaskInstanceImpl,
+}
+
+impl Task {
+    pub fn builder() -> TaskBuilder {
+        TaskBuilder::default()
+    }
+
     /// check if the task is finished or failed
     pub fn is_finished(&self) -> bool {
         matches!(
-            self.state_control,
-            TaskManagerStateControl(Some((
-                TaskState::Finished | TaskState::Failed(_),
-                _
-            )))
+            self.task_state.load(Ordering::Acquire),
+            TaskState::Finished | TaskState::Failed
         )
     }
 
     /// check if the task is initialized
     pub fn is_initialized(&self) -> bool {
-        self.state_control.0.is_some()
+        self.task_state.load(Ordering::Acquire) != TaskState::Idle
     }
 
     /// cancel the task, and do the cleanup work
     pub async fn cancel(&mut self) {
-        self.state_control
-            .dispatch(TaskState::Failed(TaskManagerFailedError::Cancelled))
-            .await;
+        self.cancel_token.cancel();
         todo!()
     }
 
     /// the main loop of the task manager
     /// This function should be called in a async spawn.
-    pub async fn run(&mut self) {
-        let (state_sender, state_receiver) = async_channel::bounded(2);
-        state_sender.send(TaskState::Idle).await.unwrap();
-        self.state_control = TaskManagerStateControl::new(TaskState::Idle, state_sender);
-
-        let state_dispatcher = self.handle_state_change(state_receiver);
-        let mut downloading_dispatcher = None;
-
-        loop {
-            let cmd = self.cmd_rx.recv().fuse();
-            let state = state_receiver.recv().fuse();
-            futures::pin_mut!(cmd, state);
-            futures::select! {
-                cmd = cmd => {
-                    let flag = match cmd {
-                        Ok(cmd) => {
-                            self.handle_cmd(cmd)
-                        }
-                        // Only the cmd is closed, so let's cancel the task immediately
-                        Err(_) => {
-                            self.cancel();
-                            true
-                        }
-                    };
-                    if flag {
-                        break;
-                    }
-                }
-                state = state => {
-                    match state {
-                        Ok(state) => {
-                            state_future = self.handle_state_change(state).boxed().fuse();
-                        }
-                        Err(_) => {
-                            log::error!("failed to receive the state from the channel");
-                            break;
-                        }
-                    }
-                }
-                // poll the state future
-                _ = &mut state_future => (),
-            }
-        }
-    }
+    pub async fn run(&mut self) {}
 }

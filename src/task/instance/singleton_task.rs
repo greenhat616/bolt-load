@@ -1,17 +1,17 @@
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
 use super::{
-    Result, TaskError,
+    Result, TaskInstance, TaskInstanceError,
     sampler::{SAMPLE_INTERVAL, Sampler},
 };
 use crate::{
     adapter::AnyAdapter,
-    manager::{
-        Progress, RunnerId, Task,
-        task::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
-    },
     runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskRunner, TaskRunnerGuard},
     runtime::ThreadedRuntimeImpl,
+    task::{
+        Progress, RunnerId, Task,
+        instance::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
+    },
     utils::ShutdownGuardExt,
 };
 
@@ -30,7 +30,7 @@ pub struct SingletonTask {
     progress: Progress,
 }
 
-impl Task for SingletonTask {
+impl TaskInstance for SingletonTask {
     fn run(
         &mut self,
         adapter: Arc<AnyAdapter>,
@@ -128,7 +128,7 @@ impl SingletonTaskInner {
             .unwrap()
             .retrieve_meta()
             .await
-            .map_err(TaskError::RetrieveMetaFailed)?;
+            .map_err(TaskInstanceError::RetrieveMetaFailed)?;
         let total = if meta.content_size == 0 {
             None
         } else {
@@ -147,19 +147,19 @@ impl SingletonTaskInner {
             .unwrap()
             .full_stream()
             .await
-            .map_err(TaskError::StreamFailed)?;
+            .map_err(TaskInstanceError::StreamFailed)?;
 
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .open(&self.path)
             .await
-            .map_err(|e| TaskError::new_write_chunk_failed(e))?;
+            .map_err(|e| TaskInstanceError::new_write_chunk_failed(e))?;
 
         if let Some(total) = self.total {
             file.set_len(total)
                 .await
-                .map_err(|e| TaskError::new_write_chunk_failed(e))?;
+                .map_err(|e| TaskInstanceError::new_write_chunk_failed(e))?;
         }
 
         let (control_tx, control_rx) = async_channel::unbounded();
@@ -202,7 +202,7 @@ impl SingletonTaskInner {
                                             break;
                                         }
                                         StoppedReason::Failed(kind) => {
-                                            return Err(TaskError::Failed(kind))
+                                            return Err(TaskInstanceError::Failed(kind))
                                         }
                                     }
                                 }
@@ -210,7 +210,7 @@ impl SingletonTaskInner {
                                     self.downloaded += chunk.len() as u64;
                                     file.write_all(&chunk)
                                         .await
-                                        .map_err(|e| TaskError::new_write_chunk_failed(e))?;
+                                        .map_err(|e| TaskInstanceError::new_write_chunk_failed(e))?;
                                     let progress = Progress {
                                         total: self.total,
                                         downloaded: self.downloaded,
@@ -306,7 +306,7 @@ impl SingletonTaskInner {
 
                 futures::select_biased! {
                     _ = cancel_token.cancelled().fuse() => {
-                        Transition(State::stopped(Some(Err(TaskError::Failed(
+                        Transition(State::stopped(Some(Err(TaskInstanceError::Failed(
                             crate::runner::TaskFailedKind::Cancelled,
                         )))))
                     }

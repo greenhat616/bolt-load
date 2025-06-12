@@ -1,6 +1,6 @@
 use crate::{
     adapter::{AnyBytesStream, StreamError},
-    manager::{ManagerMessage, ManagerMessagesVariant, RunnerId},
+    task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
     utils::ShutdownGuardExt,
 };
 use async_channel::{Receiver, Sender};

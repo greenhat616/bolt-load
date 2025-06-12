@@ -1,4 +1,4 @@
-use crate::manager::{ManagerMessage, RunnerId};
+use crate::task::{ManagerMessage, RunnerId};
 
 use super::ManagerMessagesVariant;
 use async_channel::Sender;
