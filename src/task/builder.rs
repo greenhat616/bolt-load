@@ -142,7 +142,7 @@ impl TaskBuilder {
 
     pub async fn build<'a>(
         mut self,
-    ) -> Result<(Task<'a>, Sender<TaskCommand>), TaskManagerBuildError> {
+    ) -> Result<(Task, Sender<TaskCommand>), TaskManagerBuildError> {
         if self.cancel_token.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
                 "cancel token is not set".to_string(),
@@ -185,18 +185,14 @@ impl TaskBuilder {
                 adapter,
                 mode,
                 save_path,
-                state_control: TaskStateControl::default(),
                 meta: self.meta.take().unwrap(),
-                control_channel: unbounded(),
-                runners_notification: RunnerNotification::default(),
-                cmd_rx,
                 tmp_path: temp_path,
                 rt: runtime.clone(),
                 task: TaskInstanceImpl::new(mode, runtime),
                 cancel_token,
-                runners: HashMap::new(),
-                runner_progress: HashMap::new(),
-                runner_speed: HashMap::new(),
+                on_task_state_changed: todo!(),
+                task_state: todo!(),
+                last_error: todo!(),
             },
             cmd_tx,
         ))

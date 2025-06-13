@@ -94,7 +94,7 @@ pub enum TaskFailedError {
     Cancelled,
     /// the task is stopped
     #[error("the task is stopped: {0:?}")]
-    Stopped(TaskError),
+    Stopped(TaskInstanceError),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -156,7 +156,7 @@ pub struct Task {
     on_task_state_changed: Arc<Vec<Box<dyn Fn(TaskEvent)>>>,
     task: TaskInstanceImpl,
     task_state: Arc<AtomicTaskState>,
-    last_error: Arc<Mutex<Option<TaskError>>>,
+    last_error: Arc<Mutex<Option<TaskInstanceError>>>,
 }
 
 struct EventDispatcher(Vec<Box<dyn Fn(TaskEvent)>>);
@@ -180,7 +180,7 @@ impl EventDispatcher {
 pub struct SpawnedTask {
     on_task_state_changed: Arc<EventDispatcher>,
     task_state: Arc<AtomicTaskState>,
-    last_error: Arc<Mutex<Option<TaskError>>>,
+    last_error: Arc<Mutex<Option<TaskInstanceError>>>,
     cancel_token: CancellationToken,
     task: TaskInstanceImpl,
 }
