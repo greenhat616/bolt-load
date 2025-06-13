@@ -131,12 +131,14 @@ mod tests {
     async fn test_file_writer() {
         let tmp_file = tempfile::tempdir().unwrap();
         let file_path = tmp_file.path().join("test.txt");
-        let file_writer = FileWriter::new(&file_path);
-        let FileWriterGuard(handle, guard) = file_writer.start();
-        handle.join().unwrap().unwrap();
 
         let bytes = Bytes::from_static(b"Hello, world!");
         let bytes_len = bytes.len();
+
+        let file_writer = FileWriter::new(&file_path, bytes_len as u64);
+        let FileWriterGuard(handle, guard) = file_writer.start();
+        handle.join().unwrap().unwrap();
+
         guard
             .write(0..bytes_len as u64, bytes.clone())
             .await

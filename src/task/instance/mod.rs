@@ -45,7 +45,7 @@ pub enum TaskEvent {
     /// Downloading the file
     Downloading(ProgressWithSpeed),
     /// Failed to download the file
-    Failed(TaskError),
+    Failed(TaskInstanceError),
     /// Finished downloading the file
     Finished(Progress),
 }
