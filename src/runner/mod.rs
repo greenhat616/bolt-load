@@ -235,7 +235,7 @@ impl TaskRunner {
                                     .send(RunnerMessageKind::Downloaded(item.slice(..size)))
                                     .await
                                     .map_err(|_| TaskFailedKind::ChannelClosed)?;
-                                
+
                                 // Check if we've reached the total size limit
                                 if let Some(total) = self.total {
                                     if self.downloaded >= total {
@@ -523,7 +523,7 @@ mod tests {
         let mut started = false;
         let mut finished = false;
         let mut resize_sent = false;
-        
+
         while let Ok(msg) = msg_rx.recv().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
@@ -556,7 +556,7 @@ mod tests {
     async fn test_resize_total_smaller() {
         let (control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
-        
+
         // Create a stream with multiple chunks that would normally total 60 bytes
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
@@ -588,7 +588,7 @@ mod tests {
         let mut started = false;
         let mut download_count = 0;
         let mut total_downloaded = 0;
-        
+
         while let Ok(msg) = msg_rx.recv().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
@@ -644,7 +644,7 @@ mod tests {
         let mut started = false;
         let mut finished = false;
         let mut total_downloaded = 0;
-        
+
         while let Ok(msg) = msg_rx.recv().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
