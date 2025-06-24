@@ -119,7 +119,7 @@ impl TaskStateControl {
         let Some((manager_state, sender)) = self.0.as_mut() else {
             unreachable!("we should init the state control first");
         };
-        *manager_state = state.clone();
+        *manager_state = state;
         sender.send(state).await?;
         Ok(())
     }

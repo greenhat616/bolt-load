@@ -551,7 +551,7 @@ impl ConcurrentTaskInner {
             .map(|t| t.get())
             .unwrap_or(DEFAULT_MAX_CONCURRENCY);
         // The max concurrency should follows 1 <= max_concurrency <= initial_max_concurrency
-        let mut max_concurrency = initial_max_concurrency;
+        let max_concurrency = initial_max_concurrency;
 
         let mut runner_id_generator = Generator::new(initial_max_concurrency);
         let mut chunk_planner = ChunkPlanner::new(total);

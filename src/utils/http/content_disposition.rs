@@ -460,7 +460,7 @@ impl fmt::Display for DispositionType {
             DispositionType::Inline => write!(f, "inline"),
             DispositionType::Attachment => write!(f, "attachment"),
             DispositionType::FormData => write!(f, "form-data"),
-            DispositionType::Ext(s) => write!(f, "{}", s),
+            DispositionType::Ext(s) => write!(f, "{s}"),
         }
     }
 }
@@ -506,7 +506,7 @@ impl fmt::Display for DispositionParam {
             LazyLock::new(|| Regex::new("[\x00-\x08\x10-\x1F\x7F\"\\\\]").unwrap());
 
         match self {
-            DispositionParam::Name(value) => write!(f, "name={}", value),
+            DispositionParam::Name(value) => write!(f, "name={value}"),
 
             DispositionParam::Filename(value) => {
                 write!(f, "filename=\"{}\"", RE.replace_all(value, "\\$0").as_ref())
@@ -520,11 +520,11 @@ impl fmt::Display for DispositionParam {
             ),
 
             DispositionParam::FilenameExt(ext_value) => {
-                write!(f, "filename*={}", ext_value)
+                write!(f, "filename*={ext_value}")
             }
 
             DispositionParam::UnknownExt(name, ext_value) => {
-                write!(f, "{}*={}", name, ext_value)
+                write!(f, "{name}*={ext_value}")
             }
         }
     }
@@ -535,7 +535,7 @@ impl fmt::Display for ContentDisposition {
         write!(f, "{}", self.disposition)?;
         self.parameters
             .iter()
-            .try_for_each(|param| write!(f, "; {}", param))
+            .try_for_each(|param| write!(f, "; {param}"))
     }
 }
 
@@ -875,12 +875,12 @@ mod tests {
         let as_string = "attachment; filename*=UTF-8'en'%C2%A3%20and%20%E2%82%AC%20rates";
         let a = HeaderValue::from_static(as_string);
         let a: ContentDisposition = ContentDisposition::from_raw(&a).unwrap();
-        let display_rendered = format!("{}", a);
+        let display_rendered = format!("{a}");
         assert_eq!(as_string, display_rendered);
 
         let a = HeaderValue::from_static("attachment; filename=colourful.csv");
         let a: ContentDisposition = ContentDisposition::from_raw(&a).unwrap();
-        let display_rendered = format!("{}", a);
+        let display_rendered = format!("{a}");
         assert_eq!(
             "attachment; filename=\"colourful.csv\"".to_owned(),
             display_rendered
@@ -895,7 +895,7 @@ mod tests {
             .unwrap(); // ensure `\"` is there
         let a = HeaderValue::from_static(as_string);
         let a: ContentDisposition = ContentDisposition::from_raw(&a).unwrap();
-        let display_rendered = format!("{}", a);
+        let display_rendered = format!("{a}");
         assert_eq!(as_string, display_rendered);
     }
 
@@ -904,14 +904,14 @@ mod tests {
         let as_string = "form-data; name=upload; filename=\"Space here.png\"";
         let a = HeaderValue::from_static(as_string);
         let a: ContentDisposition = ContentDisposition::from_raw(&a).unwrap();
-        let display_rendered = format!("{}", a);
+        let display_rendered = format!("{a}");
         assert_eq!(as_string, display_rendered);
 
         let a: ContentDisposition = ContentDisposition {
             disposition: DispositionType::Inline,
             parameters: vec![DispositionParam::Filename(String::from("Tab\there.png"))],
         };
-        let display_rendered = format!("{}", a);
+        let display_rendered = format!("{a}");
         assert_eq!("inline; filename=\"Tab\x09here.png\"", display_rendered);
     }
 
@@ -931,7 +931,7 @@ mod tests {
             disposition: DispositionType::Inline,
             parameters: vec![DispositionParam::Filename(String::from("bell\x07.png"))],
         };
-        let display_rendered = format!("{}", a);
+        let display_rendered = format!("{a}");
         assert_eq!("inline; filename=\"bell\\\x07.png\"", display_rendered);
     }
 

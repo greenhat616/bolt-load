@@ -19,13 +19,13 @@ impl Sampler {
     #[inline]
     pub fn sample(&self, meters: &mut usize) -> f64 {
         let total_meters = std::mem::take(meters) as f64;
-        let speed = total_meters / self.sampler_interval as f64;
-        speed
+        
+        total_meters / self.sampler_interval as f64
     }
 
     #[inline]
     pub fn growth_rate(speed_a: f64, speed_b: f64) -> f64 {
-        let growth_rate = (speed_b - speed_a) / speed_a;
-        growth_rate
+        
+        (speed_b - speed_a) / speed_a
     }
 }

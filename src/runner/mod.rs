@@ -254,7 +254,7 @@ impl TaskRunner {
                      downloaded: {}",
                     total, self.downloaded
                 );
-                log::warn!("{}", msg);
+                log::warn!("{msg}");
                 return Err(TaskFailedKind::Other(msg).into());
             }
             None if self.downloaded > 0 => {}
@@ -316,7 +316,7 @@ mod tests {
         let mut finished = false;
 
         while let Ok(msg) = msg_rx.recv().await {
-            log::debug!("msg: {:?}", msg);
+            log::debug!("msg: {msg:?}");
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
@@ -401,7 +401,7 @@ mod tests {
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
             yield Err(StreamError::Unretryable(UnretryableError::Io(
-                Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "Network error")),
+                Arc::new(std::io::Error::other("Network error")),
             )));
         };
 
@@ -456,7 +456,7 @@ mod tests {
 
         let mut got_empty_error = false;
         while let Ok(msg) = msg_rx.recv().await {
-            log::error!("msg: {:?}", msg);
+            log::error!("msg: {msg:?}");
             if let RunnerMessage(
                 _,
                 RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Empty)),

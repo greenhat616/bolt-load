@@ -27,8 +27,7 @@ pub trait BoltLoadAdapter: Send + Sync {
     /// Note: the range is followed as [start, end)
     #[allow(unused_variables)]
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
-        Err(UnretryableError::new_io_error(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(UnretryableError::new_io_error(std::io::Error::other(
             "Range stream is not supported",
         ))
         .into())
@@ -192,7 +191,7 @@ mod tests {
                         ),
                         (
                             axum::http::header::CONTENT_LENGTH,
-                            &format!("{}", file_size),
+                            &format!("{file_size}"),
                         ),
                         (
                             axum::http::header::CONTENT_DISPOSITION,

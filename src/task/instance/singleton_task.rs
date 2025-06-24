@@ -9,7 +9,7 @@ use crate::{
     runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskRunner, TaskRunnerGuard},
     runtime::ThreadedRuntimeImpl,
     task::{
-        Progress, RunnerId, Task,
+        Progress, RunnerId,
         instance::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
     },
     utils::ShutdownGuardExt,
@@ -69,7 +69,7 @@ impl TaskInstance for SingletonTask {
                     )
                     .await;
 
-                while let Some(_) = context.poll.pop_front() {
+                while context.poll.pop_front().is_some() {
                     state_machine
                         .handle_with_context(&Event::Step, &mut context)
                         .await;
@@ -164,12 +164,12 @@ impl SingletonTaskInner {
             .write(true)
             .open(&self.path)
             .await
-            .map_err(|e| TaskInstanceError::new_write_chunk_failed(e))?;
+            .map_err(TaskInstanceError::new_write_chunk_failed)?;
 
         if let Some(total) = self.total {
             file.set_len(total)
                 .await
-                .map_err(|e| TaskInstanceError::new_write_chunk_failed(e))?;
+                .map_err(TaskInstanceError::new_write_chunk_failed)?;
         }
 
         let (control_tx, control_rx) = async_channel::unbounded();
@@ -207,7 +207,7 @@ impl SingletonTaskInner {
                                     match reason {
                                         StoppedReason::Finished => {
                                             if let Err(e) = file.flush().await {
-                                                log::error!("failed to flush file: {:?}", e);
+                                                log::error!("failed to flush file: {e:?}");
                                             }
                                             break;
                                         }
@@ -220,7 +220,7 @@ impl SingletonTaskInner {
                                     self.downloaded += chunk.len() as u64;
                                     file.write_all(&chunk)
                                         .await
-                                        .map_err(|e| TaskInstanceError::new_write_chunk_failed(e))?;
+                                        .map_err(TaskInstanceError::new_write_chunk_failed)?;
                                     let progress = Progress {
                                         total: self.total,
                                         downloaded: self.downloaded,
@@ -238,7 +238,7 @@ impl SingletonTaskInner {
                             }
                         }
                         Err(e) => {
-                            log::error!("runner message error: {:?}", e);
+                            log::error!("runner message error: {e:?}");
                         }
                     }
                 }
@@ -246,7 +246,7 @@ impl SingletonTaskInner {
         }
 
         if let Err(e) = file.flush().await {
-            log::warn!("failed to flush file: {:?}", e);
+            log::warn!("failed to flush file: {e:?}");
         }
 
         Ok(())

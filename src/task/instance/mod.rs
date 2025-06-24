@@ -9,7 +9,7 @@ use crate::{
     runtime::ThreadedRuntimeImpl,
 };
 
-use super::{DownloadMode, Progress, RunnerId};
+use super::{DownloadMode, Progress};
 
 mod concurrent_task;
 mod id;

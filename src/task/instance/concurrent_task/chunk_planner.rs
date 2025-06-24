@@ -205,8 +205,7 @@ impl ChunkPlanner {
                     .iter()
                     .filter(|(_, id)| id.is_some())
                     .find(|(k, _)| k.intersect(*range) != OperationResult::Empty)
-                    .map(|(_, id)| *id)
-                    .flatten()
+                    .and_then(|(_, id)| *id)
                     .unwrap();
 
                 // Determine the range to return

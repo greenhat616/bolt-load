@@ -216,7 +216,7 @@ mod tests {
             language_tag: Some("en".parse().expect("Could not parse language tag")),
             value: vec![163, b' ', b'r', b'a', b't', b'e', b's'],
         };
-        assert_eq!("ISO-8859-1'en'%A3%20rates", format!("{}", extended_value));
+        assert_eq!("ISO-8859-1'en'%A3%20rates", format!("{extended_value}"));
     }
 
     #[test]
@@ -231,7 +231,7 @@ mod tests {
         };
         assert_eq!(
             "UTF-8''%C2%A3%20and%20%E2%82%AC%20rates",
-            format!("{}", extended_value)
+            format!("{extended_value}")
         );
     }
 }
