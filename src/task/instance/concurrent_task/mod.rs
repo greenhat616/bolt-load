@@ -40,13 +40,20 @@ use strategy::*;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
 
-/// Starts with 1 task, and then split the task by dynamic strategy
-const INITIAL_TASK_NUM: usize = 1;
-
 pub struct ConcurrentTask {
     rt: ThreadedRuntimeImpl,
     task: Option<TaskControl>,
     progress: Progress,
+}
+
+impl ConcurrentTask {
+    pub fn new(rt: ThreadedRuntimeImpl) -> Self {
+        Self {
+            rt,
+            task: None,
+            progress: Progress::default(),
+        }
+    }
 }
 
 impl TaskInstance for ConcurrentTask {
@@ -78,7 +85,7 @@ impl TaskInstance for ConcurrentTask {
                     )
                     .await;
 
-                while let Some(_) = context.poll.pop_front() {
+                while context.poll.pop_front().is_some() {
                     state_machine
                         .handle_with_context(&Event::Step, &mut context)
                         .await;
@@ -246,6 +253,7 @@ impl ConcurrentTaskInner {
         Ok((rx, handle))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn download_timer_tick(
         chunk_planner: &mut ChunkPlanner,
         runners_state: &mut HashMap<RunnerId, RunnerState>,
@@ -276,7 +284,7 @@ impl ConcurrentTaskInner {
             for chunk in available_ranges.iter() {
                 let runner_id = runner_id_generator.next().unwrap();
                 let (rx, handle) = Self::create_background_range_runner(
-                    &rt,
+                    rt,
                     chunk.clone(),
                     adapter.clone(),
                     control_rx.clone(),
@@ -318,11 +326,11 @@ impl ConcurrentTaskInner {
             let actions = dynamic_strategy.step(&strategy_context);
             for action in actions {
                 match action {
-                    StrategyAction::SplitAllTask if runners_state.len() == 0 => {
+                    StrategyAction::SplitAllTask if runners_state.is_empty() => {
                         let runner_id = runner_id_generator.next().unwrap();
                         let chunk = 0..total;
                         let (rx, handle) = Self::create_background_range_runner(
-                            &rt,
+                            rt,
                             chunk.clone(),
                             adapter.clone(),
                             control_rx.clone(),
@@ -371,16 +379,21 @@ impl ConcurrentTaskInner {
                         chunk_planner.remove_chunk(occupied_chunk.clone());
                         chunk_planner.add_chunk(occupied_chunk.start..half_end, Some(task_id));
                         chunk_planner.add_chunk(half_end..occupied_chunk.end, Some(next_id));
-                        control_tx.send(ManagerMessage(
-                            task_id,
-                            ManagerMessagesVariant::ResizeTotal(half_end),
-                        ));
+                        let _ = control_tx
+                            .send(ManagerMessage(
+                                task_id,
+                                ManagerMessagesVariant::ResizeTotal(half_end),
+                            ))
+                            .await
+                            .inspect_err(|e| {
+                                log::error!("failed to send resize total message: {e:?}");
+                            });
 
-                        drop(state);
+                        let _ = state;
 
                         // TODO: retry with backoff
                         let (rx, handle) = Self::create_background_range_runner(
-                            &rt,
+                            rt,
                             next_chunk.clone(),
                             adapter.clone(),
                             control_rx.clone(),
@@ -424,7 +437,7 @@ impl ConcurrentTaskInner {
             .collect::<Vec<_>>();
         let event_tx = event_tx.clone();
         let _ = rt.spawn(async move {
-            event_tx
+            let _ = event_tx
                 .send(TaskEvent::Downloading(ProgressWithSpeed::new(
                     Progress {
                         total: Some(total),
@@ -433,7 +446,10 @@ impl ConcurrentTaskInner {
                     },
                     current_speed,
                 )))
-                .await;
+                .await
+                .inspect_err(|e| {
+                    log::error!("failed to send downloading event: {e:?}");
+                });
         });
         Ok(())
     }
@@ -451,7 +467,7 @@ impl ConcurrentTaskInner {
         match msg {
             RunnerMessageKind::Stopped(reason) => match reason {
                 StoppedReason::Finished => {
-                    log::trace!("runner {} finished", runner_id);
+                    log::trace!("runner {runner_id} finished");
                     runners_state
                         .entry(runner_id)
                         .and_modify(|r| r.status = RunnerStatus::Finished);
@@ -489,7 +505,7 @@ impl ConcurrentTaskInner {
                 }
             }
             RunnerMessageKind::Started => {
-                log::trace!("runner {} started", runner_id);
+                log::trace!("runner {runner_id} started");
             }
         }
         Ok(())
@@ -504,10 +520,10 @@ impl ConcurrentTaskInner {
         chunk_planner: &mut ChunkPlanner,
     ) {
         for (runner_id, state) in runners_state.iter() {
-            if state.chunk.downloaded != state.chunk.occupied {
-                if chunk_planner.remove_chunk(state.chunk.occupied.clone()) {
-                    chunk_planner.add_chunk(state.chunk.occupied.clone(), Some(*runner_id));
-                }
+            if state.chunk.downloaded != state.chunk.occupied
+                && chunk_planner.remove_chunk(state.chunk.occupied.clone())
+            {
+                chunk_planner.add_chunk(state.chunk.occupied.clone(), Some(*runner_id));
             }
         }
         self.progress.downloaded_chunks = chunk_planner.get_occupied_ranges();

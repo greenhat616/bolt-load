@@ -30,6 +30,16 @@ pub struct SingletonTask {
     progress: Progress,
 }
 
+impl SingletonTask {
+    pub fn new(rt: ThreadedRuntimeImpl) -> Self {
+        Self {
+            rt,
+            task: None,
+            progress: Progress::default(),
+        }
+    }
+}
+
 impl TaskInstance for SingletonTask {
     fn run(
         &mut self,

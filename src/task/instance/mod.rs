@@ -4,7 +4,7 @@ use smol_cancellation_token::CancellationToken;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    adapter::{AnyAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError},
+    adapter::{AnyAdapter, StreamError, UnretryableError},
     runner::TaskFailedKind,
     runtime::ThreadedRuntimeImpl,
 };
@@ -148,11 +148,9 @@ pub(in crate::task) trait TaskInstance {
 
 impl TaskInstanceImpl {
     pub fn new(mode: DownloadMode, rt: ThreadedRuntimeImpl) -> Self {
-        todo!()
-    }
-
-    /// get the position of the runner in the file
-    pub fn get_runner_pos(&self, runner_id: RunnerId) -> Option<u64> {
-        todo!()
+        match mode {
+            DownloadMode::Singleton => Self::Singleton(SingletonTask::new(rt)),
+            DownloadMode::Concurrent => Self::Concurrent(ConcurrentTask::new(rt)),
+        }
     }
 }

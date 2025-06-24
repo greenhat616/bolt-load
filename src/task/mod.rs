@@ -1,21 +1,15 @@
-use async_channel::{Receiver, Sender};
-use async_fs::{File, OpenOptions};
-use bytes::Bytes;
-use futures::{AsyncSeekExt, AsyncWriteExt, FutureExt, StreamExt};
+use async_channel::Sender;
+
+use futures::task::SpawnExt;
 use smol_cancellation_token::CancellationToken;
 use std::{
-    collections::HashMap,
-    io::SeekFrom,
     ops::Range,
     path::PathBuf,
-    rc::Rc,
     sync::{Arc, Mutex, atomic::Ordering},
-    time::Instant,
 };
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
-    runner::{RunnerMessage, RunnerMessageKind, TaskFailedKind, TaskRunner},
     runtime::ThreadedRuntimeImpl,
 };
 
@@ -26,9 +20,10 @@ mod runner_notification;
 pub use builder::*;
 
 use instance::*;
-use runner_notification::*;
 
 pub type RunnerId = usize;
+
+pub type TaskStateChangedCallback = Box<dyn Fn(TaskEvent) + Send + Sync + 'static>;
 
 /// messages for manager -> runner
 pub struct ManagerMessage(pub RunnerId, pub ManagerMessagesVariant);
@@ -138,7 +133,7 @@ pub struct Task {
     rt: ThreadedRuntimeImpl,
     /// the inner adapter of this task
     // TODO: support persistent adapter
-    adapter: AnyAdapter,
+    adapter: Arc<AnyAdapter>,
     /// the current mode of this task
     // TODO: maybe we should introduce a `prefer_mode` to indicate the preferred mode of this task.
     // TODO: support resumable download
@@ -153,36 +148,10 @@ pub struct Task {
 
     cancel_token: CancellationToken,
 
-    on_task_state_changed: Arc<Vec<Box<dyn Fn(TaskEvent)>>>,
+    on_task_state_changed: Arc<Vec<TaskStateChangedCallback>>,
     task: TaskInstanceImpl,
     task_state: Arc<AtomicTaskState>,
     last_error: Arc<Mutex<Option<TaskInstanceError>>>,
-}
-
-struct EventDispatcher(Vec<Box<dyn Fn(TaskEvent)>>);
-
-impl EventDispatcher {
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    pub fn add_callback(&mut self, callback: Box<dyn Fn(TaskEvent)>) {
-        self.0.push(callback);
-    }
-
-    pub fn dispatch(&self, event: TaskEvent) {
-        for callback in self.0.iter() {
-            callback(event.clone());
-        }
-    }
-}
-
-pub struct SpawnedTask {
-    on_task_state_changed: Arc<EventDispatcher>,
-    task_state: Arc<AtomicTaskState>,
-    last_error: Arc<Mutex<Option<TaskInstanceError>>>,
-    cancel_token: CancellationToken,
-    task: TaskInstanceImpl,
 }
 
 impl Task {
@@ -204,12 +173,58 @@ impl Task {
     }
 
     /// cancel the task, and do the cleanup work
-    pub async fn cancel(&mut self) {
+    pub async fn stop(&mut self) {
         self.cancel_token.cancel();
-        todo!()
+        self.task.stop().await.unwrap();
     }
 
-    /// the main loop of the task manager
-    /// This function should be called in a async spawn.
-    pub async fn run(&mut self) {}
+    pub async fn wait(&mut self) -> Result<(), TaskInstanceError> {
+        self.task.wait().await
+    }
+
+    pub async fn run(&mut self) -> Result<(), TaskInstanceError> {
+        let (event_tx, event_rx) = async_channel::unbounded::<TaskEvent>();
+        let cancel_token = self.cancel_token.clone();
+        let on_task_state_changed = self.on_task_state_changed.clone();
+        let task_state = self.task_state.clone();
+        let last_error = self.last_error.clone();
+
+        self.rt
+            .spawn(async move {
+                while let Ok(event) = event_rx.recv().await {
+                    match &event {
+                        TaskEvent::Finished(_) => {
+                            task_state.store(TaskState::Finished, Ordering::Release);
+                        }
+                        TaskEvent::Initializing => {
+                            task_state.store(TaskState::Initializing, Ordering::Release);
+                        }
+                        TaskEvent::Downloading(_) => {
+                            task_state.store(TaskState::Downloading, Ordering::Release);
+                        }
+                        TaskEvent::Failed(error) => {
+                            task_state.store(TaskState::Failed, Ordering::Release);
+                            last_error.lock().unwrap().replace(error.clone());
+                        }
+                    }
+                    for callback in on_task_state_changed.iter() {
+                        callback(event.clone());
+                    }
+                }
+            })
+            .map_err(|e| {
+                log::error!("failed to spawn the task: {e:?}");
+                TaskInstanceError::new_failed(crate::runner::TaskFailedKind::Other(
+                    "failed to spawn the task".to_string(),
+                ))
+            })?;
+
+        self.task.run(
+            self.adapter.clone(),
+            self.save_path.clone(),
+            event_tx,
+            cancel_token,
+        )?;
+        Ok(())
+    }
 }

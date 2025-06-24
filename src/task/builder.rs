@@ -1,17 +1,16 @@
-use async_channel::{Sender, unbounded};
-use async_fs::OpenOptions;
-use async_lock::OnceCell;
-use futures::FutureExt;
-use smol_cancellation_token::CancellationToken;
-use std::{collections::HashMap, path::PathBuf};
-
-use super::{
-    DownloadMode, Task, TaskInstanceImpl, TaskCommand, TaskStateControl, TaskState,
-    runner_notification::RunnerNotification,
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
 };
+
+use async_lock::OnceCell;
+use smol_cancellation_token::CancellationToken;
+
+use super::{AtomicTaskState, DownloadMode, Task, TaskInstanceImpl, TaskState};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
     runtime::ThreadedRuntimeImpl,
+    task::{TaskStateChangedCallback, instance::TaskEvent},
 };
 
 #[non_exhaustive]
@@ -24,6 +23,7 @@ pub struct TaskBuilder {
     save_path: Option<PathBuf>,
     /// a directory to save the file, It is used to save the file, prefer the filename retrieved from the adapter
     save_dir: Option<PathBuf>,
+    on_task_state_changed: Option<Vec<TaskStateChangedCallback>>,
 }
 
 impl Default for TaskBuilder {
@@ -36,6 +36,7 @@ impl Default for TaskBuilder {
             save_dir: None,
             runtime: None,
             cancel_token: None,
+            on_task_state_changed: None,
         }
     }
 }
@@ -112,6 +113,21 @@ impl TaskBuilder {
         self
     }
 
+    pub fn on_task_state_changed<T>(mut self, callback: T) -> Self
+    where
+        T: Fn(TaskEvent) + Send + Sync + 'static,
+    {
+        match self.on_task_state_changed {
+            Some(ref mut callbacks) => {
+                callbacks.push(Box::new(callback));
+            }
+            None => {
+                self.on_task_state_changed = Some(vec![Box::new(callback)]);
+            }
+        }
+        self
+    }
+
     fn validate(&self) -> Result<(), TaskManagerBuildError> {
         if self.runtime.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
@@ -140,9 +156,7 @@ impl TaskBuilder {
         Ok(())
     }
 
-    pub async fn build<'a>(
-        mut self,
-    ) -> Result<(Task, Sender<TaskCommand>), TaskManagerBuildError> {
+    pub async fn build(mut self) -> Result<Task, TaskManagerBuildError> {
         if self.cancel_token.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
                 "cancel token is not set".to_string(),
@@ -178,23 +192,18 @@ impl TaskBuilder {
             temp_path.set_file_name(file_name);
         }
 
-        let (cmd_tx, cmd_rx) = unbounded();
-
-        Ok((
-            Task {
-                adapter,
-                mode,
-                save_path,
-                meta: self.meta.take().unwrap(),
-                tmp_path: temp_path,
-                rt: runtime.clone(),
-                task: TaskInstanceImpl::new(mode, runtime),
-                cancel_token,
-                on_task_state_changed: todo!(),
-                task_state: todo!(),
-                last_error: todo!(),
-            },
-            cmd_tx,
-        ))
+        Ok(Task {
+            adapter: Arc::new(adapter),
+            mode,
+            save_path,
+            meta: self.meta.take().unwrap(),
+            tmp_path: temp_path,
+            rt: runtime.clone(),
+            task: TaskInstanceImpl::new(mode, runtime),
+            cancel_token,
+            on_task_state_changed: Arc::new(self.on_task_state_changed.take().unwrap()),
+            task_state: Arc::new(AtomicTaskState::new(TaskState::Idle)),
+            last_error: Arc::new(Mutex::new(None)),
+        })
     }
 }
