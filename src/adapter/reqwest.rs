@@ -65,26 +65,18 @@ impl From<reqwest::Error> for StreamError {
                         .into();
                     }
                     _ => {
-                        return RetryableError::new_io_error(std::io::Error::other(
-                            e.to_string(),
-                        ))
-                        .into();
+                        return RetryableError::new_io_error(std::io::Error::other(e.to_string()))
+                            .into();
                     }
                 }
             }
         }
         if e.is_builder() || e.is_body() {
-            return UnretryableError::new_io_error(std::io::Error::other(
-                e.to_string(),
-            ))
-            .into();
+            return UnretryableError::new_io_error(std::io::Error::other(e.to_string())).into();
         }
 
         // fallback to other errors
-        RetryableError::new_io_error(std::io::Error::other(
-            e.to_string(),
-        ))
-        .into()
+        RetryableError::new_io_error(std::io::Error::other(e.to_string())).into()
     }
 }
 

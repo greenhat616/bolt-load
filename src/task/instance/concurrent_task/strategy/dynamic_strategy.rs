@@ -82,7 +82,9 @@ impl Strategy for DynamicStrategy {
                         > self.threashold2
                         && context.current_concurrency < self.max_concurrency
                     {
-                        result.push(StrategyAction::SplitGivenTask(context.remaining_largest_runner));
+                        result.push(StrategyAction::SplitGivenTask(
+                            context.remaining_largest_runner,
+                        ));
                         self.previous_total_download_speed = total_download_speed;
                     } else {
                         self.previous_total_download_speed = total_download_speed;

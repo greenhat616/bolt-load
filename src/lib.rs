@@ -1,9 +1,9 @@
 pub mod adapter;
 mod builder;
 pub mod client;
-pub mod task;
 pub mod runner;
 mod runtime;
+pub mod task;
 mod utils;
 
 pub use builder::*;

@@ -3,7 +3,7 @@
 use bitvec::prelude::*;
 
 /// Efficient ID generator for managing task ID allocation
-/// 
+///
 /// Uses BitVec to track ID usage and maintains a hint pointer for performance optimization
 pub struct Generator {
     /// Bit vector for tracking ID usage status
@@ -16,10 +16,10 @@ pub struct Generator {
 
 impl Generator {
     /// Create a new ID generator with specified capacity
-    /// 
+    ///
     /// # Arguments
     /// * `capacity` - Maximum capacity of the ID generator
-    /// 
+    ///
     /// # Example
     /// ```
     /// let mut generator = Generator::new(100);
@@ -33,9 +33,9 @@ impl Generator {
     }
 
     /// Get the next available ID
-    /// 
+    ///
     /// Time complexity: Average O(1), worst case O(n)
-    /// 
+    ///
     /// # Returns
     /// * `Some(id)` - If an ID is available
     /// * `None` - If all IDs are allocated
@@ -58,15 +58,15 @@ impl Generator {
                 return Some(index);
             }
         }
-        
+
         None
     }
 
     /// Release the specified ID, making it available for reallocation
-    /// 
+    ///
     /// # Arguments
     /// * `id` - The ID to release
-    /// 
+    ///
     /// # Returns
     /// * `true` - If successfully released
     /// * `false` - If ID is invalid or already free
@@ -90,10 +90,10 @@ impl Generator {
     }
 
     /// Check if the specified ID is allocated
-    /// 
+    ///
     /// # Arguments
     /// * `id` - The ID to check
-    /// 
+    ///
     /// # Returns
     /// * `true` - If the ID is allocated
     /// * `false` - If the ID is free or invalid
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn test_basic_allocation() {
         let mut g = Generator::new(5);
-        
+
         assert_eq!(g.next(), Some(0));
         assert_eq!(g.next(), Some(1));
         assert_eq!(g.allocated_count(), 2);
@@ -151,13 +151,13 @@ mod tests {
     #[test]
     fn test_release_and_reuse() {
         let mut g = Generator::new(3);
-        
+
         let id1 = g.next().unwrap();
         let _id2 = g.next().unwrap();
-        
+
         assert!(g.release(id1));
         assert!(!g.release(id1)); // Duplicate release should fail
-        
+
         let id3 = g.next().unwrap();
         assert_eq!(id3, id1); // Should reuse the just released ID
     }
@@ -165,12 +165,12 @@ mod tests {
     #[test]
     fn test_capacity_limits() {
         let mut g = Generator::new(2);
-        
+
         assert_eq!(g.next(), Some(0));
         assert_eq!(g.next(), Some(1));
         assert_eq!(g.next(), None); // Should be full
         assert!(g.is_full());
-        
+
         g.release(0);
         assert!(!g.is_full());
         assert_eq!(g.next(), Some(0));
@@ -181,9 +181,9 @@ mod tests {
         let mut g = Generator::new(3);
         let _ = g.next();
         let _ = g.next();
-        
+
         assert_eq!(g.allocated_count(), 2);
-        
+
         g.reset();
         assert_eq!(g.allocated_count(), 0);
         assert!(g.is_empty());

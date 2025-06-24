@@ -45,12 +45,18 @@ impl From<ureq2::Error> for StreamError {
                 std::io::Error::new(std::io::ErrorKind::NetworkDown, e.to_string()),
             )),
             ureq2::Error::Status(404, _) => StreamError::Unretryable(UnretryableError::NotFound),
-            ureq2::Error::Status(401, _) | ureq2::Error::Status(403, _) => StreamError::Unretryable(
-                UnretryableError::Unauthorized(format!("http status code: {}", 401)),
-            ),
-            ureq2::Error::Status(503, _) | ureq2::Error::Status(429, _) => StreamError::Unretryable(
-                UnretryableError::new_exceeded_request_limits(format!("http status code: {}", 503)),
-            ),
+            ureq2::Error::Status(401, _) | ureq2::Error::Status(403, _) => {
+                StreamError::Unretryable(UnretryableError::Unauthorized(format!(
+                    "http status code: {}",
+                    401
+                )))
+            }
+            ureq2::Error::Status(503, _) | ureq2::Error::Status(429, _) => {
+                StreamError::Unretryable(UnretryableError::new_exceeded_request_limits(format!(
+                    "http status code: {}",
+                    503
+                )))
+            }
             ureq2::Error::Status(status, _) if status < 500 => {
                 StreamError::Unretryable(UnretryableError::from_retryable_error(
                     RetryableError::new_io_error(std::io::Error::new(
