@@ -207,7 +207,9 @@ impl Spawn for TokioThreadedRuntime {
 /// It is used to hold by bolt-load client, and run different manager and its tasks.
 #[derive(Clone)]
 pub enum LocalRuntimeImpl {
+    #[cfg(feature = "tokio")]
     Tokio(LocalTokioRuntime),
+    #[cfg(feature = "smol")]
     Smol(SmolLocalRuntime),
     Other(Rc<dyn LocalRuntime>),
 }
@@ -226,7 +228,9 @@ impl LocalRuntimeImpl {
     #[inline]
     pub fn block_on(&self, future: impl std::future::Future<Output = ()> + 'static) {
         match self {
+            #[cfg(feature = "tokio")]
             LocalRuntimeImpl::Tokio(rt) => rt.block_on(future),
+            #[cfg(feature = "smol")]
             LocalRuntimeImpl::Smol(rt) => rt.block_on(future),
             LocalRuntimeImpl::Other(rt) => rt.block_on(Box::new(future)),
         }

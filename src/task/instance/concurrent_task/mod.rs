@@ -132,11 +132,11 @@ pub struct ConcurrentTaskInner {
 }
 
 #[derive(Default)]
-struct Context {
+pub struct Context {
     poll: VecDeque<()>,
 }
 
-enum Event {
+pub enum Event {
     Run(RunningPayload),
     Step,
 }
