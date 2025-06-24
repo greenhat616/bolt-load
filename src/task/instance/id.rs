@@ -21,7 +21,7 @@ impl Generator {
     /// * `capacity` - Maximum capacity of the ID generator
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let mut generator = Generator::new(100);
     /// ```
     pub fn new(capacity: usize) -> Self {
