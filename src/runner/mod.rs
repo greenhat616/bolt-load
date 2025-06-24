@@ -206,12 +206,18 @@ impl TaskRunner {
             futures::select! {
                 signal = control_signal => {
                     // Task layer owned the cancel token guard, ensure cancel token when manager is dropping
-                    if let Ok(signal) = signal {
-                        let ManagerMessage(_, variant) = signal;
-                        match variant {
-                            ManagerMessagesVariant::ResizeTotal(total) => {
-                                self.total = Some(total);
+                    match signal {
+                        Ok(signal) => {
+                            let ManagerMessage(_, variant) = signal;
+                            match variant {
+                                ManagerMessagesVariant::ResizeTotal(total) => {
+                                    self.total = Some(total);
+                                }
                             }
+                        }
+                        Err(_) => {
+                            // Control channel closed, should exit
+                            break Err(TaskFailedKind::ChannelClosed.into());
                         }
                     }
                 }
@@ -220,11 +226,22 @@ impl TaskRunner {
                         match item {
                             // TODO: check boundary after
                             Ok(item) => {
-                                self.downloaded += item.len() as u64;
+                                let size = match self.total {
+                                    Some(total) => item.len().min(total as usize - self.downloaded as usize),
+                                    None => item.len(),
+                                };
+                                self.downloaded += size as u64;
                                 self.notify
-                                    .send(RunnerMessageKind::Downloaded(item))
+                                    .send(RunnerMessageKind::Downloaded(item.slice(..size)))
                                     .await
                                     .map_err(|_| TaskFailedKind::ChannelClosed)?;
+                                
+                                // Check if we've reached the total size limit
+                                if let Some(total) = self.total {
+                                    if self.downloaded >= total {
+                                        break Ok(());
+                                    }
+                                }
                             }
                             // TODO: add a retry logic?
                             // First, we have to clarify whether this error is recoverable
@@ -472,7 +489,6 @@ mod tests {
     }
 
     #[test(tokio::test)]
-    // TODO: add a test for the resize small, and implement the logic
     async fn test_resize_total() {
         let (control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -492,7 +508,7 @@ mod tests {
         };
 
         let (mut runner, msg_rx) = TaskRunner::new(
-            Some(10), // Initially wrong size
+            Some(15), // Initially larger than first chunk to avoid early termination
             Box::pin(test_stream),
             1,
             control_rx,
@@ -503,30 +519,103 @@ mod tests {
             runner.run().await;
         });
 
-        // Send resize message after start
+        // Send resize message after first download to avoid early termination
         let mut started = false;
-        while let Ok(msg) = msg_rx.recv().await {
-            if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
-                started = true;
-                control_tx
-                    .send(ManagerMessage(1, ManagerMessagesVariant::ResizeTotal(60)))
-                    .await
-                    .unwrap();
-                break;
-            }
-        }
-
         let mut finished = false;
+        let mut resize_sent = false;
+        
         while let Ok(msg) = msg_rx.recv().await {
-            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) = msg {
-                finished = true;
-                break;
+            match msg {
+                RunnerMessage(_, RunnerMessageKind::Started) => {
+                    started = true;
+                }
+                RunnerMessage(_, RunnerMessageKind::Downloaded(_)) => {
+                    // Send resize message immediately after first download (only once)
+                    if !resize_sent {
+                        control_tx
+                            .send(ManagerMessage(1, ManagerMessagesVariant::ResizeTotal(60)))
+                            .await
+                            .unwrap();
+                        resize_sent = true;
+                    }
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    finished = true;
+                    break;
+                }
+                _ => {}
             }
         }
 
         runner_handle.await.unwrap();
         assert!(started);
         assert!(finished);
+    }
+
+    #[test(tokio::test)]
+    async fn test_resize_total_smaller() {
+        let (control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+        
+        // Create a stream with multiple chunks that would normally total 60 bytes
+        let test_stream = stream! {
+            yield Ok(Bytes::from(vec![1; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![2; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![3; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![4; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![5; 10]));
+            sleep(Duration::from_millis(10)).await;
+            yield Ok(Bytes::from(vec![6; 10]));
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(
+            Some(60), // Initially larger size
+            Box::pin(test_stream),
+            1,
+            control_rx,
+            cancel_token.clone(),
+        );
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        // Wait for start and collect some download messages
+        let mut started = false;
+        let mut download_count = 0;
+        let mut total_downloaded = 0;
+        
+        while let Ok(msg) = msg_rx.recv().await {
+            match msg {
+                RunnerMessage(_, RunnerMessageKind::Started) => {
+                    started = true;
+                }
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                    download_count += 1;
+                    total_downloaded += bytes.len();
+                    // After downloading 2 chunks (20 bytes), resize to 25 bytes
+                    if download_count == 2 {
+                        control_tx
+                            .send(ManagerMessage(1, ManagerMessagesVariant::ResizeTotal(25)))
+                            .await
+                            .unwrap();
+                    }
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    break;
+                }
+                _ => panic!("Unexpected message: {:?}", msg),
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(started);
+        // Should have downloaded exactly 25 bytes (2 full chunks + 5 bytes from 3rd chunk)
+        assert_eq!(total_downloaded, 25);
     }
 
     #[test(tokio::test)]
@@ -552,20 +641,31 @@ mod tests {
             runner.run().await;
         });
 
-        let mut got_size_mismatch = false;
+        let mut started = false;
+        let mut finished = false;
+        let mut total_downloaded = 0;
+        
         while let Ok(msg) = msg_rx.recv().await {
-            if let RunnerMessage(
-                _,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Other(_))),
-            ) = msg
-            {
-                got_size_mismatch = true;
-                break;
+            match msg {
+                RunnerMessage(_, RunnerMessageKind::Started) => {
+                    started = true;
+                }
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                    total_downloaded += bytes.len();
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    finished = true;
+                    break;
+                }
+                _ => panic!("Unexpected message: {:?}", msg),
             }
         }
 
         runner_handle.await.unwrap();
-        assert!(got_size_mismatch);
+        assert!(started);
+        assert!(finished);
+        // Should have downloaded exactly 10 bytes (truncated the excess)
+        assert_eq!(total_downloaded, 10);
     }
 
     #[test(tokio::test)]
