@@ -16,8 +16,8 @@ http = [
 blocking = ["dep:blocking"]
 # adapter group
 reqwest = ["dep:reqwest", "http"]
-ureq = ["dep:ureq", "blocking", "http"]
-
+ureq2 = ["dep:ureq2", "blocking", "http"]
+ureq3 = ["dep:ureq3", "blocking", "http"]
 serde = ["dep:serde"]
 
 # runtime group
@@ -65,7 +65,8 @@ headers = { version = "0.4", optional = true }
 # for reqwest adapter
 reqwest = { version = "0.12", optional = true, features = ["stream"] }
 # for ureq adapter
-ureq = { version = "2", optional = true }
+ureq2 = { version = "2", package = "ureq", optional = true }
+ureq3 = { version = "3", package = "ureq", optional = true }
 
 # runtime group
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }

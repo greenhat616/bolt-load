@@ -4,10 +4,10 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 #[cfg(feature = "reqwest")]
-mod reqwest;
+pub mod reqwest;
 
-#[cfg(feature = "ureq")]
-mod ureq;
+#[cfg(feature = "ureq2")]
+pub mod ureq2;
 
 #[async_trait]
 pub trait BoltLoadAdapter: Send + Sync {

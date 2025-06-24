@@ -2,7 +2,7 @@ use crate::utils::{http::ContentDisposition, reader::CrossRuntimeStream};
 use blocking::unblock;
 use futures::Stream;
 use std::{convert::AsRef, sync::Arc};
-use ureq::{Agent, Request};
+use ureq2::{Agent, Request};
 
 use super::{
     AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError, StreamError,
@@ -10,13 +10,13 @@ use super::{
 };
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
-type CallFn = Box<dyn Fn(Request) -> Result<ureq::Response, ureq::Error> + Send + Sync>;
+type CallFn = Box<dyn Fn(Request) -> Result<ureq2::Response, ureq2::Error> + Send + Sync>;
 
 #[non_exhaustive]
 pub struct UreqAdapter {
     agent: Agent,
     target: (String, url::Url),
-    head_response: Arc<async_lock::Mutex<Option<ureq::Response>>>,
+    head_response: Arc<async_lock::Mutex<Option<ureq2::Response>>>,
     before_request: Option<BeforeRequestFn>,
     call: Arc<Option<CallFn>>,
 }
@@ -25,7 +25,7 @@ pub trait IntoUreqAdapter {
     fn into_ureq_adapter(self, target: (impl AsRef<str>, url::Url)) -> UreqAdapter;
 }
 
-impl IntoUreqAdapter for ureq::Agent {
+impl IntoUreqAdapter for ureq2::Agent {
     fn into_ureq_adapter(self, target: (impl AsRef<str>, url::Url)) -> UreqAdapter {
         let method = target.0.as_ref().to_ascii_uppercase();
         UreqAdapter {
@@ -38,20 +38,20 @@ impl IntoUreqAdapter for ureq::Agent {
     }
 }
 
-impl From<ureq::Error> for StreamError {
-    fn from(e: ureq::Error) -> Self {
+impl From<ureq2::Error> for StreamError {
+    fn from(e: ureq2::Error) -> Self {
         match e {
-            ureq::Error::Transport(_) => StreamError::Retryable(RetryableError::new_io_error(
+            ureq2::Error::Transport(_) => StreamError::Retryable(RetryableError::new_io_error(
                 std::io::Error::new(std::io::ErrorKind::NetworkDown, e.to_string()),
             )),
-            ureq::Error::Status(404, _) => StreamError::Unretryable(UnretryableError::NotFound),
-            ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => StreamError::Unretryable(
+            ureq2::Error::Status(404, _) => StreamError::Unretryable(UnretryableError::NotFound),
+            ureq2::Error::Status(401, _) | ureq2::Error::Status(403, _) => StreamError::Unretryable(
                 UnretryableError::Unauthorized(format!("http status code: {}", 401)),
             ),
-            ureq::Error::Status(503, _) | ureq::Error::Status(429, _) => StreamError::Unretryable(
+            ureq2::Error::Status(503, _) | ureq2::Error::Status(429, _) => StreamError::Unretryable(
                 UnretryableError::new_exceeded_request_limits(format!("http status code: {}", 503)),
             ),
-            ureq::Error::Status(status, _) if status < 500 => {
+            ureq2::Error::Status(status, _) if status < 500 => {
                 StreamError::Unretryable(UnretryableError::from_retryable_error(
                     RetryableError::new_io_error(std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -59,7 +59,7 @@ impl From<ureq::Error> for StreamError {
                     )),
                 ))
             }
-            ureq::Error::Status(status, _) => {
+            ureq2::Error::Status(status, _) => {
                 StreamError::Retryable(RetryableError::new_io_error(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("http status code: {}", status),
@@ -79,7 +79,7 @@ impl UreqAdapter {
     /// For example, you can pass a closure like `|req| req.send_bytes(b"hello )` to send request
     pub fn call(
         &mut self,
-        f: impl Fn(Request) -> Result<ureq::Response, ureq::Error> + Send + Sync + 'static,
+        f: impl Fn(Request) -> Result<ureq2::Response, ureq2::Error> + Send + Sync + 'static,
     ) {
         self.call = Arc::new(Some(Box::new(f)));
     }
@@ -96,7 +96,7 @@ impl UreqAdapter {
     fn apply_call(
         call: Arc<Option<CallFn>>,
         builder: Request,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<ureq2::Response, ureq2::Error> {
         if let Some(f) = call.as_ref() {
             f(builder)
         } else {
@@ -104,7 +104,7 @@ impl UreqAdapter {
         }
     }
 
-    async fn perform_head(&self) -> Result<ureq::Response, StreamError> {
+    async fn perform_head(&self) -> Result<ureq2::Response, StreamError> {
         let request = self.apply_before_request(self.agent.head(self.target.1.as_str()));
         let call = self.call.clone();
         unblock(move || Self::apply_call(call, request))
@@ -112,14 +112,14 @@ impl UreqAdapter {
             .map_err(StreamError::from)
     }
 
-    fn get_content_size(&self, response: &ureq::Response) -> u64 {
+    fn get_content_size(&self, response: &ureq2::Response) -> u64 {
         let content_length = response.header("content-length");
         content_length
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
     }
 
-    fn suggest_filename(&self, response: &ureq::Response) -> Option<String> {
+    fn suggest_filename(&self, response: &ureq2::Response) -> Option<String> {
         response
             .header("content-disposition")
             .and_then(|v| http::HeaderValue::from_str(v).ok())
@@ -234,7 +234,7 @@ mod test {
     async fn test_get_content_size() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
-        let agent = ureq::Agent::new();
+        let agent = ureq2::Agent::new();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
         assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
 
@@ -247,7 +247,7 @@ mod test {
     async fn test_suggest_filename() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
-        let agent = ureq::Agent::new();
+        let agent = ureq2::Agent::new();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
         assert_eq!(
             adapter.retrieve_meta().await.unwrap().filename,
@@ -259,7 +259,7 @@ mod test {
     async fn test_is_range_stream_available() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
-        let agent = ureq::Agent::new();
+        let agent = ureq2::Agent::new();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
         assert!(
             adapter.is_range_stream_available().await,
@@ -278,7 +278,7 @@ mod test {
     async fn test_full_stream() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
-        let agent = ureq::Agent::new();
+        let agent = ureq2::Agent::new();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
         let mut stream = adapter.full_stream().await.unwrap();
         let mut bytes = bytes::BytesMut::new();
@@ -292,7 +292,7 @@ mod test {
     async fn test_range_stream() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
-        let agent = ureq::Agent::new();
+        let agent = ureq2::Agent::new();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
         let mut stream = adapter.range_stream(0, 100).await.unwrap();
         let mut bytes = bytes::BytesMut::new();
