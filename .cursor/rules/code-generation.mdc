@@ -1,0 +1,10 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+When generate codes, you only generate comments for key logic block.
+You should use English as first language.
+
+When tools availble, you should use tools for testing and fix up.
+
