@@ -16,6 +16,12 @@ mod id;
 mod sampler;
 mod singleton_task;
 
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod integration_test;
+
 use id::Generator;
 
 pub use concurrent_task::*;

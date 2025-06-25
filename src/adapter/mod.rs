@@ -34,7 +34,7 @@ pub trait BoltLoadAdapter: Send + Sync {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BoltLoadAdapterMeta {
     /// the content size
     pub content_size: u64,

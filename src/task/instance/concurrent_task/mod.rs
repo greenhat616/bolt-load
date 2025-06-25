@@ -177,10 +177,12 @@ impl ConcurrentTaskInner {
     /// Retrieve the meta data of the file
     async fn retrieve_meta(&mut self) -> Result<()> {
         // TODO: use backon to retry
-        let meta = self
-            .adapter
-            .as_ref()
-            .unwrap()
+        let adapter = self.adapter.as_ref().ok_or_else(|| {
+            TaskInstanceError::Failed(TaskFailedKind::Other(
+                "Adapter not set before meta retrieval".to_string()
+            ))
+        })?;
+        let meta = adapter
             .retrieve_meta()
             .await
             .map_err(TaskInstanceError::RetrieveMetaFailed)?;
@@ -196,11 +198,13 @@ impl ConcurrentTaskInner {
         if self.progress.total.is_some_and(|t| t != total) {
             self.progress.total = Some(total);
             self.progress.downloaded = 0;
+        } else if self.progress.total.is_none() {
+            self.progress.total = Some(total);
         }
         Ok(())
     }
 
-    fn create_file_writer(&self) -> (PathBuf, FileWriter) {
+    fn create_file_writer(&self) -> Result<(PathBuf, FileWriter)> {
         let tmp_path = if self.path.ends_with(DOWNLOADING_TMP_EXTENSION) {
             Cow::Borrowed(&self.path)
         } else {
@@ -212,8 +216,13 @@ impl ConcurrentTaskInner {
                 DOWNLOADING_TMP_EXTENSION
             )))
         };
-        let file_writer = FileWriter::new(tmp_path.as_ref(), self.progress.total.unwrap());
-        (tmp_path.into_owned(), file_writer)
+        let total_size = self.progress.total.ok_or_else(|| {
+            TaskInstanceError::Failed(TaskFailedKind::Other(
+                "File writer creation called before meta retrieval".to_string()
+            ))
+        })?;
+        let file_writer = FileWriter::new(tmp_path.as_ref(), total_size);
+        Ok((tmp_path.into_owned(), file_writer))
     }
 
     async fn create_background_range_runner(
@@ -568,7 +577,7 @@ impl ConcurrentTaskInner {
             DynamicStrategy::new_with_max_concurrency(initial_max_concurrency);
         let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
         let sampler = Sampler::default();
-        let (tmp_path, file_writer) = self.create_file_writer();
+        let (tmp_path, file_writer) = self.create_file_writer()?;
         let FileWriterGuard(_, file_writer_control) = file_writer.start();
 
         let mut timer = Timer::interval(Duration::from_secs(SAMPLE_INTERVAL));
