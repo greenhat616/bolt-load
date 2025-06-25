@@ -179,7 +179,7 @@ impl ConcurrentTaskInner {
         // TODO: use backon to retry
         let adapter = self.adapter.as_ref().ok_or_else(|| {
             TaskInstanceError::Failed(TaskFailedKind::Other(
-                "Adapter not set before meta retrieval".to_string()
+                "Adapter not set before meta retrieval".to_string(),
             ))
         })?;
         let meta = adapter
@@ -218,7 +218,7 @@ impl ConcurrentTaskInner {
         };
         let total_size = self.progress.total.ok_or_else(|| {
             TaskInstanceError::Failed(TaskFailedKind::Other(
-                "File writer creation called before meta retrieval".to_string()
+                "File writer creation called before meta retrieval".to_string(),
             ))
         })?;
         let file_writer = FileWriter::new(tmp_path.as_ref(), total_size);
