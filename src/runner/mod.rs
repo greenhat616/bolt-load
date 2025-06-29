@@ -212,8 +212,18 @@ impl TaskRunner {
                         Ok(signal) => {
                             let ManagerMessage(_, variant) = signal;
                             match variant {
-                                ManagerMessagesVariant::ResizeTotal(total) => {
-                                    self.total = Some(total);
+                                ManagerMessagesVariant::LimitTotal(new_total) => {
+                                    if let Some(current_total) = self.total {
+                                        if current_total >  new_total{
+                                            log::trace!("runner: limit total to {new_total}");
+                                            self.total = Some(new_total);
+                                        } else {
+                                            log::warn!(
+                                                "runner: limit total is smaller than current total,
+                                                limit: {new_total}, current: {current_total}"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -536,7 +546,7 @@ mod tests {
                     // Send resize message immediately after first download (only once)
                     if !resize_sent {
                         control_tx
-                            .send(ManagerMessage(1, ManagerMessagesVariant::ResizeTotal(60)))
+                            .send(ManagerMessage(1, ManagerMessagesVariant::LimitTotal(60)))
                             .await
                             .unwrap();
                         resize_sent = true;
@@ -603,7 +613,7 @@ mod tests {
                     // After downloading 2 chunks (20 bytes), resize to 25 bytes
                     if download_count == 2 {
                         control_tx
-                            .send(ManagerMessage(1, ManagerMessagesVariant::ResizeTotal(25)))
+                            .send(ManagerMessage(1, ManagerMessagesVariant::LimitTotal(25)))
                             .await
                             .unwrap();
                     }
@@ -755,7 +765,7 @@ mod tests {
         // Should return Some(TaskRunner)
         assert!(result.is_some());
         let mut runner = result.unwrap();
-        
+
         // The callback should have been called with a receiver
         let msg_rx = callback_rx.await.unwrap();
 
@@ -802,9 +812,9 @@ mod tests {
 
         // Create a failing stream future
         let stream_future = async {
-            Err::<AnyBytesStream, StreamError>(StreamError::Unretryable(
-                UnretryableError::Io(Arc::new(std::io::Error::other("Mock network error"))),
-            ))
+            Err::<AnyBytesStream, StreamError>(StreamError::Unretryable(UnretryableError::Io(
+                Arc::new(std::io::Error::other("Mock network error")),
+            )))
         };
 
         // Capture the receiver from the callback
@@ -833,7 +843,10 @@ mod tests {
         // Should receive a stopped message with stream error
         let msg = msg_rx.recv().await.unwrap();
         match msg {
-            RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_)))) => {
+            RunnerMessage(
+                id,
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_))),
+            ) => {
                 assert_eq!(id, runner_id);
             }
             _ => panic!("Expected stopped message with stream error, got: {:?}", msg),

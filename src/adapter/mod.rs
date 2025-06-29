@@ -142,6 +142,7 @@ pub mod tests {
     use std::{
         io::{BufWriter, Seek, Write},
         sync::Arc,
+        time::Duration,
     };
     use tempfile::tempfile;
     use tokio::{io::AsyncSeekExt, net::TcpListener};
@@ -289,9 +290,9 @@ pub mod tests {
                 "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
                 chunk_size
             );
-
             let stream = async_stream::stream! {
                 for chunk in content.chunks(chunk_size) {
+                    tokio::time::sleep(Duration::from_micros(10)).await;
                     yield Ok(Bytes::from(chunk.to_vec()));
                 }
             };
@@ -300,6 +301,12 @@ pub mod tests {
 
         async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
+
+            if self.should_fail {
+                return Err(StreamError::Unretryable(UnretryableError::Internal(
+                    "Simulated range stream failure".to_string(),
+                )));
+            }
 
             if !self.support_range {
                 return Err(StreamError::Unretryable(UnretryableError::Internal(
@@ -314,6 +321,7 @@ pub mod tests {
 
             let stream = async_stream::stream! {
                 for chunk in content.chunks(chunk_size) {
+                    tokio::time::sleep(Duration::from_micros(10)).await;
                     yield Ok(Bytes::from(chunk.to_vec()));
                 }
             };
@@ -440,8 +448,7 @@ pub mod tests {
         #[test(tokio::test)]
         async fn test_retrieve_meta_success() {
             let size = 2048;
-            let adapter = SimpleTestAdapter::new(size)
-                .with_filename("custom_test.bin".to_string());
+            let adapter = SimpleTestAdapter::new(size).with_filename("custom_test.bin".to_string());
 
             let meta = adapter.retrieve_meta().await.unwrap();
 
@@ -703,7 +710,7 @@ pub mod tests {
                 let chunk = chunk_result.unwrap();
                 chunk_count += 1;
                 total_size += chunk.len();
-                
+
                 // Each chunk should be at most the configured chunk size (8KB by default)
                 assert!(chunk.len() <= 8192);
             }
@@ -726,7 +733,7 @@ pub mod tests {
                         let start = i * 100;
                         let end = start + 100;
                         let stream = adapter.range_stream(start, end).await.unwrap();
-                        
+
                         let mut data = Vec::new();
                         let mut stream = std::pin::pin!(stream);
                         while let Some(chunk_result) = stream.next().await {
@@ -739,7 +746,7 @@ pub mod tests {
                 .collect::<Vec<_>>();
 
             let results = futures::future::join_all(handles).await;
-            
+
             // Verify all tasks completed successfully
             for (i, result) in results.into_iter().enumerate() {
                 let data = result.unwrap();

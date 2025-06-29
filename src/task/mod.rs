@@ -14,9 +14,9 @@ use crate::{
 };
 
 mod builder;
-mod instance;
 #[cfg(test)]
 mod comprehensive_tests;
+mod instance;
 
 pub use builder::*;
 
@@ -29,8 +29,10 @@ pub type TaskStateChangedCallback = Box<dyn Fn(TaskEvent) + Send + Sync + 'stati
 /// messages for manager -> runner
 pub struct ManagerMessage(pub RunnerId, pub ManagerMessagesVariant);
 pub enum ManagerMessagesVariant {
-    /// resize the total size of the task
-    ResizeTotal(u64),
+    /// limit the total size of the task
+    ///
+    /// The limit number should be smaller than the total size of the task
+    LimitTotal(u64),
 }
 
 pub type DownloadedChunks = Vec<Range<u64>>;
