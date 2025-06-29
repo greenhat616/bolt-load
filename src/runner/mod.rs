@@ -134,12 +134,14 @@ impl TaskRunner {
         let stream = match stream.await {
             Ok(stream) => stream,
             Err(e) => {
-                let _ = tx.send(RunnerMessage(
-                    runner_id,
-                    RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(
-                        e,
-                    ))),
-                ));
+                let _ = tx
+                    .send(RunnerMessage(
+                        runner_id,
+                        RunnerMessageKind::Stopped(StoppedReason::Failed(
+                            TaskFailedKind::StreamError(e),
+                        )),
+                    ))
+                    .await;
                 return None;
             }
         };
@@ -297,6 +299,7 @@ mod tests {
 
     use super::*;
     use async_stream::stream;
+    use oneshot;
     use pretty_assertions::assert_eq;
     use std::{sync::Arc, time::Duration};
     use test_log::test;
@@ -715,5 +718,128 @@ mod tests {
 
         runner_handle.await.unwrap();
         assert!(got_channel_closed);
+    }
+
+    #[test(tokio::test)]
+    async fn test_new_with_async_and_callback_success() {
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+        let runner_id = 42;
+
+        // Create a successful stream future
+        let stream_future = async {
+            let test_stream = stream! {
+                yield Ok(Bytes::from(vec![1; 10]));
+                yield Ok(Bytes::from(vec![2; 10]));
+            };
+            Ok::<AnyBytesStream, StreamError>(Box::pin(test_stream))
+        };
+
+        // Capture the receiver from the callback
+        let (callback_tx, callback_rx) = oneshot::channel();
+        let on_channel_created = move |rx: Receiver<RunnerMessage>| {
+            let _ = callback_tx.send(rx);
+        };
+
+        // Test the function
+        let result = TaskRunner::new_with_async_and_callback(
+            Some(20),
+            stream_future,
+            runner_id,
+            control_rx,
+            cancel_token,
+            on_channel_created,
+        )
+        .await;
+
+        // Should return Some(TaskRunner)
+        assert!(result.is_some());
+        let mut runner = result.unwrap();
+        
+        // The callback should have been called with a receiver
+        let msg_rx = callback_rx.await.unwrap();
+
+        // Spawn the runner to test it works
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        // Verify messages work correctly
+        let mut started = false;
+        let mut finished = false;
+        let mut total_downloaded = 0;
+
+        while let Ok(msg) = msg_rx.recv().await {
+            match msg {
+                RunnerMessage(id, RunnerMessageKind::Started) => {
+                    assert_eq!(id, runner_id);
+                    started = true;
+                }
+                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes)) => {
+                    assert_eq!(id, runner_id);
+                    total_downloaded += bytes.len();
+                }
+                RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    assert_eq!(id, runner_id);
+                    finished = true;
+                    break;
+                }
+                _ => panic!("Unexpected message: {:?}", msg),
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(started);
+        assert!(finished);
+        assert_eq!(total_downloaded, 20);
+    }
+
+    #[test(tokio::test)]
+    async fn test_new_with_async_and_callback_stream_failure() {
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+        let runner_id = 42;
+
+        // Create a failing stream future
+        let stream_future = async {
+            Err::<AnyBytesStream, StreamError>(StreamError::Unretryable(
+                UnretryableError::Io(Arc::new(std::io::Error::other("Mock network error"))),
+            ))
+        };
+
+        // Capture the receiver from the callback
+        let (callback_tx, callback_rx) = oneshot::channel();
+        let on_channel_created = move |rx: Receiver<RunnerMessage>| {
+            let _ = callback_tx.send(rx);
+        };
+
+        // Test the function
+        let result = TaskRunner::new_with_async_and_callback(
+            Some(20),
+            stream_future,
+            runner_id,
+            control_rx,
+            cancel_token,
+            on_channel_created,
+        )
+        .await;
+
+        // Should return None due to stream failure
+        assert!(result.is_none());
+
+        // The callback should still have been called with a receiver
+        let msg_rx = callback_rx.await.unwrap();
+
+        // Should receive a stopped message with stream error
+        let msg = msg_rx.recv().await.unwrap();
+        match msg {
+            RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_)))) => {
+                assert_eq!(id, runner_id);
+            }
+            _ => panic!("Expected stopped message with stream error, got: {:?}", msg),
+        }
+
+        // Channel should be closed after the error message
+        assert!(msg_rx.recv().await.is_err());
     }
 }

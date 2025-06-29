@@ -23,9 +23,10 @@ impl ThreadedRuntimeImpl {
     /// Create a new tokio runtime.
     /// If the current thread already has a tokio runtime, it will be used.
     pub fn new_tokio_rt() -> Self {
-        Self::Tokio(TokioThreadedRuntime::Runtime(
-            tokio::runtime::Runtime::new().unwrap(),
-        ))
+        Self::Tokio(match tokio::runtime::Handle::try_current() {
+            Ok(handle) => TokioThreadedRuntime::Handle(handle),
+            _ => TokioThreadedRuntime::Runtime(tokio::runtime::Runtime::new().unwrap()),
+        })
     }
 
     #[cfg(feature = "smol")]

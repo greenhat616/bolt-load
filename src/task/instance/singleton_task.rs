@@ -50,15 +50,18 @@ impl TaskInstance for SingletonTask {
     ) -> Result<()> {
         let token = cancel_token.clone();
         let rt = self.rt.clone();
+        log::trace!("[SINGLETON TASK] Attempting to spawn state machine task");
         let handle = self
             .rt
             .spawn_with_handle(async move {
+                log::trace!("[SINGLETON TASK] State machine starting");
                 let mut context = Context::default();
                 let mut state_machine = SingletonTaskInner::new(path, event_tx, rt)
                     .uninitialized_state_machine()
                     .init_with_context(&mut context)
                     .await;
 
+                log::trace!("[SINGLETON TASK] State machine initialized, handling Run event");
                 state_machine
                     .handle_with_context(
                         &Event::Run(RunningPayload {
@@ -69,11 +72,21 @@ impl TaskInstance for SingletonTask {
                     )
                     .await;
 
+                log::trace!(
+                    "[SINGLETON TASK] Run event handled, starting event loop with {} items in poll",
+                    context.poll.len()
+                );
                 while context.poll.pop_front().is_some() {
+                    log::trace!("[SINGLETON TASK] Processing Step event");
                     state_machine
                         .handle_with_context(&Event::Step, &mut context)
                         .await;
+                    log::trace!(
+                        "[SINGLETON TASK] Step event handled, {} items remaining in poll",
+                        context.poll.len()
+                    );
                 }
+                log::trace!("[SINGLETON TASK] Event loop completed");
 
                 debug_assert!(
                     matches!(state_machine.state(), State::Stopped { .. }),
@@ -81,7 +94,9 @@ impl TaskInstance for SingletonTask {
                 );
             })
             .expect("Runtime is dropped");
+        log::trace!("[SINGLETON TASK] State machine task spawned successfully");
         self.task = Some(TaskControl::new(token, handle));
+        log::trace!("[SINGLETON TASK] TaskControl created and stored");
         Ok(())
     }
 
@@ -93,8 +108,16 @@ impl TaskInstance for SingletonTask {
     }
 
     async fn wait(&mut self) -> Result<()> {
+        log::trace!(
+            "[SINGLETON TASK] wait() called, task present: {}",
+            self.task.is_some()
+        );
         if let Some(mut task) = self.task.take() {
+            log::trace!("[SINGLETON TASK] waiting for task to complete");
             task.wait().await;
+            log::trace!("[SINGLETON TASK] task completed");
+        } else {
+            log::warn!("[SINGLETON TASK] WARNING: No task to wait for!");
         }
         Ok(())
     }
@@ -151,6 +174,10 @@ impl SingletonTaskInner {
 
     /// Download the file
     async fn download(&mut self, cancel_token: &mut CancellationToken) -> Result<()> {
+        log::trace!(
+            "[SINGLETON TASK] download() method called, path: {:?}",
+            self.path
+        );
         let stream = self
             .adapter
             .as_ref()
@@ -158,6 +185,7 @@ impl SingletonTaskInner {
             .full_stream()
             .await
             .map_err(TaskInstanceError::StreamFailed)?;
+        log::trace!("[SINGLETON TASK] stream obtained successfully");
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -300,15 +328,31 @@ impl SingletonTaskInner {
         context: &mut Context,
         event: &Event,
     ) -> Response<State> {
+        log::trace!(
+            "[STATE MACHINE] initializing state entered, event: {:?}",
+            match event {
+                Event::Step => "Step",
+                Event::Run(_) => "Run",
+                Event::Stop(_) => "Stop",
+            }
+        );
         match event {
             Event::Step => {
+                log::trace!("[STATE MACHINE] processing Step event in initializing");
                 let task = async {
                     match self.retrieve_meta().await {
                         Ok(()) => {
+                            log::trace!(
+                                "[STATE MACHINE] retrieve_meta successful, transitioning to \
+                                 downloading"
+                            );
                             context.poll.push_back(());
                             Transition(State::downloading(cancel_token.clone()))
                         }
-                        Err(e) => Transition(State::stopped(Some(Err(e)))),
+                        Err(e) => {
+                            log::trace!("[STATE MACHINE] retrieve_meta failed: {:?}", e);
+                            Transition(State::stopped(Some(Err(e))))
+                        }
                     }
                 }
                 .fuse();
@@ -316,11 +360,19 @@ impl SingletonTaskInner {
 
                 futures::select_biased! {
                     _ = cancel_token.cancelled().fuse() => {
+                        log::trace!("[STATE MACHINE] initializing cancelled");
                         Transition(State::stopped(Some(Err(TaskInstanceError::Failed(
                             crate::runner::TaskFailedKind::Cancelled,
                         )))))
                     }
-                    res = task => { res },
+                    res = task => {
+                        log::trace!("[STATE MACHINE] initializing task completed: {:?}", match &res {
+                            Transition(State::Downloading { .. }) => "Downloading transition",
+                            Transition(State::Stopped { .. }) => "Stopped transition",
+                            _ => "Other transition",
+                        });
+                        res
+                    },
                 }
             }
             _ => Super,
@@ -334,11 +386,28 @@ impl SingletonTaskInner {
         context: &mut Context,
         event: &Event,
     ) -> Response<State> {
+        log::trace!(
+            "[STATE MACHINE] downloading state entered, event: {:?}",
+            match event {
+                Event::Step => "Step",
+                Event::Run(_) => "Run",
+                Event::Stop(_) => "Stop",
+            }
+        );
         match event {
-            Event::Step => match self.download(cancel_token).await {
-                Ok(()) => Transition(State::stopped(Some(Ok(())))),
-                Err(e) => Transition(State::stopped(Some(Err(e)))),
-            },
+            Event::Step => {
+                log::trace!("[STATE MACHINE] calling download method");
+                match self.download(cancel_token).await {
+                    Ok(()) => {
+                        log::trace!("[STATE MACHINE] download completed successfully");
+                        Transition(State::stopped(Some(Ok(()))))
+                    }
+                    Err(e) => {
+                        log::trace!("[STATE MACHINE] download failed: {:?}", e);
+                        Transition(State::stopped(Some(Err(e))))
+                    }
+                }
+            }
             _ => Super,
         }
     }
@@ -350,39 +419,42 @@ impl SingletonTaskInner {
                     let progress = Progress {
                         total: Some(self.total.unwrap_or(self.downloaded)),
                         downloaded: self.downloaded,
+                        #[allow(clippy::single_range_in_vec_init)]
                         downloaded_chunks: vec![0..self.downloaded],
                     };
                     let tx = self.event_tx.clone();
-                    self.rt.spawn(async move {
-                        tx.send(TaskEvent::Finished(progress)).await;
+                    let _ = self.rt.spawn(async move {
+                        let _ = tx.send(TaskEvent::Finished(progress)).await;
                     });
                 }
                 Some(Err(e)) => {
                     let tx = self.event_tx.clone();
-                    self.rt.spawn(async move {
-                        tx.send(TaskEvent::Failed(e)).await;
+                    let _ = self.rt.spawn(async move {
+                        let _ = tx.send(TaskEvent::Failed(e)).await;
                     });
                 }
                 None => unreachable!(),
             },
             State::Initializing { .. } => {
                 let tx = self.event_tx.clone();
-                self.rt.spawn(async move {
-                    tx.send(TaskEvent::Initializing).await;
+                let _ = self.rt.spawn(async move {
+                    let _ = tx.send(TaskEvent::Initializing).await;
                 });
             }
             State::Downloading { .. } => {
                 let progress = Progress {
                     total: self.total,
                     downloaded: self.downloaded,
+                    #[allow(clippy::single_range_in_vec_init)]
                     downloaded_chunks: vec![0..self.downloaded],
                 };
                 let tx = self.event_tx.clone();
-                self.rt.spawn(async move {
-                    tx.send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                        progress, 0.0,
-                    )))
-                    .await;
+                let _ = self.rt.spawn(async move {
+                    let _ = tx
+                        .send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                            progress, 0.0,
+                        )))
+                        .await;
                 });
             }
         }

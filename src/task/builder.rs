@@ -113,17 +113,27 @@ impl TaskBuilder {
         self
     }
 
+    /// set the save directory
+    pub fn save_dir(mut self, dir: PathBuf) -> Self {
+        self.save_dir = Some(dir);
+        self
+    }
+
+    /// set the runtime
+    pub fn runtime(mut self, runtime: ThreadedRuntimeImpl) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     pub fn on_task_state_changed<T>(mut self, callback: T) -> Self
     where
         T: Fn(TaskEvent) + Send + Sync + 'static,
     {
-        match self.on_task_state_changed {
-            Some(ref mut callbacks) => {
-                callbacks.push(Box::new(callback));
-            }
-            None => {
-                self.on_task_state_changed = Some(vec![Box::new(callback)]);
-            }
+        let boxed_callback: Box<dyn Fn(TaskEvent) + Send + Sync + 'static> = Box::new(callback);
+        if let Some(ref mut callbacks) = self.on_task_state_changed {
+            callbacks.push(boxed_callback);
+        } else {
+            self.on_task_state_changed = Some(vec![boxed_callback]);
         }
         self
     }
@@ -201,8 +211,9 @@ impl TaskBuilder {
             rt: runtime.clone(),
             task: TaskInstanceImpl::new(mode, runtime),
             cancel_token,
-            on_task_state_changed: Arc::new(self.on_task_state_changed.take().unwrap()),
+            on_task_state_changed: Arc::new(self.on_task_state_changed.take().unwrap_or_default()),
             task_state: Arc::new(AtomicTaskState::new(TaskState::Idle)),
+            event_handler_handle: None,
             last_error: Arc::new(Mutex::new(None)),
         })
     }

@@ -2,6 +2,7 @@ mod dynamic_strategy;
 
 pub use dynamic_strategy::*;
 
+#[derive(Debug)]
 pub enum StrategyAction {
     ChangeMaxThread(usize),
     // Split all task into two separate tasks

@@ -1,6 +1,6 @@
 use async_channel::Sender;
 
-use futures::task::SpawnExt;
+use futures::{future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use std::{
     ops::Range,
@@ -15,7 +15,8 @@ use crate::{
 
 mod builder;
 mod instance;
-mod runner_notification;
+#[cfg(test)]
+mod comprehensive_tests;
 
 pub use builder::*;
 
@@ -72,6 +73,9 @@ pub enum TaskState {
     #[default]
     /// the task is idle, the initial state
     Idle,
+    /// the task is spawning the task,
+    /// Spawn the task and wait for the task to be initialized
+    Spawning,
     /// the task is initializing the task
     Initializing,
     /// the task is downloading the content
@@ -150,6 +154,7 @@ pub struct Task {
 
     on_task_state_changed: Arc<Vec<TaskStateChangedCallback>>,
     task: TaskInstanceImpl,
+    event_handler_handle: Option<RemoteHandle<()>>,
     task_state: Arc<AtomicTaskState>,
     last_error: Arc<Mutex<Option<TaskInstanceError>>>,
 }
@@ -179,7 +184,22 @@ impl Task {
     }
 
     pub async fn wait(&mut self) -> Result<(), TaskInstanceError> {
-        self.task.wait().await
+        if matches!(
+            self.task_state.load(Ordering::Acquire),
+            TaskState::Spawning | TaskState::Initializing | TaskState::Downloading
+        ) {
+            self.task.wait().await?;
+            if let Some(handle) = self.event_handler_handle.take() {
+                handle.await;
+            }
+        }
+        let current_state = self.task_state.load(Ordering::Acquire);
+        log::trace!("[TASK] Task::wait, current_state: {current_state:?}");
+        if matches!(current_state, TaskState::Failed) {
+            let error = self.last_error.lock().unwrap().clone().unwrap();
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn run(&mut self) -> Result<(), TaskInstanceError> {
@@ -188,21 +208,30 @@ impl Task {
         let on_task_state_changed = self.on_task_state_changed.clone();
         let task_state = self.task_state.clone();
         let last_error = self.last_error.clone();
-
-        self.rt
-            .spawn(async move {
+        task_state.store(TaskState::Spawning, Ordering::Release);
+        let handle = self
+            .rt
+            .spawn_with_handle(async move {
                 while let Ok(event) = event_rx.recv().await {
                     match &event {
                         TaskEvent::Finished(_) => {
+                            #[cfg(test)]
+                            log::trace!("[TASK] TaskEvent::Finished");
                             task_state.store(TaskState::Finished, Ordering::Release);
                         }
                         TaskEvent::Initializing => {
+                            #[cfg(test)]
+                            log::trace!("[TASK] TaskEvent::Initializing");
                             task_state.store(TaskState::Initializing, Ordering::Release);
                         }
-                        TaskEvent::Downloading(_) => {
+                        TaskEvent::Downloading(progress) => {
+                            #[cfg(test)]
+                            log::trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
                             task_state.store(TaskState::Downloading, Ordering::Release);
                         }
                         TaskEvent::Failed(error) => {
+                            #[cfg(test)]
+                            log::trace!("[TASK] TaskEvent::Failed");
                             task_state.store(TaskState::Failed, Ordering::Release);
                             last_error.lock().unwrap().replace(error.clone());
                         }
@@ -218,6 +247,13 @@ impl Task {
                     "failed to spawn the task".to_string(),
                 ))
             })?;
+        self.event_handler_handle = Some(handle);
+
+        log::trace!("[TASK] Calling TaskInstance::run(), mode: {:?}", self.mode);
+        match &self.task {
+            TaskInstanceImpl::Singleton(_) => log::trace!("[TASK] Using SingletonTask"),
+            TaskInstanceImpl::Concurrent(_) => log::trace!("[TASK] Using ConcurrentTask"),
+        }
 
         self.task.run(
             self.adapter.clone(),
@@ -225,6 +261,7 @@ impl Task {
             event_tx,
             cancel_token,
         )?;
+        log::trace!("[TASK] TaskInstance::run() completed");
         Ok(())
     }
 }

@@ -29,9 +29,13 @@ impl TaskRunnerGuard {
     }
 
     pub async fn send_message(&self, message: ManagerMessagesVariant) {
-        self.control_signal
+        if let Err(e) = self
+            .control_signal
             .send(ManagerMessage(self.runner_id, message))
-            .await;
+            .await
+        {
+            log::warn!("Failed to send message to task runner: {e:?}");
+        }
     }
 }
 impl Drop for TaskRunnerGuard {

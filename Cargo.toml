@@ -34,6 +34,9 @@ log = "0.4"
 thiserror = "2"
 async-trait = "0.1"
 futures = { version = "0.3" } 
+futures-concurrency = "7"
+lending-stream = "1"
+pin-project-lite = "0.2"
 url = "2"
 bytes = "1"
 enum_dispatch = "0.3"
@@ -85,6 +88,9 @@ async-stream = "0.3"
 
 # for generate a random file
 rand = "0.9"
+
+# for hash verification in tests
+sha2 = "0.10"
 
 # for http server test
 axum = "0.8.1"

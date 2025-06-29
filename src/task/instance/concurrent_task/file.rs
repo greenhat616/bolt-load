@@ -36,10 +36,7 @@ impl Payload {
     }
 }
 
-pub struct FileWriterGuard(
-    pub std::thread::JoinHandle<Result<(), std::io::Error>>,
-    pub FileWriterControl,
-);
+pub struct FileWriterGuard(pub std::thread::JoinHandle<()>, pub FileWriterControl);
 
 #[derive(Debug, Clone)]
 pub struct FileWriterControl {
@@ -107,7 +104,8 @@ impl FileWriter {
         Ok(())
     }
 
-    pub fn start(self) -> FileWriterGuard {
+    pub async fn start(self) -> Result<FileWriterGuard, std::io::Error> {
+        let (ready_tx, ready_rx) = oneshot::channel();
         let (tx, rx) = async_channel::bounded(FILE_WRITER_QUEUE_SIZE);
         let total = self.total;
         let mode = self.mode;
@@ -121,13 +119,21 @@ impl FileWriter {
             let mut opts = OpenOptions::new();
             opts.read(true).write(true).create(true).truncate(false);
 
-            let mut file = opts.open(&self.path).inspect_err(|e| {
-                log::error!("failed to open file: {e:?}");
-            })?;
+            let mut file = match opts.open(&self.path) {
+                Ok(file) => file,
+                Err(e) => {
+                    log::error!("failed to open file: {e:?}");
+
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
             if file_size != total {
-                file.set_len(total).inspect_err(|e| {
+                if let Err(e) = file.set_len(total) {
                     log::error!("failed to set file length: {e:?}");
-                })?;
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
             }
 
             // In 32-bit machine, the pointer size is 4 bytes, some large file may exceed the pointer size
@@ -135,10 +141,16 @@ impl FileWriter {
             if file_size <= isize::MAX as u64 && mode == Mode::Mmap {
                 log::trace!("use mmap mode");
                 let mut mmap = unsafe {
-                    MmapMut::map_mut(&file).inspect_err(|e| {
-                        log::error!("failed to map file: {e:?}");
-                    })?
+                    match MmapMut::map_mut(&file) {
+                        Ok(mmap) => mmap,
+                        Err(e) => {
+                            log::error!("failed to map file: {e:?}");
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    }
                 };
+                let _ = ready_tx.send(Ok(()));
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
                     mmap[range.start as usize..range.end as usize].copy_from_slice(&data);
                     let _ = tx.send(mmap.flush_async_range(
@@ -148,14 +160,17 @@ impl FileWriter {
                 }
             } else {
                 log::trace!("use seek write mode");
+                let _ = ready_tx.send(Ok(()));
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
                     let _ = tx.send(Self::handle_seek_write(&mut file, range, data));
                 }
             }
-
-            Ok(())
         });
-        FileWriterGuard(handle, FileWriterControl::new(tx))
+        let control = FileWriterControl::new(tx);
+        ready_rx
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))??;
+        Ok(FileWriterGuard(handle, control))
     }
 }
 
@@ -173,7 +188,7 @@ mod tests {
         let bytes_len = bytes.len();
 
         let file_writer = FileWriter::new(&file_path, bytes_len as u64);
-        let FileWriterGuard(handle, guard) = file_writer.start();
+        let FileWriterGuard(handle, guard) = file_writer.start().await.unwrap();
 
         guard
             .write(0..bytes_len as u64, bytes.clone())
@@ -181,7 +196,7 @@ mod tests {
             .unwrap();
 
         drop(guard);
-        handle.join().unwrap().unwrap();
+        handle.join().unwrap();
 
         let file = OpenOptions::new().read(true).open(&file_path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
@@ -198,7 +213,7 @@ mod tests {
 
         let mut file_writer = FileWriter::new(&file_path, bytes_len as u64);
         file_writer.set_mode(Mode::SeekWrite);
-        let FileWriterGuard(handle, guard) = file_writer.start();
+        let FileWriterGuard(handle, guard) = file_writer.start().await.unwrap();
 
         guard
             .write(0..bytes_len as u64, bytes.clone())
@@ -206,7 +221,7 @@ mod tests {
             .unwrap();
 
         drop(guard);
-        handle.join().unwrap().unwrap();
+        handle.join().unwrap();
 
         let file = OpenOptions::new().read(true).open(&file_path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };

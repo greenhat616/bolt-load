@@ -368,7 +368,7 @@ async fn test_progress_tracking() {
     assert_eq!(downloaded_content, content);
 }
 
-#[test(tokio::test)]
+#[test(tokio::test(flavor = "multi_thread"))]
 async fn test_concurrent_vs_singleton_comparison() {
     let rt = create_test_runtime();
     let content = create_test_content(20000);

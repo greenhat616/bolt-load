@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -10,6 +11,7 @@ use std::{
 use async_channel::{Receiver, Sender};
 use async_io::Timer;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
+use lending_stream::prelude::*;
 use smol_cancellation_token::CancellationToken;
 use statig::{Response::*, prelude::*};
 
@@ -24,7 +26,6 @@ use crate::{
             ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent, TaskInstanceError,
             sampler::{SAMPLE_INTERVAL, Sampler},
         },
-        runner_notification::RunnerNotification,
     },
 };
 
@@ -32,10 +33,12 @@ use super::{Generator, Result, TaskInstance};
 
 mod chunk_planner;
 mod file;
+mod runner_notification;
 mod strategy;
 
 use chunk_planner::*;
 use file::*;
+use runner_notification::RunnerNotification;
 use strategy::*;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
@@ -236,6 +239,9 @@ impl ConcurrentTaskInner {
         let (tx, rx) = oneshot::channel();
         let handle = rt
             .spawn_with_handle(async move {
+                log::trace!(
+                    "[TASK] create background range runner: id: {runner_id}, range: {range:?}"
+                );
                 let mut runner = match TaskRunner::new_with_async_and_callback(
                     Some(range.end - range.start),
                     async { adapter.range_stream(range.start, range.end).await },
@@ -266,7 +272,7 @@ impl ConcurrentTaskInner {
     async fn download_timer_tick(
         chunk_planner: &mut ChunkPlanner,
         runners_state: &mut HashMap<RunnerId, RunnerState>,
-        notification_subscriber: &mut RunnerNotification<'_, RunnerMessage>,
+        runner_notification: &mut RunnerNotification,
         dynamic_strategy: &mut DynamicStrategy,
         runner_id_generator: &mut Generator,
         max_concurrency: usize,
@@ -290,8 +296,10 @@ impl ConcurrentTaskInner {
         let available_ranges = chunk_planner.get_available_ranges();
         // TODO: move it to a new strategy for error and concurrency control
         if !available_ranges.is_empty() {
+            log::trace!("[TASK] create background runners: available_ranges: {available_ranges:?}");
             for chunk in available_ranges.iter() {
-                let runner_id = runner_id_generator.next().unwrap();
+                let runner_id = runner_id_generator.next().expect("no more runner id");
+                chunk_planner.add_chunk(chunk.clone(), Some(runner_id));
                 let (rx, handle) = Self::create_background_range_runner(
                     rt,
                     chunk.clone(),
@@ -312,7 +320,7 @@ impl ConcurrentTaskInner {
                         handle,
                     },
                 );
-                notification_subscriber.add(runner_id, rx);
+                runner_notification.add(runner_id, rx);
             }
         }
         let running_runners = runners_state
@@ -334,9 +342,10 @@ impl ConcurrentTaskInner {
             };
             let actions = dynamic_strategy.step(&strategy_context);
             for action in actions {
+                log::trace!("[TASK] download_timer_tick: action: {action:?}");
                 match action {
                     StrategyAction::SplitAllTask if runners_state.is_empty() => {
-                        let runner_id = runner_id_generator.next().unwrap();
+                        let runner_id = runner_id_generator.next().expect("no more runner id");
                         let chunk = 0..total;
                         let (rx, handle) = Self::create_background_range_runner(
                             rt,
@@ -359,16 +368,13 @@ impl ConcurrentTaskInner {
                                 handle,
                             },
                         );
-                        notification_subscriber.add(runner_id, rx);
 
                         // read next notification
-                        let RunnerMessage(_, msg) = notification_subscriber
-                            .next()
-                            .await
-                            .expect("Runner maybe corrupt?");
-                        if let RunnerMessageKind::Stopped(StoppedReason::Failed(kind)) = msg {
-                            return Err(TaskInstanceError::Failed(kind));
-                        }
+                        // let RunnerMessage(_, msg) = rx.recv().await.expect("Runner maybe corrupt?");
+                        // if let RunnerMessageKind::Stopped(StoppedReason::Failed(kind)) = msg {
+                        //     return Err(TaskInstanceError::Failed(kind));
+                        // }
+                        runner_notification.add(runner_id, rx);
                     }
                     StrategyAction::SplitGivenTask(task_id) => {
                         let state = (*runners_state)
@@ -383,7 +389,9 @@ impl ConcurrentTaskInner {
                             continue;
                         }
 
-                        let next_id = runner_id_generator.next().unwrap();
+                        log::trace!("[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}");
+
+                        let next_id = runner_id_generator.next().expect("no more runner id");
                         let next_chunk = half_end..occupied_chunk.end;
                         chunk_planner.remove_chunk(occupied_chunk.clone());
                         chunk_planner.add_chunk(occupied_chunk.start..half_end, Some(task_id));
@@ -422,7 +430,7 @@ impl ConcurrentTaskInner {
                                 handle,
                             },
                         );
-                        notification_subscriber.add(next_id, rx);
+                        runner_notification.add(next_id, rx);
                     }
                     _ => {}
                 }
@@ -465,7 +473,7 @@ impl ConcurrentTaskInner {
 
     async fn handle_runner_message(
         runners_state: &mut HashMap<RunnerId, RunnerState>,
-        notification_subscriber: &mut RunnerNotification<'_, RunnerMessage>,
+        runner_notification: &mut RunnerNotification,
         chunk_planner: &mut ChunkPlanner,
         id_generator: &mut Generator,
         file_writer_control: &FileWriterControl,
@@ -485,12 +493,13 @@ impl ConcurrentTaskInner {
                         .all(|r| r.status == RunnerStatus::Finished)
                         && chunk_planner.get_available_ranges().is_empty()
                     {
+                        log::trace!("[TASK] handle_runner_message: all chunks finished");
                         on_all_chunks_finished();
                     }
                 }
                 StoppedReason::Failed(_kind) => {
                     if let Some(state) = runners_state.remove(&runner_id) {
-                        notification_subscriber.remove(runner_id);
+                        runner_notification.remove(runner_id);
                         chunk_planner.remove_chunk(state.chunk.occupied.clone());
                         chunk_planner.add_chunk(state.chunk.occupied, None);
                         id_generator.release(runner_id);
@@ -570,27 +579,27 @@ impl ConcurrentTaskInner {
         let mut runners_state: HashMap<RunnerId, RunnerState> =
             HashMap::with_capacity(initial_max_concurrency);
         let (control_tx, control_rx) = async_channel::unbounded();
-        let mut notification_subscriber = RunnerNotification::default();
-        // futures::pin_mut!(notification_subscriber, runners_state, chunk_planner);
+        let mut runner_notification = RunnerNotification::new();
 
         let mut dynamic_strategy =
             DynamicStrategy::new_with_max_concurrency(initial_max_concurrency);
         let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
         let sampler = Sampler::default();
         let (tmp_path, file_writer) = self.create_file_writer()?;
-        let FileWriterGuard(_, file_writer_control) = file_writer.start();
+        let FileWriterGuard(_, file_writer_control) = file_writer
+            .start()
+            .await
+            .map_err(|e| TaskInstanceError::AllocateFileSpaceFailed(Arc::new(e)))?;
 
         let mut timer = Timer::interval(Duration::from_secs(SAMPLE_INTERVAL));
 
         loop {
-            let mut notification = notification_subscriber.next().fuse();
-
             futures::select_biased! {
                 _ = timer.next().fuse() => {
                     Self::download_timer_tick(
                         &mut chunk_planner,
                         &mut runners_state,
-                        &mut notification_subscriber,
+                        &mut runner_notification,
                         &mut dynamic_strategy,
                         &mut runner_id_generator,
                         max_concurrency,
@@ -607,12 +616,12 @@ impl ConcurrentTaskInner {
                         self.sync_runner_chunks_and_chunk_planner(&runners_state, &mut chunk_planner);
                     })?;
                 }
-                msg = notification => {
+                msg = runner_notification.next().fuse() => {
                     if let Some(msg) = msg {
                         let mut flag = false;
                         Self::handle_runner_message(
                             &mut runners_state,
-                            &mut notification_subscriber,
+                            &mut runner_notification,
                             &mut chunk_planner,
                             &mut runner_id_generator,
                             &file_writer_control,
@@ -657,6 +666,7 @@ impl ConcurrentTaskInner {
         match event {
             Event::Run(payload) => {
                 context.poll.push_back(());
+                self.adapter = Some(payload.adapter.clone());
                 Transition(State::initializing(payload.cancel_token.clone()))
             }
             _ => Super,
@@ -734,38 +744,490 @@ impl ConcurrentTaskInner {
 
     fn on_transition(&mut self, _source: &State, target: &State) {
         match target {
-            State::Stopped { reason } => match reason.clone() {
-                Some(Ok(())) => {
-                    let tx = self.event_tx.clone();
-                    let progress = self.progress.clone();
-                    self.rt.spawn(async move {
-                        tx.send(TaskEvent::Finished(progress)).await;
-                    });
+            State::Stopped { reason } => {
+                log::trace!("on_transition: enter stopped state, reason: {reason:?}");
+                match reason.clone() {
+                    Some(Ok(())) => {
+                        let tx = self.event_tx.clone();
+                        let progress = self.progress.clone();
+                        let _ = self.rt.spawn(async move {
+                            let _ = tx.send(TaskEvent::Finished(progress)).await;
+                        });
+                    }
+                    Some(Err(e)) => {
+                        let tx = self.event_tx.clone();
+                        let _ = self.rt.spawn(async move {
+                            let _ = tx.send(TaskEvent::Failed(e)).await;
+                        });
+                    }
+                    None => unreachable!(),
                 }
-                Some(Err(e)) => {
-                    let tx = self.event_tx.clone();
-                    self.rt.spawn(async move {
-                        tx.send(TaskEvent::Failed(e)).await;
-                    });
-                }
-                None => unreachable!(),
-            },
+            }
             State::Initializing { .. } => {
+                log::trace!("on_transition: enter initializing state");
                 let tx = self.event_tx.clone();
-                self.rt.spawn(async move {
-                    tx.send(TaskEvent::Initializing).await;
+                let _ = self.rt.spawn(async move {
+                    let _ = tx.send(TaskEvent::Initializing).await;
                 });
             }
             State::Downloading { .. } => {
+                log::trace!("on_transition: enter downloading state");
                 let tx = self.event_tx.clone();
                 let progress = self.progress.clone();
-                self.rt.spawn(async move {
-                    tx.send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                        progress, 0.0,
-                    )))
-                    .await;
+                let _ = self.rt.spawn(async move {
+                    let _ = tx
+                        .send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                            progress, 0.0,
+                        )))
+                        .await;
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        adapter::{BoltLoadAdapter, tests::SimpleTestAdapter},
+        runtime::ThreadedRuntimeImpl,
+        task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
+    };
+    use futures::StreamExt;
+    use pretty_assertions::assert_eq;
+    use smol_cancellation_token::CancellationToken;
+    use std::sync::Arc;
+    use test_log::test;
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_success() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let range = 1000u64..3000u64;
+        let runner_id = 1;
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+
+        let result = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            range.clone(),
+            adapter.clone(),
+            control_rx,
+            runner_id,
+            cancel_token,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (msg_rx, _handle) = result.unwrap();
+
+        // 验证能收到 Started 消息
+        let msg = msg_rx.recv().await.unwrap();
+        match msg {
+            RunnerMessage(id, RunnerMessageKind::Started) => {
+                assert_eq!(id, runner_id);
+            }
+            _ => panic!("Expected Started message, got: {:?}", msg),
+        }
+
+        // 验证能收到下载数据
+        let mut total_downloaded = 0;
+        let mut downloaded_data = Vec::new();
+
+        while let Ok(msg) = msg_rx.recv().await {
+            match msg {
+                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes)) => {
+                    assert_eq!(id, runner_id);
+                    total_downloaded += bytes.len();
+                    downloaded_data.extend_from_slice(&bytes);
+                }
+                RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    assert_eq!(id, runner_id);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // 验证下载的数据量
+        assert_eq!(total_downloaded, (range.end - range.start) as usize);
+        assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
+
+        // 验证数据的确定性 - 创建相同的适配器获取相同范围的数据进行比较
+        let reference_adapter = SimpleTestAdapter::new(10240);
+        let reference_stream =
+            BoltLoadAdapter::range_stream(&reference_adapter, range.start, range.end)
+                .await
+                .unwrap();
+        let mut reference_data = Vec::new();
+        let mut reference_stream = std::pin::pin!(reference_stream);
+        while let Some(chunk_result) = reference_stream.next().await {
+            let chunk = chunk_result.unwrap();
+            reference_data.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(downloaded_data, reference_data);
+    }
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_with_adapter_failure() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1024).with_failure(true))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let range = 0u64..500u64;
+        let runner_id = 2;
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+
+        let result = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            range,
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (msg_rx, _handle) = result.unwrap();
+
+        // 应该收到失败消息
+        let msg = msg_rx.recv().await.unwrap();
+        match msg {
+            RunnerMessage(
+                id,
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_))),
+            ) => {
+                assert_eq!(id, runner_id);
+            }
+            _ => panic!("Expected StreamError failure message, got: {:?}", msg),
+        }
+    }
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_with_cancellation() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let range = 0u64..5000u64;
+        let runner_id = 3;
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+
+        let result = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            range,
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token.clone(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (msg_rx, _handle) = result.unwrap();
+
+        // 等待开始消息
+        let msg = msg_rx.recv().await.unwrap();
+        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+
+        // 取消任务
+        cancel_token.cancel();
+
+        // 等待取消消息
+        while let Ok(msg) = msg_rx.recv().await {
+            if let RunnerMessage(
+                id,
+                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Cancelled)),
+            ) = msg
+            {
+                assert_eq!(id, runner_id);
+                break;
+            }
+        }
+    }
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_with_control_messages() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let range = 0u64..2000u64;
+        let runner_id = 4;
+        let (control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+
+        let result = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            range.clone(),
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (msg_rx, _handle) = result.unwrap();
+
+        // 等待开始消息
+        let msg = msg_rx.recv().await.unwrap();
+        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+
+        // 发送调整总大小的控制消息
+        let new_total = 1000u64;
+        control_tx
+            .send(ManagerMessage(
+                runner_id,
+                ManagerMessagesVariant::ResizeTotal(new_total),
+            ))
+            .await
+            .unwrap();
+
+        // 收集下载数据
+        let mut total_downloaded = 0;
+        while let Ok(msg) = msg_rx.recv().await {
+            match msg {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                    total_downloaded += bytes.len();
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // 验证下载量应该是调整后的大小
+        assert_eq!(total_downloaded, new_total as usize);
+    }
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_edge_ranges() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let content_size = 1000;
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(content_size))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+
+        // 测试边界范围：从文件末尾开始
+        let range = 900u64..1000u64;
+        let runner_id = 5;
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+
+        let result = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            range.clone(),
+            adapter.clone(),
+            control_rx,
+            runner_id,
+            cancel_token,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (msg_rx, _handle) = result.unwrap();
+
+        // 等待开始
+        let msg = msg_rx.recv().await.unwrap();
+        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+
+        // 收集所有数据
+        let mut downloaded_data = Vec::new();
+        while let Ok(msg) = msg_rx.recv().await {
+            match msg {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                    downloaded_data.extend_from_slice(&bytes);
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
+    }
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_zero_length_range() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1000))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+
+        // 测试零长度范围
+        let range = 500u64..500u64;
+        let runner_id = 6;
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+
+        let result = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            range,
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (msg_rx, _handle) = result.unwrap();
+
+        // 等待开始
+        let msg = msg_rx.recv().await.unwrap();
+        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+
+        // 应该立即完成，没有下载任何数据
+        let msg = msg_rx.recv().await.unwrap();
+        match msg {
+            RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                assert_eq!(id, runner_id);
+            }
+            _ => panic!(
+                "Expected immediate finish for zero-length range, got: {msg:?}"
+            ),
+        }
+    }
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_multiple_runners() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(4000))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+
+        // 创建多个并发的范围运行器
+        let ranges = vec![
+            (1, 0u64..1000u64),
+            (2, 1000u64..2000u64),
+            (3, 2000u64..3000u64),
+            (4, 3000u64..4000u64),
+        ];
+
+        let mut handles = Vec::new();
+
+        for (runner_id, range) in ranges {
+            let rt_clone = rt.clone();
+            let adapter_clone = adapter.clone();
+            let (_control_tx, control_rx) = async_channel::unbounded();
+            let cancel_token = CancellationToken::new();
+
+            let handle = tokio::spawn(async move {
+                let result = ConcurrentTaskInner::create_background_range_runner(
+                    &rt_clone,
+                    range.clone(),
+                    adapter_clone,
+                    control_rx,
+                    runner_id,
+                    cancel_token,
+                )
+                .await
+                .unwrap();
+
+                let (msg_rx, _handle) = result;
+
+                // 等待开始
+                let msg = msg_rx.recv().await.unwrap();
+                assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+
+                // 收集所有数据
+                let mut downloaded_size = 0;
+                while let Ok(msg) = msg_rx.recv().await {
+                    match msg {
+                        RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                            downloaded_size += bytes.len();
+                        }
+                        RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                            assert_eq!(id, runner_id);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                (runner_id, downloaded_size, range.end - range.start)
+            });
+
+            handles.push(handle);
+        }
+
+        // 等待所有任务完成
+        let results = futures::future::join_all(handles).await;
+
+        for result in results {
+            let (runner_id, downloaded_size, expected_size) = result.unwrap();
+            println!(
+                "Runner {runner_id}: downloaded {downloaded_size} bytes, expected {expected_size} bytes"
+            );
+            assert_eq!(downloaded_size, expected_size as usize);
+        }
+    }
+
+    #[test(tokio::test(flavor = "multi_thread"))]
+    async fn test_create_background_range_runner_hash_verification() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(5000))
+            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let range = 1500u64..3500u64;
+        let runner_id = 7;
+        let (_control_tx, control_rx) = async_channel::unbounded();
+        let cancel_token = CancellationToken::new();
+
+        let result = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            range.clone(),
+            adapter.clone(),
+            control_rx,
+            runner_id,
+            cancel_token,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (msg_rx, _handle) = result.unwrap();
+
+        // 等待开始消息
+        let msg = msg_rx.recv().await.unwrap();
+        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+
+        // 收集所有下载的数据
+        let mut downloaded_data = Vec::new();
+        while let Ok(msg) = msg_rx.recv().await {
+            match msg {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                    downloaded_data.extend_from_slice(&bytes);
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // 使用相同的适配器直接获取相同范围的数据进行比较
+        let reference_adapter = SimpleTestAdapter::new(5000);
+        let reference_stream =
+            BoltLoadAdapter::range_stream(&reference_adapter, range.start, range.end)
+                .await
+                .unwrap();
+        let mut reference_data = Vec::new();
+        let mut reference_stream = std::pin::pin!(reference_stream);
+        while let Some(chunk_result) = reference_stream.next().await {
+            let chunk = chunk_result.unwrap();
+            reference_data.extend_from_slice(&chunk);
+        }
+
+        // 验证数据完整性
+        assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
+        assert_eq!(downloaded_data, reference_data);
+
+        // 计算并比较 hash
+        use crate::adapter::tests::calculate_sha256;
+        let downloaded_hash = calculate_sha256(&downloaded_data);
+        let reference_hash = calculate_sha256(&reference_data);
+        assert_eq!(downloaded_hash, reference_hash);
     }
 }

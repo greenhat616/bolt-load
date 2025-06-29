@@ -222,7 +222,7 @@ mod tests {
         }
     }
 
-    #[test(tokio::test)]
+    #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_concurrent_basic_functionality() {
         let content = create_test_content(4096);
         let adapter = Arc::new(
@@ -279,7 +279,7 @@ mod tests {
         }
     }
 
-    #[test(tokio::test)]
+    #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_task_cancellation() {
         let content = create_test_content(10240); // Larger file
         let adapter =
@@ -318,7 +318,7 @@ mod tests {
         }
     }
 
-    #[test(tokio::test)]
+    #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_adapter_failure_handling() {
         let adapter =
             Arc::new(Box::new(TestAdapter::new(vec![]).with_failure())
@@ -350,7 +350,7 @@ mod tests {
         println!("✓ Adapter failure handling test passed");
     }
 
-    #[test(tokio::test)]
+    #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_task_modes_comparison() {
         let content = create_test_content(1024);
 

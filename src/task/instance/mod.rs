@@ -39,6 +39,31 @@ impl ProgressWithSpeed {
     pub fn new(progress: Progress, speed: f64) -> Self {
         Self { progress, speed }
     }
+
+    /// Get the progress
+    pub fn progress(&self) -> &Progress {
+        &self.progress
+    }
+
+    /// Get the speed in bytes per second
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
+    /// Get the total size
+    pub fn total(&self) -> Option<u64> {
+        self.progress.total
+    }
+
+    /// Get the downloaded size
+    pub fn downloaded(&self) -> u64 {
+        self.progress.downloaded
+    }
+
+    /// Get the downloaded chunks
+    pub fn downloaded_chunks(&self) -> &[std::ops::Range<u64>] {
+        &self.progress.downloaded_chunks
+    }
 }
 
 /// The event of the task

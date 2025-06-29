@@ -118,6 +118,7 @@ impl ChunkPlanner {
     /// get the available chunks ranges
     pub fn get_available_ranges(&self) -> Vec<Range<u64>> {
         let chunks = Ranges::from_iter(self.chunks.keys().cloned());
+        log::trace!("[TASK] occupied chunks: {chunks:?}");
         let full_range = Ranges::from(GenericRange::from(0..self.total));
         let available_ranges = full_range - chunks;
         let mut ranges: Vec<_> = available_ranges
