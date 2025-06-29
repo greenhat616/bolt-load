@@ -120,12 +120,41 @@ async fn test_task_builder_validation_errors() {
         Err(TaskManagerBuildError::FieldValidationFailed(_))
     ));
 
-    // Test invalid save path (directory without filename)
+    // Test invalid save path (parent directory does not exist)
     let result = TaskBuilder::default()
-        .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
+        .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
+        .save_path(temp_dir.path().join("nonexistent/test.bin"))
+        .cancel_token(CancellationToken::new())
+        .runtime(runtime.clone())
+        .build()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(TaskManagerBuildError::FieldValidationFailed(_))
+    ));
+
+    // Test invalid save path (parent directory is not a directory)
+    let parent = temp_dir.path().join("nonexistent");
+    std::fs::write(&parent, b"not a directory").unwrap();
+    let result = TaskBuilder::default()
+        .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
+        .save_path(parent.join("test.bin"))
+        .cancel_token(CancellationToken::new())
+        .runtime(runtime.clone())
+        .build()
+        .await;
+    assert!(matches!(
+        result,
+        Err(TaskManagerBuildError::FieldValidationFailed(_))
+    ));
+
+    // Test invalid save path (write a directory)
+    let result = TaskBuilder::default()
+        .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(temp_dir.path().to_path_buf())
         .cancel_token(CancellationToken::new())
-        .runtime(runtime)
+        .runtime(runtime.clone())
         .build()
         .await;
 

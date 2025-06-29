@@ -195,6 +195,29 @@ impl TaskBuilder {
 
         // prepare the file handle
         let save_path = self.save_path.unwrap();
+
+        // Check if the parent directory exists
+        let parent_dir = save_path
+            .parent()
+            .ok_or(TaskManagerBuildError::FieldValidationFailed(
+                "save path parent directory does not exist".to_string(),
+            ))?;
+
+        let meta = async_fs::metadata(parent_dir).await.ok();
+        if meta.is_none_or(|m| !m.is_dir()) {
+            return Err(TaskManagerBuildError::FieldValidationFailed(
+                "save path parent directory does not exist or is not a directory".to_string(),
+            ));
+        }
+
+        // Check if the file exists and is a directory
+        let meta = async_fs::metadata(&save_path).await;
+        if meta.is_ok_and(|m| m.is_dir()) {
+            return Err(TaskManagerBuildError::FieldValidationFailed(
+                "save path already exists as a directory".to_string(),
+            ));
+        }
+
         let mut temp_path = save_path.clone();
         if let Some(filename) = temp_path.file_name() {
             let mut file_name = filename.to_os_string();
