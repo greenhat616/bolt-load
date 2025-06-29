@@ -226,9 +226,8 @@ impl Task {
                             log::trace!("[TASK] TaskEvent::Initializing");
                             task_state.store(TaskState::Initializing, Ordering::Release);
                         }
-                        TaskEvent::Downloading(progress) => {
-                            #[cfg(test)]
-                            log::trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
+                        TaskEvent::Downloading(_) => {
+                            // log::trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
                             task_state.store(TaskState::Downloading, Ordering::Release);
                         }
                         TaskEvent::Failed(error) => {

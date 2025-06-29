@@ -1,5 +1,4 @@
 pub mod http;
-#[cfg(feature = "blocking")]
 pub mod reader;
 
 /// A guard that ensures the task is shutdown

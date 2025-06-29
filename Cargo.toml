@@ -13,11 +13,10 @@ http = [
     "dep:percent-encoding",
     "dep:http",
 ]
-blocking = ["dep:blocking"]
 # adapter group
 reqwest = ["dep:reqwest", "http"]
-ureq2 = ["dep:ureq2", "blocking", "http"]
-ureq3 = ["dep:ureq3", "blocking", "http"]
+ureq2 = ["dep:ureq2", "http"]
+ureq3 = ["dep:ureq3", "http"]
 serde = ["dep:serde"]
 
 # runtime group
@@ -53,8 +52,8 @@ ranges = "0.4"                                         # for range set operation
 async-channel = "2"                                    # for async channel
 async-broadcast = { version = "0.7", optional = true }
 async-fs = "2"                                         # for async file operation
-async-io = "2" #                                       # for async timer
-blocking = { version = "1", optional = true }          # convert blocking io to async
+async-io = "2"                                         # for async timer
+blocking = "1"                                         # convert blocking io to async
 
 serde = { version = "1", features = ["derive"], optional = true }
 

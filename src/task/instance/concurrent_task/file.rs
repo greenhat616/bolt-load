@@ -11,6 +11,7 @@ use std::{
 };
 
 use async_channel::Sender;
+use blocking::unblock;
 use bytes::Bytes;
 use memmap2::MmapMut;
 
@@ -36,7 +37,10 @@ impl Payload {
     }
 }
 
-pub struct FileWriterGuard(pub std::thread::JoinHandle<()>, pub FileWriterControl);
+pub struct FileWriterGuard(
+    pub blocking::Task<std::io::Result<()>>,
+    pub FileWriterControl,
+);
 
 #[derive(Debug, Clone)]
 pub struct FileWriterControl {
@@ -110,7 +114,7 @@ impl FileWriter {
         let total = self.total;
         let mode = self.mode;
         log::trace!("start file writer: {:?}", self.path);
-        let handle = std::thread::spawn(move || {
+        let handle: blocking::Task<std::io::Result<()>> = unblock(move || {
             let file_size = std::fs::metadata(&self.path)
                 .map(|meta| meta.len())
                 .unwrap_or(0);
@@ -125,14 +129,14 @@ impl FileWriter {
                     log::error!("failed to open file: {e:?}");
 
                     let _ = ready_tx.send(Err(e));
-                    return;
+                    return Ok(());
                 }
             };
             if file_size != total {
                 if let Err(e) = file.set_len(total) {
                     log::error!("failed to set file length: {e:?}");
                     let _ = ready_tx.send(Err(e));
-                    return;
+                    return Ok(());
                 }
             }
 
@@ -146,25 +150,28 @@ impl FileWriter {
                         Err(e) => {
                             log::error!("failed to map file: {e:?}");
                             let _ = ready_tx.send(Err(e));
-                            return;
+                            return Ok(());
                         }
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
                     mmap[range.start as usize..range.end as usize].copy_from_slice(&data);
-                    let _ = tx.send(mmap.flush_async_range(
+                    let _ = tx.send(mmap.flush_range(
                         range.start as usize,
                         range.end as usize - range.start as usize,
                     ));
                 }
+                mmap.flush()?;
             } else {
                 log::trace!("use seek write mode");
                 let _ = ready_tx.send(Ok(()));
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
                     let _ = tx.send(Self::handle_seek_write(&mut file, range, data));
                 }
+                file.flush()?;
             }
+            Ok(())
         });
         let control = FileWriterControl::new(tx);
         ready_rx
@@ -196,7 +203,7 @@ mod tests {
             .unwrap();
 
         drop(guard);
-        handle.join().unwrap();
+        handle.await.unwrap();
 
         let file = OpenOptions::new().read(true).open(&file_path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
@@ -221,7 +228,7 @@ mod tests {
             .unwrap();
 
         drop(guard);
-        handle.join().unwrap();
+        handle.await.unwrap();
 
         let file = OpenOptions::new().read(true).open(&file_path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };

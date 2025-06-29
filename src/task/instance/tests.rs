@@ -192,7 +192,7 @@ async fn test_singleton_task_basic_download() {
     assert_eq!(downloaded_content, content);
 }
 
-#[test(tokio::test)]
+#[test(tokio::test(flavor = "multi_thread"))]
 async fn test_concurrent_task_basic_download() {
     let rt = create_test_runtime();
     let content = create_test_content(10000);

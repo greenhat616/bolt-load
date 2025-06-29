@@ -292,7 +292,6 @@ pub mod tests {
             );
             let stream = async_stream::stream! {
                 for chunk in content.chunks(chunk_size) {
-                    tokio::time::sleep(Duration::from_micros(10)).await;
                     yield Ok(Bytes::from(chunk.to_vec()));
                 }
             };
@@ -321,7 +320,6 @@ pub mod tests {
 
             let stream = async_stream::stream! {
                 for chunk in content.chunks(chunk_size) {
-                    tokio::time::sleep(Duration::from_micros(10)).await;
                     yield Ok(Bytes::from(chunk.to_vec()));
                 }
             };

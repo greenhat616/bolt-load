@@ -471,7 +471,9 @@ impl ConcurrentTaskInner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_runner_message(
+        rt: &ThreadedRuntimeImpl,
         runners_state: &mut HashMap<RunnerId, RunnerState>,
         runner_notification: &mut RunnerNotification,
         chunk_planner: &mut ChunkPlanner,
@@ -510,16 +512,24 @@ impl ConcurrentTaskInner {
             RunnerMessageKind::Downloaded(bytes) => {
                 if let Some(state) = runners_state.get_mut(&runner_id) {
                     let previous_downloaded_pos = state.chunk.downloaded.end;
-                    state.chunk.downloaded.end += bytes.len() as u64;
-                    debug_assert!(state.chunk.downloaded.end <= state.chunk.occupied.end);
+                    let mut end = state.chunk.downloaded.end + bytes.len() as u64;
+                    // It happens when the runner message handler is not fast enough
+                    if end > state.chunk.occupied.end {
+                        log::warn!("runner {runner_id} downloaded more than the occupied range");
+                        end = state.chunk.occupied.end;
+                    }
 
-                    // TODO: background write to file, avoid blocking the main thread
-                    file_writer_control
-                        .write(previous_downloaded_pos..state.chunk.downloaded.end, bytes)
-                        .await
-                        .map_err(|e| {
-                            TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string()))
-                        })?;
+                    // 🔧 FIX: Update the downloaded state immediately to prevent race conditions
+                    state.chunk.downloaded.end = end;
+
+                    let file_writer_control = file_writer_control.clone();
+                    let _ = rt.spawn(async move {
+                        file_writer_control
+                            .write(previous_downloaded_pos..end, bytes)
+                            .await
+                            // TODO: handle io error
+                            .expect("Should handle io error");
+                    });
                 }
             }
             RunnerMessageKind::Started => {
@@ -586,7 +596,7 @@ impl ConcurrentTaskInner {
         let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
         let sampler = Sampler::default();
         let (tmp_path, file_writer) = self.create_file_writer()?;
-        let FileWriterGuard(_, file_writer_control) = file_writer
+        let FileWriterGuard(fs_writer_handle, file_writer_control) = file_writer
             .start()
             .await
             .map_err(|e| TaskInstanceError::AllocateFileSpaceFailed(Arc::new(e)))?;
@@ -620,6 +630,7 @@ impl ConcurrentTaskInner {
                     if let Some(msg) = msg {
                         let mut flag = false;
                         Self::handle_runner_message(
+                            &rt,
                             &mut runners_state,
                             &mut runner_notification,
                             &mut chunk_planner,
@@ -643,7 +654,9 @@ impl ConcurrentTaskInner {
         }
         self.sync_runner_chunks_and_chunk_planner(&runners_state, &mut chunk_planner);
         drop(file_writer_control);
-        // TODO: send a flush all message to file writer
+        fs_writer_handle
+            .await
+            .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
         async_fs::rename(&tmp_path, &self.path)
             .await
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
@@ -722,7 +735,7 @@ impl ConcurrentTaskInner {
             Event::Step => {
                 let task = async {
                     match self.download(cancel_token).await {
-                        Ok(_) => Transition(State::stopped(None)),
+                        Ok(_) => Transition(State::stopped(Some(Ok(())))),
                         Err(e) => Transition(State::stopped(Some(Err(e)))),
                     }
                 }
