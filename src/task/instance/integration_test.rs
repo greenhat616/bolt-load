@@ -12,104 +12,10 @@
 //! 5. Comparison between different modes
 
 #[cfg(test)]
-mod test_utils {
-    use crate::adapter::{
-        AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError,
-    };
-    use async_stream::stream;
-    use bytes::Bytes;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    /// Simple test adapter
-    pub struct TestAdapter {
-        pub content: Vec<u8>,
-        pub should_fail: bool,
-        pub call_count: Arc<AtomicUsize>,
-    }
-
-    impl TestAdapter {
-        pub fn new(content: Vec<u8>) -> Self {
-            Self {
-                content,
-                should_fail: false,
-                call_count: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        pub fn with_failure(mut self) -> Self {
-            self.should_fail = true;
-            self
-        }
-
-        pub fn get_call_count(&self) -> usize {
-            self.call_count.load(Ordering::Relaxed)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl BoltLoadAdapter for TestAdapter {
-        async fn is_range_stream_available(&self) -> bool {
-            true
-        }
-
-        async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
-            if self.should_fail {
-                return Err(UnretryableError::Internal(
-                    "Test adapter failure".to_string(),
-                ));
-            }
-            Ok(BoltLoadAdapterMeta {
-                content_size: self.content.len() as u64,
-                filename: Some("test_file.txt".to_string()),
-            })
-        }
-
-        async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
-            if self.should_fail {
-                return Err(StreamError::Unretryable(UnretryableError::Internal(
-                    "Stream failure".to_string(),
-                )));
-            }
-
-            let content = self.content.clone();
-            let stream = stream! {
-                for chunk in content.chunks(1024) {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    yield Ok(Bytes::from(chunk.to_vec()));
-                }
-            };
-            Ok(Box::pin(stream))
-        }
-
-        async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
-            let start = start as usize;
-            let end = end as usize;
-            let content = self.content[start..end.min(self.content.len())].to_vec();
-
-            let stream = stream! {
-                for chunk in content.chunks(512) {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    yield Ok(Bytes::from(chunk.to_vec()));
-                }
-            };
-            Ok(Box::pin(stream))
-        }
-    }
-
-    pub fn create_test_content(size: usize) -> Vec<u8> {
-        (0..size).map(|i| (i % 256) as u8).collect()
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_utils::*;
+    use crate::adapter::tests::{SimpleTestAdapter, calculate_sha256};
     use smol_cancellation_token::CancellationToken;
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
     use tempfile::TempDir;
     use test_log::test;
 
@@ -121,6 +27,9 @@ mod tests {
             instance::{TaskEvent, TaskInstance, TaskInstanceImpl},
         },
     };
+
+    const TEST_FILE_SIZE: usize = 4 * 1024 * 1024; // 4MB
+    const CHUNK_SIZE: usize = 8 * 1024; // 8KB
 
     // Use current Tokio runtime handle to avoid creating new runtime
     fn get_test_runtime() -> ThreadedRuntimeImpl {
@@ -162,10 +71,9 @@ mod tests {
 
     #[test(tokio::test)]
     async fn test_singleton_basic_functionality() {
-        let content = create_test_content(2048);
-        let adapter = Arc::new(
-            Box::new(TestAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>
-        );
+        let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
+        let content_hash = simple_adapter.expected_hash().to_string();
+        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("singleton_test.bin");
@@ -176,7 +84,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         // Start download task
-        task.run(adapter, file_path.clone(), event_tx, cancel_token)
+        task.run(adapter.clone(), file_path.clone(), event_tx, cancel_token)
             .unwrap();
 
         // Collect events
@@ -196,8 +104,8 @@ mod tests {
         let final_event = events.last().unwrap();
         match final_event {
             TaskEvent::Finished(progress) => {
-                assert_eq!(progress.total, Some(content.len() as u64));
-                assert_eq!(progress.downloaded, content.len() as u64);
+                assert_eq!(progress.total, Some(TEST_FILE_SIZE as u64));
+                assert_eq!(progress.downloaded, TEST_FILE_SIZE as u64);
                 println!("✓ Singleton task completed successfully");
             }
             TaskEvent::Failed(err) => {
@@ -214,8 +122,9 @@ mod tests {
         // Verify downloaded file content
         if file_path.exists() {
             let downloaded = std::fs::read(&file_path).unwrap();
+            let downloaded_hash = calculate_sha256(&downloaded);
             assert_eq!(
-                downloaded, content,
+                downloaded_hash, content_hash,
                 "Downloaded file content should match original content"
             );
             println!("✓ File content verification passed");
@@ -224,10 +133,9 @@ mod tests {
 
     #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_concurrent_basic_functionality() {
-        let content = create_test_content(4096);
-        let adapter = Arc::new(
-            Box::new(TestAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>
-        );
+        let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
+        let content_hash = simple_adapter.expected_hash().to_string();
+        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("concurrent_test.bin");
@@ -262,15 +170,16 @@ mod tests {
 
             let final_event = events.last().unwrap();
             if let TaskEvent::Finished(progress) = final_event {
-                assert_eq!(progress.total, Some(content.len() as u64));
-                assert_eq!(progress.downloaded, content.len() as u64);
+                assert_eq!(progress.total, Some(TEST_FILE_SIZE as u64));
+                assert_eq!(progress.downloaded, TEST_FILE_SIZE as u64);
                 println!("✓ Concurrent task completed successfully");
 
                 // Verify downloaded file content
                 if file_path.exists() {
                     let downloaded = std::fs::read(&file_path).unwrap();
+                    let downloaded_hash = calculate_sha256(&downloaded);
                     assert_eq!(
-                        downloaded, content,
+                        downloaded_hash, content_hash,
                         "Downloaded file content should match original content"
                     );
                     println!("✓ File content verification passed");
@@ -281,9 +190,9 @@ mod tests {
 
     #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_task_cancellation() {
-        let content = create_test_content(10240); // Larger file
-        let adapter =
-            Arc::new(Box::new(TestAdapter::new(content)) as Box<dyn BoltLoadAdapter + Send>);
+        let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
+        let content_hash = simple_adapter.expected_hash().to_string();
+        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("cancel_test.bin");
@@ -320,9 +229,10 @@ mod tests {
 
     #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_adapter_failure_handling() {
-        let adapter =
-            Arc::new(Box::new(TestAdapter::new(vec![]).with_failure())
-                as Box<dyn BoltLoadAdapter + Send>);
+        let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE)
+            .with_chunk_size(CHUNK_SIZE)
+            .with_failure(true);
+        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("failure_test.bin");
@@ -352,12 +262,14 @@ mod tests {
 
     #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_task_modes_comparison() {
-        let content = create_test_content(1024);
+        let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE)
+            .with_chunk_size(CHUNK_SIZE)
+            .with_range_support(true);
+        let content_hash = simple_adapter.expected_hash().to_string();
+        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
 
         // Test singleton mode
-        let singleton_adapter = Arc::new(
-            Box::new(TestAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>
-        );
+
         let singleton_temp = TempDir::new().unwrap();
         let singleton_path = singleton_temp.path().join("singleton.bin");
 
@@ -368,7 +280,7 @@ mod tests {
 
         singleton_task
             .run(
-                singleton_adapter,
+                adapter.clone(),
                 singleton_path.clone(),
                 singleton_tx,
                 singleton_token,
@@ -376,9 +288,6 @@ mod tests {
             .unwrap();
 
         // Test concurrent mode
-        let concurrent_adapter = Arc::new(
-            Box::new(TestAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>
-        );
         let concurrent_temp = TempDir::new().unwrap();
         let concurrent_path = concurrent_temp.path().join("concurrent.bin");
 
@@ -389,7 +298,7 @@ mod tests {
 
         concurrent_task
             .run(
-                concurrent_adapter,
+                adapter.clone(),
                 concurrent_path.clone(),
                 concurrent_tx,
                 concurrent_token,
@@ -406,8 +315,8 @@ mod tests {
             tokio::join!(singleton_task.wait(), concurrent_task.wait());
 
         // Verify results
-        println!("Singleton task result: {:?}", singleton_result);
-        println!("Concurrent task result: {:?}", concurrent_result);
+        println!("Singleton task result: {singleton_result:?}");
+        println!("Concurrent task result: {concurrent_result:?}");
 
         // Check singleton task
         let singleton_success = singleton_result.is_ok()
@@ -432,12 +341,14 @@ mod tests {
             if singleton_path.exists() && concurrent_path.exists() {
                 let singleton_content = std::fs::read(&singleton_path).unwrap();
                 let concurrent_content = std::fs::read(&concurrent_path).unwrap();
+                let singleton_hash = calculate_sha256(&singleton_content);
+                let concurrent_hash = calculate_sha256(&concurrent_content);
                 assert_eq!(
-                    singleton_content, concurrent_content,
+                    singleton_hash, concurrent_hash,
                     "Download results from both modes should be identical"
                 );
                 assert_eq!(
-                    singleton_content, content,
+                    singleton_hash, content_hash,
                     "Downloaded content should match original content"
                 );
                 println!("✓ File content comparison test passed");

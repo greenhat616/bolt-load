@@ -226,6 +226,12 @@ pub mod tests {
             self
         }
 
+        /// Configure chunk size
+        pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+            self.chunk_size = chunk_size;
+            self
+        }
+
         /// Get expected hash for verification
         pub fn expected_hash(&self) -> &str {
             &self.expected_hash
