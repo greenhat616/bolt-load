@@ -634,13 +634,13 @@ async fn test_zero_size_file_handling() {
 
 #[test(tokio::test(flavor = "multi_thread"))]
 async fn test_concurrent_vs_singleton_performance() {
-    let file_size = 1024 * 1024; // 1MB for reasonable test time
+    let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 
     // Test concurrent mode
     let runtime1 = create_test_runtime();
     let adapter1 = SimpleTestAdapter::new(file_size).with_range_support(true);
-    let expected_hash = adapter1.expected_hash().to_string();
+    let concurrent_expected_hash = adapter1.expected_hash().to_string();
     let concurrent_path = temp_dir.path().join("concurrent.bin");
 
     let mut concurrent_task = TaskBuilder::default()
@@ -656,6 +656,7 @@ async fn test_concurrent_vs_singleton_performance() {
     // Test singleton mode
     let runtime2 = create_test_runtime();
     let adapter2 = SimpleTestAdapter::new(file_size).with_range_support(false);
+    let singleton_expected_hash = adapter2.expected_hash().to_string();
     let singleton_path = temp_dir.path().join("singleton.bin");
 
     let mut singleton_task = TaskBuilder::default()
@@ -676,10 +677,23 @@ async fn test_concurrent_vs_singleton_performance() {
     concurrent_task.run().await.unwrap();
     singleton_task.run().await.unwrap();
 
-    let (concurrent_result, singleton_result) =
-        tokio::join!(concurrent_task.wait(), singleton_task.wait());
+    let ((concurrent_result, concurrent_duration), (singleton_result, singleton_duration)) = tokio::join!(
+        async {
+            let result = concurrent_task.wait().await;
+            eprintln!("Concurrent task finished");
+            (result, start_time.elapsed())
+        },
+        async {
+            let result = singleton_task.wait().await;
+            eprintln!("Singleton task finished");
+            (result, start_time.elapsed())
+        }
+    );
 
     let total_duration = start_time.elapsed();
+
+    let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
+    let singleton_speed = (file_size as f64 / singleton_duration.as_secs_f64()).round();
 
     // At least singleton should succeed
     assert!(
@@ -690,22 +704,42 @@ async fn test_concurrent_vs_singleton_performance() {
     // Verify singleton file
     let singleton_content = std::fs::read(&singleton_path).unwrap();
     let singleton_hash = calculate_sha256(&singleton_content);
+    let concurrent_content = std::fs::read(&concurrent_path).unwrap();
+    let concurrent_hash = calculate_sha256(&concurrent_content);
     assert_eq!(
-        singleton_hash, expected_hash,
+        singleton_hash, singleton_expected_hash,
         "Singleton file hash should be correct"
+    );
+    assert_eq!(
+        concurrent_hash, concurrent_expected_hash,
+        "Concurrent file hash should be correct"
     );
 
     println!("✓ Performance comparison test completed");
-    println!("  - Concurrent result: {:?}", concurrent_result);
-    println!("  - Singleton result: {:?}", singleton_result);
-    println!("  - Total test duration: {:?}", total_duration);
+    println!(
+        "
+    - Concurrent result: {concurrent_result:?}
+        - Measured Speed: {concurrent_speed} MB/s
+        - Duration: {concurrent_duration:?}
+        - Hash: {concurrent_hash}
+        - File size: {file_size} bytes"
+    );
+    println!(
+        "
+    - Singleton result: {singleton_result:?}
+        - Measured Speed: {singleton_speed} MB/s
+        - Duration: {singleton_duration:?}
+        - Hash: {singleton_hash}
+        - File size: {file_size} bytes"
+    );
+    println!("  - Total test duration: {total_duration:?}");
 
     // If concurrent also succeeded, verify its file
     if concurrent_result.is_ok() && concurrent_path.exists() {
         let concurrent_content = std::fs::read(&concurrent_path).unwrap();
         let concurrent_hash = calculate_sha256(&concurrent_content);
         assert_eq!(
-            concurrent_hash, expected_hash,
+            concurrent_hash, concurrent_expected_hash,
             "Concurrent file hash should be correct"
         );
         println!("  - Both modes completed successfully with matching hashes");

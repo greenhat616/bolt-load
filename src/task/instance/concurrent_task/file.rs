@@ -157,10 +157,7 @@ impl FileWriter {
                 let _ = ready_tx.send(Ok(()));
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
                     mmap[range.start as usize..range.end as usize].copy_from_slice(&data);
-                    let _ = tx.send(mmap.flush_range(
-                        range.start as usize,
-                        range.end as usize - range.start as usize,
-                    ));
+                    let _ = tx.send(Ok(()));
                 }
                 mmap.flush()?;
             } else {
