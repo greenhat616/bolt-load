@@ -215,10 +215,10 @@ impl TaskRunner {
                                 ManagerMessagesVariant::LimitTotal(new_total) => {
                                     if let Some(current_total) = self.total {
                                         if current_total >  new_total{
-                                            log::trace!("runner: limit total to {new_total}");
+                                            tracing::trace!("runner: limit total to {new_total}");
                                             self.total = Some(new_total);
                                         } else {
-                                            log::warn!(
+                                            tracing::warn!(
                                                 "runner: limit total is smaller than current total,
                                                 limit: {new_total}, current: {current_total}"
                                             );
@@ -283,7 +283,7 @@ impl TaskRunner {
                      downloaded: {}",
                     total, self.downloaded
                 );
-                log::warn!("{msg}");
+                tracing::warn!("{msg}");
                 return Err(TaskFailedKind::Other(msg).into());
             }
             None if self.downloaded > 0 => {}
@@ -312,10 +312,9 @@ mod tests {
     use oneshot;
     use pretty_assertions::assert_eq;
     use std::{sync::Arc, time::Duration};
-    use test_log::test;
     use tokio::time::sleep;
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_normal_download() {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let token = CancellationToken::new();
@@ -346,7 +345,7 @@ mod tests {
         let mut finished = false;
 
         while let Ok(msg) = msg_rx.recv().await {
-            log::debug!("msg: {msg:?}");
+            tracing::debug!("msg: {msg:?}");
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
@@ -368,7 +367,7 @@ mod tests {
         assert_eq!(downloaded_size, 30);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_cancel_download() {
         let (control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -423,7 +422,7 @@ mod tests {
         assert!(cancelled);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_network_error() {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -463,7 +462,7 @@ mod tests {
         assert!(got_error);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_empty_stream() {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -486,7 +485,7 @@ mod tests {
 
         let mut got_empty_error = false;
         while let Ok(msg) = msg_rx.recv().await {
-            log::error!("msg: {msg:?}");
+            tracing::error!("msg: {msg:?}");
             if let RunnerMessage(
                 _,
                 RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Empty)),
@@ -501,7 +500,7 @@ mod tests {
         assert!(got_empty_error);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_resize_total() {
         let (control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -565,7 +564,7 @@ mod tests {
         assert!(finished);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_resize_total_smaller() {
         let (control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -631,7 +630,7 @@ mod tests {
         assert_eq!(total_downloaded, 25);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_size_mismatch() {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -681,7 +680,7 @@ mod tests {
         assert_eq!(total_downloaded, 10);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_channel_closed() {
         let (control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -730,7 +729,7 @@ mod tests {
         assert!(got_channel_closed);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_new_with_async_and_callback_success() {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
@@ -804,7 +803,7 @@ mod tests {
         assert_eq!(total_downloaded, 20);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_new_with_async_and_callback_stream_failure() {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();

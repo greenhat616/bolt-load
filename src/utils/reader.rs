@@ -44,9 +44,8 @@ mod tests {
     use super::*;
     use futures::{StreamExt, TryStreamExt};
     use std::io::Cursor;
-    use test_log::test;
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_cross_runtime_stream() {
         let data = vec![1, 2, 3, 4, 5];
         let reader = Box::new(Cursor::new(data.clone()));
@@ -61,7 +60,7 @@ mod tests {
         assert_eq!(result.unwrap(), data);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_empty_reader() {
         let reader = Box::new(Cursor::new(vec![]));
         let mut stream = CrossRuntimeStream::new(reader, 1024);
@@ -69,7 +68,7 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_large_data() {
         let data = vec![42; 100_000];
         let reader = Box::new(Cursor::new(data.clone()));

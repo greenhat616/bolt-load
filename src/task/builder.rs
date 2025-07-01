@@ -78,7 +78,7 @@ impl TaskBuilder {
                 if let Some(ref save_dir) = self.save_dir {
                     self.save_path = Some(save_dir.join(filename));
                 } else {
-                    log::warn!(
+                    tracing::warn!(
                         "save dir is not set, the retrieved filename will not be automatically \
                          set."
                     );

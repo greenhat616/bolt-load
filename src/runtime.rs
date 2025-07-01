@@ -67,11 +67,12 @@ pub struct SmolJoinHandle<T> {
 #[cfg(feature = "smol")]
 impl SmolThreadedRuntime {
     pub fn build_with_threads(threads: usize) -> Self {
+        crate::utils::logger::init_tracing();
         use std::sync::Arc;
         let executor = Arc::new(smol::Executor::new());
         let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
         for i in 0..threads {
-            log::debug!("spawn thread {} for smol runtime executor", i);
+            tracing::debug!("spawn thread {} for smol runtime executor", i);
             let executor = executor.clone();
             let mut shutdown_signal = shutdown_rx.clone();
             std::thread::spawn(move || {
@@ -343,13 +344,14 @@ mod tests {
     #[test]
     #[cfg(feature = "smol")]
     fn test_smol_runtime() {
+        crate::utils::logger::init_tracing();
         let rt = SmolThreadedRuntime::build_with_threads(5);
         let (tx, rx) = oneshot::channel();
         // test detach
         let handle = rt.spawn(async move {
-            log::info!("start async");
+            tracing::info!("start async");
             smol::Timer::after(Duration::from_millis(10)).await;
-            log::info!("finished async");
+            tracing::info!("finished async");
             tx.send(200).unwrap();
         });
         assert!(!handle.is_finished());
@@ -358,9 +360,9 @@ mod tests {
 
         // test join
         let handle = rt.spawn(async move {
-            log::info!("start async");
+            tracing::info!("start async");
             smol::Timer::after(Duration::from_millis(10)).await;
-            log::info!("finished async");
+            tracing::info!("finished async");
             200
         });
         assert!(!handle.is_finished());
@@ -370,9 +372,9 @@ mod tests {
 
         // test abort
         let handle = rt.spawn(async move {
-            log::info!("start async");
+            tracing::info!("start async");
             smol::Timer::after(Duration::from_millis(100)).await;
-            log::info!("finished async");
+            tracing::info!("finished async");
             200
         });
         assert!(!handle.is_finished());

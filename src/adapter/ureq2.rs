@@ -233,10 +233,9 @@ mod test {
     use super::*;
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
-    use test_log::test;
     use url::Url;
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_get_content_size() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
@@ -249,7 +248,7 @@ mod test {
         assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_suggest_filename() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
@@ -261,7 +260,7 @@ mod test {
         );
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_is_range_stream_available() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
@@ -280,7 +279,7 @@ mod test {
         );
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_full_stream() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
@@ -294,7 +293,7 @@ mod test {
         assert_eq!(bytes.len(), 1040384);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_range_stream() {
         let (port, _) = super::super::tests::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();

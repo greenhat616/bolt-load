@@ -5,7 +5,7 @@ version = "0.1.0"
 rust-version = "1.85.0" # the first version that supports 2024 edition
 
 [features]
-default = ["reqwest", "tokio", "serde"]
+default = ["reqwest", "tokio", "serde", "tracing"]
 http = [
     "dep:headers",
     "dep:regex",
@@ -24,12 +24,12 @@ tokio = ["dep:tokio"]
 smol = ["dep:smol", "dep:async-broadcast"]
 async-std = ["dep:async-std"]
 
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
 [lib]
 name = "bolt_load"
 path = "src/lib.rs"
 
 [dependencies]
-log = "0.4"
 thiserror = "2"
 async-trait = "0.1"
 futures = { version = "0.3" } 
@@ -75,12 +75,15 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
 async-std = { version = "1", optional = true }
 smol = { version = "2", optional = true }
 
+# tracing
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
 [dev-dependencies]
 pretty_assertions = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1"
-test-log = "0.2"
 
 # for stream test
 async-stream = "0.3"
@@ -96,3 +99,4 @@ axum = "0.8.1"
 axum-extra = { version = "0.10", features = ["typed-header"] }
 axum-range = "0.5"
 portpicker = "0.1"
+tracing-tracy = "0.11"

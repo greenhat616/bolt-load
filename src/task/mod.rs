@@ -3,6 +3,7 @@ use async_channel::Sender;
 use futures::{future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use std::{
+    fmt::Debug,
     ops::Range,
     path::PathBuf,
     sync::{Arc, Mutex, atomic::Ordering},
@@ -132,7 +133,7 @@ impl TaskStateControl {
 }
 
 // #[derive(Clone)]
-// #[derive(Clone)]
+// #[derive(Debug)]
 #[non_exhaustive]
 pub struct Task {
     /// the async runtime passed from the client
@@ -196,7 +197,7 @@ impl Task {
             }
         }
         let current_state = self.task_state.load(Ordering::Acquire);
-        log::trace!("[TASK] Task::wait, current_state: {current_state:?}");
+        tracing::trace!("[TASK] Task::wait, current_state: {current_state:?}");
         if matches!(current_state, TaskState::Failed) {
             let error = self.last_error.lock().unwrap().clone().unwrap();
             return Err(error);
@@ -204,6 +205,7 @@ impl Task {
         Ok(())
     }
 
+    // #[tracing::instrument]
     pub async fn run(&mut self) -> Result<(), TaskInstanceError> {
         let (event_tx, event_rx) = async_channel::unbounded::<TaskEvent>();
         let cancel_token = self.cancel_token.clone();
@@ -218,21 +220,21 @@ impl Task {
                     match &event {
                         TaskEvent::Finished(_) => {
                             #[cfg(test)]
-                            log::trace!("[TASK] TaskEvent::Finished");
+                            tracing::trace!("[TASK] TaskEvent::Finished");
                             task_state.store(TaskState::Finished, Ordering::Release);
                         }
                         TaskEvent::Initializing => {
                             #[cfg(test)]
-                            log::trace!("[TASK] TaskEvent::Initializing");
+                            tracing::trace!("[TASK] TaskEvent::Initializing");
                             task_state.store(TaskState::Initializing, Ordering::Release);
                         }
                         TaskEvent::Downloading(_) => {
-                            // log::trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
+                            // tracing::trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
                             task_state.store(TaskState::Downloading, Ordering::Release);
                         }
                         TaskEvent::Failed(error) => {
                             #[cfg(test)]
-                            log::trace!("[TASK] TaskEvent::Failed");
+                            tracing::trace!("[TASK] TaskEvent::Failed");
                             task_state.store(TaskState::Failed, Ordering::Release);
                             last_error.lock().unwrap().replace(error.clone());
                         }
@@ -243,17 +245,17 @@ impl Task {
                 }
             })
             .map_err(|e| {
-                log::error!("failed to spawn the task: {e:?}");
+                tracing::error!("failed to spawn the task: {e:?}");
                 TaskInstanceError::new_failed(crate::runner::TaskFailedKind::Other(
                     "failed to spawn the task".to_string(),
                 ))
             })?;
         self.event_handler_handle = Some(handle);
 
-        log::trace!("[TASK] Calling TaskInstance::run(), mode: {:?}", self.mode);
+        tracing::trace!("[TASK] Calling TaskInstance::run(), mode: {:?}", self.mode);
         match &self.task {
-            TaskInstanceImpl::Singleton(_) => log::trace!("[TASK] Using SingletonTask"),
-            TaskInstanceImpl::Concurrent(_) => log::trace!("[TASK] Using ConcurrentTask"),
+            TaskInstanceImpl::Singleton(_) => tracing::trace!("[TASK] Using SingletonTask"),
+            TaskInstanceImpl::Concurrent(_) => tracing::trace!("[TASK] Using ConcurrentTask"),
         }
 
         self.task.run(
@@ -262,7 +264,7 @@ impl Task {
             event_tx,
             cancel_token,
         )?;
-        log::trace!("[TASK] TaskInstance::run() completed");
+        tracing::trace!("[TASK] TaskInstance::run() completed");
         Ok(())
     }
 }

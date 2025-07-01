@@ -5,7 +5,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
-use test_log::test;
 
 use crate::{
     adapter::{
@@ -155,7 +154,7 @@ async fn wait_for_completion(
     Err("Test timed out")
 }
 
-#[test(tokio::test)]
+#[tokio::test]
 async fn test_singleton_task_basic_download() {
     let rt = create_test_runtime();
     let content = create_test_content(5000);
@@ -192,7 +191,7 @@ async fn test_singleton_task_basic_download() {
     assert_eq!(downloaded_content, content);
 }
 
-#[test(tokio::test(flavor = "multi_thread"))]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_task_basic_download() {
     let rt = create_test_runtime();
     let content = create_test_content(10000);
@@ -234,7 +233,7 @@ async fn test_concurrent_task_basic_download() {
     // If concurrent task fails, that's also acceptable for this test
 }
 
-#[test(tokio::test)]
+#[tokio::test]
 async fn test_singleton_task_cancellation() {
     let rt = create_test_runtime();
     let content = create_test_content(100000); // Large file to ensure cancellation timing
@@ -259,10 +258,10 @@ async fn test_singleton_task_cancellation() {
 
     // Task might complete successfully if it's fast enough, or fail if cancelled
     // Both outcomes are acceptable
-    println!("Cancellation test result: {:?}", result);
+    tracing::info!("Cancellation test result: {:?}", result);
 }
 
-#[test(tokio::test)]
+#[tokio::test]
 async fn test_concurrent_task_zero_size_failure() {
     let rt = create_test_runtime();
     let adapter = Arc::new(Box::new(MockAdapter::zero_size()) as Box<dyn BoltLoadAdapter + Send>);
@@ -282,10 +281,10 @@ async fn test_concurrent_task_zero_size_failure() {
     let result = task.wait().await;
 
     // Concurrent task with zero-size might fail or succeed, both are acceptable
-    println!("Zero-size test result: {:?}", result);
+    tracing::info!("Zero-size test result: {:?}", result);
 }
 
-#[test(tokio::test)]
+#[tokio::test]
 async fn test_singleton_task_adapter_failure() {
     let rt = create_test_runtime();
     let adapter =
@@ -316,11 +315,11 @@ async fn test_singleton_task_adapter_failure() {
                 .any(|e| matches!(e, TaskEvent::Failed(_))));
 
     if !task_failed {
-        println!("Adapter failure test: Task unexpectedly succeeded");
+        tracing::info!("Adapter failure test: Task unexpectedly succeeded");
     }
 }
 
-#[test(tokio::test)]
+#[tokio::test]
 async fn test_progress_tracking() {
     let rt = create_test_runtime();
     let content = create_test_content(8000);
@@ -361,14 +360,14 @@ async fn test_progress_tracking() {
     task.wait().await.unwrap();
 
     // Progress events might be empty for fast downloads, that's OK
-    println!("Progress events captured: {}", progress_events.len());
+    tracing::info!("Progress events captured: {}", progress_events.len());
 
     // Verify file content is correct
     let downloaded_content = std::fs::read(&file_path).unwrap();
     assert_eq!(downloaded_content, content);
 }
 
-#[test(tokio::test(flavor = "multi_thread"))]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_vs_singleton_comparison() {
     let rt = create_test_runtime();
     let content = create_test_content(20000);
@@ -444,6 +443,6 @@ async fn test_concurrent_vs_singleton_comparison() {
         }
     }
 
-    println!("Concurrent task result: {:?}", concurrent_wait);
-    println!("Singleton task result: {:?}", singleton_wait);
+    tracing::info!("Concurrent task result: {:?}", concurrent_wait);
+    tracing::info!("Singleton task result: {:?}", singleton_wait);
 }

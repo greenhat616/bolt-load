@@ -118,7 +118,7 @@ impl ChunkPlanner {
     /// get the available chunks ranges
     pub fn get_available_ranges(&self) -> Vec<Range<u64>> {
         let chunks = Ranges::from_iter(self.chunks.keys().cloned());
-        log::trace!("[TASK] occupied chunks: {chunks:?}");
+        tracing::trace!("[TASK] occupied chunks: {chunks:?}");
         let full_range = Ranges::from(GenericRange::from(0..self.total));
         let available_ranges = full_range - chunks;
         let mut ranges: Vec<_> = available_ranges
@@ -177,7 +177,7 @@ impl ChunkPlanner {
                 .iter()
                 .any(|(k, _)| *range - *k != OperationResult::Empty)
             {
-                log::warn!(
+                tracing::warn!(
                     "the downloaded range is out of the occupied range, {:?} - {:?}",
                     range,
                     self.chunks
@@ -251,7 +251,6 @@ fn unwrap_range_start_bound<T>(bound: Bound<T>) -> T {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use test_log::test;
 
     #[test]
     fn test_add_chunk() {

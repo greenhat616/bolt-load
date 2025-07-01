@@ -239,7 +239,7 @@ impl ConcurrentTaskInner {
         let (tx, rx) = oneshot::channel();
         let handle = rt
             .spawn_with_handle(async move {
-                log::trace!(
+                tracing::trace!(
                     "[TASK] create background range runner: id: {runner_id}, range: {range:?}"
                 );
                 let mut runner = match TaskRunner::new_with_async_and_callback(
@@ -296,7 +296,7 @@ impl ConcurrentTaskInner {
         let available_ranges = chunk_planner.get_available_ranges();
         // TODO: move it to a new strategy for error and concurrency control
         if !available_ranges.is_empty() {
-            log::trace!("[TASK] create background runners: available_ranges: {available_ranges:?}");
+            tracing::trace!("[TASK] create background runners: available_ranges: {available_ranges:?}");
             for chunk in available_ranges.iter() {
                 let runner_id = runner_id_generator.next().expect("no more runner id");
                 chunk_planner.add_chunk(chunk.clone(), Some(runner_id));
@@ -342,7 +342,7 @@ impl ConcurrentTaskInner {
             };
             let actions = dynamic_strategy.step(&strategy_context);
             for action in actions {
-                log::trace!("[TASK] download_timer_tick: action: {action:?}");
+                tracing::trace!("[TASK] download_timer_tick: action: {action:?}");
                 match action {
                     StrategyAction::SplitAllTask if runners_state.is_empty() => {
                         let runner_id = runner_id_generator.next().expect("no more runner id");
@@ -389,7 +389,7 @@ impl ConcurrentTaskInner {
                             continue;
                         }
 
-                        log::trace!("[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}");
+                        tracing::trace!("[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}");
 
                         let next_id = runner_id_generator.next().expect("no more runner id");
                         let next_chunk = half_end..occupied_chunk.end;
@@ -403,7 +403,7 @@ impl ConcurrentTaskInner {
                             ))
                             .await
                             .inspect_err(|e| {
-                                log::error!("failed to send resize total message: {e:?}");
+                                tracing::error!("failed to send resize total message: {e:?}");
                             });
 
                         let _ = state;
@@ -465,7 +465,7 @@ impl ConcurrentTaskInner {
                 )))
                 .await
                 .inspect_err(|e| {
-                    log::error!("failed to send downloading event: {e:?}");
+                    tracing::error!("failed to send downloading event: {e:?}");
                 });
         });
         Ok(())
@@ -486,7 +486,7 @@ impl ConcurrentTaskInner {
         match msg {
             RunnerMessageKind::Stopped(reason) => match reason {
                 StoppedReason::Finished => {
-                    log::trace!("runner {runner_id} finished");
+                    tracing::trace!("runner {runner_id} finished");
                     runners_state
                         .entry(runner_id)
                         .and_modify(|r| r.status = RunnerStatus::Finished);
@@ -495,7 +495,7 @@ impl ConcurrentTaskInner {
                         .all(|r| r.status == RunnerStatus::Finished)
                         && chunk_planner.get_available_ranges().is_empty()
                     {
-                        log::trace!("[TASK] handle_runner_message: all chunks finished");
+                        tracing::trace!("[TASK] handle_runner_message: all chunks finished");
                         on_all_chunks_finished();
                     }
                 }
@@ -515,7 +515,7 @@ impl ConcurrentTaskInner {
                     let mut end = state.chunk.downloaded.end + bytes.len() as u64;
                     // It happens when the runner message handler is not fast enough
                     if end > state.chunk.occupied.end {
-                        log::warn!("runner {runner_id} downloaded more than the occupied range");
+                        tracing::warn!("runner {runner_id} downloaded more than the occupied range");
                         end = state.chunk.occupied.end;
                     }
 
@@ -533,7 +533,7 @@ impl ConcurrentTaskInner {
                 }
             }
             RunnerMessageKind::Started => {
-                log::trace!("runner {runner_id} started");
+                tracing::trace!("runner {runner_id} started");
             }
         }
         Ok(())
@@ -758,7 +758,7 @@ impl ConcurrentTaskInner {
     fn on_transition(&mut self, _source: &State, target: &State) {
         match target {
             State::Stopped { reason } => {
-                log::trace!("on_transition: enter stopped state, reason: {reason:?}");
+                tracing::trace!("on_transition: enter stopped state, reason: {reason:?}");
                 match reason.clone() {
                     Some(Ok(())) => {
                         let tx = self.event_tx.clone();
@@ -777,14 +777,14 @@ impl ConcurrentTaskInner {
                 }
             }
             State::Initializing { .. } => {
-                log::trace!("on_transition: enter initializing state");
+                tracing::trace!("on_transition: enter initializing state");
                 let tx = self.event_tx.clone();
                 let _ = self.rt.spawn(async move {
                     let _ = tx.send(TaskEvent::Initializing).await;
                 });
             }
             State::Downloading { .. } => {
-                log::trace!("on_transition: enter downloading state");
+                tracing::trace!("on_transition: enter downloading state");
                 let tx = self.event_tx.clone();
                 let progress = self.progress.clone();
                 let _ = self.rt.spawn(async move {
@@ -811,9 +811,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use smol_cancellation_token::CancellationToken;
     use std::sync::Arc;
-    use test_log::test;
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_success() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
@@ -884,7 +883,7 @@ mod tests {
         assert_eq!(downloaded_data, reference_data);
     }
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_with_adapter_failure() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1024).with_failure(true))
@@ -920,7 +919,7 @@ mod tests {
         }
     }
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_with_cancellation() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
@@ -963,7 +962,7 @@ mod tests {
         }
     }
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_small_range_runner_with_control_messages() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
@@ -1017,12 +1016,12 @@ mod tests {
 
         // 验证下载量应该是调整后的大小
         if total_downloaded != new_total as usize {
-            eprintln!("total_downloaded: {total_downloaded}, new_total: {new_total}");
+            tracing::error!("total_downloaded: {total_downloaded}, new_total: {new_total}");
         }
         assert!(total_downloaded >= new_total as usize);
     }
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_edge_ranges() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let content_size = 1000;
@@ -1069,7 +1068,7 @@ mod tests {
         assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
     }
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_zero_length_range() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1000))
@@ -1108,7 +1107,7 @@ mod tests {
         }
     }
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_multiple_runners() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(4000))
@@ -1194,7 +1193,7 @@ mod tests {
 
         for result in results {
             let (runner_id, downloaded_size, expected_size) = result.unwrap();
-            println!(
+            tracing::info!(
                 "Runner {runner_id}: downloaded {downloaded_size} bytes, expected {expected_size} \
                  bytes"
             );
@@ -1202,7 +1201,7 @@ mod tests {
         }
     }
 
-    #[test(tokio::test(flavor = "multi_thread"))]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_hash_verification() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(5000))

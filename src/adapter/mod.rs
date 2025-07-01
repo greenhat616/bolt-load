@@ -189,6 +189,7 @@ pub mod tests {
     impl SimpleTestAdapter {
         /// Create a new test adapter with deterministic content
         pub fn new(size: usize) -> Self {
+            crate::utils::logger::init_tracing();
             let content = create_deterministic_content(size);
             let expected_hash = calculate_sha256(&content);
 
@@ -246,7 +247,7 @@ pub mod tests {
     #[async_trait::async_trait]
     impl BoltLoadAdapter for SimpleTestAdapter {
         async fn is_range_stream_available(&self) -> bool {
-            println!(
+            tracing::info!(
                 "[TEST ADAPTER] is_range_stream_available() called, returning: {}",
                 self.support_range
             );
@@ -255,17 +256,17 @@ pub mod tests {
         }
 
         async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
-            println!("[TEST ADAPTER] retrieve_meta() called");
+            tracing::info!("[TEST ADAPTER] retrieve_meta() called");
             self.call_count.fetch_add(1, Ordering::Relaxed);
 
             if self.should_fail {
-                println!("[TEST ADAPTER] retrieve_meta() returning failure");
+                tracing::info!("[TEST ADAPTER] retrieve_meta() returning failure");
                 return Err(UnretryableError::Internal(
                     "Simulated meta retrieval failure".to_string(),
                 ));
             }
 
-            println!(
+            tracing::info!(
                 "[TEST ADAPTER] retrieve_meta() success, size: {}",
                 self.content.len()
             );
@@ -277,14 +278,14 @@ pub mod tests {
         }
 
         async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
-            println!(
+            tracing::info!(
                 "[TEST ADAPTER] full_stream() called, content size: {}",
                 self.content.len()
             );
             self.call_count.fetch_add(1, Ordering::Relaxed);
 
             if self.should_fail {
-                println!("[TEST ADAPTER] full_stream() returning failure");
+                tracing::info!("[TEST ADAPTER] full_stream() returning failure");
                 return Err(StreamError::Unretryable(UnretryableError::Internal(
                     "Simulated stream failure".to_string(),
                 )));
@@ -292,7 +293,7 @@ pub mod tests {
 
             let content = self.content.clone();
             let chunk_size = self.chunk_size;
-            println!(
+            tracing::info!(
                 "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
                 chunk_size
             );
@@ -428,9 +429,8 @@ pub mod tests {
         use super::*;
         use futures::StreamExt;
         use pretty_assertions::assert_eq;
-        use test_log::test;
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_simple_test_adapter_basic_functionality() {
             let size = 1024;
             let adapter = SimpleTestAdapter::new(size);
@@ -449,7 +449,7 @@ pub mod tests {
             assert_eq!(adapter.expected_hash(), adapter2.expected_hash());
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_retrieve_meta_success() {
             let size = 2048;
             let adapter = SimpleTestAdapter::new(size).with_filename("custom_test.bin".to_string());
@@ -461,7 +461,7 @@ pub mod tests {
             assert_eq!(adapter.call_count(), 1);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_retrieve_meta_failure() {
             let adapter = SimpleTestAdapter::new(1024).with_failure(true);
 
@@ -478,7 +478,7 @@ pub mod tests {
             assert_eq!(adapter.call_count(), 1);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_is_range_stream_available() {
             // Test range support enabled
             let adapter_with_range = SimpleTestAdapter::new(1024).with_range_support(true);
@@ -491,7 +491,7 @@ pub mod tests {
             assert_eq!(adapter_without_range.call_count(), 1);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_full_stream_success_with_hash_verification() {
             let size = 4096;
             let adapter = SimpleTestAdapter::new(size);
@@ -518,7 +518,7 @@ pub mod tests {
             assert_eq!(actual_hash, expected_hash);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_full_stream_failure() {
             let adapter = SimpleTestAdapter::new(1024).with_failure(true);
 
@@ -535,7 +535,7 @@ pub mod tests {
             assert_eq!(adapter.call_count(), 1);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_range_stream_success_with_hash_verification() {
             let size = 8192;
             let adapter = SimpleTestAdapter::new(size).with_range_support(true);
@@ -566,7 +566,7 @@ pub mod tests {
             assert_eq!(actual_hash, expected_range_hash);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_range_stream_not_supported() {
             let adapter = SimpleTestAdapter::new(1024).with_range_support(false);
 
@@ -583,7 +583,7 @@ pub mod tests {
             assert_eq!(adapter.call_count(), 1);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_range_stream_edge_cases() {
             let size = 1000;
             let adapter = SimpleTestAdapter::new(size).with_range_support(true);
@@ -614,7 +614,7 @@ pub mod tests {
             assert_eq!(adapter.call_count(), 2);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_large_adapter() {
             let adapter = SimpleTestAdapter::new_large();
             let expected_size = 100 * 1024 * 1024; // 100MB
@@ -645,7 +645,7 @@ pub mod tests {
             assert_eq!(actual_hash, expected_hash);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_call_count_tracking() {
             let adapter = SimpleTestAdapter::new(1024);
 
@@ -665,7 +665,7 @@ pub mod tests {
             assert_eq!(adapter.call_count(), 4);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_configuration_chain() {
             let adapter = SimpleTestAdapter::new(2048)
                 .with_range_support(false)
@@ -681,7 +681,7 @@ pub mod tests {
             assert!(range_result.is_err());
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_deterministic_content_generation() {
             // Test that content generation is truly deterministic
             let content1 = create_deterministic_content(1000);
@@ -701,7 +701,7 @@ pub mod tests {
             assert_eq!(hash1, hash2);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_chunk_size_behavior() {
             let adapter = SimpleTestAdapter::new(10000); // 10KB content
             let stream = adapter.full_stream().await.unwrap();
@@ -724,7 +724,7 @@ pub mod tests {
             assert_eq!(chunk_count, 2);
         }
 
-        #[test(tokio::test)]
+        #[tokio::test]
         async fn test_concurrent_access() {
             let adapter = SimpleTestAdapter::new(1024);
             let adapter = Arc::new(adapter);

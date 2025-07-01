@@ -34,7 +34,7 @@ impl TaskRunnerGuard {
             .send(ManagerMessage(self.runner_id, message))
             .await
         {
-            log::warn!("Failed to send message to task runner: {e:?}");
+            tracing::warn!("Failed to send message to task runner: {e:?}");
         }
     }
 }

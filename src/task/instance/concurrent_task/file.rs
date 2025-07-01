@@ -113,20 +113,20 @@ impl FileWriter {
         let (tx, rx) = async_channel::bounded(FILE_WRITER_QUEUE_SIZE);
         let total = self.total;
         let mode = self.mode;
-        log::trace!("start file writer: {:?}", self.path);
+        tracing::trace!("start file writer: {:?}", self.path);
         let handle: blocking::Task<std::io::Result<()>> = unblock(move || {
             let file_size = std::fs::metadata(&self.path)
                 .map(|meta| meta.len())
                 .unwrap_or(0);
 
-            log::trace!("file size: {file_size:?}");
+            tracing::trace!("file size: {file_size:?}");
             let mut opts = OpenOptions::new();
             opts.read(true).write(true).create(true).truncate(false);
 
             let mut file = match opts.open(&self.path) {
                 Ok(file) => file,
                 Err(e) => {
-                    log::error!("failed to open file: {e:?}");
+                    tracing::error!("failed to open file: {e:?}");
 
                     let _ = ready_tx.send(Err(e));
                     return Ok(());
@@ -134,7 +134,7 @@ impl FileWriter {
             };
             if file_size != total {
                 if let Err(e) = file.set_len(total) {
-                    log::error!("failed to set file length: {e:?}");
+                    tracing::error!("failed to set file length: {e:?}");
                     let _ = ready_tx.send(Err(e));
                     return Ok(());
                 }
@@ -143,12 +143,12 @@ impl FileWriter {
             // In 32-bit machine, the pointer size is 4 bytes, some large file may exceed the pointer size
             // so we use the seek write to write the file
             if file_size <= isize::MAX as u64 && mode == Mode::Mmap {
-                log::trace!("use mmap mode");
+                tracing::trace!("use mmap mode");
                 let mut mmap = unsafe {
                     match MmapMut::map_mut(&file) {
                         Ok(mmap) => mmap,
                         Err(e) => {
-                            log::error!("failed to map file: {e:?}");
+                            tracing::error!("failed to map file: {e:?}");
                             let _ = ready_tx.send(Err(e));
                             return Ok(());
                         }
@@ -161,7 +161,7 @@ impl FileWriter {
                 }
                 mmap.flush()?;
             } else {
-                log::trace!("use seek write mode");
+                tracing::trace!("use seek write mode");
                 let _ = ready_tx.send(Ok(()));
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
                     let _ = tx.send(Self::handle_seek_write(&mut file, range, data));
@@ -181,9 +181,8 @@ impl FileWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_log::test;
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_mmap_file_writer() {
         let tmp_file = tempfile::tempdir().unwrap();
         let file_path = tmp_file.path().join("test.txt");
@@ -207,7 +206,7 @@ mod tests {
         assert_eq!(mmap[0..bytes_len], bytes);
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
     async fn test_seek_write_file_writer() {
         let tmp_file = tempfile::tempdir().unwrap();
         let file_path = tmp_file.path().join("test.txt");
