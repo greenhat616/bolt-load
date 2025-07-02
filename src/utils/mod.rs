@@ -1,6 +1,6 @@
 pub mod http;
-pub mod reader;
 pub mod logger;
+pub mod reader;
 
 /// A guard that ensures the task is shutdown
 pub struct ShutdownGuard(Option<oneshot::Sender<()>>);

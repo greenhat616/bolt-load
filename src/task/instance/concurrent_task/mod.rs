@@ -296,7 +296,9 @@ impl ConcurrentTaskInner {
         let available_ranges = chunk_planner.get_available_ranges();
         // TODO: move it to a new strategy for error and concurrency control
         if !available_ranges.is_empty() {
-            tracing::trace!("[TASK] create background runners: available_ranges: {available_ranges:?}");
+            tracing::trace!(
+                "[TASK] create background runners: available_ranges: {available_ranges:?}"
+            );
             for chunk in available_ranges.iter() {
                 let runner_id = runner_id_generator.next().expect("no more runner id");
                 chunk_planner.add_chunk(chunk.clone(), Some(runner_id));
@@ -389,7 +391,9 @@ impl ConcurrentTaskInner {
                             continue;
                         }
 
-                        tracing::trace!("[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}");
+                        tracing::trace!(
+                            "[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}"
+                        );
 
                         let next_id = runner_id_generator.next().expect("no more runner id");
                         let next_chunk = half_end..occupied_chunk.end;
@@ -515,7 +519,9 @@ impl ConcurrentTaskInner {
                     let mut end = state.chunk.downloaded.end + bytes.len() as u64;
                     // It happens when the runner message handler is not fast enough
                     if end > state.chunk.occupied.end {
-                        tracing::warn!("runner {runner_id} downloaded more than the occupied range");
+                        tracing::warn!(
+                            "runner {runner_id} downloaded more than the occupied range"
+                        );
                         end = state.chunk.occupied.end;
                     }
 
