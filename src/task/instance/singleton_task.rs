@@ -14,6 +14,7 @@ use crate::{
     },
     utils::ShutdownGuardExt,
 };
+use crate::utils::logging::*;
 
 use async_fs::OpenOptions;
 use async_io::Timer;
@@ -50,18 +51,18 @@ impl TaskInstance for SingletonTask {
     ) -> Result<()> {
         let token = cancel_token.clone();
         let rt = self.rt.clone();
-        tracing::trace!("[SINGLETON TASK] Attempting to spawn state machine task");
+        trace!("[SINGLETON TASK] Attempting to spawn state machine task");
         let handle = self
             .rt
             .spawn_with_handle(async move {
-                tracing::trace!("[SINGLETON TASK] State machine starting");
+                trace!("[SINGLETON TASK] State machine starting");
                 let mut context = Context::default();
                 let mut state_machine = SingletonTaskInner::new(path, event_tx, rt)
                     .uninitialized_state_machine()
                     .init_with_context(&mut context)
                     .await;
 
-                tracing::trace!("[SINGLETON TASK] State machine initialized, handling Run event");
+                trace!("[SINGLETON TASK] State machine initialized, handling Run event");
                 state_machine
                     .handle_with_context(
                         &Event::Run(RunningPayload {
@@ -72,21 +73,21 @@ impl TaskInstance for SingletonTask {
                     )
                     .await;
 
-                tracing::trace!(
+                trace!(
                     "[SINGLETON TASK] Run event handled, starting event loop with {} items in poll",
                     context.poll.len()
                 );
                 while context.poll.pop_front().is_some() {
-                    tracing::trace!("[SINGLETON TASK] Processing Step event");
+                    trace!("[SINGLETON TASK] Processing Step event");
                     state_machine
                         .handle_with_context(&Event::Step, &mut context)
                         .await;
-                    tracing::trace!(
+                    trace!(
                         "[SINGLETON TASK] Step event handled, {} items remaining in poll",
                         context.poll.len()
                     );
                 }
-                tracing::trace!("[SINGLETON TASK] Event loop completed");
+                trace!("[SINGLETON TASK] Event loop completed");
 
                 debug_assert!(
                     matches!(state_machine.state(), State::Stopped { .. }),
@@ -94,9 +95,9 @@ impl TaskInstance for SingletonTask {
                 );
             })
             .expect("Runtime is dropped");
-        tracing::trace!("[SINGLETON TASK] State machine task spawned successfully");
+        trace!("[SINGLETON TASK] State machine task spawned successfully");
         self.task = Some(TaskControl::new(token, handle));
-        tracing::trace!("[SINGLETON TASK] TaskControl created and stored");
+        trace!("[SINGLETON TASK] TaskControl created and stored");
         Ok(())
     }
 
@@ -108,16 +109,16 @@ impl TaskInstance for SingletonTask {
     }
 
     async fn wait(&mut self) -> Result<()> {
-        tracing::trace!(
+        trace!(
             "[SINGLETON TASK] wait() called, task present: {}",
             self.task.is_some()
         );
         if let Some(mut task) = self.task.take() {
-            tracing::trace!("[SINGLETON TASK] waiting for task to complete");
+            trace!("[SINGLETON TASK] waiting for task to complete");
             task.wait().await;
-            tracing::trace!("[SINGLETON TASK] task completed");
+            trace!("[SINGLETON TASK] task completed");
         } else {
-            tracing::warn!("[SINGLETON TASK] WARNING: No task to wait for!");
+            warn!("[SINGLETON TASK] WARNING: No task to wait for!");
         }
         Ok(())
     }
@@ -174,7 +175,7 @@ impl SingletonTaskInner {
 
     /// Download the file
     async fn download(&mut self, cancel_token: &mut CancellationToken) -> Result<()> {
-        tracing::trace!(
+        trace!(
             "[SINGLETON TASK] download() method called, path: {:?}",
             self.path
         );
@@ -185,7 +186,7 @@ impl SingletonTaskInner {
             .full_stream()
             .await
             .map_err(TaskInstanceError::StreamFailed)?;
-        tracing::trace!("[SINGLETON TASK] stream obtained successfully");
+        trace!("[SINGLETON TASK] stream obtained successfully");
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -235,7 +236,7 @@ impl SingletonTaskInner {
                                     match reason {
                                         StoppedReason::Finished => {
                                             if let Err(e) = file.flush().await {
-                                                tracing::error!("failed to flush file: {e:?}");
+                                                error!("failed to flush file: {e:?}");
                                             }
                                             break;
                                         }
@@ -266,7 +267,7 @@ impl SingletonTaskInner {
                             }
                         }
                         Err(e) => {
-                            tracing::error!("runner message error: {e:?}");
+                            error!("runner message error: {e:?}");
                         }
                     }
                 }
@@ -274,7 +275,7 @@ impl SingletonTaskInner {
         }
 
         if let Err(e) = file.flush().await {
-            tracing::warn!("failed to flush file: {e:?}");
+            warn!("failed to flush file: {e:?}");
         }
 
         Ok(())
@@ -328,7 +329,7 @@ impl SingletonTaskInner {
         context: &mut Context,
         event: &Event,
     ) -> Response<State> {
-        tracing::trace!(
+        trace!(
             "[STATE MACHINE] initializing state entered, event: {:?}",
             match event {
                 Event::Step => "Step",
@@ -338,11 +339,11 @@ impl SingletonTaskInner {
         );
         match event {
             Event::Step => {
-                tracing::trace!("[STATE MACHINE] processing Step event in initializing");
+                trace!("[STATE MACHINE] processing Step event in initializing");
                 let task = async {
                     match self.retrieve_meta().await {
                         Ok(()) => {
-                            tracing::trace!(
+                            trace!(
                                 "[STATE MACHINE] retrieve_meta successful, transitioning to \
                                  downloading"
                             );
@@ -350,7 +351,7 @@ impl SingletonTaskInner {
                             Transition(State::downloading(cancel_token.clone()))
                         }
                         Err(e) => {
-                            tracing::trace!("[STATE MACHINE] retrieve_meta failed: {:?}", e);
+                            trace!("[STATE MACHINE] retrieve_meta failed: {:?}", e);
                             Transition(State::stopped(Some(Err(e))))
                         }
                     }
@@ -360,13 +361,13 @@ impl SingletonTaskInner {
 
                 futures::select_biased! {
                     _ = cancel_token.cancelled().fuse() => {
-                        tracing::trace!("[STATE MACHINE] initializing cancelled");
+                        trace!("[STATE MACHINE] initializing cancelled");
                         Transition(State::stopped(Some(Err(TaskInstanceError::Failed(
                             crate::runner::TaskFailedKind::Cancelled,
                         )))))
                     }
                     res = task => {
-                        tracing::trace!("[STATE MACHINE] initializing task completed: {:?}", match &res {
+                        trace!("[STATE MACHINE] initializing task completed: {:?}", match &res {
                             Transition(State::Downloading { .. }) => "Downloading transition",
                             Transition(State::Stopped { .. }) => "Stopped transition",
                             _ => "Other transition",
@@ -386,7 +387,7 @@ impl SingletonTaskInner {
         context: &mut Context,
         event: &Event,
     ) -> Response<State> {
-        tracing::trace!(
+        trace!(
             "[STATE MACHINE] downloading state entered, event: {:?}",
             match event {
                 Event::Step => "Step",
@@ -396,14 +397,14 @@ impl SingletonTaskInner {
         );
         match event {
             Event::Step => {
-                tracing::trace!("[STATE MACHINE] calling download method");
+                trace!("[STATE MACHINE] calling download method");
                 match self.download(cancel_token).await {
                     Ok(()) => {
-                        tracing::trace!("[STATE MACHINE] download completed successfully");
+                        trace!("[STATE MACHINE] download completed successfully");
                         Transition(State::stopped(Some(Ok(()))))
                     }
                     Err(e) => {
-                        tracing::trace!("[STATE MACHINE] download failed: {:?}", e);
+                        trace!("[STATE MACHINE] download failed: {:?}", e);
                         Transition(State::stopped(Some(Err(e))))
                     }
                 }

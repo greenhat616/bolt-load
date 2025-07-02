@@ -11,17 +11,9 @@ pub fn init_tracing() {
         .with(filter_layer)
         .with(fmt_layer);
 
-    #[cfg(test)]
-    {
-        let tokio_console_layer = console_subscriber::spawn();
-        let _ = subscriber
-            .with(tracing_tracy::TracyLayer::default())
-            .with(tokio_console_layer)
-            .try_init();
-    }
-
-    #[cfg(not(test))]
-    {
-        let _ = subscriber.try_init();
-    }
+    let tokio_console_layer = console_subscriber::spawn();
+    let _ = subscriber
+        .with(tracing_tracy::TracyLayer::default())
+        .with(tokio_console_layer)
+        .try_init();
 }

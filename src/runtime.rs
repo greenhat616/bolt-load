@@ -6,6 +6,8 @@ use smol::future::FutureExt;
 
 use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
 
+use crate::utils::logging::*;
+
 /// ThreadedRuntime is a wrapper around the different multi-threaded runtime libraries.
 /// It is used to hold by bolt-load client, and run different manager and its tasks.
 // TODO: support?
@@ -67,12 +69,11 @@ pub struct SmolJoinHandle<T> {
 #[cfg(feature = "smol")]
 impl SmolThreadedRuntime {
     pub fn build_with_threads(threads: usize) -> Self {
-        crate::utils::logger::init_tracing();
         use std::sync::Arc;
         let executor = Arc::new(smol::Executor::new());
         let (shutdown_tx, shutdown_rx) = async_broadcast::broadcast(1);
         for i in 0..threads {
-            tracing::debug!("spawn thread {} for smol runtime executor", i);
+            debug!("spawn thread {} for smol runtime executor", i);
             let executor = executor.clone();
             let mut shutdown_signal = shutdown_rx.clone();
             std::thread::spawn(move || {
@@ -173,9 +174,8 @@ impl Clone for TokioThreadedRuntime {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl TokioThreadedRuntime {
-    pub fn new() -> Self {
+impl Default for TokioThreadedRuntime {
+    fn default() -> Self {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => Self::Handle(handle),
             _ => Self::Runtime(
@@ -185,6 +185,13 @@ impl TokioThreadedRuntime {
                     .unwrap(),
             ),
         }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl TokioThreadedRuntime {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -344,14 +351,13 @@ mod tests {
     #[test]
     #[cfg(feature = "smol")]
     fn test_smol_runtime() {
-        crate::utils::logger::init_tracing();
         let rt = SmolThreadedRuntime::build_with_threads(5);
         let (tx, rx) = oneshot::channel();
         // test detach
         let handle = rt.spawn(async move {
-            tracing::info!("start async");
+            info!("start async");
             smol::Timer::after(Duration::from_millis(10)).await;
-            tracing::info!("finished async");
+            info!("finished async");
             tx.send(200).unwrap();
         });
         assert!(!handle.is_finished());
@@ -360,9 +366,9 @@ mod tests {
 
         // test join
         let handle = rt.spawn(async move {
-            tracing::info!("start async");
+            info!("start async");
             smol::Timer::after(Duration::from_millis(10)).await;
-            tracing::info!("finished async");
+            info!("finished async");
             200
         });
         assert!(!handle.is_finished());
@@ -372,9 +378,9 @@ mod tests {
 
         // test abort
         let handle = rt.spawn(async move {
-            tracing::info!("start async");
+            info!("start async");
             smol::Timer::after(Duration::from_millis(100)).await;
-            tracing::info!("finished async");
+            info!("finished async");
             200
         });
         assert!(!handle.is_finished());

@@ -15,6 +15,8 @@ use blocking::unblock;
 use bytes::Bytes;
 use memmap2::MmapMut;
 
+use crate::utils::logging::*;
+
 const FILE_WRITER_QUEUE_SIZE: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -99,7 +101,7 @@ impl FileWriter {
         self.mode = mode;
     }
 
-    #[tracing::instrument]
+    #[cfg_attr(feature = "tracing", tracing::instrument)]
     fn handle_seek_write(
         file: &mut std::fs::File,
         range: Range<u64>,
@@ -110,26 +112,26 @@ impl FileWriter {
         Ok(())
     }
 
-    #[tracing::instrument]
+    #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub async fn start(self) -> Result<FileWriterGuard, std::io::Error> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (tx, rx) = async_channel::bounded(FILE_WRITER_QUEUE_SIZE);
         let total = self.total;
         let mode = self.mode;
-        tracing::trace!("start file writer: {:?}", self.path);
+        trace!("start file writer: {:?}", self.path);
         let handle: blocking::Task<std::io::Result<()>> = unblock(move || {
             let file_size = std::fs::metadata(&self.path)
                 .map(|meta| meta.len())
                 .unwrap_or(0);
 
-            tracing::trace!("file size: {file_size:?}");
+            trace!("file size: {file_size:?}");
             let mut opts = OpenOptions::new();
             opts.read(true).write(true).create(true).truncate(false);
 
             let mut file = match opts.open(&self.path) {
                 Ok(file) => file,
                 Err(e) => {
-                    tracing::error!("failed to open file: {e:?}");
+                    error!("failed to open file: {e:?}");
 
                     let _ = ready_tx.send(Err(e));
                     return Ok(());
@@ -137,7 +139,7 @@ impl FileWriter {
             };
             if file_size != total {
                 if let Err(e) = file.set_len(total) {
-                    tracing::error!("failed to set file length: {e:?}");
+                    error!("failed to set file length: {e:?}");
                     let _ = ready_tx.send(Err(e));
                     return Ok(());
                 }
@@ -146,12 +148,12 @@ impl FileWriter {
             // In 32-bit machine, the pointer size is 4 bytes, some large file may exceed the pointer size
             // so we use the seek write to write the file
             if file_size <= isize::MAX as u64 && mode == Mode::Mmap {
-                tracing::trace!("use mmap mode");
+                trace!("use mmap mode");
                 let mut mmap = unsafe {
                     match MmapMut::map_mut(&file) {
                         Ok(mmap) => mmap,
                         Err(e) => {
-                            tracing::error!("failed to map file: {e:?}");
+                            error!("failed to map file: {e:?}");
                             let _ = ready_tx.send(Err(e));
                             return Ok(());
                         }
@@ -164,7 +166,7 @@ impl FileWriter {
                 }
                 mmap.flush()?;
             } else {
-                tracing::trace!("use seek write mode");
+                trace!("use seek write mode");
                 let _ = ready_tx.send(Ok(()));
                 while let Ok(Payload(range, data, tx)) = rx.recv_blocking() {
                     let _ = tx.send(Self::handle_seek_write(&mut file, range, data));

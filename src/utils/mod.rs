@@ -1,5 +1,5 @@
 pub mod http;
-pub mod logger;
+pub mod logging;
 pub mod reader;
 
 /// A guard that ensures the task is shutdown

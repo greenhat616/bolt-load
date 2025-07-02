@@ -13,3 +13,4 @@ use_field_init_shorthand = false
 force_explicit_abi = true
 imports_granularity = "Crate"
 format_strings = true
+group_imports = "StdExternalCrate"

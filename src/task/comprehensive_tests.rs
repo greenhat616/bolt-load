@@ -25,6 +25,7 @@ use crate::{
     runtime::ThreadedRuntimeImpl,
     task::{DownloadMode, TaskBuilder, TaskEvent, TaskManagerBuildError},
 };
+use crate::utils::logging::*;
 
 /// Create test runtime
 fn create_test_runtime() -> ThreadedRuntimeImpl {
@@ -70,7 +71,7 @@ async fn test_task_builder_basic_configuration() {
     assert!(!task.is_initialized(), "Task should start uninitialized");
     assert!(!task.is_finished(), "Task should not be finished initially");
 
-    tracing::info!("✓ Basic TaskBuilder configuration test passed");
+    info!("✓ Basic TaskBuilder configuration test passed");
 }
 
 #[tokio::test]
@@ -162,7 +163,7 @@ async fn test_task_builder_validation_errors() {
         Err(TaskManagerBuildError::FieldValidationFailed(_))
     ));
 
-    tracing::info!("✓ TaskBuilder validation errors test passed");
+    info!("✓ TaskBuilder validation errors test passed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -202,7 +203,7 @@ async fn test_task_builder_with_mode_preference() {
     // Should still build successfully (falls back to singleton mode)
     assert!(!task.is_finished());
 
-    tracing::info!("✓ TaskBuilder mode preference test passed");
+    info!("✓ TaskBuilder mode preference test passed");
 }
 
 #[tokio::test]
@@ -247,7 +248,7 @@ async fn test_task_builder_callback_configuration() {
         "Callback should have been invoked"
     );
 
-    tracing::info!("✓ TaskBuilder callback configuration test passed");
+    info!("✓ TaskBuilder callback configuration test passed");
 }
 
 #[tokio::test]
@@ -272,7 +273,7 @@ async fn test_task_builder_meta_retrieval() {
     let task = builder.build().await.unwrap();
     assert!(!task.is_finished());
 
-    tracing::info!("✓ TaskBuilder meta retrieval test passed");
+    info!("✓ TaskBuilder meta retrieval test passed");
 }
 
 // ============================================================================
@@ -312,15 +313,15 @@ async fn test_task_basic_lifecycle() {
 
     // Wait for completion
     let wait_result = task.wait().await;
-    tracing::info!("Wait result: {:?}", wait_result);
+    info!("Wait result: {:?}", wait_result);
     assert!(wait_result.is_ok(), "Task should complete successfully");
 
     // Task should be finished
     assert!(task.is_finished());
 
     // Debug file path and directory contents
-    tracing::info!("Expected save path: {:?}", save_path);
-    tracing::info!("Path exists: {}", save_path.exists());
+    info!("Expected save path: {:?}", save_path);
+    info!("Path exists: {}", save_path.exists());
 
     // Check for partial file
     let mut partial_path = save_path.clone();
@@ -329,25 +330,25 @@ async fn test_task_basic_lifecycle() {
         file_name.push(".partial");
         partial_path.set_file_name(file_name);
     }
-    tracing::info!("Partial path: {:?}", partial_path);
-    tracing::info!("Partial exists: {}", partial_path.exists());
+    info!("Partial path: {:?}", partial_path);
+    info!("Partial exists: {}", partial_path.exists());
 
     if let Some(parent) = save_path.parent() {
-        tracing::info!("Parent directory: {:?}", parent);
+        info!("Parent directory: {:?}", parent);
         if parent.exists() {
             match std::fs::read_dir(parent) {
                 Ok(entries) => {
-                    tracing::info!("Directory contents:");
+                    info!("Directory contents:");
                     for entry in entries {
                         if let Ok(entry) = entry {
-                            tracing::info!("  - {:?}", entry.path());
+                            info!("  - {:?}", entry.path());
                         }
                     }
                 }
-                Err(e) => tracing::info!("Failed to read directory: {:?}", e),
+                Err(e) => info!("Failed to read directory: {:?}", e),
             }
         } else {
-            tracing::info!("Parent directory doesn't exist");
+            info!("Parent directory doesn't exist");
         }
     }
 
@@ -360,7 +361,7 @@ async fn test_task_basic_lifecycle() {
         "Downloaded file should have correct size"
     );
 
-    tracing::info!("✓ Task basic lifecycle test passed");
+    info!("✓ Task basic lifecycle test passed");
 }
 
 #[tokio::test]
@@ -394,7 +395,7 @@ async fn test_task_cancellation() {
     // Task should have been cancelled or completed
     assert!(task.is_finished());
 
-    tracing::info!(
+    info!(
         "✓ Task cancellation test passed (result: {:?})",
         wait_result
     );
@@ -448,10 +449,10 @@ async fn test_small_file_download_with_hash_verification() {
         "Downloaded file should have correct size"
     );
 
-    tracing::info!("✓ Small file download test passed");
-    tracing::info!("  - Size: 10KB");
-    tracing::info!("  - Duration: {:?}", duration);
-    tracing::info!("  - Hash: {}", actual_hash);
+    info!("✓ Small file download test passed");
+    info!("  - Size: 10KB");
+    info!("  - Duration: {:?}", duration);
+    info!("  - Hash: {}", actual_hash);
 }
 
 #[tokio::test]
@@ -493,10 +494,10 @@ async fn test_medium_file_download_with_hash_verification() {
         "File size verification failed"
     );
 
-    tracing::info!("✓ Medium file download test passed");
-    tracing::info!("  - Size: 1MB");
-    tracing::info!("  - Duration: {:?}", duration);
-    tracing::info!("  - Hash: {}", actual_hash);
+    info!("✓ Medium file download test passed");
+    info!("  - Size: 1MB");
+    info!("  - Duration: {:?}", duration);
+    info!("  - Hash: {}", actual_hash);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -517,7 +518,7 @@ async fn test_large_file_download_with_hash_verification() {
         .await
         .unwrap();
 
-    tracing::info!("🚀 Starting 100MB file download test...");
+    info!("🚀 Starting 100MB file download test...");
     let start_time = Instant::now();
 
     // Run the download
@@ -541,7 +542,7 @@ async fn test_large_file_download_with_hash_verification() {
     );
 
     // Calculate and verify hash
-    tracing::info!("🔍 Calculating hash for verification...");
+    info!("🔍 Calculating hash for verification...");
     let hash_start = Instant::now();
     let downloaded_content = std::fs::read(&save_path).unwrap();
     let actual_hash = calculate_sha256(&downloaded_content);
@@ -555,12 +556,12 @@ async fn test_large_file_download_with_hash_verification() {
     // Calculate download speed
     let speed_mbps = (100.0 / duration.as_secs_f64()).round();
 
-    tracing::info!("🎉 Large file download test passed!");
-    tracing::info!("  - Size: 100MB");
-    tracing::info!("  - Download time: {:?}", duration);
-    tracing::info!("  - Hash calculation time: {:?}", hash_duration);
-    tracing::info!("  - Average speed: {} MB/s", speed_mbps);
-    tracing::info!("  - Hash: {}", actual_hash);
+    info!("🎉 Large file download test passed!");
+    info!("  - Size: 100MB");
+    info!("  - Download time: {:?}", duration);
+    info!("  - Hash calculation time: {:?}", hash_duration);
+    info!("  - Average speed: {} MB/s", speed_mbps);
+    info!("  - Hash: {}", actual_hash);
 
     // Clean up large file
     let _ = std::fs::remove_file(&save_path);
@@ -593,7 +594,7 @@ async fn test_adapter_failure_handling() {
         "Task should fail to build when adapter fails"
     );
 
-    tracing::info!("✓ Adapter failure handling test passed");
+    info!("✓ Adapter failure handling test passed");
     return;
 
     // This code is unreachable due to the return above
@@ -622,19 +623,17 @@ async fn test_zero_size_file_handling() {
     task.run().await.unwrap();
     let result = task.wait().await;
 
-    tracing::info!("state: {:?}", task.task_state.load(Ordering::Acquire));
+    info!("state: {:?}", task.task_state.load(Ordering::Acquire));
     result.expect("should be ok");
     // Zero-size downloads should complete successfully
     assert!(save_path.exists(), "Zero-size file should exist");
     let content = std::fs::read(&save_path).unwrap();
     assert!(content.is_empty(), "Zero-size file should be empty");
-    tracing::info!("✓ Zero-size file handling test passed");
+    info!("✓ Zero-size file handling test passed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_vs_singleton_performance() {
-    crate::utils::logger::init_tracing();
-
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 
@@ -670,7 +669,7 @@ async fn test_concurrent_vs_singleton_performance() {
         .await
         .unwrap();
 
-    tracing::info!("🏁 Starting performance comparison test (1MB)...");
+    info!("🏁 Starting performance comparison test (1MB)...");
 
     // Run both downloads and measure time
     let start_time = Instant::now();
@@ -681,12 +680,12 @@ async fn test_concurrent_vs_singleton_performance() {
     let ((concurrent_result, concurrent_duration), (singleton_result, singleton_duration)) = tokio::join!(
         async {
             let result = concurrent_task.wait().await;
-            tracing::error!("Concurrent task finished");
+            error!("Concurrent task finished");
             (result, start_time.elapsed())
         },
         async {
             let result = singleton_task.wait().await;
-            tracing::error!("Singleton task finished");
+            error!("Singleton task finished");
             (result, start_time.elapsed())
         }
     );
@@ -716,8 +715,8 @@ async fn test_concurrent_vs_singleton_performance() {
         "Concurrent file hash should be correct"
     );
 
-    tracing::info!("✓ Performance comparison test completed");
-    tracing::info!(
+    info!("✓ Performance comparison test completed");
+    info!(
         "
     - Concurrent result: {concurrent_result:?}
         - Measured Speed: {concurrent_speed} MB/s
@@ -725,7 +724,7 @@ async fn test_concurrent_vs_singleton_performance() {
         - Hash: {concurrent_hash}
         - File size: {file_size} bytes"
     );
-    tracing::info!(
+    info!(
         "
     - Singleton result: {singleton_result:?}
         - Measured Speed: {singleton_speed} MB/s
@@ -733,7 +732,7 @@ async fn test_concurrent_vs_singleton_performance() {
         - Hash: {singleton_hash}
         - File size: {file_size} bytes"
     );
-    tracing::info!("  - Total test duration: {total_duration:?}");
+    info!("  - Total test duration: {total_duration:?}");
 
     // If concurrent also succeeded, verify its file
     if concurrent_result.is_ok() && concurrent_path.exists() {
@@ -743,7 +742,7 @@ async fn test_concurrent_vs_singleton_performance() {
             concurrent_hash, concurrent_expected_hash,
             "Concurrent file hash should be correct"
         );
-        tracing::info!("  - Both modes completed successfully with matching hashes");
+        info!("  - Both modes completed successfully with matching hashes");
     }
 }
 
@@ -775,5 +774,5 @@ async fn test_concurrent_task_with_range_stream() {
         1024 * 1024,
         "Downloaded file should have correct size"
     );
-    tracing::info!("✓ Concurrent task with range stream test passed");
+    info!("✓ Concurrent task with range stream test passed");
 }

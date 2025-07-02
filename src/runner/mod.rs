@@ -1,7 +1,7 @@
 use crate::{
     adapter::{AnyBytesStream, StreamError},
     task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
-    utils::ShutdownGuardExt,
+    utils::{logging::*, ShutdownGuardExt},
 };
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
@@ -215,10 +215,10 @@ impl TaskRunner {
                                 ManagerMessagesVariant::LimitTotal(new_total) => {
                                     if let Some(current_total) = self.total {
                                         if current_total >  new_total{
-                                            tracing::trace!("runner: limit total to {new_total}");
+                                            trace!("runner: limit total to {new_total}");
                                             self.total = Some(new_total);
                                         } else {
-                                            tracing::warn!(
+                                            warn!(
                                                 "runner: limit total is smaller than current total,
                                                 limit: {new_total}, current: {current_total}"
                                             );
@@ -283,7 +283,7 @@ impl TaskRunner {
                      downloaded: {}",
                     total, self.downloaded
                 );
-                tracing::warn!("{msg}");
+                warn!("{msg}");
                 return Err(TaskFailedKind::Other(msg).into());
             }
             None if self.downloaded > 0 => {}
@@ -345,7 +345,7 @@ mod tests {
         let mut finished = false;
 
         while let Ok(msg) = msg_rx.recv().await {
-            tracing::debug!("msg: {msg:?}");
+            debug!("msg: {msg:?}");
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
@@ -485,7 +485,7 @@ mod tests {
 
         let mut got_empty_error = false;
         while let Ok(msg) = msg_rx.recv().await {
-            tracing::error!("msg: {msg:?}");
+            error!("msg: {msg:?}");
             if let RunnerMessage(
                 _,
                 RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Empty)),

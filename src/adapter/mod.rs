@@ -135,6 +135,8 @@ pub type AnyAdapter = Box<dyn BoltLoadAdapter + Send>;
 pub mod tests {
     use super::*;
 
+    use crate::utils::logging::*;
+
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use rand::Rng;
@@ -142,7 +144,6 @@ pub mod tests {
     use std::{
         io::{BufWriter, Seek, Write},
         sync::Arc,
-        time::Duration,
     };
     use tempfile::tempfile;
     use tokio::{io::AsyncSeekExt, net::TcpListener};
@@ -189,7 +190,6 @@ pub mod tests {
     impl SimpleTestAdapter {
         /// Create a new test adapter with deterministic content
         pub fn new(size: usize) -> Self {
-            crate::utils::logger::init_tracing();
             let content = create_deterministic_content(size);
             let expected_hash = calculate_sha256(&content);
 
@@ -247,7 +247,7 @@ pub mod tests {
     #[async_trait::async_trait]
     impl BoltLoadAdapter for SimpleTestAdapter {
         async fn is_range_stream_available(&self) -> bool {
-            tracing::info!(
+            info!(
                 "[TEST ADAPTER] is_range_stream_available() called, returning: {}",
                 self.support_range
             );
@@ -256,17 +256,17 @@ pub mod tests {
         }
 
         async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
-            tracing::info!("[TEST ADAPTER] retrieve_meta() called");
+            info!("[TEST ADAPTER] retrieve_meta() called");
             self.call_count.fetch_add(1, Ordering::Relaxed);
 
             if self.should_fail {
-                tracing::info!("[TEST ADAPTER] retrieve_meta() returning failure");
+                info!("[TEST ADAPTER] retrieve_meta() returning failure");
                 return Err(UnretryableError::Internal(
                     "Simulated meta retrieval failure".to_string(),
                 ));
             }
 
-            tracing::info!(
+            info!(
                 "[TEST ADAPTER] retrieve_meta() success, size: {}",
                 self.content.len()
             );
@@ -278,14 +278,14 @@ pub mod tests {
         }
 
         async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
-            tracing::info!(
+            info!(
                 "[TEST ADAPTER] full_stream() called, content size: {}",
                 self.content.len()
             );
             self.call_count.fetch_add(1, Ordering::Relaxed);
 
             if self.should_fail {
-                tracing::info!("[TEST ADAPTER] full_stream() returning failure");
+                info!("[TEST ADAPTER] full_stream() returning failure");
                 return Err(StreamError::Unretryable(UnretryableError::Internal(
                     "Simulated stream failure".to_string(),
                 )));
@@ -293,7 +293,7 @@ pub mod tests {
 
             let content = self.content.clone();
             let chunk_size = self.chunk_size;
-            tracing::info!(
+            info!(
                 "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
                 chunk_size
             );

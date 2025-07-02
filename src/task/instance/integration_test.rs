@@ -17,7 +17,7 @@ mod tests {
     use smol_cancellation_token::CancellationToken;
     use std::{sync::Arc, time::Duration};
     use tempfile::TempDir;
-
+    use crate::utils::logging::*;
     use crate::{
         adapter::BoltLoadAdapter,
         runtime::ThreadedRuntimeImpl,
@@ -105,7 +105,7 @@ mod tests {
             TaskEvent::Finished(progress) => {
                 assert_eq!(progress.total, Some(TEST_FILE_SIZE as u64));
                 assert_eq!(progress.downloaded, TEST_FILE_SIZE as u64);
-                tracing::info!("✓ Singleton task completed successfully");
+                info!("✓ Singleton task completed successfully");
             }
             TaskEvent::Failed(err) => {
                 panic!("Task failed unexpectedly: {:?}", err);
@@ -126,7 +126,7 @@ mod tests {
                 downloaded_hash, content_hash,
                 "Downloaded file content should match original content"
             );
-            tracing::info!("✓ File content verification passed");
+            info!("✓ File content verification passed");
         }
     }
 
@@ -157,8 +157,8 @@ mod tests {
         // Verify results
         if let Err(e) = result {
             // If task failed, check if it's for expected reasons
-            tracing::info!("Concurrent task result: {:?}", e);
-            tracing::info!("Collected events: {:?}", events);
+            info!("Concurrent task result: {:?}", e);
+            info!("Collected events: {:?}", events);
         } else {
             // Verify event sequence
             assert!(!events.is_empty(), "Should receive events");
@@ -171,7 +171,7 @@ mod tests {
             if let TaskEvent::Finished(progress) = final_event {
                 assert_eq!(progress.total, Some(TEST_FILE_SIZE as u64));
                 assert_eq!(progress.downloaded, TEST_FILE_SIZE as u64);
-                tracing::info!("✓ Concurrent task completed successfully");
+                info!("✓ Concurrent task completed successfully");
 
                 // Verify downloaded file content
                 if file_path.exists() {
@@ -181,7 +181,7 @@ mod tests {
                         downloaded_hash, content_hash,
                         "Downloaded file content should match original content"
                     );
-                    tracing::info!("✓ File content verification passed");
+                    info!("✓ File content verification passed");
                 }
             }
         }
@@ -220,9 +220,9 @@ mod tests {
             result.is_err() || events.iter().any(|e| matches!(e, TaskEvent::Failed(_)));
 
         if task_cancelled {
-            tracing::info!("✓ Task cancellation test passed");
+            info!("✓ Task cancellation test passed");
         } else {
-            tracing::info!("! Task may have completed before cancellation, which is also normal");
+            info!("! Task may have completed before cancellation, which is also normal");
         }
     }
 
@@ -256,7 +256,7 @@ mod tests {
             result.is_err() || events.iter().any(|e| matches!(e, TaskEvent::Failed(_)));
 
         assert!(task_failed, "Task should fail when adapter fails");
-        tracing::info!("✓ Adapter failure handling test passed");
+        info!("✓ Adapter failure handling test passed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -314,8 +314,8 @@ mod tests {
             tokio::join!(singleton_task.wait(), concurrent_task.wait());
 
         // Verify results
-        tracing::info!("Singleton task result: {singleton_result:?}");
-        tracing::info!("Concurrent task result: {concurrent_result:?}");
+        info!("Singleton task result: {singleton_result:?}");
+        info!("Concurrent task result: {concurrent_result:?}");
 
         // Check singleton task
         let singleton_success = singleton_result.is_ok()
@@ -324,7 +324,7 @@ mod tests {
                 .any(|e| matches!(e, TaskEvent::Finished(_)));
 
         if singleton_success {
-            tracing::info!("✓ Singleton mode test passed");
+            info!("✓ Singleton mode test passed");
         }
 
         // Check concurrent task (may fail due to zero size or other reasons)
@@ -334,7 +334,7 @@ mod tests {
                 .any(|e| matches!(e, TaskEvent::Finished(_)));
 
         if concurrent_completed {
-            tracing::info!("✓ Concurrent mode test passed");
+            info!("✓ Concurrent mode test passed");
 
             // Compare file contents
             if singleton_path.exists() && concurrent_path.exists() {
@@ -350,10 +350,10 @@ mod tests {
                     singleton_hash, content_hash,
                     "Downloaded content should match original content"
                 );
-                tracing::info!("✓ File content comparison test passed");
+                info!("✓ File content comparison test passed");
             }
         } else {
-            tracing::info!(
+            info!(
                 "! Concurrent task may have failed for specific reasons, which could be expected \
                  behavior"
             );

@@ -10,6 +10,7 @@ use std::{
 use ranges::{GenericRange, OperationResult, Ranges};
 
 use crate::task::RunnerId;
+use crate::utils::logging::*;
 
 pub const DEFAULT_MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 
@@ -118,7 +119,7 @@ impl ChunkPlanner {
     /// get the available chunks ranges
     pub fn get_available_ranges(&self) -> Vec<Range<u64>> {
         let chunks = Ranges::from_iter(self.chunks.keys().cloned());
-        tracing::trace!("[TASK] occupied chunks: {chunks:?}");
+        trace!("[TASK] occupied chunks: {chunks:?}");
         let full_range = Ranges::from(GenericRange::from(0..self.total));
         let available_ranges = full_range - chunks;
         let mut ranges: Vec<_> = available_ranges
@@ -177,7 +178,7 @@ impl ChunkPlanner {
                 .iter()
                 .any(|(k, _)| *range - *k != OperationResult::Empty)
             {
-                tracing::warn!(
+                warn!(
                     "the downloaded range is out of the occupied range, {:?} - {:?}",
                     range,
                     self.chunks

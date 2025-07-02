@@ -12,6 +12,7 @@ use crate::{
     runtime::ThreadedRuntimeImpl,
     task::{TaskStateChangedCallback, instance::TaskEvent},
 };
+use crate::utils::logging::*;
 
 #[non_exhaustive]
 pub struct TaskBuilder {
@@ -78,7 +79,7 @@ impl TaskBuilder {
                 if let Some(ref save_dir) = self.save_dir {
                     self.save_path = Some(save_dir.join(filename));
                 } else {
-                    tracing::warn!(
+                    warn!(
                         "save dir is not set, the retrieved filename will not be automatically \
                          set."
                     );

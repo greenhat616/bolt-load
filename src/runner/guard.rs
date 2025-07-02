@@ -1,4 +1,5 @@
 use crate::task::{ManagerMessage, RunnerId};
+use crate::utils::logging::*;
 
 use super::ManagerMessagesVariant;
 use async_channel::Sender;
@@ -34,7 +35,7 @@ impl TaskRunnerGuard {
             .send(ManagerMessage(self.runner_id, message))
             .await
         {
-            tracing::warn!("Failed to send message to task runner: {e:?}");
+            warn!("Failed to send message to task runner: {e:?}");
         }
     }
 }

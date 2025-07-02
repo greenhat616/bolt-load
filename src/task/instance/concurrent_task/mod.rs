@@ -3,7 +3,6 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
-    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -11,7 +10,6 @@ use std::{
 use async_channel::{Receiver, Sender};
 use async_io::Timer;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
-use lending_stream::prelude::*;
 use smol_cancellation_token::CancellationToken;
 use statig::{Response::*, prelude::*};
 
@@ -28,6 +26,7 @@ use crate::{
         },
     },
 };
+use crate::utils::logging::*;
 
 use super::{Generator, Result, TaskInstance};
 
@@ -239,7 +238,7 @@ impl ConcurrentTaskInner {
         let (tx, rx) = oneshot::channel();
         let handle = rt
             .spawn_with_handle(async move {
-                tracing::trace!(
+                trace!(
                     "[TASK] create background range runner: id: {runner_id}, range: {range:?}"
                 );
                 let mut runner = match TaskRunner::new_with_async_and_callback(
@@ -296,7 +295,7 @@ impl ConcurrentTaskInner {
         let available_ranges = chunk_planner.get_available_ranges();
         // TODO: move it to a new strategy for error and concurrency control
         if !available_ranges.is_empty() {
-            tracing::trace!(
+            trace!(
                 "[TASK] create background runners: available_ranges: {available_ranges:?}"
             );
             for chunk in available_ranges.iter() {
@@ -344,7 +343,7 @@ impl ConcurrentTaskInner {
             };
             let actions = dynamic_strategy.step(&strategy_context);
             for action in actions {
-                tracing::trace!("[TASK] download_timer_tick: action: {action:?}");
+                trace!("[TASK] download_timer_tick: action: {action:?}");
                 match action {
                     StrategyAction::SplitAllTask if runners_state.is_empty() => {
                         let runner_id = runner_id_generator.next().expect("no more runner id");
@@ -391,7 +390,7 @@ impl ConcurrentTaskInner {
                             continue;
                         }
 
-                        tracing::trace!(
+                        trace!(
                             "[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}"
                         );
 
@@ -407,7 +406,7 @@ impl ConcurrentTaskInner {
                             ))
                             .await
                             .inspect_err(|e| {
-                                tracing::error!("failed to send resize total message: {e:?}");
+                                error!("failed to send resize total message: {e:?}");
                             });
 
                         let _ = state;
@@ -469,7 +468,7 @@ impl ConcurrentTaskInner {
                 )))
                 .await
                 .inspect_err(|e| {
-                    tracing::error!("failed to send downloading event: {e:?}");
+                    error!("failed to send downloading event: {e:?}");
                 });
         });
         Ok(())
@@ -490,7 +489,7 @@ impl ConcurrentTaskInner {
         match msg {
             RunnerMessageKind::Stopped(reason) => match reason {
                 StoppedReason::Finished => {
-                    tracing::trace!("runner {runner_id} finished");
+                    trace!("runner {runner_id} finished");
                     runners_state
                         .entry(runner_id)
                         .and_modify(|r| r.status = RunnerStatus::Finished);
@@ -499,7 +498,7 @@ impl ConcurrentTaskInner {
                         .all(|r| r.status == RunnerStatus::Finished)
                         && chunk_planner.get_available_ranges().is_empty()
                     {
-                        tracing::trace!("[TASK] handle_runner_message: all chunks finished");
+                        trace!("[TASK] handle_runner_message: all chunks finished");
                         on_all_chunks_finished();
                     }
                 }
@@ -519,7 +518,7 @@ impl ConcurrentTaskInner {
                     let mut end = state.chunk.downloaded.end + bytes.len() as u64;
                     // It happens when the runner message handler is not fast enough
                     if end > state.chunk.occupied.end {
-                        tracing::warn!(
+                        warn!(
                             "runner {runner_id} downloaded more than the occupied range"
                         );
                         end = state.chunk.occupied.end;
@@ -539,7 +538,7 @@ impl ConcurrentTaskInner {
                 }
             }
             RunnerMessageKind::Started => {
-                tracing::trace!("runner {runner_id} started");
+                trace!("runner {runner_id} started");
             }
         }
         Ok(())
@@ -764,7 +763,7 @@ impl ConcurrentTaskInner {
     fn on_transition(&mut self, _source: &State, target: &State) {
         match target {
             State::Stopped { reason } => {
-                tracing::trace!("on_transition: enter stopped state, reason: {reason:?}");
+                trace!("on_transition: enter stopped state, reason: {reason:?}");
                 match reason.clone() {
                     Some(Ok(())) => {
                         let tx = self.event_tx.clone();
@@ -783,14 +782,14 @@ impl ConcurrentTaskInner {
                 }
             }
             State::Initializing { .. } => {
-                tracing::trace!("on_transition: enter initializing state");
+                trace!("on_transition: enter initializing state");
                 let tx = self.event_tx.clone();
                 let _ = self.rt.spawn(async move {
                     let _ = tx.send(TaskEvent::Initializing).await;
                 });
             }
             State::Downloading { .. } => {
-                tracing::trace!("on_transition: enter downloading state");
+                trace!("on_transition: enter downloading state");
                 let tx = self.event_tx.clone();
                 let progress = self.progress.clone();
                 let _ = self.rt.spawn(async move {
@@ -1022,7 +1021,7 @@ mod tests {
 
         // 验证下载量应该是调整后的大小
         if total_downloaded != new_total as usize {
-            tracing::error!("total_downloaded: {total_downloaded}, new_total: {new_total}");
+            error!("total_downloaded: {total_downloaded}, new_total: {new_total}");
         }
         assert!(total_downloaded >= new_total as usize);
     }
@@ -1199,7 +1198,7 @@ mod tests {
 
         for result in results {
             let (runner_id, downloaded_size, expected_size) = result.unwrap();
-            tracing::info!(
+            info!(
                 "Runner {runner_id}: downloaded {downloaded_size} bytes, expected {expected_size} \
                  bytes"
             );

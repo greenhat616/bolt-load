@@ -13,6 +13,7 @@ use crate::{
     runtime::ThreadedRuntimeImpl,
     task::DownloadMode,
 };
+use crate::utils::logging::*;
 
 use super::{ProgressWithSpeed, TaskEvent, TaskInstance, TaskInstanceImpl};
 
@@ -258,7 +259,7 @@ async fn test_singleton_task_cancellation() {
 
     // Task might complete successfully if it's fast enough, or fail if cancelled
     // Both outcomes are acceptable
-    tracing::info!("Cancellation test result: {:?}", result);
+    info!("Cancellation test result: {:?}", result);
 }
 
 #[tokio::test]
@@ -281,7 +282,7 @@ async fn test_concurrent_task_zero_size_failure() {
     let result = task.wait().await;
 
     // Concurrent task with zero-size might fail or succeed, both are acceptable
-    tracing::info!("Zero-size test result: {:?}", result);
+    info!("Zero-size test result: {:?}", result);
 }
 
 #[tokio::test]
@@ -315,7 +316,7 @@ async fn test_singleton_task_adapter_failure() {
                 .any(|e| matches!(e, TaskEvent::Failed(_))));
 
     if !task_failed {
-        tracing::info!("Adapter failure test: Task unexpectedly succeeded");
+        info!("Adapter failure test: Task unexpectedly succeeded");
     }
 }
 
@@ -360,7 +361,7 @@ async fn test_progress_tracking() {
     task.wait().await.unwrap();
 
     // Progress events might be empty for fast downloads, that's OK
-    tracing::info!("Progress events captured: {}", progress_events.len());
+    info!("Progress events captured: {}", progress_events.len());
 
     // Verify file content is correct
     let downloaded_content = std::fs::read(&file_path).unwrap();
@@ -443,6 +444,6 @@ async fn test_concurrent_vs_singleton_comparison() {
         }
     }
 
-    tracing::info!("Concurrent task result: {:?}", concurrent_wait);
-    tracing::info!("Singleton task result: {:?}", singleton_wait);
+    info!("Concurrent task result: {:?}", concurrent_wait);
+    info!("Singleton task result: {:?}", singleton_wait);
 }
