@@ -42,7 +42,7 @@ enum_dispatch = "0.3"
 atomic_enum = "0.3"
 tempfile = "3"
 smol-cancellation-token = "0.1"
-derive_more = { version = "1.0", features = ["debug"] }
+derive_more = { version = "2", features = ["debug"] }
 statig = { version ="0.3", features = ["async"] }
 bitvec = "1"                                           # for task id generation
 memmap2 = "0.9"                                        # for better random range write for files if machine is available
@@ -81,6 +81,7 @@ tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
+tracing-test = { git = "https://github.com/Frando/tracing-test.git", rev = "e81ec65", features = ["pretty-log-printing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1"

@@ -155,6 +155,7 @@ async fn wait_for_completion(
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_singleton_task_basic_download() {
     let rt = create_test_runtime();
     let content = create_test_content(5000);
@@ -192,6 +193,7 @@ async fn test_singleton_task_basic_download() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[tracing_test::traced_test]
 async fn test_concurrent_task_basic_download() {
     let rt = create_test_runtime();
     let content = create_test_content(10000);
@@ -234,6 +236,7 @@ async fn test_concurrent_task_basic_download() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_singleton_task_cancellation() {
     let rt = create_test_runtime();
     let content = create_test_content(100000); // Large file to ensure cancellation timing
@@ -262,6 +265,7 @@ async fn test_singleton_task_cancellation() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_concurrent_task_zero_size_failure() {
     let rt = create_test_runtime();
     let adapter = Arc::new(Box::new(MockAdapter::zero_size()) as Box<dyn BoltLoadAdapter + Send>);
@@ -285,6 +289,7 @@ async fn test_concurrent_task_zero_size_failure() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_singleton_task_adapter_failure() {
     let rt = create_test_runtime();
     let adapter =
@@ -320,6 +325,7 @@ async fn test_singleton_task_adapter_failure() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_progress_tracking() {
     let rt = create_test_runtime();
     let content = create_test_content(8000);
@@ -368,6 +374,7 @@ async fn test_progress_tracking() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[tracing_test::traced_test]
 async fn test_concurrent_vs_singleton_comparison() {
     let rt = create_test_runtime();
     let content = create_test_content(20000);

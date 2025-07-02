@@ -347,9 +347,11 @@ mod tests {
 
     #[cfg(feature = "smol")]
     use super::SmolThreadedRuntime;
+    use crate::utils::logging::*;
 
     #[test]
     #[cfg(feature = "smol")]
+    #[tracing_test::traced_test]
     fn test_smol_runtime() {
         let rt = SmolThreadedRuntime::build_with_threads(5);
         let (tx, rx) = oneshot::channel();

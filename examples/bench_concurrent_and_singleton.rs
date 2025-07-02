@@ -1,3 +1,4 @@
+use bolt_load::runtime::ThreadedRuntimeImpl;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -16,4 +17,10 @@ pub fn init_tracing() {
         .with(tracing_tracy::TracyLayer::default())
         .with(tokio_console_layer)
         .try_init();
+}
+
+fn main() {
+    init_tracing();
+
+    let rt = ThreadedRuntimeImpl::new_tokio_rt();
 }
