@@ -71,7 +71,7 @@ ureq2 = { version = "2", package = "ureq", optional = true }
 ureq3 = { version = "3", package = "ureq", optional = true }
 
 # runtime group
-tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "tracing"], optional = true }
 async-std = { version = "1", optional = true }
 smol = { version = "2", optional = true }
 
@@ -100,3 +100,4 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 axum-range = "0.5"
 portpicker = "0.1"
 tracing-tracy = "0.11"
+console-subscriber = "0.4.1"

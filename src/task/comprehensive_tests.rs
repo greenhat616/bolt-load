@@ -634,6 +634,7 @@ async fn test_zero_size_file_handling() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_vs_singleton_performance() {
     crate::utils::logger::init_tracing();
+
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 

@@ -13,8 +13,10 @@ pub fn init_tracing() {
 
     #[cfg(test)]
     {
+        let tokio_console_layer = console_subscriber::spawn();
         let _ = subscriber
             .with(tracing_tracy::TracyLayer::default())
+            .with(tokio_console_layer)
             .try_init();
     }
 

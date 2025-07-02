@@ -70,7 +70,7 @@ impl FileWriterControl {
     }
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 enum Mode {
     #[default]
@@ -78,6 +78,7 @@ enum Mode {
     SeekWrite,
 }
 
+#[derive(Debug)]
 pub struct FileWriter {
     total: u64,
     path: PathBuf,
@@ -98,6 +99,7 @@ impl FileWriter {
         self.mode = mode;
     }
 
+    #[tracing::instrument]
     fn handle_seek_write(
         file: &mut std::fs::File,
         range: Range<u64>,
@@ -108,6 +110,7 @@ impl FileWriter {
         Ok(())
     }
 
+    #[tracing::instrument]
     pub async fn start(self) -> Result<FileWriterGuard, std::io::Error> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (tx, rx) = async_channel::bounded(FILE_WRITER_QUEUE_SIZE);

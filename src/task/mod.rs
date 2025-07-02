@@ -8,6 +8,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex, atomic::Ordering},
 };
+use tracing::Instrument;
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
@@ -133,7 +134,6 @@ impl TaskStateControl {
 }
 
 // #[derive(Clone)]
-// #[derive(Debug)]
 #[non_exhaustive]
 pub struct Task {
     /// the async runtime passed from the client
@@ -162,6 +162,25 @@ pub struct Task {
     last_error: Arc<Mutex<Option<TaskInstanceError>>>,
 }
 
+impl Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Task")
+            // .field("rt", &self.rt)
+            // .field("adapter", &self.adapter)
+            .field("mode", &self.mode)
+            .field("save_path", &self.save_path)
+            .field("tmp_path", &self.tmp_path)
+            .field("meta", &self.meta)
+            .field("cancel_token", &self.cancel_token)
+            // .field("on_task_state_changed", &self.on_task_state_changed)
+            // .field("task", &self.task)
+            .field("event_handler_handle", &self.event_handler_handle)
+            .field("task_state", &self.task_state)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
+}
+
 impl Task {
     pub fn builder() -> TaskBuilder {
         TaskBuilder::default()
@@ -186,6 +205,7 @@ impl Task {
         self.task.stop().await.unwrap();
     }
 
+    #[tracing::instrument]
     pub async fn wait(&mut self) -> Result<(), TaskInstanceError> {
         if matches!(
             self.task_state.load(Ordering::Acquire),
@@ -205,7 +225,7 @@ impl Task {
         Ok(())
     }
 
-    // #[tracing::instrument]
+    #[tracing::instrument]
     pub async fn run(&mut self) -> Result<(), TaskInstanceError> {
         let (event_tx, event_rx) = async_channel::unbounded::<TaskEvent>();
         let cancel_token = self.cancel_token.clone();
@@ -215,35 +235,38 @@ impl Task {
         task_state.store(TaskState::Spawning, Ordering::Release);
         let handle = self
             .rt
-            .spawn_with_handle(async move {
-                while let Ok(event) = event_rx.recv().await {
-                    match &event {
-                        TaskEvent::Finished(_) => {
-                            #[cfg(test)]
-                            tracing::trace!("[TASK] TaskEvent::Finished");
-                            task_state.store(TaskState::Finished, Ordering::Release);
+            .spawn_with_handle(
+                async move {
+                    while let Ok(event) = event_rx.recv().await {
+                        match &event {
+                            TaskEvent::Finished(_) => {
+                                #[cfg(test)]
+                                tracing::trace!("[TASK] TaskEvent::Finished");
+                                task_state.store(TaskState::Finished, Ordering::Release);
+                            }
+                            TaskEvent::Initializing => {
+                                #[cfg(test)]
+                                tracing::trace!("[TASK] TaskEvent::Initializing");
+                                task_state.store(TaskState::Initializing, Ordering::Release);
+                            }
+                            TaskEvent::Downloading(_) => {
+                                // tracing::trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
+                                task_state.store(TaskState::Downloading, Ordering::Release);
+                            }
+                            TaskEvent::Failed(error) => {
+                                #[cfg(test)]
+                                tracing::trace!("[TASK] TaskEvent::Failed");
+                                task_state.store(TaskState::Failed, Ordering::Release);
+                                last_error.lock().unwrap().replace(error.clone());
+                            }
                         }
-                        TaskEvent::Initializing => {
-                            #[cfg(test)]
-                            tracing::trace!("[TASK] TaskEvent::Initializing");
-                            task_state.store(TaskState::Initializing, Ordering::Release);
+                        for callback in on_task_state_changed.iter() {
+                            callback(event.clone());
                         }
-                        TaskEvent::Downloading(_) => {
-                            // tracing::trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
-                            task_state.store(TaskState::Downloading, Ordering::Release);
-                        }
-                        TaskEvent::Failed(error) => {
-                            #[cfg(test)]
-                            tracing::trace!("[TASK] TaskEvent::Failed");
-                            task_state.store(TaskState::Failed, Ordering::Release);
-                            last_error.lock().unwrap().replace(error.clone());
-                        }
-                    }
-                    for callback in on_task_state_changed.iter() {
-                        callback(event.clone());
                     }
                 }
-            })
+                .instrument(tracing::span::Span::current()),
+            )
             .map_err(|e| {
                 tracing::error!("failed to spawn the task: {e:?}");
                 TaskInstanceError::new_failed(crate::runner::TaskFailedKind::Other(
