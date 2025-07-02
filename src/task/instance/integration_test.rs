@@ -13,18 +13,22 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::adapter::tests::{SimpleTestAdapter, calculate_sha256};
-    use smol_cancellation_token::CancellationToken;
     use std::{sync::Arc, time::Duration};
+
+    use smol_cancellation_token::CancellationToken;
     use tempfile::TempDir;
-    use crate::utils::logging::*;
+
     use crate::{
-        adapter::BoltLoadAdapter,
+        adapter::{
+            BoltLoadAdapter,
+            tests::{SimpleTestAdapter, calculate_sha256},
+        },
         runtime::ThreadedRuntimeImpl,
         task::{
             DownloadMode,
             instance::{TaskEvent, TaskInstance, TaskInstanceImpl},
         },
+        utils::logging::*,
     };
 
     const TEST_FILE_SIZE: usize = 4 * 1024 * 1024; // 4MB

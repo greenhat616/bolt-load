@@ -1,13 +1,14 @@
 use std::{pin::Pin, sync::Arc};
 
-use super::{
-    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError, StreamError,
-    UnretryableError,
-};
 use async_trait::async_trait;
 use futures::Stream;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use url::Url;
+
+use super::{
+    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError, StreamError,
+    UnretryableError,
+};
 
 type BeforeRequestFn =
     Box<dyn Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + Sync>;
@@ -232,9 +233,10 @@ impl BoltLoadAdapter for ReqwestAdapter {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_get_content_size() {

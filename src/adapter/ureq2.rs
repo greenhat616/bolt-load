@@ -1,13 +1,14 @@
-use crate::utils::{http::ContentDisposition, reader::CrossRuntimeStream};
+use std::{convert::AsRef, sync::Arc};
+
 use blocking::unblock;
 use futures::Stream;
-use std::{convert::AsRef, sync::Arc};
 use ureq2::{Agent, Request};
 
 use super::{
     AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError, StreamError,
     UnretryableError,
 };
+use crate::utils::{http::ContentDisposition, reader::CrossRuntimeStream};
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
 type CallFn = Box<dyn Fn(Request) -> Result<ureq2::Response, ureq2::Error> + Send + Sync>;
@@ -230,10 +231,11 @@ impl BoltLoadAdapter for UreqAdapter {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use url::Url;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_get_content_size() {

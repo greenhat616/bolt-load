@@ -6,16 +6,15 @@ use futures::StreamExt;
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
+use super::{ProgressWithSpeed, TaskEvent, TaskInstance, TaskInstanceImpl};
 use crate::{
     adapter::{
         AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError,
     },
     runtime::ThreadedRuntimeImpl,
     task::DownloadMode,
+    utils::logging::*,
 };
-use crate::utils::logging::*;
-
-use super::{ProgressWithSpeed, TaskEvent, TaskInstance, TaskInstanceImpl};
 
 // Mock adapter for testing
 #[derive(Clone)]

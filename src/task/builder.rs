@@ -11,8 +11,8 @@ use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
     runtime::ThreadedRuntimeImpl,
     task::{TaskStateChangedCallback, instance::TaskEvent},
+    utils::logging::*,
 };
-use crate::utils::logging::*;
 
 #[non_exhaustive]
 pub struct TaskBuilder {

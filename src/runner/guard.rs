@@ -1,9 +1,11 @@
-use crate::task::{ManagerMessage, RunnerId};
-use crate::utils::logging::*;
-
-use super::ManagerMessagesVariant;
 use async_channel::Sender;
 use smol_cancellation_token::CancellationToken;
+
+use super::ManagerMessagesVariant;
+use crate::{
+    task::{ManagerMessage, RunnerId},
+    utils::logging::*,
+};
 
 pub struct TaskRunnerGuard {
     runner_id: RunnerId,

@@ -1,5 +1,11 @@
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
+use async_fs::OpenOptions;
+use async_io::Timer;
+use futures::{AsyncWriteExt, FutureExt, StreamExt, task::SpawnExt};
+use smol_cancellation_token::CancellationToken;
+use statig::prelude::*;
+
 use super::{
     Result, TaskInstance, TaskInstanceError,
     sampler::{SAMPLE_INTERVAL, Sampler},
@@ -12,15 +18,8 @@ use crate::{
         Progress, RunnerId,
         instance::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
     },
-    utils::ShutdownGuardExt,
+    utils::{ShutdownGuardExt, logging::*},
 };
-use crate::utils::logging::*;
-
-use async_fs::OpenOptions;
-use async_io::Timer;
-use futures::{AsyncWriteExt, FutureExt, StreamExt, task::SpawnExt};
-use smol_cancellation_token::CancellationToken;
-use statig::prelude::*;
 
 /// Singleton task only have one runner, so we use a static id for the runner
 const STATIC_RUNNER_ID: RunnerId = 0;

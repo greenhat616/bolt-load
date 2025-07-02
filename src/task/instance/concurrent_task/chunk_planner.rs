@@ -9,8 +9,7 @@ use std::{
 
 use ranges::{GenericRange, OperationResult, Ranges};
 
-use crate::task::RunnerId;
-use crate::utils::logging::*;
+use crate::{task::RunnerId, utils::logging::*};
 
 pub const DEFAULT_MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1MB
 
@@ -180,8 +179,7 @@ impl ChunkPlanner {
             {
                 warn!(
                     "the downloaded range is out of the occupied range, {:?} - {:?}",
-                    range,
-                    self.chunks
+                    range, self.chunks
                 );
                 return (None, None);
             }
@@ -250,8 +248,9 @@ fn unwrap_range_start_bound<T>(bound: Bound<T>) -> T {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pretty_assertions::assert_eq;
+
+    use super::*;
 
     #[test]
     fn test_add_chunk() {

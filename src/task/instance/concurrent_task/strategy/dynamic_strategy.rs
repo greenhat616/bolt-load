@@ -1,6 +1,5 @@
-use crate::task::instance::concurrent_task::DEFAULT_MAX_CONCURRENCY;
-
 use super::{Strategy, StrategyAction};
+use crate::task::instance::concurrent_task::DEFAULT_MAX_CONCURRENCY;
 
 enum DynamicPlannerStage {
     QuickStart,

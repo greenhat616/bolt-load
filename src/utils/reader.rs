@@ -1,11 +1,12 @@
-use blocking::Unblock;
-use bytes::Bytes;
-use futures::{AsyncRead, Stream};
 use std::{
     io::Read,
     pin::Pin,
     task::{Context, Poll},
 };
+
+use blocking::Unblock;
+use bytes::Bytes;
+use futures::{AsyncRead, Stream};
 
 pub struct CrossRuntimeStream {
     pub(crate) reader: Unblock<Box<dyn Read + Send>>,
@@ -41,9 +42,11 @@ impl Stream for CrossRuntimeStream {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use futures::{StreamExt, TryStreamExt};
     use std::io::Cursor;
+
+    use futures::{StreamExt, TryStreamExt};
+
+    use super::*;
 
     #[tokio::test]
     async fn test_cross_runtime_stream() {

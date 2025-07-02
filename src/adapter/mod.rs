@@ -133,22 +133,23 @@ pub type AnyAdapter = Box<dyn BoltLoadAdapter + Send>;
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-
-    use crate::utils::logging::*;
+    use std::{
+        io::{BufWriter, Seek, Write},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use rand::Rng;
     use sha2::{Digest, Sha256};
-    use std::{
-        io::{BufWriter, Seek, Write},
-        sync::Arc,
-    };
     use tempfile::tempfile;
     use tokio::{io::AsyncSeekExt, net::TcpListener};
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::*;
+    use crate::utils::logging::*;
 
     /// Creates a deterministic test content with specified size for hash verification
     pub fn create_deterministic_content(size: usize) -> Vec<u8> {
@@ -426,9 +427,10 @@ pub mod tests {
     }
 
     mod simple_test_adapter_tests {
-        use super::*;
         use futures::StreamExt;
         use pretty_assertions::assert_eq;
+
+        use super::*;
 
         #[tokio::test]
         async fn test_simple_test_adapter_basic_functionality() {

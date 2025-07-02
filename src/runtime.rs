@@ -1,10 +1,9 @@
 #![allow(dead_code)]
 use std::{rc::Rc, sync::Arc};
 
+use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
 #[cfg(feature = "smol")]
 use smol::future::FutureExt;
-
-use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
 
 use crate::utils::logging::*;
 
@@ -344,9 +343,10 @@ impl LocalSpawn for SmolLocalRuntime {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "smol")]
-    use super::SmolThreadedRuntime;
-    #[cfg(feature = "smol")]
     use std::time::Duration;
+
+    #[cfg(feature = "smol")]
+    use super::SmolThreadedRuntime;
 
     #[test]
     #[cfg(feature = "smol")]

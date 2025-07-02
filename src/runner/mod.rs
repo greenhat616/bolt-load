@@ -1,12 +1,13 @@
-use crate::{
-    adapter::{AnyBytesStream, StreamError},
-    task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
-    utils::{logging::*, ShutdownGuardExt},
-};
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
+
+use crate::{
+    adapter::{AnyBytesStream, StreamError},
+    task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
+    utils::{ShutdownGuardExt, logging::*},
+};
 
 mod guard;
 pub use guard::*;
@@ -305,14 +306,15 @@ impl TaskRunner {
 
 #[cfg(test)]
 mod tests {
-    use crate::adapter::{StreamError, UnretryableError};
+    use std::{sync::Arc, time::Duration};
 
-    use super::*;
     use async_stream::stream;
     use oneshot;
     use pretty_assertions::assert_eq;
-    use std::{sync::Arc, time::Duration};
     use tokio::time::sleep;
+
+    use super::*;
+    use crate::adapter::{StreamError, UnretryableError};
 
     #[tokio::test]
     async fn test_normal_download() {

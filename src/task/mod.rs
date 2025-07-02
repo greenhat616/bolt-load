@@ -14,8 +14,8 @@ use tracing::Instrument;
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runtime::ThreadedRuntimeImpl,
+    utils::logging::*,
 };
-use crate::utils::logging::*;
 
 mod builder;
 #[cfg(test)]

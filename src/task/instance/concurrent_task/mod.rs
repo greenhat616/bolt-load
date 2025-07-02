@@ -13,6 +13,7 @@ use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::{Response::*, prelude::*};
 
+use super::{Generator, Result, TaskInstance};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
@@ -25,10 +26,8 @@ use crate::{
             sampler::{SAMPLE_INTERVAL, Sampler},
         },
     },
+    utils::logging::*,
 };
-use crate::utils::logging::*;
-
-use super::{Generator, Result, TaskInstance};
 
 mod chunk_planner;
 mod file;
@@ -238,9 +237,7 @@ impl ConcurrentTaskInner {
         let (tx, rx) = oneshot::channel();
         let handle = rt
             .spawn_with_handle(async move {
-                trace!(
-                    "[TASK] create background range runner: id: {runner_id}, range: {range:?}"
-                );
+                trace!("[TASK] create background range runner: id: {runner_id}, range: {range:?}");
                 let mut runner = match TaskRunner::new_with_async_and_callback(
                     Some(range.end - range.start),
                     async { adapter.range_stream(range.start, range.end).await },
@@ -295,9 +292,7 @@ impl ConcurrentTaskInner {
         let available_ranges = chunk_planner.get_available_ranges();
         // TODO: move it to a new strategy for error and concurrency control
         if !available_ranges.is_empty() {
-            trace!(
-                "[TASK] create background runners: available_ranges: {available_ranges:?}"
-            );
+            trace!("[TASK] create background runners: available_ranges: {available_ranges:?}");
             for chunk in available_ranges.iter() {
                 let runner_id = runner_id_generator.next().expect("no more runner id");
                 chunk_planner.add_chunk(chunk.clone(), Some(runner_id));
@@ -390,9 +385,7 @@ impl ConcurrentTaskInner {
                             continue;
                         }
 
-                        trace!(
-                            "[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}"
-                        );
+                        trace!("[TASK] StrategyAction::SplitGivenTask: task_id: {task_id}");
 
                         let next_id = runner_id_generator.next().expect("no more runner id");
                         let next_chunk = half_end..occupied_chunk.end;
@@ -518,9 +511,7 @@ impl ConcurrentTaskInner {
                     let mut end = state.chunk.downloaded.end + bytes.len() as u64;
                     // It happens when the runner message handler is not fast enough
                     if end > state.chunk.occupied.end {
-                        warn!(
-                            "runner {runner_id} downloaded more than the occupied range"
-                        );
+                        warn!("runner {runner_id} downloaded more than the occupied range");
                         end = state.chunk.occupied.end;
                     }
 
@@ -806,16 +797,18 @@ impl ConcurrentTaskInner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use futures::StreamExt;
+    use pretty_assertions::assert_eq;
+    use smol_cancellation_token::CancellationToken;
+
     use super::*;
     use crate::{
         adapter::{BoltLoadAdapter, tests::SimpleTestAdapter},
         runtime::ThreadedRuntimeImpl,
         task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
     };
-    use futures::StreamExt;
-    use pretty_assertions::assert_eq;
-    use smol_cancellation_token::CancellationToken;
-    use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create_background_range_runner_success() {

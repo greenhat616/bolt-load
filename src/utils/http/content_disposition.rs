@@ -12,12 +12,10 @@
 //! - Browser conformance tests at: <http://greenbytes.de/tech/tc2231/>
 //! - IANA assignment: <http://www.iana.org/assignments/cont-disp/cont-disp.xhtml>
 
-use std::fmt;
-
-use regex::Regex;
-use std::sync::LazyLock;
+use std::{fmt, sync::LazyLock};
 
 use headers::{Header, HeaderValue};
+use regex::Regex;
 
 use super::ExtendedValue;
 
@@ -543,9 +541,8 @@ impl fmt::Display for ContentDisposition {
 mod tests {
     use http::HeaderValue;
 
-    use crate::utils::http::ExtendedValue;
-
     use super::{ContentDisposition, DispositionParam, DispositionType};
+    use crate::utils::http::ExtendedValue;
 
     #[test]
     fn test_from_raw_basic() {

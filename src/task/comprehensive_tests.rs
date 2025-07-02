@@ -24,8 +24,8 @@ use crate::{
     },
     runtime::ThreadedRuntimeImpl,
     task::{DownloadMode, TaskBuilder, TaskEvent, TaskManagerBuildError},
+    utils::logging::*,
 };
-use crate::utils::logging::*;
 
 /// Create test runtime
 fn create_test_runtime() -> ThreadedRuntimeImpl {

@@ -1,15 +1,14 @@
+use std::{path::PathBuf, sync::Arc};
+
 use futures::future::RemoteHandle;
 use smol_cancellation_token::CancellationToken;
 
-use std::{path::PathBuf, sync::Arc};
-
+use super::{DownloadMode, Progress};
 use crate::{
     adapter::{AnyAdapter, StreamError, UnretryableError},
     runner::TaskFailedKind,
     runtime::ThreadedRuntimeImpl,
 };
-
-use super::{DownloadMode, Progress};
 
 mod concurrent_task;
 mod id;
@@ -22,9 +21,8 @@ mod tests;
 #[cfg(test)]
 mod integration_test;
 
-use id::Generator;
-
 pub use concurrent_task::*;
+use id::Generator;
 pub use singleton_task::*;
 
 #[derive(Debug, Clone)]
