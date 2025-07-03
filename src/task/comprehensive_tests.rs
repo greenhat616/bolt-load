@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use crate::{
     adapter::{
         BoltLoadAdapter,
-        tests::{SimpleTestAdapter, calculate_sha256},
+        tests::{SimpleTestAdapter, calculate_blake3},
     },
     runtime::ThreadedRuntimeImpl,
     task::{DownloadMode, TaskBuilder, TaskEvent, TaskManagerBuildError},
@@ -445,7 +445,7 @@ async fn test_small_file_download_with_hash_verification() {
     // Verify file exists and calculate hash
     assert!(save_path.exists(), "Downloaded file should exist");
     let downloaded_content = std::fs::read(&save_path).unwrap();
-    let actual_hash = calculate_sha256(&downloaded_content);
+    let actual_hash = calculate_blake3(&downloaded_content);
 
     assert_eq!(
         actual_hash, expected_hash,
@@ -494,7 +494,7 @@ async fn test_medium_file_download_with_hash_verification() {
 
     // Verify file and hash
     let downloaded_content = std::fs::read(&save_path).unwrap();
-    let actual_hash = calculate_sha256(&downloaded_content);
+    let actual_hash = calculate_blake3(&downloaded_content);
 
     assert_eq!(actual_hash, expected_hash, "Hash verification failed");
     assert_eq!(
@@ -555,7 +555,7 @@ async fn test_large_file_download_with_hash_verification() {
     info!("🔍 Calculating hash for verification...");
     let hash_start = Instant::now();
     let downloaded_content = std::fs::read(&save_path).unwrap();
-    let actual_hash = calculate_sha256(&downloaded_content);
+    let actual_hash = calculate_blake3(&downloaded_content);
     let hash_duration = hash_start.elapsed();
 
     assert_eq!(
@@ -648,9 +648,14 @@ async fn test_concurrent_vs_singleton_performance() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 
-    // Test concurrent mode
-    let runtime1 = create_test_runtime();
+    // Set up adapters
     let adapter1 = SimpleTestAdapter::new(file_size).with_range_support(true);
+    info!("adapter1: {:?}", adapter1);
+    let adapter2 = adapter1.clone_reset_count().with_range_support(false);
+    info!("adapter2: {:?}", adapter2);
+
+    // Test concurrent mode
+    let runtime = ThreadedRuntimeImpl::new_tokio_rt();
     let concurrent_expected_hash = adapter1.expected_hash().to_string();
     let concurrent_path = temp_dir.path().join("concurrent.bin");
 
@@ -659,14 +664,12 @@ async fn test_concurrent_vs_singleton_performance() {
         .save_path(concurrent_path.clone())
         .prefer_mode(DownloadMode::Concurrent)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime1)
+        .runtime(runtime.clone())
         .build()
         .await
         .unwrap();
 
     // Test singleton mode
-    let runtime2 = create_test_runtime();
-    let adapter2 = SimpleTestAdapter::new(file_size).with_range_support(false);
     let singleton_expected_hash = adapter2.expected_hash().to_string();
     let singleton_path = temp_dir.path().join("singleton.bin");
 
@@ -675,7 +678,7 @@ async fn test_concurrent_vs_singleton_performance() {
         .save_path(singleton_path.clone())
         .prefer_mode(DownloadMode::Singleton)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime2)
+        .runtime(runtime.clone())
         .build()
         .await
         .unwrap();
@@ -684,39 +687,31 @@ async fn test_concurrent_vs_singleton_performance() {
 
     // Run both downloads and measure time
     let start_time = Instant::now();
-
     concurrent_task.run().await.unwrap();
+    concurrent_task
+        .wait()
+        .await
+        .expect("concurrent task should succeed");
+    info!("Concurrent task finished");
+    let concurrent_duration = start_time.elapsed();
+
+    let start_time = Instant::now();
     singleton_task.run().await.unwrap();
-
-    let ((concurrent_result, concurrent_duration), (singleton_result, singleton_duration)) = tokio::join!(
-        async {
-            let result = concurrent_task.wait().await;
-            error!("Concurrent task finished");
-            (result, start_time.elapsed())
-        },
-        async {
-            let result = singleton_task.wait().await;
-            error!("Singleton task finished");
-            (result, start_time.elapsed())
-        }
-    );
-
-    let total_duration = start_time.elapsed();
+    singleton_task
+        .wait()
+        .await
+        .expect("singleton task should succeed");
+    info!("Singleton task finished");
+    let singleton_duration = start_time.elapsed();
 
     let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
     let singleton_speed = (file_size as f64 / singleton_duration.as_secs_f64()).round();
 
-    // At least singleton should succeed
-    assert!(
-        singleton_result.is_ok(),
-        "Singleton download should succeed"
-    );
-
     // Verify singleton file
     let singleton_content = std::fs::read(&singleton_path).unwrap();
-    let singleton_hash = calculate_sha256(&singleton_content);
+    let singleton_hash = calculate_blake3(&singleton_content);
     let concurrent_content = std::fs::read(&concurrent_path).unwrap();
-    let concurrent_hash = calculate_sha256(&concurrent_content);
+    let concurrent_hash = calculate_blake3(&concurrent_content);
     assert_eq!(
         singleton_hash, singleton_expected_hash,
         "Singleton file hash should be correct"
@@ -729,7 +724,7 @@ async fn test_concurrent_vs_singleton_performance() {
     info!("✓ Performance comparison test completed");
     info!(
         "
-    - Concurrent result: {concurrent_result:?}
+    - Concurrent result:
         - Measured Speed: {concurrent_speed} MB/s
         - Duration: {concurrent_duration:?}
         - Hash: {concurrent_hash}
@@ -737,24 +732,20 @@ async fn test_concurrent_vs_singleton_performance() {
     );
     info!(
         "
-    - Singleton result: {singleton_result:?}
+    - Singleton result:
         - Measured Speed: {singleton_speed} MB/s
         - Duration: {singleton_duration:?}
         - Hash: {singleton_hash}
         - File size: {file_size} bytes"
     );
-    info!("  - Total test duration: {total_duration:?}");
 
-    // If concurrent also succeeded, verify its file
-    if concurrent_result.is_ok() && concurrent_path.exists() {
-        let concurrent_content = std::fs::read(&concurrent_path).unwrap();
-        let concurrent_hash = calculate_sha256(&concurrent_content);
-        assert_eq!(
-            concurrent_hash, concurrent_expected_hash,
-            "Concurrent file hash should be correct"
-        );
-        info!("  - Both modes completed successfully with matching hashes");
-    }
+    let concurrent_content = std::fs::read(&concurrent_path).unwrap();
+    let concurrent_hash = calculate_blake3(&concurrent_content);
+    assert_eq!(
+        concurrent_hash, concurrent_expected_hash,
+        "Concurrent file hash should be correct"
+    );
+    info!("  - Both modes completed successfully with matching hashes");
 }
 
 #[tokio::test(flavor = "multi_thread")]

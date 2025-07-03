@@ -14,7 +14,6 @@ use bolt_load::{
     task::{DownloadMode, TaskBuilder},
 };
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 use tracing::{level_filters::LevelFilter, *};
@@ -22,12 +21,11 @@ use tracing_subscriber::{
     EnvFilter, Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
 };
 
-/// Calculate SHA256 hash of the content
+/// Calculate blake3 hash of the content
 #[cfg_attr(feature = "tracing", tracing::instrument(skip(content), ret))]
-pub fn calculate_sha256(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    format!("{:x}", hasher.finalize())
+pub fn calculate_blake3(content: &[u8]) -> String {
+    let hash = blake3::hash(content);
+    hash.to_hex().to_string()
 }
 
 /// Creates a deterministic test content with specified size for hash verification
@@ -36,23 +34,32 @@ pub fn create_deterministic_content(size: usize) -> Vec<u8> {
     let mut content = Vec::with_capacity(size);
     let mut counter = 0u64;
 
-    while content.len() < size {
-        let bytes = counter.to_le_bytes();
-        for &byte in &bytes {
-            if content.len() < size {
-                content.push(byte);
-            }
+    unsafe {
+        let ptr: *mut u8 = content.as_mut_ptr();
+        let mut offset = 0;
+
+        while offset + 8 <= size {
+            std::ptr::write_unaligned(ptr.add(offset) as *mut u64, counter.to_le());
+            offset += 8;
+            counter += 1;
         }
-        counter += 1;
+
+        if offset < size {
+            let bytes = counter.to_le_bytes();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), size - offset);
+        }
+
+        content.set_len(size);
     }
 
     content
 }
 
 /// Simple test adapter for testing Task and TaskBuilder
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 pub struct SimpleTestAdapter {
-    content: Vec<u8>,
+    #[debug(ignore)]
+    content: Arc<Vec<u8>>,
     expected_hash: String,
     support_range: bool,
     should_fail: bool,
@@ -62,14 +69,26 @@ pub struct SimpleTestAdapter {
 }
 
 impl SimpleTestAdapter {
+    pub fn clone_reset_count(&self) -> Self {
+        Self {
+            content: self.content.clone(),
+            expected_hash: self.expected_hash.clone(),
+            support_range: self.support_range,
+            should_fail: self.should_fail,
+            chunk_size: self.chunk_size,
+            call_count: Arc::new(AtomicUsize::new(0)),
+            filename: self.filename.clone(),
+        }
+    }
+
     /// Create a new test adapter with deterministic content
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub fn new(size: usize) -> Self {
         let content = create_deterministic_content(size);
-        let expected_hash = calculate_sha256(&content);
+        let expected_hash = calculate_blake3(&content);
 
         Self {
-            content,
+            content: Arc::new(content),
             expected_hash,
             support_range: true,
             should_fail: false,
@@ -211,15 +230,20 @@ impl BoltLoadAdapter for SimpleTestAdapter {
 
 pub fn init_tracing() {
     let current_crate = env!("CARGO_CRATE_NAME");
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_level(true)
-        // .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
-        .with_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::WARN.into())
-                .parse(format!("bolt_load=trace,{current_crate}=trace"))
-                .unwrap(),
-        );
+    let has_arg_spans = std::env::args().any(|arg| arg == "--spans");
+    let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
+    let fmt_layer = if has_arg_spans {
+        fmt_layer.with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
+    } else {
+        fmt_layer
+    }
+    .with_filter(
+        EnvFilter::builder()
+            .with_default_directive(LevelFilter::WARN.into())
+            .parse(format!("bolt_load=trace,{current_crate}=trace"))
+            .unwrap(),
+    );
+
     let filter_layer = EnvFilter::builder()
         .with_default_directive(LevelFilter::TRACE.into())
         .from_env_lossy();
@@ -240,9 +264,14 @@ async fn test_concurrent_vs_singleton_performance() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 
+    // Set up adapters
+    let adapter1 = SimpleTestAdapter::new(file_size).with_range_support(true);
+    info!("adapter1: {:?}", adapter1);
+    let adapter2 = adapter1.clone_reset_count().with_range_support(false);
+    info!("adapter2: {:?}", adapter2);
+
     // Test concurrent mode
     let runtime = ThreadedRuntimeImpl::new_tokio_rt();
-    let adapter1 = SimpleTestAdapter::new(file_size).with_range_support(true);
     let concurrent_expected_hash = adapter1.expected_hash().to_string();
     let concurrent_path = temp_dir.path().join("concurrent.bin");
 
@@ -257,7 +286,6 @@ async fn test_concurrent_vs_singleton_performance() {
         .unwrap();
 
     // Test singleton mode
-    let adapter2 = SimpleTestAdapter::new(file_size).with_range_support(false);
     let singleton_expected_hash = adapter2.expected_hash().to_string();
     let singleton_path = temp_dir.path().join("singleton.bin");
 
@@ -275,39 +303,31 @@ async fn test_concurrent_vs_singleton_performance() {
 
     // Run both downloads and measure time
     let start_time = Instant::now();
-
     concurrent_task.run().await.unwrap();
+    concurrent_task
+        .wait()
+        .await
+        .expect("concurrent task should succeed");
+    info!("Concurrent task finished");
+    let concurrent_duration = start_time.elapsed();
+
+    let start_time = Instant::now();
     singleton_task.run().await.unwrap();
-
-    let ((concurrent_result, concurrent_duration), (singleton_result, singleton_duration)) = tokio::join!(
-        async {
-            let result = concurrent_task.wait().await;
-            error!("Concurrent task finished");
-            (result, start_time.elapsed())
-        },
-        async {
-            let result = singleton_task.wait().await;
-            error!("Singleton task finished");
-            (result, start_time.elapsed())
-        }
-    );
-
-    let total_duration = start_time.elapsed();
+    singleton_task
+        .wait()
+        .await
+        .expect("singleton task should succeed");
+    info!("Singleton task finished");
+    let singleton_duration = start_time.elapsed();
 
     let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
     let singleton_speed = (file_size as f64 / singleton_duration.as_secs_f64()).round();
 
-    // At least singleton should succeed
-    assert!(
-        singleton_result.is_ok(),
-        "Singleton download should succeed"
-    );
-
     // Verify singleton file
     let singleton_content = std::fs::read(&singleton_path).unwrap();
-    let singleton_hash = calculate_sha256(&singleton_content);
+    let singleton_hash = calculate_blake3(&singleton_content);
     let concurrent_content = std::fs::read(&concurrent_path).unwrap();
-    let concurrent_hash = calculate_sha256(&concurrent_content);
+    let concurrent_hash = calculate_blake3(&concurrent_content);
     assert_eq!(
         singleton_hash, singleton_expected_hash,
         "Singleton file hash should be correct"
@@ -320,7 +340,7 @@ async fn test_concurrent_vs_singleton_performance() {
     info!("✓ Performance comparison test completed");
     info!(
         "
-    - Concurrent result: {concurrent_result:?}
+    - Concurrent result:
         - Measured Speed: {concurrent_speed} MB/s
         - Duration: {concurrent_duration:?}
         - Hash: {concurrent_hash}
@@ -328,24 +348,20 @@ async fn test_concurrent_vs_singleton_performance() {
     );
     info!(
         "
-    - Singleton result: {singleton_result:?}
+    - Singleton result:
         - Measured Speed: {singleton_speed} MB/s
         - Duration: {singleton_duration:?}
         - Hash: {singleton_hash}
         - File size: {file_size} bytes"
     );
-    info!("  - Total test duration: {total_duration:?}");
 
-    // If concurrent also succeeded, verify its file
-    if concurrent_result.is_ok() && concurrent_path.exists() {
-        let concurrent_content = std::fs::read(&concurrent_path).unwrap();
-        let concurrent_hash = calculate_sha256(&concurrent_content);
-        assert_eq!(
-            concurrent_hash, concurrent_expected_hash,
-            "Concurrent file hash should be correct"
-        );
-        info!("  - Both modes completed successfully with matching hashes");
-    }
+    let concurrent_content = std::fs::read(&concurrent_path).unwrap();
+    let concurrent_hash = calculate_blake3(&concurrent_content);
+    assert_eq!(
+        concurrent_hash, concurrent_expected_hash,
+        "Concurrent file hash should be correct"
+    );
+    info!("  - Both modes completed successfully with matching hashes");
 }
 
 fn main() {

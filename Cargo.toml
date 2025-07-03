@@ -93,7 +93,7 @@ async-stream = "0.3"
 rand = "0.9"
 
 # for hash verification in tests
-sha2 = "0.10"
+blake3 = "1"
 
 # for http server test
 axum = "0.8.4"

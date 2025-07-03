@@ -21,7 +21,7 @@ mod tests {
     use crate::{
         adapter::{
             BoltLoadAdapter,
-            tests::{SimpleTestAdapter, calculate_sha256},
+            tests::{SimpleTestAdapter, calculate_blake3},
         },
         runtime::ThreadedRuntimeImpl,
         task::{
@@ -126,7 +126,7 @@ mod tests {
         // Verify downloaded file content
         if file_path.exists() {
             let downloaded = std::fs::read(&file_path).unwrap();
-            let downloaded_hash = calculate_sha256(&downloaded);
+            let downloaded_hash = calculate_blake3(&downloaded);
             assert_eq!(
                 downloaded_hash, content_hash,
                 "Downloaded file content should match original content"
@@ -182,7 +182,7 @@ mod tests {
                 // Verify downloaded file content
                 if file_path.exists() {
                     let downloaded = std::fs::read(&file_path).unwrap();
-                    let downloaded_hash = calculate_sha256(&downloaded);
+                    let downloaded_hash = calculate_blake3(&downloaded);
                     assert_eq!(
                         downloaded_hash, content_hash,
                         "Downloaded file content should match original content"
@@ -349,8 +349,8 @@ mod tests {
             if singleton_path.exists() && concurrent_path.exists() {
                 let singleton_content = std::fs::read(&singleton_path).unwrap();
                 let concurrent_content = std::fs::read(&concurrent_path).unwrap();
-                let singleton_hash = calculate_sha256(&singleton_content);
-                let concurrent_hash = calculate_sha256(&concurrent_content);
+                let singleton_hash = calculate_blake3(&singleton_content);
+                let concurrent_hash = calculate_blake3(&concurrent_content);
                 assert_eq!(
                     singleton_hash, concurrent_hash,
                     "Download results from both modes should be identical"

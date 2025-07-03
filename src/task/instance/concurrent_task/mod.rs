@@ -1266,9 +1266,9 @@ mod tests {
         assert_eq!(downloaded_data, reference_data);
 
         // 计算并比较 hash
-        use crate::adapter::tests::calculate_sha256;
-        let downloaded_hash = calculate_sha256(&downloaded_data);
-        let reference_hash = calculate_sha256(&reference_data);
+        use crate::adapter::tests::calculate_blake3;
+        let downloaded_hash = calculate_blake3(&downloaded_data);
+        let reference_hash = calculate_blake3(&reference_data);
         assert_eq!(downloaded_hash, reference_hash);
     }
 }

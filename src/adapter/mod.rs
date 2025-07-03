@@ -144,7 +144,6 @@ pub mod tests {
     use axum::response::IntoResponse;
     use bytes::Bytes;
     use rand::Rng;
-    use sha2::{Digest, Sha256};
     use tempfile::tempfile;
     use tokio::{io::AsyncSeekExt, net::TcpListener};
 
@@ -156,30 +155,40 @@ pub mod tests {
         let mut content = Vec::with_capacity(size);
         let mut counter = 0u64;
 
-        while content.len() < size {
-            let bytes = counter.to_le_bytes();
-            for &byte in &bytes {
-                if content.len() < size {
-                    content.push(byte);
-                }
+        // SAFETY: we are sure the content is not shared and the size is correct
+        // It's useful for testing (debug mode) to have a fastest content generation
+        unsafe {
+            let ptr: *mut u8 = content.as_mut_ptr();
+            let mut offset = 0;
+
+            while offset + 8 <= size {
+                std::ptr::write_unaligned(ptr.add(offset) as *mut u64, counter.to_le());
+                offset += 8;
+                counter += 1;
             }
-            counter += 1;
+
+            if offset < size {
+                let bytes = counter.to_le_bytes();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), size - offset);
+            }
+
+            content.set_len(size);
         }
 
         content
     }
 
-    /// Calculate SHA256 hash of the content
-    pub fn calculate_sha256(content: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        format!("{:x}", hasher.finalize())
+    /// Calculate blake3 hash of the content
+    pub fn calculate_blake3(content: &[u8]) -> String {
+        let hash = blake3::hash(content);
+        hash.to_hex().to_string()
     }
 
     /// Simple test adapter for testing Task and TaskBuilder
-    #[derive(Clone)]
+    #[derive(Clone, derive_more::Debug)]
     pub struct SimpleTestAdapter {
-        content: Vec<u8>,
+        #[debug(ignore)]
+        content: Arc<Vec<u8>>,
         expected_hash: String,
         support_range: bool,
         should_fail: bool,
@@ -189,13 +198,26 @@ pub mod tests {
     }
 
     impl SimpleTestAdapter {
+        pub fn clone_reset_count(&self) -> Self {
+            Self {
+                content: self.content.clone(),
+                expected_hash: self.expected_hash.clone(),
+                support_range: self.support_range,
+                should_fail: self.should_fail,
+                chunk_size: self.chunk_size,
+                call_count: Arc::new(AtomicUsize::new(0)),
+                filename: self.filename.clone(),
+            }
+        }
+
         /// Create a new test adapter with deterministic content
+        #[cfg_attr(feature = "tracing", tracing::instrument)]
         pub fn new(size: usize) -> Self {
             let content = create_deterministic_content(size);
-            let expected_hash = calculate_sha256(&content);
+            let expected_hash = calculate_blake3(&content);
 
             Self {
-                content,
+                content: Arc::new(content),
                 expected_hash,
                 support_range: true,
                 should_fail: false,
@@ -443,7 +465,7 @@ pub mod tests {
             assert_eq!(adapter.call_count(), 0);
 
             // Test expected hash is calculated correctly
-            let expected_hash = calculate_sha256(&adapter.content);
+            let expected_hash = calculate_blake3(&adapter.content);
             assert_eq!(adapter.expected_hash(), &expected_hash);
 
             // Test that content is deterministic
@@ -521,7 +543,7 @@ pub mod tests {
             assert_eq!(downloaded_data, adapter.content);
 
             // Verify hash
-            let actual_hash = calculate_sha256(&downloaded_data);
+            let actual_hash = calculate_blake3(&downloaded_data);
             assert_eq!(actual_hash, expected_hash);
         }
 
@@ -570,8 +592,8 @@ pub mod tests {
             assert_eq!(downloaded_data, expected_range_data);
 
             // Verify hash of range data
-            let expected_range_hash = calculate_sha256(expected_range_data);
-            let actual_hash = calculate_sha256(&downloaded_data);
+            let expected_range_hash = calculate_blake3(expected_range_data);
+            let actual_hash = calculate_blake3(&downloaded_data);
             assert_eq!(actual_hash, expected_range_hash);
         }
 
@@ -652,8 +674,8 @@ pub mod tests {
             }
 
             assert_eq!(downloaded_data, expected_data);
-            let expected_hash = calculate_sha256(expected_data);
-            let actual_hash = calculate_sha256(&downloaded_data);
+            let expected_hash = calculate_blake3(expected_data);
+            let actual_hash = calculate_blake3(&downloaded_data);
             assert_eq!(actual_hash, expected_hash);
         }
 
@@ -711,8 +733,8 @@ pub mod tests {
             assert_eq!(content_small, content_large[..100]);
 
             // Test hash calculation consistency
-            let hash1 = calculate_sha256(&content1);
-            let hash2 = calculate_sha256(&content2);
+            let hash1 = calculate_blake3(&content1);
+            let hash2 = calculate_blake3(&content2);
             assert_eq!(hash1, hash2);
         }
 
