@@ -540,7 +540,7 @@ pub mod tests {
 
             // Verify downloaded data
             assert_eq!(downloaded_data.len(), size);
-            assert_eq!(downloaded_data, adapter.content);
+            assert_eq!(downloaded_data, *adapter.content);
 
             // Verify hash
             let actual_hash = calculate_blake3(&downloaded_data);
