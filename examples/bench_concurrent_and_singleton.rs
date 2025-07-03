@@ -18,9 +18,12 @@ use sha2::{Digest, Sha256};
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 use tracing::{level_filters::LevelFilter, *};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 /// Calculate SHA256 hash of the content
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(content), ret))]
 pub fn calculate_sha256(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content);
@@ -28,6 +31,7 @@ pub fn calculate_sha256(content: &[u8]) -> String {
 }
 
 /// Creates a deterministic test content with specified size for hash verification
+#[cfg_attr(feature = "tracing", tracing::instrument)]
 pub fn create_deterministic_content(size: usize) -> Vec<u8> {
     let mut content = Vec::with_capacity(size);
     let mut counter = 0u64;
@@ -59,6 +63,7 @@ pub struct SimpleTestAdapter {
 
 impl SimpleTestAdapter {
     /// Create a new test adapter with deterministic content
+    #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub fn new(size: usize) -> Self {
         let content = create_deterministic_content(size);
         let expected_hash = calculate_sha256(&content);
@@ -205,7 +210,16 @@ impl BoltLoadAdapter for SimpleTestAdapter {
 }
 
 pub fn init_tracing() {
-    let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
+    let current_crate = env!("CARGO_CRATE_NAME");
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_level(true)
+        // .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
+        .with_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::WARN.into())
+                .parse(format!("bolt_load=trace,{current_crate}=trace"))
+                .unwrap(),
+        );
     let filter_layer = EnvFilter::builder()
         .with_default_directive(LevelFilter::TRACE.into())
         .from_env_lossy();
@@ -221,6 +235,7 @@ pub fn init_tracing() {
         .try_init();
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument)]
 async fn test_concurrent_vs_singleton_performance() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
@@ -333,9 +348,18 @@ async fn test_concurrent_vs_singleton_performance() {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let time = Instant::now();
     init_tracing();
+    trace!("tracing initialized in {:?}", time.elapsed());
 
-    test_concurrent_vs_singleton_performance().await;
+    let time = Instant::now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let elapsed = time.elapsed();
+        info!("Runtime initialized in {:?}", elapsed);
+        test_concurrent_vs_singleton_performance().await;
+    });
+    let elapsed = time.elapsed();
+    info!("Total time: {:?}", elapsed);
 }

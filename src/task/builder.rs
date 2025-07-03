@@ -65,6 +65,7 @@ async fn try_get_or_init_meta<'a>(
 
 impl TaskBuilder {
     /// You can call this method to get the meta before build the task manager
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub async fn retrieve_meta(&mut self) -> Result<&BoltLoadAdapterMeta, TaskManagerBuildError> {
         if self.adapter.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
@@ -167,6 +168,14 @@ impl TaskBuilder {
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(
+        skip(self),
+        fields(
+            save_path = ?self.save_path.as_ref().map(|p| p.to_string_lossy()),
+            save_dir = ?self.save_dir.as_ref().map(|p| p.to_string_lossy()),
+            prefer_mode = ?self.prefer_mode,
+        )
+    ))]
     pub async fn build(mut self) -> Result<Task, TaskManagerBuildError> {
         if self.cancel_token.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
@@ -174,7 +183,6 @@ impl TaskBuilder {
             ));
         }
         let cancel_token = self.cancel_token.take().unwrap();
-
         // retrieve the meta
         let _ = self.retrieve_meta().await?;
         self.validate()?;
