@@ -99,7 +99,31 @@ blake3 = "1"
 axum = "0.8.4"
 axum-extra = { version = "0.10", features = ["typed-header"] }
 axum-range = "0.5"
+
+# Tracing and bench
 portpicker = "0.1"
 tracing-tracy = "0.11"
 console-subscriber = "0.4.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = { version = "0.31", features = [
+    "metrics",
+] }
+opentelemetry = { version = "0.30", features = [
+    "trace",
+    "metrics",
+] }
+opentelemetry_sdk = { version = "0.30", features = [
+    "trace",
+    "rt-tokio",
+] }
+opentelemetry-otlp = { version = "0.30", features = [
+    "metrics",
+    "grpc-tonic",
+] }
+opentelemetry-semantic-conventions = { version = "0.30", features = [
+    "semconv_experimental",
+] }
+opentelemetry-stdout = { version = "0.30", features = [
+    "trace",
+    "metrics",
+] }

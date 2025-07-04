@@ -14,12 +14,116 @@ use bolt_load::{
     task::{DownloadMode, TaskBuilder},
 };
 use bytes::Bytes;
+use opentelemetry::{Key, KeyValue, Value, global};
+use opentelemetry_otlp::{ExportConfig, WithExportConfig};
+use opentelemetry_sdk::{
+    Resource,
+    metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
+    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
+};
+use opentelemetry_semantic_conventions::{
+    SCHEMA_URL,
+    attribute::{
+        DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_NAME, SERVICE_VERSION, VCS_REF_BASE_REVISION,
+    },
+};
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 use tracing::{level_filters::LevelFilter, *};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
 };
+
+// Create a Resource that captures information about the entity for which telemetry is recorded.
+fn resource() -> Resource {
+    Resource::builder_empty()
+        .with_schema_url(
+            [
+                KeyValue::new(SERVICE_NAME, "bolt-load"),
+                KeyValue::new(SERVICE_VERSION, "0.1.0"),
+            ],
+            SCHEMA_URL,
+        )
+        .build()
+}
+
+// Construct MeterProvider for MetricsLayer
+fn init_meter_provider() -> SdkMeterProvider {
+    let mut builder = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_temporality(opentelemetry_sdk::metrics::Temporality::default());
+    if let Ok(otlp_endpoint) = std::env::var("BOLT_LOAD_OTLP_METRIC_ENDPOINT") {
+        builder = builder.with_endpoint(otlp_endpoint);
+    }
+    let exporter = builder.build().expect("failed to build metric exporter");
+
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(std::time::Duration::from_secs(30))
+        .build();
+
+    // For debugging in development
+    let stdout_reader =
+        PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default()).build();
+
+    let meter_provider = MeterProviderBuilder::default()
+        .with_resource(resource())
+        .with_reader(reader)
+        .with_reader(stdout_reader)
+        .build();
+
+    global::set_meter_provider(meter_provider.clone());
+
+    meter_provider
+}
+
+// Construct TracerProvider for OpenTelemetryLayer
+fn init_tracer_provider() -> SdkTracerProvider {
+    let mut builder = opentelemetry_otlp::SpanExporter::builder().with_tonic();
+    if let Ok(otlp_endpoint) = std::env::var("BOLT_LOAD_OTLP_TRACE_ENDPOINT") {
+        builder = builder.with_endpoint(otlp_endpoint);
+    }
+    let exporter = builder.build().expect("failed to build span exporter");
+
+    SdkTracerProvider::builder()
+        // Customize sampling strategy
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+            1.0,
+        ))))
+        // If export trace to AWS X-Ray, you can use XrayIdGenerator
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource())
+        .with_batch_exporter(exporter)
+        .build()
+}
+
+pub struct OtelGuard {
+    pub tracer_provider: SdkTracerProvider,
+    pub meter_provider: SdkMeterProvider,
+}
+
+impl Drop for OtelGuard {
+    fn drop(&mut self) {
+        if let Err(err) = self.tracer_provider.shutdown() {
+            eprintln!("{err:?}");
+        }
+        if let Err(err) = self.meter_provider.shutdown() {
+            eprintln!("{err:?}");
+        }
+    }
+}
+
+pub async fn init_telemetry() -> OtelGuard {
+    // NOTE: this is needed for otlp grpc exporter, because it inner use tokio as executor to run grpc connection,
+    // when it do not run in a tokio context, it will exit with status code 1, and with no more information.
+    // So please do NOT remove this `block_on` call.
+    let tracer_provider = init_tracer_provider();
+    let meter_provider = init_meter_provider();
+
+    OtelGuard {
+        tracer_provider,
+        meter_provider,
+    }
+}
 
 /// Calculate blake3 hash of the content
 #[cfg_attr(feature = "tracing", tracing::instrument(skip(content), ret))]
@@ -228,9 +332,11 @@ impl BoltLoadAdapter for SimpleTestAdapter {
     }
 }
 
-pub fn init_tracing() {
+pub async fn init_tracing() {
     let current_crate = env!("CARGO_CRATE_NAME");
     let has_arg_spans = std::env::args().any(|arg| arg == "--spans");
+    let has_arg_opentelemetry = std::env::args().any(|arg| arg == "--opentelemetry");
+
     let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);
     let fmt_layer = if has_arg_spans {
         fmt_layer.with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
@@ -251,12 +357,34 @@ pub fn init_tracing() {
     let subscriber = tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer);
-
     let tokio_console_layer = console_subscriber::spawn();
-    let _ = subscriber
+    let subscriber = subscriber
         .with(tracing_tracy::TracyLayer::default())
-        .with(tokio_console_layer)
-        .try_init();
+        .with(tokio_console_layer);
+
+    if has_arg_opentelemetry {
+        let (subscriber, telemetry_guard) = {
+            use opentelemetry::trace::TracerProvider as _;
+            let guard = init_telemetry().await;
+            let tracer = guard.tracer_provider.tracer("bolt-load");
+            let opentelemetry_trace_filter =
+                tracing_subscriber::filter::LevelFilter::from_level(Level::TRACE);
+            let subscriber = subscriber
+                .with(
+                    tracing_opentelemetry::MetricsLayer::new(guard.meter_provider.clone())
+                        .with_filter(opentelemetry_trace_filter),
+                )
+                .with(
+                    tracing_opentelemetry::OpenTelemetryLayer::new(tracer)
+                        .with_filter(opentelemetry_trace_filter),
+                );
+            (subscriber, guard)
+        };
+        Box::leak(Box::new(telemetry_guard));
+        subscriber.init();
+    } else {
+        subscriber.init();
+    }
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument)]
@@ -366,14 +494,13 @@ async fn test_concurrent_vs_singleton_performance() {
 
 fn main() {
     let time = Instant::now();
-    init_tracing();
-    trace!("tracing initialized in {:?}", time.elapsed());
-
-    let time = Instant::now();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let elapsed = time.elapsed();
-        info!("Runtime initialized in {:?}", elapsed);
+        println!("Runtime initialized in {elapsed:?}");
+        let time = Instant::now();
+        init_tracing().await;
+        trace!("tracing initialized in {:?}", time.elapsed());
         test_concurrent_vs_singleton_performance().await;
     });
     let elapsed = time.elapsed();
