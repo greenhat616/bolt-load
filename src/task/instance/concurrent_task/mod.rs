@@ -58,6 +58,10 @@ impl ConcurrentTask {
 }
 
 impl TaskInstance for ConcurrentTask {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, name = "ConcurrentTask::run")
+    )]
     fn run(
         &mut self,
         adapter: Arc<AnyAdapter>,
@@ -67,37 +71,43 @@ impl TaskInstance for ConcurrentTask {
     ) -> Result<()> {
         let token = cancel_token.clone();
         let rt = self.rt.clone();
-        let handle = self
-            .rt
-            .spawn_with_handle(async move {
-                let mut context = Context::default();
-                let mut state_machine = ConcurrentTaskInner::new(path, event_tx, rt)
-                    .uninitialized_state_machine()
-                    .init_with_context(&mut context)
-                    .await;
+        let task = async move {
+            let mut context = Context::default();
+            let mut state_machine = ConcurrentTaskInner::new(path, event_tx, rt)
+                .uninitialized_state_machine()
+                .init_with_context(&mut context)
+                .await;
 
+            state_machine
+                .handle_with_context(
+                    &Event::Run(RunningPayload {
+                        adapter,
+                        cancel_token,
+                    }),
+                    &mut context,
+                )
+                .await;
+
+            while context.poll.pop_front().is_some() {
                 state_machine
-                    .handle_with_context(
-                        &Event::Run(RunningPayload {
-                            adapter,
-                            cancel_token,
-                        }),
-                        &mut context,
-                    )
+                    .handle_with_context(&Event::Step, &mut context)
                     .await;
+            }
 
-                while context.poll.pop_front().is_some() {
-                    state_machine
-                        .handle_with_context(&Event::Step, &mut context)
-                        .await;
-                }
-
-                debug_assert!(
-                    matches!(state_machine.state(), State::Stopped { .. }),
-                    "the task should be stopped after the state machine is finished"
-                );
-            })
-            .expect("Runtime is dropped");
+            debug_assert!(
+                matches!(state_machine.state(), State::Stopped { .. }),
+                "the task should be stopped after the state machine is finished"
+            );
+        };
+        #[cfg(feature = "tracing")]
+        let task = tracing::Instrument::instrument(
+            task,
+            tracing::trace_span!(
+                parent: None,
+                "ConcurrentTask::background_task",
+            ),
+        );
+        let handle = self.rt.spawn_with_handle(task).expect("Runtime is dropped");
         self.task = Some(TaskControl::new(token, handle));
         Ok(())
     }
@@ -265,6 +275,7 @@ impl ConcurrentTaskInner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn download_timer_tick(
         chunk_planner: &mut ChunkPlanner,
         runners_state: &mut HashMap<RunnerId, RunnerState>,
@@ -468,6 +479,7 @@ impl ConcurrentTaskInner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    // #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn handle_runner_message(
         rt: &ThreadedRuntimeImpl,
         runners_state: &mut HashMap<RunnerId, RunnerState>,
@@ -559,6 +571,7 @@ impl ConcurrentTaskInner {
             .sum();
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
         let total = self
             .progress
@@ -665,6 +678,7 @@ impl ConcurrentTaskInner {
     on_transition = "Self::on_transition"
 )]
 impl ConcurrentTaskInner {
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     #[state]
     fn stopped(
         &mut self,
@@ -687,6 +701,7 @@ impl ConcurrentTaskInner {
         Super
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     #[state(superstate = "running")]
     async fn initializing(
         &mut self,
@@ -721,6 +736,7 @@ impl ConcurrentTaskInner {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     #[state(superstate = "running")]
     async fn downloading(
         &mut self,

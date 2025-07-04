@@ -250,7 +250,10 @@ impl Task {
         };
 
         #[cfg(feature = "tracing")]
-        let fut = fut.instrument(tracing::span::Span::current());
+        let fut = fut.instrument(tracing::trace_span!(
+            parent: None,
+            "Task::event_loop",
+        ));
 
         let handle = self.rt.spawn_with_handle(fut).map_err(|e| {
             error!("failed to spawn the task: {e:?}");

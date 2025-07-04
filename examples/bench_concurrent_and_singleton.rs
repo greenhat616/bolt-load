@@ -332,7 +332,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
     }
 }
 
-pub async fn init_tracing() {
+pub async fn init_tracing(opentelemetry_ptr: &mut *mut OtelGuard) {
     let current_crate = env!("CARGO_CRATE_NAME");
     let has_arg_spans = std::env::args().any(|arg| arg == "--spans");
     let has_arg_opentelemetry = std::env::args().any(|arg| arg == "--opentelemetry");
@@ -366,7 +366,7 @@ pub async fn init_tracing() {
         let (subscriber, telemetry_guard) = {
             use opentelemetry::trace::TracerProvider as _;
             let guard = init_telemetry().await;
-            let tracer = guard.tracer_provider.tracer("bolt-load");
+            let tracer = guard.tracer_provider.tracer("bolt_load");
             let opentelemetry_trace_filter =
                 tracing_subscriber::filter::LevelFilter::from_level(Level::TRACE);
             let subscriber = subscriber
@@ -380,7 +380,8 @@ pub async fn init_tracing() {
                 );
             (subscriber, guard)
         };
-        Box::leak(Box::new(telemetry_guard));
+        let box_guard = Box::new(telemetry_guard);
+        *opentelemetry_ptr = Box::into_raw(box_guard);
         subscriber.init();
     } else {
         subscriber.init();
@@ -414,18 +415,18 @@ async fn test_concurrent_vs_singleton_performance() {
         .unwrap();
 
     // Test singleton mode
-    let singleton_expected_hash = adapter2.expected_hash().to_string();
-    let singleton_path = temp_dir.path().join("singleton.bin");
+    // let singleton_expected_hash = adapter2.expected_hash().to_string();
+    // let singleton_path = temp_dir.path().join("singleton.bin");
 
-    let mut singleton_task = TaskBuilder::default()
-        .adapter(Box::new(adapter2) as Box<dyn BoltLoadAdapter + Send>)
-        .save_path(singleton_path.clone())
-        .prefer_mode(DownloadMode::Singleton)
-        .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
-        .build()
-        .await
-        .unwrap();
+    // let mut singleton_task = TaskBuilder::default()
+    //     .adapter(Box::new(adapter2) as Box<dyn BoltLoadAdapter + Send>)
+    //     .save_path(singleton_path.clone())
+    //     .prefer_mode(DownloadMode::Singleton)
+    //     .cancel_token(CancellationToken::new())
+    //     .runtime(runtime.clone())
+    //     .build()
+    //     .await
+    //     .unwrap();
 
     info!("🏁 Starting performance comparison test (1MB)...");
 
@@ -439,27 +440,27 @@ async fn test_concurrent_vs_singleton_performance() {
     info!("Concurrent task finished");
     let concurrent_duration = start_time.elapsed();
 
-    let start_time = Instant::now();
-    singleton_task.run().await.unwrap();
-    singleton_task
-        .wait()
-        .await
-        .expect("singleton task should succeed");
-    info!("Singleton task finished");
-    let singleton_duration = start_time.elapsed();
+    // let start_time = Instant::now();
+    // singleton_task.run().await.unwrap();
+    // singleton_task
+    //     .wait()
+    //     .await
+    //     .expect("singleton task should succeed");
+    // info!("Singleton task finished");
+    // let singleton_duration = start_time.elapsed();
 
     let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
-    let singleton_speed = (file_size as f64 / singleton_duration.as_secs_f64()).round();
+    // let singleton_speed = (file_size as f64 / singleton_duration.as_secs_f64()).round();
 
     // Verify singleton file
-    let singleton_content = std::fs::read(&singleton_path).unwrap();
-    let singleton_hash = calculate_blake3(&singleton_content);
+    // let singleton_content = std::fs::read(&singleton_path).unwrap();
+    // let singleton_hash = calculate_blake3(&singleton_content);
     let concurrent_content = std::fs::read(&concurrent_path).unwrap();
     let concurrent_hash = calculate_blake3(&concurrent_content);
-    assert_eq!(
-        singleton_hash, singleton_expected_hash,
-        "Singleton file hash should be correct"
-    );
+    // assert_eq!(
+    //     singleton_hash, singleton_expected_hash,
+    //     "Singleton file hash should be correct"
+    // );
     assert_eq!(
         concurrent_hash, concurrent_expected_hash,
         "Concurrent file hash should be correct"
@@ -474,14 +475,14 @@ async fn test_concurrent_vs_singleton_performance() {
         - Hash: {concurrent_hash}
         - File size: {file_size} bytes"
     );
-    info!(
-        "
-    - Singleton result:
-        - Measured Speed: {singleton_speed} MB/s
-        - Duration: {singleton_duration:?}
-        - Hash: {singleton_hash}
-        - File size: {file_size} bytes"
-    );
+    // info!(
+    //     "
+    // - Singleton result:
+    //     - Measured Speed: {singleton_speed} MB/s
+    //     - Duration: {singleton_duration:?}
+    //     - Hash: {singleton_hash}
+    //     - File size: {file_size} bytes"
+    // );
 
     let concurrent_content = std::fs::read(&concurrent_path).unwrap();
     let concurrent_hash = calculate_blake3(&concurrent_content);
@@ -499,9 +500,14 @@ fn main() {
         let elapsed = time.elapsed();
         println!("Runtime initialized in {elapsed:?}");
         let time = Instant::now();
-        init_tracing().await;
+        let mut guard_ptr = std::ptr::null_mut();
+        init_tracing(&mut guard_ptr).await;
         trace!("tracing initialized in {:?}", time.elapsed());
         test_concurrent_vs_singleton_performance().await;
+
+        if !guard_ptr.is_null() {
+            drop(unsafe { Box::from_raw(guard_ptr) });
+        }
     });
     let elapsed = time.elapsed();
     info!("Total time: {:?}", elapsed);

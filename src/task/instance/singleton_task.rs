@@ -41,6 +41,10 @@ impl SingletonTask {
 }
 
 impl TaskInstance for SingletonTask {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, name = "SingletonTask::run")
+    )]
     fn run(
         &mut self,
         adapter: Arc<AnyAdapter>,
@@ -51,49 +55,55 @@ impl TaskInstance for SingletonTask {
         let token = cancel_token.clone();
         let rt = self.rt.clone();
         trace!("[SINGLETON TASK] Attempting to spawn state machine task");
-        let handle = self
-            .rt
-            .spawn_with_handle(async move {
-                trace!("[SINGLETON TASK] State machine starting");
-                let mut context = Context::default();
-                let mut state_machine = SingletonTaskInner::new(path, event_tx, rt)
-                    .uninitialized_state_machine()
-                    .init_with_context(&mut context)
-                    .await;
+        let task = async move {
+            trace!("[SINGLETON TASK] State machine starting");
+            let mut context = Context::default();
+            let mut state_machine = SingletonTaskInner::new(path, event_tx, rt)
+                .uninitialized_state_machine()
+                .init_with_context(&mut context)
+                .await;
 
-                trace!("[SINGLETON TASK] State machine initialized, handling Run event");
+            trace!("[SINGLETON TASK] State machine initialized, handling Run event");
+            state_machine
+                .handle_with_context(
+                    &Event::Run(RunningPayload {
+                        adapter,
+                        cancel_token,
+                    }),
+                    &mut context,
+                )
+                .await;
+
+            trace!(
+                "[SINGLETON TASK] Run event handled, starting event loop with {} items in poll",
+                context.poll.len()
+            );
+            while context.poll.pop_front().is_some() {
+                trace!("[SINGLETON TASK] Processing Step event");
                 state_machine
-                    .handle_with_context(
-                        &Event::Run(RunningPayload {
-                            adapter,
-                            cancel_token,
-                        }),
-                        &mut context,
-                    )
+                    .handle_with_context(&Event::Step, &mut context)
                     .await;
-
                 trace!(
-                    "[SINGLETON TASK] Run event handled, starting event loop with {} items in poll",
+                    "[SINGLETON TASK] Step event handled, {} items remaining in poll",
                     context.poll.len()
                 );
-                while context.poll.pop_front().is_some() {
-                    trace!("[SINGLETON TASK] Processing Step event");
-                    state_machine
-                        .handle_with_context(&Event::Step, &mut context)
-                        .await;
-                    trace!(
-                        "[SINGLETON TASK] Step event handled, {} items remaining in poll",
-                        context.poll.len()
-                    );
-                }
-                trace!("[SINGLETON TASK] Event loop completed");
+            }
+            trace!("[SINGLETON TASK] Event loop completed");
 
-                debug_assert!(
-                    matches!(state_machine.state(), State::Stopped { .. }),
-                    "the task should be stopped after the state machine is finished"
-                );
-            })
-            .expect("Runtime is dropped");
+            debug_assert!(
+                matches!(state_machine.state(), State::Stopped { .. }),
+                "the task should be stopped after the state machine is finished"
+            );
+        };
+        #[cfg(feature = "tracing")]
+        let task = tracing::Instrument::instrument(
+            task,
+            tracing::trace_span!(
+                parent: None,
+                "SingletonTask::background_task",
+            ),
+        );
+        let handle = self.rt.spawn_with_handle(task).expect("Runtime is dropped");
         trace!("[SINGLETON TASK] State machine task spawned successfully");
         self.task = Some(TaskControl::new(token, handle));
         trace!("[SINGLETON TASK] TaskControl created and stored");
@@ -255,8 +265,8 @@ impl SingletonTaskInner {
                                         downloaded_chunks: vec![0..self.downloaded],
                                     };
                                     let tx = self.event_tx.clone();
-                                    self.rt.spawn(async move {
-                                        tx.send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                                    let _ = self.rt.spawn(async move {
+                                        let _ = tx.send(TaskEvent::Downloading(ProgressWithSpeed::new(
                                             progress, speed,
                                         )))
                                         .await;
