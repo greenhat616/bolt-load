@@ -1,5 +1,5 @@
 use super::{Strategy, StrategyAction};
-use crate::task::instance::concurrent_task::DEFAULT_MAX_CONCURRENCY;
+use crate::task::{RunnerId, instance::concurrent_task::DEFAULT_MAX_CONCURRENCY};
 
 enum DynamicPlannerStage {
     QuickStart,
@@ -53,7 +53,7 @@ pub struct DynamicStrategyContext {
     /// the current concurrency of the task
     pub current_concurrency: usize,
     /// The largest remaining download bytes of a runner
-    pub remaining_largest_runner: usize,
+    pub remaining_largest_runner_id: RunnerId,
 }
 
 impl Strategy for DynamicStrategy {
@@ -82,7 +82,7 @@ impl Strategy for DynamicStrategy {
                         && context.current_concurrency < self.max_concurrency
                     {
                         result.push(StrategyAction::SplitGivenTask(
-                            context.remaining_largest_runner,
+                            context.remaining_largest_runner_id,
                         ));
                         self.previous_total_download_speed = total_download_speed;
                     } else {
