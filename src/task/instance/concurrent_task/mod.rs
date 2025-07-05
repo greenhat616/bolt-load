@@ -23,7 +23,7 @@ use crate::{
         ManagerMessage, ManagerMessagesVariant, Progress, RunnerId,
         instance::{
             ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent, TaskInstanceError,
-            sampler::{SAMPLE_INTERVAL, Sampler},
+            sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
         },
     },
     utils::logging::*,
@@ -136,8 +136,7 @@ pub struct ConcurrentTaskInner {
     rt: ThreadedRuntimeImpl,
     path: PathBuf,
     adapter: Option<Arc<AnyAdapter>>,
-    /// the chunk planner of this task
-    chunk_planner: ChunkPlanner,
+    /// The initial progress of the task, for task resume
     progress: Progress,
     event_tx: async_channel::Sender<TaskEvent>,
 }
@@ -152,22 +151,11 @@ pub enum Event {
     Step,
 }
 
-struct RunnerChunk {
-    occupied: Range<u64>,
-    downloaded: Range<u64>,
-}
-
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum RunnerStatus {
     Running,
     Finished,
-}
-
-struct RunnerState {
-    status: RunnerStatus,
-    chunk: RunnerChunk,
-    handle: RemoteHandle<()>,
 }
 
 impl ConcurrentTaskInner {
@@ -180,7 +168,6 @@ impl ConcurrentTaskInner {
             rt,
             path,
             adapter: None,
-            chunk_planner: ChunkPlanner::new(0),
             progress: Progress::default(),
             event_tx,
         }
@@ -241,6 +228,7 @@ impl ConcurrentTaskInner {
         feature = "tracing",
         tracing::instrument(skip_all, fields(runner_id, range))
     )]
+    #[allow(clippy::too_many_arguments)]
     async fn split_task(
         rt: &ThreadedRuntimeImpl,
         chunk_planner: &mut ChunkPlanner,
@@ -263,13 +251,18 @@ impl ConcurrentTaskInner {
                 runner_id,
                 ManagerMessagesVariant::LimitTotal(incomplete_range.start + half_size),
             ))
-            .await;
+            .await
+            .expect("control channel should not fail");
 
         // Create a new runner for the remaining range
         let next_runner_id = runner_id_generator.next().expect("no more runner id");
+        let next_range = incomplete_range.start + half_size..incomplete_range.end;
+        if !chunk_planner.allocate_chunk(next_range.clone(), Some(next_runner_id)) {
+            panic!("failed to allocate chunk: {next_range:?}");
+        }
         let (rx, _) = Self::create_background_range_runner(
             rt,
-            incomplete_range.start + half_size..incomplete_range.end,
+            next_range,
             adapter.clone(),
             control_rx.clone(),
             next_runner_id,
@@ -322,6 +315,48 @@ impl ConcurrentTaskInner {
         Ok((rx, handle))
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    fn throughout_meter_tick(
+        rt: &ThreadedRuntimeImpl,
+        chunk_planner: &ChunkPlanner,
+
+        meters: &mut HashMap<RunnerId, usize>,
+        sampler: &mut SpeedSampler,
+        current_speed: &mut f64,
+        per_runner_avg_speed: &mut f64,
+
+        event_tx: &async_channel::Sender<TaskEvent>,
+    ) {
+        let count = meters.len();
+        let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
+        let (_, ema_speed) = sampler.sample(&mut total_bytes);
+        *current_speed = ema_speed;
+        *per_runner_avg_speed = ema_speed / count as f64;
+
+        let event_tx = event_tx.clone();
+        let total = chunk_planner.total;
+        let downloaded_chunks = chunk_planner.get_downloaded_ranges();
+        let downloaded = downloaded_chunks
+            .iter()
+            .map(|r| r.end - r.start)
+            .sum::<u64>();
+        let _ = rt.spawn(async move {
+            if let Err(e) = event_tx
+                .send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                    Progress {
+                        total: Some(total),
+                        downloaded,
+                        downloaded_chunks,
+                    },
+                    ema_speed,
+                )))
+                .await
+            {
+                error!("failed to send downloading event: {e:?}");
+            }
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn download_strategy_timer_tick(
@@ -330,29 +365,22 @@ impl ConcurrentTaskInner {
         dynamic_strategy: &mut DynamicStrategy,
         runner_id_generator: &mut Generator,
         max_concurrency: usize,
-        total: u64,
         rt: &ThreadedRuntimeImpl,
         adapter: &Arc<AnyAdapter>,
-        event_tx: &async_channel::Sender<TaskEvent>,
         control_channel: (&Sender<ManagerMessage>, &Receiver<ManagerMessage>),
         runners_cancel_token: &CancellationToken,
-        meters: &mut HashMap<RunnerId, usize>,
-        sampler: &Sampler,
+        current_speed: f64,
+        per_runner_avg_speed: f64,
     ) -> Result<()> {
         let (_, control_rx) = control_channel;
-
-        let runners_speed = meters
-            .values_mut()
-            .map(|r| sampler.sample(r))
-            .collect::<Vec<_>>();
-        let current_speed = runners_speed.iter().sum::<f64>();
-        let avg_runner_speed = current_speed / runners_speed.len() as f64;
 
         // get the available ranges, and create background runners for them
         let available_ranges = chunk_planner.get_available_ranges();
         // TODO: move it to a new strategy for error and concurrency control
         if !available_ranges.is_empty() {
+            trace!("[TASK] create background runners for available ranges: {available_ranges:?}");
             for chunk in available_ranges.iter() {
+                trace!("[TASK] create background runner for chunk: {chunk:?}");
                 let runner_id = runner_id_generator.next().expect("no more runner id");
 
                 if !chunk_planner.allocate_chunk(chunk.clone(), Some(runner_id)) {
@@ -372,6 +400,8 @@ impl ConcurrentTaskInner {
 
                 runner_notification.add(runner_id, rx);
             }
+
+            return Ok(());
         }
         let active_runners = chunk_planner.get_active_runners_count();
         if active_runners < max_concurrency {
@@ -383,7 +413,9 @@ impl ConcurrentTaskInner {
                     None => {
                         // create a new runner
                         let runner_id = runner_id_generator.next().expect("no more runner id");
-                        chunk_planner.allocate_chunk(suggested_range.clone(), Some(runner_id));
+                        if !chunk_planner.allocate_chunk(suggested_range.clone(), Some(runner_id)) {
+                            panic!("failed to allocate chunk: {suggested_range:?}");
+                        }
                         let (rx, _) = Self::create_background_range_runner(
                             rt,
                             suggested_range,
@@ -399,8 +431,8 @@ impl ConcurrentTaskInner {
                         // split the chunk
                         let strategy_context = DynamicStrategyContext {
                             speed: current_speed,
-                            per_runner_speed: avg_runner_speed,
-                            current_concurrency: runners_speed.len(),
+                            per_runner_speed: per_runner_avg_speed,
+                            current_concurrency: chunk_planner.get_active_runners_count(),
                             remaining_largest_runner_id: runner_id,
                         };
                         let actions = dynamic_strategy.step(&strategy_context);
@@ -461,31 +493,20 @@ impl ConcurrentTaskInner {
             }
         }
 
-        let downloaded_chunks = chunk_planner.get_downloaded_ranges();
-        let downloaded = chunk_planner.get_total_downloaded();
-        let event_tx = event_tx.clone();
-        let _ = rt.spawn(async move {
-            let _ = event_tx
-                .send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                    Progress {
-                        total: Some(total),
-                        downloaded,
-                        downloaded_chunks,
-                    },
-                    current_speed,
-                )))
-                .await
-                .inspect_err(|e| {
-                    error!("failed to send downloading event: {e:?}");
-                });
-        });
         Ok(())
+    }
+
+    /// Sync the progress of the task
+    fn sync_progress(&mut self, chunk_planner: &ChunkPlanner) {
+        self.progress.downloaded = chunk_planner.get_total_downloaded();
+        self.progress.downloaded_chunks = chunk_planner.get_downloaded_ranges();
     }
 
     #[allow(clippy::too_many_arguments)]
     // #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn handle_runner_message(
         rt: &ThreadedRuntimeImpl,
+        meters: &mut HashMap<RunnerId, usize>,
         chunk_planner: &mut ChunkPlanner,
         runner_notification: &mut RunnerNotification,
         id_generator: &mut Generator,
@@ -496,47 +517,51 @@ impl ConcurrentTaskInner {
         let RunnerMessage(runner_id, msg) = msg;
 
         match msg {
-            RunnerMessageKind::Stopped(reason) => match reason {
-                StoppedReason::Finished => {
-                    trace!("runner {runner_id} finished");
-                    chunk_planner
-                        .mark_finished(runner_id)
-                        .expect("chunk planner should not fail");
+            RunnerMessageKind::Stopped(reason) => {
+                meters.remove(&runner_id);
+                match reason {
+                    StoppedReason::Finished => {
+                        trace!("runner {runner_id} finished");
+                        chunk_planner
+                            .mark_finished(runner_id)
+                            .expect("chunk planner should not fail");
 
-                    if chunk_planner.is_complete() {
-                        trace!("[TASK] all chunks finished");
-                        on_all_chunks_finished();
+                        if chunk_planner.is_complete() {
+                            trace!("[TASK] all chunks finished");
+                            on_all_chunks_finished();
+                        }
+                    }
+                    StoppedReason::Failed(_kind) => {
+                        let unfinished_range = chunk_planner
+                            .mark_failed(runner_id)
+                            .expect("chunk planner should not fail");
+                        runner_notification.remove(runner_id);
+                        id_generator.release(runner_id);
+                        trace!("Runner {runner_id} failed, released range: {unfinished_range:?}");
                     }
                 }
-                StoppedReason::Failed(_kind) => {
-                    let unfinished_range = chunk_planner
-                        .mark_failed(runner_id)
-                        .expect("chunk planner should not fail");
-                    runner_notification.remove(runner_id);
-                    id_generator.release(runner_id);
-                    trace!("Runner {runner_id} failed, released range: {unfinished_range:?}");
-                }
-            },
+            }
             RunnerMessageKind::Downloaded(bytes) => {
+                let bytes_len = bytes.len();
+                *meters.entry(runner_id).or_insert(0) += bytes_len;
+
                 let state = chunk_planner.get_runner_state(runner_id).ok_or_else(|| {
                     TaskInstanceError::Failed(TaskFailedKind::Other(format!(
-                        "Runner {} not found",
-                        runner_id
+                        "Runner {runner_id} not found"
                     )))
                 })?;
 
                 let write_start = state.downloaded.end;
-                let bytes_len = bytes.len() as u64;
 
                 // update the chunk planner progress
                 chunk_planner
-                    .update_progress(runner_id, bytes_len)
+                    .update_progress(runner_id, bytes_len as u64)
                     .expect("chunk planner should not fail");
 
                 let file_writer_control = file_writer_control.clone();
                 let _ = rt.spawn(async move {
                     file_writer_control
-                        .write(write_start..write_start + bytes_len, bytes)
+                        .write(write_start..write_start + bytes_len as u64, bytes)
                         .await
                         .expect("Should handle io error");
                 });
@@ -569,47 +594,66 @@ impl ConcurrentTaskInner {
 
         let mut runner_id_generator = Generator::new(initial_max_concurrency);
         let mut chunk_planner = ChunkPlanner::new(total);
-        
+
         let (control_tx, control_rx) = async_channel::unbounded();
         let mut runner_notification = RunnerNotification::new();
 
         let mut dynamic_strategy =
             DynamicStrategy::new_with_max_concurrency(initial_max_concurrency);
+        // TODO: make meters removal more efficient
         let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
-        let sampler = Sampler::default();
+        let mut sampler = SpeedSampler::new();
+        let mut current_speed = 0.0;
+        let mut per_runner_avg_speed = 0.0;
+
         let (tmp_path, file_writer) = self.create_file_writer()?;
         let FileWriterGuard(fs_writer_handle, file_writer_control) = file_writer
             .start()
             .await
             .map_err(|e| TaskInstanceError::AllocateFileSpaceFailed(Arc::new(e)))?;
 
-        let mut timer = Timer::interval(Duration::from_secs(SAMPLE_INTERVAL));
+        let mut throughout_meter_timer =
+            Timer::interval(Duration::from_millis(DEFAULT_SAMPLE_INTERVAL));
+        let mut strategy_timer =
+            Timer::interval(Duration::from_millis(DEFAULT_STRATEGY_TICK_INTERVAL));
 
         loop {
             futures::select_biased! {
-                _ = timer.next().fuse() => {
+                _ = strategy_timer.next().fuse() => {
                     Self::download_strategy_timer_tick(
                         &mut chunk_planner,
                         &mut runner_notification,
                         &mut dynamic_strategy,
                         &mut runner_id_generator,
                         max_concurrency,
-                        total,
                         &rt,
                         &adapter,
-                        &event_tx,
                         (&control_tx, &control_rx),
                         &runners_cancel_token,
+                        current_speed,
+                        per_runner_avg_speed,
+                    ).await.inspect_err(|e| {
+                        error!("failed to download strategy timer tick: {e:?}");
+                        self.sync_progress(&chunk_planner);
+                    })?;
+                }
+                _ = throughout_meter_timer.next().fuse() => {
+                    Self::throughout_meter_tick(
+                        &rt,
+                        &chunk_planner,
                         &mut meters,
-                        &sampler,
-                    ).await?;
+                        &mut sampler,
+                        &mut current_speed,
+                        &mut per_runner_avg_speed,
+                        &event_tx,
+                    );
                 }
                 msg = runner_notification.next().fuse() => {
                     if let Some(msg) = msg {
                         let mut flag = false;
                         Self::handle_runner_message(
                             &rt,
-
+                            &mut meters,
                             &mut chunk_planner,
                             &mut runner_notification,
                             &mut runner_id_generator,
@@ -619,7 +663,10 @@ impl ConcurrentTaskInner {
                             },
                             msg,
                         )
-                        .await?;
+                        .await.inspect_err(|e| {
+                            error!("failed to handle runner message: {e:?}");
+                            self.sync_progress(&chunk_planner);
+                        })?;
                         if flag {
                             break;
                         }
@@ -627,6 +674,7 @@ impl ConcurrentTaskInner {
                 }
             }
         }
+        self.sync_progress(&chunk_planner);
         drop(file_writer_control);
         fs_writer_handle
             .await
@@ -634,6 +682,7 @@ impl ConcurrentTaskInner {
         async_fs::rename(&tmp_path, &self.path)
             .await
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
+
         Ok(())
     }
 }
@@ -788,7 +837,7 @@ mod tests {
     use crate::{
         adapter::{BoltLoadAdapter, tests::SimpleTestAdapter},
         runtime::ThreadedRuntimeImpl,
-        task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
+        task::{ManagerMessage, ManagerMessagesVariant},
     };
 
     #[tokio::test(flavor = "multi_thread")]

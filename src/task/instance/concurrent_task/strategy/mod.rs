@@ -1,5 +1,7 @@
 mod dynamic_strategy;
 
+pub const DEFAULT_STRATEGY_TICK_INTERVAL: u64 = 1500; // 1.5 seconds
+
 pub use dynamic_strategy::*;
 
 #[derive(Debug)]

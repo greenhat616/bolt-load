@@ -8,7 +8,7 @@ use statig::prelude::*;
 
 use super::{
     Result, TaskInstance, TaskInstanceError,
-    sampler::{SAMPLE_INTERVAL, Sampler},
+    sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
 };
 use crate::{
     adapter::AnyAdapter,
@@ -226,15 +226,16 @@ impl SingletonTaskInner {
 
         let mut meter = 0;
         let mut speed = 0.0;
-        let sampler = Sampler::default();
-        let mut timer = Timer::interval(Duration::from_secs(SAMPLE_INTERVAL));
+        let mut sampler = SpeedSampler::new();
+        let mut timer = Timer::interval(Duration::from_millis(DEFAULT_SAMPLE_INTERVAL));
 
         let fut = runner.run().fuse();
         futures::pin_mut!(fut);
         loop {
             futures::select_biased! {
                 _ = timer.next().fuse() => {
-                    speed = sampler.sample(&mut meter);
+                    let (_, ema_speed) = sampler.sample(&mut meter);
+                    speed = ema_speed;
                 }
                 _ = fut => (),
                 msg = runner_rx.recv().fuse() => {
