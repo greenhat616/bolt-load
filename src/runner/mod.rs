@@ -531,7 +531,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resize_total() {
+    #[tracing_test::traced_test]
+    async fn test_resize_total_larger() {
+        let runner_id = 1;
         let (control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
         // Create a stream with known size
@@ -552,7 +554,7 @@ mod tests {
         let (mut runner, msg_rx) = TaskRunner::new(
             Some(15), // Initially larger than first chunk to avoid early termination
             Box::pin(test_stream),
-            1,
+            runner_id,
             control_rx,
             cancel_token.clone(),
         );
@@ -575,7 +577,10 @@ mod tests {
                     // Send resize message immediately after first download (only once)
                     if !resize_sent {
                         control_tx
-                            .send(ManagerMessage(1, ManagerMessagesVariant::LimitTotal(60)))
+                            .send(ManagerMessage(
+                                runner_id,
+                                ManagerMessagesVariant::LimitTotal(60),
+                            ))
                             .await
                             .unwrap();
                         resize_sent = true;
@@ -585,13 +590,16 @@ mod tests {
                     finished = true;
                     break;
                 }
-                _ => {}
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) => {
+                    error!("runner: stopped with error: {e:?}");
+                    break;
+                }
             }
         }
 
         runner_handle.await.unwrap();
         assert!(started);
-        assert!(finished);
+        assert!(!finished, "runner should failed");
     }
 
     #[tokio::test]
