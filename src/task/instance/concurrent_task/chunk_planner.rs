@@ -150,7 +150,7 @@ impl ChunkPlanner {
         &mut self,
         runner_id: RunnerId,
         bytes_downloaded: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Range<u64>, String> {
         let range = self
             .runner_to_chunk
             .get(&runner_id)
@@ -163,14 +163,14 @@ impl ChunkPlanner {
 
         // Update downloaded range
         let new_end = (chunk.downloaded.end + bytes_downloaded).min(chunk.allocated.end);
-        chunk.downloaded.end = new_end;
+        let previous_end = std::mem::replace(&mut chunk.downloaded.end, new_end);
 
         // Check if complete
         if chunk.is_complete() {
             chunk.status = ChunkStatus::Finished;
         }
 
-        Ok(())
+        Ok(previous_end..new_end)
     }
 
     /// Mark a runner as finished
@@ -307,13 +307,19 @@ impl ChunkPlanner {
     }
 
     /// Get incomplete states from occupied ranges
-    pub fn get_incomplete_states(&self) -> Vec<(RunnerId, Range<u64>)> {
+    pub fn get_incomplete_states(
+        &self,
+        min_chunk_size: Option<u64>,
+    ) -> Vec<(RunnerId, Range<u64>)> {
         self.chunks
             .values()
             .filter(|c| {
                 c.status != ChunkStatus::Finished
                     && c.downloaded.end < c.allocated.end
-                    && c.remaining() >= 2 * self.min_chunk_size // For split check
+                    && c.remaining() // For split check
+                        >= min_chunk_size
+                            .map(|v| v.max(2 * self.min_chunk_size))
+                            .unwrap_or(2 * self.min_chunk_size)
             })
             .map(|c| {
                 (
@@ -344,7 +350,7 @@ impl ChunkPlanner {
             .filter(|c| {
                 c.status == ChunkStatus::Running
                     && c.runner_id.is_some()
-                    && c.remaining() >= required_size.min(self.min_chunk_size)
+                    && c.remaining() >= required_size.max(self.min_chunk_size)
             })
             .max_by_key(|c| c.remaining());
 
@@ -989,7 +995,7 @@ mod tests {
         assert!(planner.mark_finished(3).is_ok());
 
         // Get incomplete states
-        let incomplete = planner.get_incomplete_states();
+        let incomplete = planner.get_incomplete_states(None);
         assert_eq!(incomplete.len(), 2);
 
         // Check results

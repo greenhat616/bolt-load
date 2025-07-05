@@ -60,6 +60,10 @@ impl RunnerMessageSender {
         Self(task_id, sender)
     }
 
+    fn runner_id(&self) -> RunnerId {
+        self.0
+    }
+
     pub async fn send(
         &self,
         message: RunnerMessageKind,
@@ -160,6 +164,8 @@ impl TaskRunner {
     /// run the task runner
     /// This function will block until the task is finished or cancelled
     /// It should be called in a new thread or async spawn context
+    #[cfg(feature = "tracing")]
+    #[tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.notify.runner_id()))]
     pub async fn run(&mut self) {
         match self.run_inner().await {
             Ok(_) => {
@@ -189,6 +195,36 @@ impl TaskRunner {
         }
     }
 
+    /// Handle the control signal from the manager
+    fn handle_control_signal(&mut self, signal: &ManagerMessage) -> Result<(), TaskFailedKind> {
+        // Task layer owned the cancel token guard, ensure cancel token when manager is dropping
+        match signal {
+            ManagerMessage(runner_id, variant) if *runner_id == self.notify.runner_id() => {
+                match variant {
+                    ManagerMessagesVariant::LimitTotal(new_total) => {
+                        if let Some(current_total) = self.total {
+                            if current_total > *new_total {
+                                trace!("runner: limit total to {new_total}");
+                                self.total = Some(*new_total);
+                            } else {
+                                error!(
+                                    "runner: limit total is smaller than current total,
+                                    limit: {new_total}, current: {current_total}"
+                                );
+                                Err(TaskFailedKind::Other(format!(
+                                    "limit total is smaller than current total, limit: \
+                                     {new_total}, current: {current_total}"
+                                )))?;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// The inner logic of the task runner
     /// Just wrap a Result<(), TaskFailedKind> to return the error kind
     async fn run_inner(&mut self) -> Result<(), TaskRunError> {
@@ -208,28 +244,13 @@ impl TaskRunner {
             futures::pin_mut!(control_signal, download, cancelled);
             futures::select! {
                 signal = control_signal => {
-                    // Task layer owned the cancel token guard, ensure cancel token when manager is dropping
                     match signal {
                         Ok(signal) => {
-                            let ManagerMessage(_, variant) = signal;
-                            match variant {
-                                ManagerMessagesVariant::LimitTotal(new_total) => {
-                                    if let Some(current_total) = self.total {
-                                        if current_total >  new_total{
-                                            trace!("runner: limit total to {new_total}");
-                                            self.total = Some(new_total);
-                                        } else {
-                                            warn!(
-                                                "runner: limit total is smaller than current total,
-                                                limit: {new_total}, current: {current_total}"
-                                            );
-                                        }
-                                    }
-                                }
+                            if let Err(err) = self.handle_control_signal(&signal) {
+                                break Err(err.into());
                             }
                         }
                         Err(_) => {
-                            // Control channel closed, should exit
                             break Err(TaskFailedKind::ChannelClosed.into());
                         }
                     }
@@ -278,9 +299,16 @@ impl TaskRunner {
         // TODO: handle the error
         match self.total {
             Some(total) if total == self.downloaded => {}
+            Some(total) if self.downloaded > total => {
+                warn!(
+                    "runner: downloaded content is larger than the total size, total: {}, \
+                     downloaded: {}",
+                    total, self.downloaded
+                );
+            }
             Some(total) => {
                 let msg = format!(
-                    "runner: downloaded content is not match the total size, total: {}, \
+                    "runner: downloaded content is smaller than the total size, total: {}, \
                      downloaded: {}",
                     total, self.downloaded
                 );

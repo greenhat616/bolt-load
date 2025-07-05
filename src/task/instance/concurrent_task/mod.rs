@@ -9,6 +9,7 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use async_io::Timer;
+use bytes::Bytes;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::{Response::*, prelude::*};
@@ -286,28 +287,40 @@ impl ConcurrentTaskInner {
         cancel_token: CancellationToken,
     ) -> Result<(Receiver<RunnerMessage>, RemoteHandle<()>)> {
         let (tx, rx) = oneshot::channel();
+        let (start, end) = (range.start, range.end);
+        let fut = async move {
+            trace!("[TASK] create background range runner: id: {runner_id}, range: {range:?}");
+            let mut runner = match TaskRunner::new_with_async_and_callback(
+                Some(end - start),
+                async { adapter.range_stream(start, end).await },
+                runner_id,
+                notify,
+                cancel_token.clone(),
+                move |rx| {
+                    let _ = tx.send(rx);
+                },
+            )
+            .await
+            {
+                Some(runner) => runner,
+                None => {
+                    return;
+                }
+            };
+            runner.run().await;
+        };
+        #[cfg(feature = "tracing")]
+        let fut = tracing::Instrument::instrument(
+            fut,
+            tracing::trace_span!(
+                parent: None,
+                "background_range_runner",
+                runner_id = runner_id,
+                range = ?start..end,
+            ),
+        );
         let handle = rt
-            .spawn_with_handle(async move {
-                trace!("[TASK] create background range runner: id: {runner_id}, range: {range:?}");
-                let mut runner = match TaskRunner::new_with_async_and_callback(
-                    Some(range.end - range.start),
-                    async { adapter.range_stream(range.start, range.end).await },
-                    runner_id,
-                    notify,
-                    cancel_token.clone(),
-                    move |rx| {
-                        let _ = tx.send(rx);
-                    },
-                )
-                .await
-                {
-                    Some(runner) => runner,
-                    None => {
-                        return;
-                    }
-                };
-                runner.run().await;
-            })
+            .spawn_with_handle(fut)
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
         let rx = rx
             .await
@@ -404,46 +417,79 @@ impl ConcurrentTaskInner {
             return Ok(());
         }
         let active_runners = chunk_planner.get_active_runners_count();
-        if active_runners < max_concurrency {
+
+        // TODO: maybe move into the strategy?
+        let planned_chunk_size = (current_speed * 2.0) as u64;
+
+        if active_runners < max_concurrency && current_speed > 0.0 {
+            trace!(
+                "[TASK] current speed: {current_speed}, per runner avg speed: \
+                 {per_runner_avg_speed}"
+            );
             if let Some((runner_id, suggested_range)) =
-                chunk_planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE)
+                chunk_planner.find_chunk_to_split(planned_chunk_size)
             {
-                match runner_id {
-                    //
-                    None => {
-                        // create a new runner
-                        let runner_id = runner_id_generator.next().expect("no more runner id");
-                        if !chunk_planner.allocate_chunk(suggested_range.clone(), Some(runner_id)) {
-                            panic!("failed to allocate chunk: {suggested_range:?}");
+                if suggested_range.end - suggested_range.start >= planned_chunk_size {
+                    match runner_id {
+                        //
+                        None => {
+                            // create a new runner
+                            let runner_id = runner_id_generator.next().expect("no more runner id");
+                            if !chunk_planner
+                                .allocate_chunk(suggested_range.clone(), Some(runner_id))
+                            {
+                                panic!("failed to allocate chunk: {suggested_range:?}");
+                            }
+                            let (rx, _) = Self::create_background_range_runner(
+                                rt,
+                                suggested_range,
+                                adapter.clone(),
+                                control_rx.clone(),
+                                runner_id,
+                                runners_cancel_token.clone(),
+                            )
+                            .await?;
+                            runner_notification.add(runner_id, rx);
                         }
-                        let (rx, _) = Self::create_background_range_runner(
-                            rt,
-                            suggested_range,
-                            adapter.clone(),
-                            control_rx.clone(),
-                            runner_id,
-                            runners_cancel_token.clone(),
-                        )
-                        .await?;
-                        runner_notification.add(runner_id, rx);
-                    }
-                    Some(runner_id) => {
-                        // split the chunk
-                        let strategy_context = DynamicStrategyContext {
-                            speed: current_speed,
-                            per_runner_speed: per_runner_avg_speed,
-                            current_concurrency: chunk_planner.get_active_runners_count(),
-                            remaining_largest_runner_id: runner_id,
-                        };
-                        let actions = dynamic_strategy.step(&strategy_context);
-                        for action in actions {
-                            match action {
-                                // Split current all task into two separate tasks
-                                StrategyAction::SplitAllTask => {
-                                    trace!("[TASK] Strategy: split all task");
-                                    let states = chunk_planner.get_incomplete_states();
-                                    for (runner_id, incomplete_range) in states {
-                                        trace!("split task: {runner_id}, {incomplete_range:?}");
+                        Some(runner_id) => {
+                            // split the chunk
+                            let strategy_context = DynamicStrategyContext {
+                                speed: current_speed,
+                                per_runner_speed: per_runner_avg_speed,
+                                current_concurrency: chunk_planner.get_active_runners_count(),
+                                remaining_largest_runner_id: runner_id,
+                            };
+                            let actions = dynamic_strategy.step(&strategy_context);
+                            for action in actions {
+                                match action {
+                                    // Split current all task into two separate tasks
+                                    StrategyAction::SplitAllTask if current_speed > 0.0 => {
+                                        trace!("[TASK] Strategy: split all task");
+                                        let states = chunk_planner
+                                            .get_incomplete_states(Some(planned_chunk_size));
+                                        for (runner_id, incomplete_range) in states {
+                                            trace!("split task: {runner_id}, {incomplete_range:?}");
+                                            Self::split_task(
+                                                rt,
+                                                chunk_planner,
+                                                runner_id_generator,
+                                                runner_notification,
+                                                runners_cancel_token,
+                                                incomplete_range,
+                                                adapter.clone(),
+                                                control_channel,
+                                                runner_id,
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                    // Split the given task into two separate tasks
+                                    StrategyAction::SplitGivenTask(task_id) => {
+                                        trace!("[TASK] Strategy: split given task: {task_id}");
+                                        let incomplete_range = chunk_planner
+                                            .get_runner_state(task_id)
+                                            .map(|s| s.incomplete_range())
+                                            .expect("task id not found");
                                         Self::split_task(
                                             rt,
                                             chunk_planner,
@@ -457,34 +503,15 @@ impl ConcurrentTaskInner {
                                         )
                                         .await?;
                                     }
-                                }
-                                // Split the given task into two separate tasks
-                                StrategyAction::SplitGivenTask(task_id) => {
-                                    trace!("[TASK] Strategy: split given task: {task_id}");
-                                    let incomplete_range = chunk_planner
-                                        .get_runner_state(task_id)
-                                        .map(|s| s.incomplete_range())
-                                        .expect("task id not found");
-                                    Self::split_task(
-                                        rt,
-                                        chunk_planner,
-                                        runner_id_generator,
-                                        runner_notification,
-                                        runners_cancel_token,
-                                        incomplete_range,
-                                        adapter.clone(),
-                                        control_channel,
-                                        runner_id,
-                                    )
-                                    .await?;
-                                }
-                                // Change the max concurrency
-                                StrategyAction::ChangeMaxThread(new_max_concurrency) => {
-                                    trace!(
-                                        "[TASK] Strategy: change max concurrency: \
-                                         {new_max_concurrency}"
-                                    );
-                                    todo!("change max concurrency");
+                                    // Change the max concurrency
+                                    StrategyAction::ChangeMaxThread(new_max_concurrency) => {
+                                        trace!(
+                                            "[TASK] Strategy: change max concurrency: \
+                                             {new_max_concurrency}"
+                                        );
+                                        todo!("change max concurrency");
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -541,29 +568,36 @@ impl ConcurrentTaskInner {
                     }
                 }
             }
-            RunnerMessageKind::Downloaded(bytes) => {
+            RunnerMessageKind::Downloaded(mut bytes) => {
                 let bytes_len = bytes.len();
                 *meters.entry(runner_id).or_insert(0) += bytes_len;
 
-                let state = chunk_planner.get_runner_state(runner_id).ok_or_else(|| {
-                    TaskInstanceError::Failed(TaskFailedKind::Other(format!(
-                        "Runner {runner_id} not found"
-                    )))
-                })?;
-
-                let write_start = state.downloaded.end;
-
                 // update the chunk planner progress
-                chunk_planner
+                let fixed_downloaded_range = chunk_planner
                     .update_progress(runner_id, bytes_len as u64)
                     .expect("chunk planner should not fail");
+                let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
+                bytes.truncate(picked_size as usize);
 
                 let file_writer_control = file_writer_control.clone();
                 let _ = rt.spawn(async move {
-                    file_writer_control
-                        .write(write_start..write_start + bytes_len as u64, bytes)
+                    if let Err(e) = file_writer_control
+                        .write(fixed_downloaded_range, bytes)
                         .await
-                        .expect("Should handle io error");
+                    {
+                        // TODO: notify the task to stop
+                        match e {
+                            FileWriterError::Io(e) => {
+                                error!("failed to write to file: {e:?}");
+                            }
+                            FileWriterError::Send(e) => {
+                                error!("failed to send to file writer: {e:?}");
+                            }
+                            FileWriterError::Recv(e) => {
+                                error!("failed to receive from file writer: {e:?}");
+                            }
+                        }
+                    }
                 });
             }
             RunnerMessageKind::Started => {
@@ -617,68 +651,73 @@ impl ConcurrentTaskInner {
         let mut strategy_timer =
             Timer::interval(Duration::from_millis(DEFAULT_STRATEGY_TICK_INTERVAL));
 
-        loop {
-            futures::select_biased! {
-                _ = strategy_timer.next().fuse() => {
-                    Self::download_strategy_timer_tick(
-                        &mut chunk_planner,
-                        &mut runner_notification,
-                        &mut dynamic_strategy,
-                        &mut runner_id_generator,
-                        max_concurrency,
-                        &rt,
-                        &adapter,
-                        (&control_tx, &control_rx),
-                        &runners_cancel_token,
-                        current_speed,
-                        per_runner_avg_speed,
-                    ).await.inspect_err(|e| {
-                        error!("failed to download strategy timer tick: {e:?}");
-                        self.sync_progress(&chunk_planner);
-                    })?;
-                }
-                _ = throughout_meter_timer.next().fuse() => {
-                    Self::throughout_meter_tick(
-                        &rt,
-                        &chunk_planner,
-                        &mut meters,
-                        &mut sampler,
-                        &mut current_speed,
-                        &mut per_runner_avg_speed,
-                        &event_tx,
-                    );
-                }
-                msg = runner_notification.next().fuse() => {
-                    if let Some(msg) = msg {
-                        let mut flag = false;
-                        Self::handle_runner_message(
-                            &rt,
-                            &mut meters,
+        let event_loop_result: Result<()> = async {
+            loop {
+                futures::select_biased! {
+                    _ = strategy_timer.next().fuse() => {
+                        Self::download_strategy_timer_tick(
                             &mut chunk_planner,
                             &mut runner_notification,
+                            &mut dynamic_strategy,
                             &mut runner_id_generator,
-                            &file_writer_control,
-                            || {
-                                flag = true;
-                            },
-                            msg,
-                        )
-                        .await.inspect_err(|e| {
-                            error!("failed to handle runner message: {e:?}");
+                            max_concurrency,
+                            &rt,
+                            &adapter,
+                            (&control_tx, &control_rx),
+                            &runners_cancel_token,
+                            current_speed,
+                            per_runner_avg_speed,
+                        ).await.inspect_err(|e| {
+                            error!("failed to download strategy timer tick: {e:?}");
                             self.sync_progress(&chunk_planner);
                         })?;
-                        if flag {
-                            break;
+                    }
+                    _ = throughout_meter_timer.next().fuse() => {
+                        Self::throughout_meter_tick(
+                            &rt,
+                            &chunk_planner,
+                            &mut meters,
+                            &mut sampler,
+                            &mut current_speed,
+                            &mut per_runner_avg_speed,
+                            &event_tx,
+                        );
+                    }
+                    msg = runner_notification.next().fuse() => {
+                        if let Some(msg) = msg {
+                            let mut flag = false;
+                            Self::handle_runner_message(
+                                &rt,
+                                &mut meters,
+                                &mut chunk_planner,
+                                &mut runner_notification,
+                                &mut runner_id_generator,
+                                &file_writer_control,
+                                || {
+                                    flag = true;
+                                },
+                                msg,
+                            )
+                            .await.inspect_err(|e| {
+                                error!("failed to handle runner message: {e:?}");
+                                self.sync_progress(&chunk_planner);
+                            })?;
+                            if flag {
+                                break;
+                            }
                         }
                     }
                 }
             }
+            Ok(())
         }
+        .await;
         self.sync_progress(&chunk_planner);
         drop(file_writer_control);
         fs_writer_handle
             .await
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
+        event_loop_result?;
         async_fs::rename(&tmp_path, &self.path)
             .await
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
