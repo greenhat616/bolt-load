@@ -43,7 +43,7 @@ atomic_enum = "0.3"
 tempfile = "3"
 smol-cancellation-token = "0.1"
 derive_more = { version = "2", features = ["debug"] }
-statig = { version ="0.3", features = ["async"] }
+statig = { version ="0.4", features = ["async"] }
 bitvec = "1"                                           # for task id generation
 memmap2 = "0.9"                                        # for better random range write for files if machine is available
 backon = "1"                                           # for retry strategy
