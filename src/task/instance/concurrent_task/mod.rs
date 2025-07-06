@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use async_broadcast::{Receiver as BroadcastReceiver, Sender as BroadcastSender};
 use async_channel::{Receiver, Sender};
 use async_io::Timer;
 use async_waitgroup::WaitGroup;
@@ -23,7 +24,8 @@ use crate::{
     task::{
         ManagerMessage, ManagerMessagesVariant, Progress, RunnerId,
         instance::{
-            ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent, TaskInstanceError,
+            DEFAULT_CONTROL_CHANNEL_CAPACITY, ProgressWithSpeed, RunningPayload, TaskControl,
+            TaskEvent, TaskInstanceError,
             sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
         },
     },
@@ -41,6 +43,11 @@ use runner_notification::RunnerNotification;
 use strategy::*;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
+
+type ControlChannelRef<'a> = (
+    &'a BroadcastSender<ManagerMessage>,
+    &'a BroadcastReceiver<ManagerMessage>,
+);
 
 pub struct ConcurrentTask {
     threaded_rt: ThreadedRuntimeImpl,
@@ -251,7 +258,7 @@ impl ConcurrentTaskInner {
         runners_cancel_token: &CancellationToken,
         incomplete_range: Range<u64>,
         adapter: Arc<AnyAdapter>,
-        control_channel: (&Sender<ManagerMessage>, &Receiver<ManagerMessage>),
+        control_channel: ControlChannelRef<'_>,
         runner_id: RunnerId,
     ) -> Result<()> {
         let (control_tx, control_rx) = control_channel;
@@ -260,8 +267,9 @@ impl ConcurrentTaskInner {
         chunk_planner
             .resize_runner_state(runner_id, half_size)
             .expect("chunk planner should not fail");
+
         control_tx
-            .send(ManagerMessage(
+            .broadcast_direct(ManagerMessage(
                 runner_id,
                 ManagerMessagesVariant::LimitTotal(incomplete_range.start + half_size),
             ))
@@ -297,7 +305,7 @@ impl ConcurrentTaskInner {
         wg: &WaitGroup,
         range: Range<u64>,
         adapter: Arc<AnyAdapter>,
-        notify: Receiver<ManagerMessage>,
+        notify: BroadcastReceiver<ManagerMessage>,
         runner_id: RunnerId,
         cancel_token: CancellationToken,
     ) -> Result<(Receiver<RunnerMessage>, RemoteHandle<()>)> {
@@ -401,7 +409,7 @@ impl ConcurrentTaskInner {
 
         threaded_rt: &ThreadedRuntimeImpl,
         adapter: &Arc<AnyAdapter>,
-        control_channel: (&Sender<ManagerMessage>, &Receiver<ManagerMessage>),
+        control_channel: ControlChannelRef<'_>,
         runners_cancel_token: &CancellationToken,
         wg: &WaitGroup,
 
@@ -660,7 +668,7 @@ impl ConcurrentTaskInner {
         let mut runner_id_generator = Generator::new(initial_max_concurrency);
         let mut chunk_planner = ChunkPlanner::new(total);
 
-        let (control_tx, control_rx) = async_channel::unbounded();
+        let (control_tx, control_rx) = async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let mut runner_notification = RunnerNotification::new();
 
         let mut dynamic_strategy =
@@ -918,7 +926,8 @@ mod tests {
             as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
         let range = 1000u64..3000u64;
         let runner_id = 1;
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) =
+            async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
@@ -992,7 +1001,8 @@ mod tests {
             as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
         let range = 0u64..500u64;
         let runner_id = 2;
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) =
+            async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -1032,7 +1042,8 @@ mod tests {
             as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
         let range = 0u64..5000u64;
         let runner_id = 3;
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) =
+            async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -1080,13 +1091,13 @@ mod tests {
         let old_total = 10240u64;
         let range = 0u64..old_total;
         let runner_id = 4;
-        let (control_tx, control_rx) = async_channel::unbounded();
+        let (control_tx, control_rx) = async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
         // 在创建运行器之前预先发送控制消息
         let new_total = 1000u64;
         control_tx
-            .send(ManagerMessage(
+            .broadcast_direct(ManagerMessage(
                 runner_id,
                 ManagerMessagesVariant::LimitTotal(new_total),
             ))
@@ -1145,7 +1156,8 @@ mod tests {
         // 测试边界范围：从文件末尾开始
         let range = 900u64..1000u64;
         let runner_id = 5;
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) =
+            async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -1195,7 +1207,8 @@ mod tests {
         // 测试零长度范围
         let range = 500u64..500u64;
         let runner_id = 6;
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) =
+            async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -1248,7 +1261,8 @@ mod tests {
         for (runner_id, range) in ranges {
             let rt_clone = rt.clone();
             let adapter_clone = adapter.clone();
-            let (control_tx, control_rx) = async_channel::unbounded();
+            let (control_tx, control_rx) =
+                async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
             let cancel_token = CancellationToken::new();
 
             let handle = tokio::spawn(async move {
@@ -1334,7 +1348,8 @@ mod tests {
             as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
         let range = 1500u64..3500u64;
         let runner_id = 7;
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) =
+            async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();

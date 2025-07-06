@@ -1,4 +1,4 @@
-use async_channel::Sender;
+use async_broadcast::Sender;
 use smol_cancellation_token::CancellationToken;
 
 use super::ManagerMessagesVariant;
@@ -34,7 +34,7 @@ impl TaskRunnerGuard {
     pub async fn send_message(&self, message: ManagerMessagesVariant) {
         if let Err(e) = self
             .control_signal
-            .send(ManagerMessage(self.runner_id, message))
+            .broadcast_direct(ManagerMessage(self.runner_id, message))
             .await
         {
             warn!("Failed to send message to task runner: {e:?}");

@@ -21,7 +21,7 @@ serde = ["dep:serde"]
 
 # runtime group
 tokio = ["dep:tokio"]
-smol = ["dep:smol", "dep:async-broadcast"]
+smol = ["dep:smol"]
 
 tracing = ["dep:tracing"]
 
@@ -51,7 +51,7 @@ async-waitgroup = "0.1.3"                              # for cross runtime wait 
 async-lock = "3"                                       # for cross runtime async lock
 ranges = "0.4"                                         # for range set operation
 async-channel = "2"                                    # for async channel
-async-broadcast = { version = "0.7", optional = true }
+async-broadcast = { version = "0.7" }
 async-fs = "2"                                         # for async file operation
 async-io = "2"                                         # for async timer
 blocking = "1"                                         # convert blocking io to async

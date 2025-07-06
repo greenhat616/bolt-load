@@ -30,7 +30,10 @@ pub type RunnerId = usize;
 pub type TaskStateChangedCallback = Box<dyn Fn(TaskEvent) + Send + Sync + 'static>;
 
 /// messages for manager -> runner
+#[derive(Debug, Clone)]
 pub struct ManagerMessage(pub RunnerId, pub ManagerMessagesVariant);
+
+#[derive(Debug, Clone)]
 pub enum ManagerMessagesVariant {
     /// limit the total size of the task
     ///

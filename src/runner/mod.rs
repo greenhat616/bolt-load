@@ -1,3 +1,4 @@
+use async_broadcast::Receiver as BroadcastReceiver;
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
@@ -94,7 +95,7 @@ pub struct TaskRunner {
     /// the adapter of the task
     stream: AnyBytesStream,
     /// the receiver of the manager messages
-    control_signal: Receiver<ManagerMessage>,
+    control_signal: BroadcastReceiver<ManagerMessage>,
     /// the sender of the task messages
     notify: RunnerMessageSender,
     /// the cancel token
@@ -108,7 +109,7 @@ impl TaskRunner {
         total: Option<u64>,
         stream: AnyBytesStream,
         runner_id: RunnerId,
-        receiver: Receiver<ManagerMessage>,
+        receiver: BroadcastReceiver<ManagerMessage>,
         cancel_token: CancellationToken,
     ) -> (Self, Receiver<RunnerMessage>) {
         let (tx, rx) = async_channel::unbounded();
@@ -130,7 +131,7 @@ impl TaskRunner {
         total: Option<u64>,
         stream: impl Future<Output = Result<AnyBytesStream, StreamError>>,
         runner_id: RunnerId,
-        receiver: Receiver<ManagerMessage>,
+        receiver: BroadcastReceiver<ManagerMessage>,
         cancel_token: CancellationToken,
         on_channel_created: impl FnOnce(Receiver<RunnerMessage>),
     ) -> Option<Self> {
@@ -346,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_normal_download() {
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
         let token = CancellationToken::new();
 
         // Create a stream that emits 3 chunks
@@ -399,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_download() {
-        let (control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
 
         // Create an infinite stream that we'll cancel
@@ -454,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_network_error() {
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
         // Create a stream that yields an error
         let test_stream = stream! {
@@ -494,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_stream() {
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
         // Create an empty stream
         let test_stream = stream! {
@@ -534,7 +535,7 @@ mod tests {
     #[tracing_test::traced_test]
     async fn test_resize_total_larger() {
         let runner_id = 1;
-        let (control_tx, control_rx) = async_channel::unbounded();
+        let (control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
         // Create a stream with known size
         let test_stream = stream! {
@@ -577,7 +578,7 @@ mod tests {
                     // Send resize message immediately after first download (only once)
                     if !resize_sent {
                         control_tx
-                            .send(ManagerMessage(
+                            .broadcast_direct(ManagerMessage(
                                 runner_id,
                                 ManagerMessagesVariant::LimitTotal(60),
                             ))
@@ -604,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resize_total_smaller() {
-        let (control_tx, control_rx) = async_channel::unbounded();
+        let (control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
 
         // Create a stream with multiple chunks that would normally total 60 bytes
@@ -650,7 +651,10 @@ mod tests {
                     // After downloading 2 chunks (20 bytes), resize to 25 bytes
                     if download_count == 2 {
                         control_tx
-                            .send(ManagerMessage(1, ManagerMessagesVariant::LimitTotal(25)))
+                            .broadcast_direct(ManagerMessage(
+                                1,
+                                ManagerMessagesVariant::LimitTotal(25),
+                            ))
                             .await
                             .unwrap();
                     }
@@ -658,7 +662,7 @@ mod tests {
                 RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
                     break;
                 }
-                _ => panic!("Unexpected message: {:?}", msg),
+                _ => panic!("Unexpected message: {msg:?}"),
             }
         }
 
@@ -670,7 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_size_mismatch() {
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
 
         // Create a stream that produces more data than expected
@@ -707,7 +711,7 @@ mod tests {
                     finished = true;
                     break;
                 }
-                _ => panic!("Unexpected message: {:?}", msg),
+                _ => panic!("Unexpected message: {msg:?}"),
             }
         }
 
@@ -720,7 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_closed() {
-        let (control_tx, control_rx) = async_channel::unbounded();
+        let (control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
 
         // Create a stream that will never complete
@@ -769,7 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_with_async_and_callback_success() {
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
 
@@ -831,7 +835,7 @@ mod tests {
                     finished = true;
                     break;
                 }
-                _ => panic!("Unexpected message: {:?}", msg),
+                _ => panic!("Unexpected message: {msg:?}"),
             }
         }
 
@@ -843,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_with_async_and_callback_stream_failure() {
-        let (_control_tx, control_rx) = async_channel::unbounded();
+        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
 
@@ -886,10 +890,208 @@ mod tests {
             ) => {
                 assert_eq!(id, runner_id);
             }
-            _ => panic!("Expected stopped message with stream error, got: {:?}", msg),
+            _ => panic!("Expected stopped message with stream error, got: {msg:?}"),
         }
 
         // Channel should be closed after the error message
         assert!(msg_rx.recv().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn test_multiple_runners_handle_own_messages() {
+        let (control_tx, control_rx1) = async_broadcast::broadcast(10);
+        let control_rx2 = control_tx.new_receiver();
+        let control_rx3 = control_tx.new_receiver();
+
+        let cancel_token = CancellationToken::new();
+
+        // Create streams for all runners - each will yield 6 chunks of 10 bytes
+        let create_stream = || {
+            stream! {
+                for i in 0..6 {
+                    sleep(Duration::from_millis(10)).await;
+                    yield Ok(Bytes::from(vec![i as u8; 10]));
+                }
+            }
+        };
+
+        // Create three runners with different IDs
+        let runner_id1 = 1;
+        let runner_id2 = 2;
+        let runner_id3 = 3;
+
+        let (mut runner1, msg_rx1) = TaskRunner::new(
+            Some(60), // Total 60 bytes
+            Box::pin(create_stream()),
+            runner_id1,
+            control_rx1,
+            cancel_token.clone(),
+        );
+
+        let (mut runner2, msg_rx2) = TaskRunner::new(
+            Some(60), // Total 60 bytes
+            Box::pin(create_stream()),
+            runner_id2,
+            control_rx2,
+            cancel_token.clone(),
+        );
+
+        let (mut runner3, msg_rx3) = TaskRunner::new(
+            Some(60), // Total 60 bytes
+            Box::pin(create_stream()),
+            runner_id3,
+            control_rx3,
+            cancel_token.clone(),
+        );
+
+        // Spawn all runners
+        let runner1_handle = tokio::spawn(async move {
+            runner1.run().await;
+        });
+
+        let runner2_handle = tokio::spawn(async move {
+            runner2.run().await;
+        });
+
+        let runner3_handle = tokio::spawn(async move {
+            runner3.run().await;
+        });
+
+        // Track the state of each runner
+        let mut runner1_started = false;
+        let mut runner2_started = false;
+        let mut runner3_started = false;
+
+        let mut runner1_downloaded = 0;
+        let mut runner2_downloaded = 0;
+        let mut runner3_downloaded = 0;
+
+        let mut runner1_finished = false;
+        let mut runner2_finished = false;
+        let mut runner3_finished = false;
+
+        let mut limit_sent = false;
+
+        // Use timeout to prevent infinite waiting
+        let timeout_duration = Duration::from_secs(10);
+        let result = tokio::time::timeout(timeout_duration, async {
+            // Use select to handle messages from all runners
+            loop {
+                tokio::select! {
+                    msg = msg_rx1.recv(), if !runner1_finished => {
+                        match msg {
+                            Ok(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                                assert_eq!(id, runner_id1);
+                                runner1_started = true;
+                            }
+                            Ok(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                                assert_eq!(id, runner_id1);
+                                runner1_downloaded += bytes.len();
+
+                                // Send limit message to runner2 only after some downloads
+                                if !limit_sent && runner1_downloaded >= 20 && runner2_downloaded >= 20 {
+                                    // Limit runner2 to 35 bytes (should stop after 3.5 chunks)
+                                    control_tx
+                                        .broadcast_direct(ManagerMessage(
+                                            runner_id2,
+                                            ManagerMessagesVariant::LimitTotal(35),
+                                        ))
+                                        .await
+                                        .unwrap();
+                                    limit_sent = true;
+                                }
+                            }
+                            Ok(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                                assert_eq!(id, runner_id1);
+                                assert!(matches!(reason, StoppedReason::Finished));
+                                runner1_finished = true;
+                            }
+                            Err(_) => {
+                                // Channel closed, treat as finished
+                                runner1_finished = true;
+                            }
+                        }
+                    }
+                    msg = msg_rx2.recv(), if !runner2_finished => {
+                        match msg {
+                            Ok(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                                assert_eq!(id, runner_id2);
+                                runner2_started = true;
+                            }
+                            Ok(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                                assert_eq!(id, runner_id2);
+                                runner2_downloaded += bytes.len();
+                            }
+                            Ok(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                                assert_eq!(id, runner_id2);
+                                assert!(matches!(reason, StoppedReason::Finished));
+                                runner2_finished = true;
+                            }
+                            Err(_) => {
+                                // Channel closed, treat as finished
+                                runner2_finished = true;
+                            }
+                        }
+                    }
+                    msg = msg_rx3.recv(), if !runner3_finished => {
+                        match msg {
+                            Ok(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                                assert_eq!(id, runner_id3);
+                                runner3_started = true;
+                            }
+                            Ok(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                                assert_eq!(id, runner_id3);
+                                runner3_downloaded += bytes.len();
+                            }
+                            Ok(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                                assert_eq!(id, runner_id3);
+                                assert!(matches!(reason, StoppedReason::Finished));
+                                runner3_finished = true;
+                            }
+                            Err(_) => {
+                                // Channel closed, treat as finished
+                                runner3_finished = true;
+                            }
+                        }
+                    }
+                }
+
+                // Break when all runners are finished
+                if runner1_finished && runner2_finished && runner3_finished {
+                    break;
+                }
+            }
+        }).await;
+
+        // Check if test timed out
+        if result.is_err() {
+            panic!(
+                "Test timed out after {} seconds",
+                timeout_duration.as_secs()
+            );
+        }
+
+        // Wait for all runners to complete
+        runner1_handle.await.unwrap();
+        runner2_handle.await.unwrap();
+        runner3_handle.await.unwrap();
+
+        // Verify results
+        assert!(runner1_started && runner2_started && runner3_started);
+        assert!(runner1_finished && runner2_finished && runner3_finished);
+        assert!(limit_sent);
+
+        // Runner1 and Runner3 should have downloaded the full 60 bytes
+        assert_eq!(runner1_downloaded, 60);
+        assert_eq!(runner3_downloaded, 60);
+
+        // Runner2 should have been limited to 35 bytes
+        assert_eq!(runner2_downloaded, 35);
+
+        println!("✓ Multiple runners correctly handled their own messages");
+        println!("  - Runner1 downloaded: {runner1_downloaded} bytes (expected: 60)");
+        println!("  - Runner2 downloaded: {runner2_downloaded} bytes (expected: 35, limited)");
+        println!("  - Runner3 downloaded: {runner3_downloaded} bytes (expected: 60)");
     }
 }
