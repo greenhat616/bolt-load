@@ -1,3 +1,7 @@
+<p align="center">
+    <img src="./.github/bolt-load-transparent.svg" alt="logo" width="200" height="200">
+</p>
+
 ### Thread control algroithm
 Split the process into 2 parts, slow start & max thread control
 

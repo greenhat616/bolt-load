@@ -22,7 +22,6 @@ serde = ["dep:serde"]
 # runtime group
 tokio = ["dep:tokio"]
 smol = ["dep:smol", "dep:async-broadcast"]
-async-std = ["dep:async-std"]
 
 tracing = ["dep:tracing"]
 
@@ -73,7 +72,6 @@ ureq3 = { version = "3", package = "ureq", optional = true }
 
 # runtime group
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "tracing"], optional = true }
-async-std = { version = "1", optional = true }
 smol = { version = "2", optional = true }
 
 # tracing
