@@ -1,6 +1,6 @@
 use async_broadcast::Receiver as BroadcastReceiver;
 use async_channel::{Receiver, Sender};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
 
@@ -13,6 +13,9 @@ use crate::{
 
 mod guard;
 pub use guard::*;
+
+// TODO: make it configurable or detect the local disk performance?
+const BUFFER_SIZE: usize = 32 * 1024; // 32KB
 
 /// messages for runner -> manager
 #[derive(Debug)]
@@ -227,6 +230,60 @@ impl TaskRunner {
         Ok(())
     }
 
+    async fn flush_buff(&mut self, buff: &mut BytesMut) -> Result<(), TaskFailedKind> {
+        self.downloaded += buff.len() as u64;
+        let chunk = buff.split().freeze();
+        self.notify
+            .send(RunnerMessageKind::Downloaded(chunk))
+            .await
+            .map_err(|_| TaskFailedKind::ChannelClosed)?;
+        buff.clear();
+        Ok(())
+    }
+
+    async fn handle_download(
+        &mut self,
+        event: Option<Result<Bytes, StreamError>>,
+        buff: &mut BytesMut,
+        is_finished: &mut bool,
+    ) -> Result<(), TaskFailedKind> {
+        match event {
+            // TODO: check boundary after
+            Some(Ok(item)) => {
+                let size = match self.total {
+                    Some(total) => item.len().min(total as usize - self.downloaded as usize),
+                    None => item.len(),
+                };
+
+                if buff.len() + item.len() > BUFFER_SIZE {
+                    self.flush_buff(buff).await?;
+                }
+
+                buff.extend_from_slice(&item[..size]);
+
+                // Check if we've reached the total size limit
+                if self.total.is_some_and(|total| self.downloaded >= total) {
+                    self.flush_buff(buff).await?;
+                    *is_finished = true;
+                }
+            }
+            // TODO: add a retry logic?
+            // First, we have to clarify whether this error is recoverable
+            // If it is, we can retry it
+            // If it is not, we should just return the error, and terminate the task
+            Some(Err(err)) => {
+                self.flush_buff(buff).await?;
+                return Err(TaskFailedKind::StreamError(err));
+            }
+            // In this case, the download is closed, which means the stream is finished
+            None => {
+                self.flush_buff(buff).await?;
+                *is_finished = true;
+            }
+        }
+        Ok(())
+    }
+
     /// The inner logic of the task runner
     /// Just wrap a Result<(), TaskFailedKind> to return the error kind
     async fn run_inner(&mut self) -> Result<(), TaskRunError> {
@@ -239,6 +296,9 @@ impl TaskRunner {
         let _guard = shutdown_tx.shutdown_guard();
         self.shutdown_rx = Some(shutdown_rx);
 
+        let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
+
+        let mut is_finished = false;
         let result = loop {
             let control_signal = self.control_signal.recv().fuse();
             let download = self.stream.next().fuse();
@@ -261,38 +321,16 @@ impl TaskRunner {
                         }
                     }
                 }
-                item = download => match item {
-                    Some(item) => {
-                        match item {
-                            // TODO: check boundary after
-                            Ok(item) => {
-                                let size = match self.total {
-                                    Some(total) => item.len().min(total as usize - self.downloaded as usize),
-                                    None => item.len(),
-                                };
-                                self.downloaded += size as u64;
-                                self.notify
-                                    .send(RunnerMessageKind::Downloaded(item.slice(..size)))
-                                    .await
-                                    .map_err(|_| TaskFailedKind::ChannelClosed)?;
-
-                                // Check if we've reached the total size limit
-                                if let Some(total) = self.total {
-                                    if self.downloaded >= total {
-                                        break Ok(());
-                                    }
-                                }
+                item = download => {
+                    match self.handle_download(item, &mut buff, &mut is_finished).await {
+                        Ok(_) => {
+                            if is_finished {
+                                break Ok(());
                             }
-                            // TODO: add a retry logic?
-                            // First, we have to clarify whether this error is recoverable
-                            // If it is, we can retry it
-                            // If it is not, we should just return the error, and terminate the task
-                            Err(err) => break Err(TaskFailedKind::StreamError(err).into()),
                         }
-                    },
-                    // In this case, the download is closed, which means the stream is finished
-                    None => {
-                        break Ok(());
+                        Err(err) => {
+                            break Err(err.into());
+                        }
                     }
                 },
             }
