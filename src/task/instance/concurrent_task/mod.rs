@@ -9,17 +9,16 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use async_io::Timer;
-use bytes::Bytes;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
-use statig::{Response::*, prelude::*};
+use statig::prelude::*;
 
 use super::{Generator, Result, TaskInstance};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
     runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskFailedKind, TaskRunner},
-    runtime::ThreadedRuntimeImpl,
+    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
         ManagerMessage, ManagerMessagesVariant, Progress, RunnerId,
         instance::{
@@ -43,15 +42,20 @@ use strategy::*;
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
 
 pub struct ConcurrentTask {
-    rt: ThreadedRuntimeImpl,
+    threaded_rt: ThreadedRuntimeImpl,
+    local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     task: Option<TaskControl>,
     progress: Progress,
 }
 
 impl ConcurrentTask {
-    pub fn new(rt: ThreadedRuntimeImpl) -> Self {
+    pub fn new(
+        threaded_rt: ThreadedRuntimeImpl,
+        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
+    ) -> Self {
         Self {
-            rt,
+            threaded_rt,
+            local_runtime_builder,
             task: None,
             progress: Progress::default(),
         }
@@ -71,45 +75,52 @@ impl TaskInstance for ConcurrentTask {
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let token = cancel_token.clone();
-        let rt = self.rt.clone();
-        let task = async move {
-            let mut context = Context::default();
-            let mut state_machine = ConcurrentTaskInner::new(path, event_tx, rt)
-                .uninitialized_state_machine()
-                .init_with_context(&mut context)
-                .await;
-
-            state_machine
-                .handle_with_context(
-                    &Event::Run(RunningPayload {
-                        adapter,
-                        cancel_token,
-                    }),
-                    &mut context,
-                )
-                .await;
-
-            while context.poll.pop_front().is_some() {
-                state_machine
-                    .handle_with_context(&Event::Step, &mut context)
+        let threaded_rt = self.threaded_rt.clone();
+        let local_rt_builder = self.local_runtime_builder.clone();
+        let task = ::blocking::unblock(move || {
+            // TODO: handle the error
+            let local_rt = threaded_rt
+                .downcast_local(local_rt_builder)
+                .expect("failed to downcast the runtime");
+            let task = async move {
+                let mut context = Context::default();
+                let mut state_machine = ConcurrentTaskInner::new(path, event_tx, threaded_rt)
+                    .uninitialized_state_machine()
+                    .init_with_context(&mut context)
                     .await;
-            }
 
-            debug_assert!(
-                matches!(state_machine.state(), State::Stopped { .. }),
-                "the task should be stopped after the state machine is finished"
+                state_machine
+                    .handle_with_context(
+                        &Event::Run(RunningPayload {
+                            adapter,
+                            cancel_token,
+                        }),
+                        &mut context,
+                    )
+                    .await;
+
+                while context.poll.pop_front().is_some() {
+                    state_machine
+                        .handle_with_context(&Event::Step, &mut context)
+                        .await;
+                }
+
+                debug_assert!(
+                    matches!(state_machine.state(), State::Stopped { .. }),
+                    "the task should be stopped after the state machine is finished"
+                );
+            };
+            #[cfg(feature = "tracing")]
+            let task = tracing::Instrument::instrument(
+                task,
+                tracing::trace_span!(
+                    parent: None,
+                    "ConcurrentTask::background_task",
+                ),
             );
-        };
-        #[cfg(feature = "tracing")]
-        let task = tracing::Instrument::instrument(
-            task,
-            tracing::trace_span!(
-                parent: None,
-                "ConcurrentTask::background_task",
-            ),
-        );
-        let handle = self.rt.spawn_with_handle(task).expect("Runtime is dropped");
-        self.task = Some(TaskControl::new(token, handle));
+            local_rt.block_on(task)
+        });
+        self.task = Some(TaskControl::new(token, task));
         Ok(())
     }
 
@@ -724,11 +735,45 @@ impl ConcurrentTaskInner {
 
         Ok(())
     }
+
+    async fn before_transition(&mut self, _source: &State, target: &State, _context: &mut Context) {
+        match target {
+            State::Stopped { reason } => {
+                trace!("on_transition: enter stopped state, reason: {reason:?}");
+                match reason.clone() {
+                    Some(Ok(())) => {
+                        let _ = self
+                            .event_tx
+                            .send(TaskEvent::Finished(self.progress.clone()))
+                            .await;
+                    }
+                    Some(Err(e)) => {
+                        let _ = self.event_tx.send(TaskEvent::Failed(e)).await;
+                    }
+                    None => unreachable!(),
+                }
+            }
+            State::Initializing { .. } => {
+                trace!("on_transition: enter initializing state");
+                let _ = self.event_tx.send(TaskEvent::Initializing).await;
+            }
+            State::Downloading { .. } => {
+                trace!("on_transition: enter downloading state");
+                let _ = self
+                    .event_tx
+                    .send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                        self.progress.clone(),
+                        0.0,
+                    )))
+                    .await;
+            }
+        }
+    }
 }
 
 #[state_machine(
     initial = "State::stopped(None)",
-    on_transition = "Self::on_transition"
+    before_transition = "Self::before_transition"
 )]
 impl ConcurrentTaskInner {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -738,7 +783,7 @@ impl ConcurrentTaskInner {
         context: &mut Context,
         reason: &mut Option<Result<()>>,
         event: &Event,
-    ) -> Response<State> {
+    ) -> Outcome<State> {
         match event {
             Event::Run(payload) => {
                 context.poll.push_back(());
@@ -750,7 +795,7 @@ impl ConcurrentTaskInner {
     }
 
     #[superstate]
-    async fn running(event: &Event) -> Response<State> {
+    async fn running(event: &Event) -> Outcome<State> {
         Super
     }
 
@@ -761,7 +806,7 @@ impl ConcurrentTaskInner {
         cancel_token: &mut CancellationToken,
         context: &mut Context,
         event: &Event,
-    ) -> Response<State> {
+    ) -> Outcome<State> {
         match event {
             Event::Step => {
                 let task = async {
@@ -795,7 +840,7 @@ impl ConcurrentTaskInner {
         &mut self,
         cancel_token: &mut CancellationToken,
         event: &Event,
-    ) -> Response<State> {
+    ) -> Outcome<State> {
         match event {
             Event::Step => {
                 let task = async {
@@ -817,49 +862,6 @@ impl ConcurrentTaskInner {
                 }
             }
             _ => Super,
-        }
-    }
-
-    fn on_transition(&mut self, _source: &State, target: &State) {
-        match target {
-            State::Stopped { reason } => {
-                trace!("on_transition: enter stopped state, reason: {reason:?}");
-                match reason.clone() {
-                    Some(Ok(())) => {
-                        let tx = self.event_tx.clone();
-                        let progress = self.progress.clone();
-                        let _ = self.rt.spawn(async move {
-                            let _ = tx.send(TaskEvent::Finished(progress)).await;
-                        });
-                    }
-                    Some(Err(e)) => {
-                        let tx = self.event_tx.clone();
-                        let _ = self.rt.spawn(async move {
-                            let _ = tx.send(TaskEvent::Failed(e)).await;
-                        });
-                    }
-                    None => unreachable!(),
-                }
-            }
-            State::Initializing { .. } => {
-                trace!("on_transition: enter initializing state");
-                let tx = self.event_tx.clone();
-                let _ = self.rt.spawn(async move {
-                    let _ = tx.send(TaskEvent::Initializing).await;
-                });
-            }
-            State::Downloading { .. } => {
-                trace!("on_transition: enter downloading state");
-                let tx = self.event_tx.clone();
-                let progress = self.progress.clone();
-                let _ = self.rt.spawn(async move {
-                    let _ = tx
-                        .send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                            progress, 0.0,
-                        )))
-                        .await;
-                });
-            }
         }
     }
 }

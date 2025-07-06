@@ -83,7 +83,7 @@ mod tests {
         let file_path = temp_dir.path().join("singleton_test.bin");
 
         let rt = get_test_runtime();
-        let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+        let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
         let (event_tx, event_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
@@ -146,7 +146,7 @@ mod tests {
         let file_path = temp_dir.path().join("concurrent_test.bin");
 
         let rt = get_test_runtime();
-        let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt);
+        let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt, None);
         let (event_tx, event_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
@@ -204,7 +204,7 @@ mod tests {
         let file_path = temp_dir.path().join("cancel_test.bin");
 
         let rt = get_test_runtime();
-        let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+        let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
         let (event_tx, event_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
@@ -245,7 +245,7 @@ mod tests {
         let file_path = temp_dir.path().join("failure_test.bin");
 
         let rt = get_test_runtime();
-        let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+        let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
         let (event_tx, event_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
@@ -282,7 +282,7 @@ mod tests {
         let singleton_path = singleton_temp.path().join("singleton.bin");
 
         let rt1 = get_test_runtime();
-        let mut singleton_task = TaskInstanceImpl::new(DownloadMode::Singleton, rt1);
+        let mut singleton_task = TaskInstanceImpl::new(DownloadMode::Singleton, rt1, None);
         let (singleton_tx, singleton_rx) = async_channel::unbounded();
         let singleton_token = CancellationToken::new();
 
@@ -300,7 +300,7 @@ mod tests {
         let concurrent_path = concurrent_temp.path().join("concurrent.bin");
 
         let rt2 = get_test_runtime();
-        let mut concurrent_task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt2);
+        let mut concurrent_task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt2, None);
         let (concurrent_tx, concurrent_rx) = async_channel::unbounded();
         let concurrent_token = CancellationToken::new();
 

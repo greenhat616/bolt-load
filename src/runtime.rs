@@ -9,15 +9,35 @@ use crate::utils::logging::*;
 
 /// ThreadedRuntime is a wrapper around the different multi-threaded runtime libraries.
 /// It is used to hold by bolt-load client, and run different manager and its tasks.
-// TODO: support?
 #[derive(Clone)]
 pub enum ThreadedRuntimeImpl {
     #[cfg(feature = "tokio")]
     Tokio(TokioThreadedRuntime),
     #[cfg(feature = "smol")]
     Smol(SmolThreadedRuntime),
-    Other(Arc<dyn Spawn + Send + Sync + 'static>),
+    Other(Arc<dyn ThreadedRuntime + Send + Sync + 'static>),
 }
+
+/// ThreadedRuntime is a trait to execute a future in the threaded context.
+///
+/// Provide the `spawn_obj` method to spawn tasks in the threaded context.
+pub trait ThreadedRuntime: Spawn + DowncastLocalRuntime {}
+
+pub trait ThreadedRuntimeExt: ThreadedRuntime {
+    /// Downcast the runtime to a local runtime.
+    ///
+    /// If the runtime is a custom runtime and downcast is not supported, it will use the builder to create a local runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `builder` - The builder to create a local runtime.
+    fn downcast_local(&self, builder: Option<LocalRuntimeBuilderImpl>) -> Option<LocalRuntimeImpl> {
+        self.downcast_local_runtime()
+            .or_else(|| builder.map(|builder| builder.build()))
+    }
+}
+
+impl ThreadedRuntimeExt for ThreadedRuntimeImpl {}
 
 impl ThreadedRuntimeImpl {
     #[cfg(feature = "tokio")]
@@ -31,11 +51,24 @@ impl ThreadedRuntimeImpl {
     }
 
     #[cfg(feature = "smol")]
+    /// Create a new smol threaded runtime.
+    ///
     pub fn new_smol_rt() -> Self {
         let available_threads = std::thread::available_parallelism().unwrap();
         Self::Smol(SmolThreadedRuntime::build_with_threads(
             available_threads.get(),
         ))
+    }
+
+    /// Create a new other runtime.
+    ///
+    /// It is used to create a runtime from a custom runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `rt` - The custom runtime.
+    pub fn new_other_rt<T: ThreadedRuntime + Send + Sync + 'static>(rt: T) -> Self {
+        Self::Other(Arc::new(rt))
     }
 }
 
@@ -50,6 +83,20 @@ impl Spawn for ThreadedRuntimeImpl {
         }
     }
 }
+
+impl DowncastLocalRuntime for ThreadedRuntimeImpl {
+    fn downcast_local_runtime(&self) -> Option<LocalRuntimeImpl> {
+        match self {
+            #[cfg(feature = "tokio")]
+            ThreadedRuntimeImpl::Tokio(rt) => rt.downcast_local_runtime(),
+            #[cfg(feature = "smol")]
+            ThreadedRuntimeImpl::Smol(rt) => rt.downcast_local_runtime(),
+            ThreadedRuntimeImpl::Other(rt) => rt.downcast_local_runtime(),
+        }
+    }
+}
+
+impl ThreadedRuntime for ThreadedRuntimeImpl {}
 
 #[cfg(feature = "smol")]
 /// SmolRuntime is a dead simple runtime for smol.
@@ -156,6 +203,13 @@ impl Spawn for SmolThreadedRuntime {
     }
 }
 
+#[cfg(feature = "smol")]
+impl DowncastLocalRuntime for SmolThreadedRuntime {
+    fn downcast_local_runtime(&self) -> Option<LocalRuntimeImpl> {
+        Some(LocalRuntimeImpl::Smol(SmolLocalRuntime::new()))
+    }
+}
+
 #[cfg(feature = "tokio")]
 pub enum TokioThreadedRuntime {
     Runtime(tokio::runtime::Runtime),
@@ -173,6 +227,7 @@ impl Clone for TokioThreadedRuntime {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl Default for TokioThreadedRuntime {
     fn default() -> Self {
         match tokio::runtime::Handle::try_current() {
@@ -188,12 +243,27 @@ impl Default for TokioThreadedRuntime {
 }
 
 #[cfg(feature = "tokio")]
+impl DowncastLocalRuntime for TokioThreadedRuntime {
+    fn downcast_local_runtime(&self) -> Option<LocalRuntimeImpl> {
+        match self {
+            TokioThreadedRuntime::Runtime(rt) => Some(LocalRuntimeImpl::Tokio(
+                LocalTokioRuntime::from_handle(rt.handle().clone()),
+            )),
+            TokioThreadedRuntime::Handle(handle) => Some(LocalRuntimeImpl::Tokio(
+                LocalTokioRuntime::from_handle(handle.clone()),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl TokioThreadedRuntime {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
+#[cfg(feature = "tokio")]
 impl Spawn for TokioThreadedRuntime {
     fn spawn_obj(
         &self,
@@ -222,15 +292,35 @@ pub enum LocalRuntimeImpl {
     Other(Rc<dyn LocalRuntime>),
 }
 
+/// LocalRuntimeBuilder is a trait to build a local runtime.
+///
+/// It is used to create a local runtime from a new thread.
+///
 pub trait LocalRuntimeBuilder {
     fn build(&self) -> LocalRuntimeImpl;
 }
 
+/// LocalRuntimeExecutor is a trait to execute a future in the local context.
+///
+/// Provide the `block_on` method to execute a future in the local context.
 pub trait LocalRuntimeExecutor {
     fn block_on(&self, future: Box<dyn std::future::Future<Output = ()>>);
 }
 
+/// LocalRuntime is a trait to execute a future in the local context.
+///
+/// Provide the `spawn_local_obj` method to spawn tasks in the local context.
 pub trait LocalRuntime: LocalRuntimeExecutor + LocalSpawn {}
+
+/// `DowncastLocalRuntime` is a trait to downcast a runtime to a local runtime.
+///
+/// It is used to downcast a threaded runtime to a local runtime.
+///
+pub trait DowncastLocalRuntime {
+    fn downcast_local_runtime(&self) -> Option<LocalRuntimeImpl> {
+        None
+    }
+}
 
 impl LocalRuntimeImpl {
     #[inline]
@@ -245,6 +335,7 @@ impl LocalRuntimeImpl {
     }
 }
 
+#[derive(Clone)]
 pub enum LocalRuntimeBuilderImpl {
     #[cfg(feature = "tokio")]
     Tokio,
@@ -268,9 +359,16 @@ impl LocalRuntimeBuilder for LocalRuntimeBuilderImpl {
 
 #[cfg(feature = "tokio")]
 #[derive(Clone)]
-pub struct LocalTokioRuntime {
+enum TokioLocalRuntimeImpl {
     // TODO: use `tokio::runtime::LocalRuntime` instead.
-    rt: Rc<tokio::runtime::Runtime>,
+    Runtime(Rc<tokio::runtime::Runtime>),
+    Handle(tokio::runtime::Handle),
+}
+
+#[cfg(feature = "tokio")]
+#[derive(Clone)]
+pub struct LocalTokioRuntime {
+    rt: TokioLocalRuntimeImpl,
 }
 
 #[cfg(feature = "tokio")]
@@ -280,22 +378,35 @@ tokio::task_local! {
 
 #[cfg(feature = "tokio")]
 impl LocalTokioRuntime {
+    /// Create a local runtime from a current thread.
     pub fn new() -> Self {
         Self {
-            rt: Rc::new(
+            rt: TokioLocalRuntimeImpl::Runtime(Rc::new(
                 tokio::runtime::Builder::new_current_thread()
                     .build()
                     .unwrap(),
-            ),
+            )),
+        }
+    }
+
+    /// Create a local runtime from a handle.
+    pub fn from_handle(handle: tokio::runtime::Handle) -> Self {
+        Self {
+            rt: TokioLocalRuntimeImpl::Handle(handle),
         }
     }
 
     /// Block on a future in the local context.
     pub fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
         let local = tokio::task::LocalSet::new();
-        local.block_on(&self.rt, async {
-            IN_TOKIO_LOCAL_CONTEXT.scope(true, future).await
-        })
+        match &self.rt {
+            TokioLocalRuntimeImpl::Runtime(rt) => local.block_on(rt, async {
+                IN_TOKIO_LOCAL_CONTEXT.scope(true, future).await
+            }),
+            TokioLocalRuntimeImpl::Handle(handle) => handle.block_on(
+                local.run_until(async { IN_TOKIO_LOCAL_CONTEXT.scope(true, future).await }),
+            ),
+        }
     }
 }
 

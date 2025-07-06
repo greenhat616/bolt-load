@@ -409,7 +409,7 @@ async fn test_concurrent_vs_singleton_performance() {
         .save_path(concurrent_path.clone())
         .prefer_mode(DownloadMode::Concurrent)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await
         .unwrap();

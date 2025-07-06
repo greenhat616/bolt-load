@@ -9,7 +9,7 @@ use smol_cancellation_token::CancellationToken;
 use super::{AtomicTaskState, DownloadMode, Task, TaskInstanceImpl, TaskState};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
-    runtime::ThreadedRuntimeImpl,
+    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     task::{TaskStateChangedCallback, instance::TaskEvent},
     utils::logging::*,
 };
@@ -17,7 +17,8 @@ use crate::{
 #[non_exhaustive]
 pub struct TaskBuilder {
     cancel_token: Option<CancellationToken>,
-    runtime: Option<ThreadedRuntimeImpl>,
+    threaded_runtime: Option<ThreadedRuntimeImpl>,
+    local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     meta: OnceCell<BoltLoadAdapterMeta>,
     adapter: Option<AnyAdapter>,
     prefer_mode: Option<DownloadMode>,
@@ -35,7 +36,8 @@ impl Default for TaskBuilder {
             prefer_mode: None,
             save_path: None,
             save_dir: None,
-            runtime: None,
+            threaded_runtime: None,
+            local_runtime_builder: None,
             cancel_token: None,
             on_task_state_changed: None,
         }
@@ -121,9 +123,19 @@ impl TaskBuilder {
         self
     }
 
-    /// set the runtime
-    pub fn runtime(mut self, runtime: ThreadedRuntimeImpl) -> Self {
-        self.runtime = Some(runtime);
+    /// set the threaded runtime
+    pub fn threaded_runtime(mut self, runtime: ThreadedRuntimeImpl) -> Self {
+        self.threaded_runtime = Some(runtime);
+        self
+    }
+
+    /// set the local runtime builder
+    ///
+    /// It is optional, if not set, the local runtime will be the same as the threaded runtime.
+    ///
+    /// If you use custom runtime, you may need to set the local runtime builder if its runtime cannot downcast the runtime to a local runtime.
+    pub fn local_runtime_builder(mut self, builder: LocalRuntimeBuilderImpl) -> Self {
+        self.local_runtime_builder = Some(builder);
         self
     }
 
@@ -141,7 +153,7 @@ impl TaskBuilder {
     }
 
     fn validate(&self) -> Result<(), TaskManagerBuildError> {
-        if self.runtime.is_none() {
+        if self.threaded_runtime.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed(
                 "runtime is not set".to_string(),
             ));
@@ -188,7 +200,7 @@ impl TaskBuilder {
         self.validate()?;
 
         let adapter = self.adapter.take().unwrap();
-        let runtime = self.runtime.take().unwrap();
+        let runtime = self.threaded_runtime.take().unwrap();
 
         // TODO: support dynamic check while manager support resumable or persistent
         let mode = if self
@@ -240,8 +252,9 @@ impl TaskBuilder {
             save_path,
             meta: self.meta.take().unwrap(),
             tmp_path: temp_path,
-            rt: runtime.clone(),
-            task: TaskInstanceImpl::new(mode, runtime),
+            threaded_rt: runtime.clone(),
+            local_runtime_builder: self.local_runtime_builder.clone(),
+            task: TaskInstanceImpl::new(mode, runtime, self.local_runtime_builder.clone()),
             cancel_token,
             on_task_state_changed: Arc::new(self.on_task_state_changed.take().unwrap_or_default()),
             task_state: Arc::new(AtomicTaskState::new(TaskState::Idle)),

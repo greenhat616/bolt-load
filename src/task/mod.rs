@@ -13,7 +13,7 @@ use tracing::Instrument;
 
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
-    runtime::ThreadedRuntimeImpl,
+    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     utils::logging::*,
 };
 
@@ -139,7 +139,9 @@ impl TaskStateControl {
 pub struct Task {
     /// the async runtime passed from the client
     #[debug(ignore)]
-    rt: ThreadedRuntimeImpl,
+    threaded_rt: ThreadedRuntimeImpl,
+    #[debug(ignore)]
+    local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     /// the inner adapter of this task
     // TODO: support persistent adapter
     #[debug(ignore)]
@@ -255,7 +257,7 @@ impl Task {
             "Task::event_loop",
         ));
 
-        let handle = self.rt.spawn_with_handle(fut).map_err(|e| {
+        let handle = self.threaded_rt.spawn_with_handle(fut).map_err(|e| {
             error!("failed to spawn the task: {e:?}");
             TaskInstanceError::new_failed(crate::runner::TaskFailedKind::Other(
                 "failed to spawn the task".to_string(),

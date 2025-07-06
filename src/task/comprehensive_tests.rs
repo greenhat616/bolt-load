@@ -62,7 +62,7 @@ async fn test_task_builder_basic_configuration() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await;
 
@@ -87,7 +87,7 @@ async fn test_task_builder_validation_errors() {
     let result = TaskBuilder::default()
         .save_path(save_path.clone())
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await;
 
@@ -100,7 +100,7 @@ async fn test_task_builder_validation_errors() {
     let result = TaskBuilder::default()
         .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await;
 
@@ -113,7 +113,7 @@ async fn test_task_builder_validation_errors() {
     let result = TaskBuilder::default()
         .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await;
 
@@ -127,7 +127,7 @@ async fn test_task_builder_validation_errors() {
         .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(temp_dir.path().join("nonexistent/test.bin"))
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await;
 
@@ -143,7 +143,7 @@ async fn test_task_builder_validation_errors() {
         .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(parent.join("test.bin"))
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await;
     assert!(matches!(
@@ -156,7 +156,7 @@ async fn test_task_builder_validation_errors() {
         .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(temp_dir.path().to_path_buf())
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await;
 
@@ -182,7 +182,7 @@ async fn test_task_builder_with_mode_preference() {
         .save_path(save_path.clone())
         .prefer_mode(DownloadMode::Concurrent)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await
         .unwrap();
@@ -198,7 +198,7 @@ async fn test_task_builder_with_mode_preference() {
         .save_path(save_path2)
         .prefer_mode(DownloadMode::Concurrent)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();
@@ -226,7 +226,7 @@ async fn test_task_builder_callback_configuration() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path)
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .on_task_state_changed(move |_event: TaskEvent| {
             callback_counter_clone.fetch_add(1, Ordering::Relaxed);
         })
@@ -267,7 +267,7 @@ async fn test_task_builder_meta_retrieval() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_dir(temp_dir.path().to_path_buf())
         .cancel_token(cancel_token)
-        .runtime(runtime);
+        .threaded_runtime(runtime);
 
     // Test meta retrieval before building
     let meta = builder.retrieve_meta().await.unwrap();
@@ -298,7 +298,7 @@ async fn test_task_basic_lifecycle() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();
@@ -383,7 +383,7 @@ async fn test_task_cancellation() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token.clone())
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();
@@ -426,7 +426,7 @@ async fn test_small_file_download_with_hash_verification() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();
@@ -477,7 +477,7 @@ async fn test_medium_file_download_with_hash_verification() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();
@@ -523,7 +523,7 @@ async fn test_large_file_download_with_hash_verification() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();
@@ -595,7 +595,7 @@ async fn test_adapter_failure_handling() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path)
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await;
 
@@ -623,7 +623,7 @@ async fn test_zero_size_file_handling() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();
@@ -662,7 +662,7 @@ async fn test_concurrent_vs_singleton_performance() {
         .save_path(concurrent_path.clone())
         .prefer_mode(DownloadMode::Concurrent)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await
         .unwrap();
@@ -676,7 +676,7 @@ async fn test_concurrent_vs_singleton_performance() {
         .save_path(singleton_path.clone())
         .prefer_mode(DownloadMode::Singleton)
         .cancel_token(CancellationToken::new())
-        .runtime(runtime.clone())
+        .threaded_runtime(runtime.clone())
         .build()
         .await
         .unwrap();
@@ -759,7 +759,7 @@ async fn test_concurrent_task_with_range_stream() {
         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
         .save_path(save_path.clone())
         .cancel_token(cancel_token)
-        .runtime(runtime)
+        .threaded_runtime(runtime)
         .build()
         .await
         .unwrap();

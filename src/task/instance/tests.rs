@@ -1,12 +1,11 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_stream::stream;
 use bytes::Bytes;
-use futures::StreamExt;
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
-use super::{ProgressWithSpeed, TaskEvent, TaskInstance, TaskInstanceImpl};
+use super::{TaskEvent, TaskInstance, TaskInstanceImpl};
 use crate::{
     adapter::{
         AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError,
@@ -165,7 +164,7 @@ async fn test_singleton_task_basic_download() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_singleton.txt");
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
     let (event_tx, event_rx) = async_channel::unbounded();
     let cancel_token = CancellationToken::new();
 
@@ -203,7 +202,7 @@ async fn test_concurrent_task_basic_download() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_concurrent.txt");
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt);
+    let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt, None);
     let (event_tx, event_rx) = async_channel::unbounded();
     let cancel_token = CancellationToken::new();
 
@@ -246,7 +245,7 @@ async fn test_singleton_task_cancellation() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_cancel.txt");
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
     let (event_tx, _event_rx) = async_channel::unbounded();
     let cancel_token = CancellationToken::new();
 
@@ -274,7 +273,7 @@ async fn test_concurrent_task_zero_size_failure() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_zero_size.txt");
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt);
+    let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt, None);
     let (event_tx, _event_rx) = async_channel::unbounded();
     let cancel_token = CancellationToken::new();
 
@@ -300,7 +299,7 @@ async fn test_singleton_task_adapter_failure() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_fail.txt");
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
     let (event_tx, event_rx) = async_channel::unbounded();
     let cancel_token = CancellationToken::new();
 
@@ -336,7 +335,7 @@ async fn test_progress_tracking() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_progress.txt");
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
     let (event_tx, event_rx) = async_channel::unbounded();
     let cancel_token = CancellationToken::new();
 
@@ -386,7 +385,7 @@ async fn test_concurrent_vs_singleton_comparison() {
     let temp_dir_concurrent = TempDir::new().unwrap();
     let file_path_concurrent = temp_dir_concurrent.path().join("concurrent.txt");
 
-    let mut concurrent_task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt.clone());
+    let mut concurrent_task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt.clone(), None);
     let (event_tx_concurrent, event_rx_concurrent) = async_channel::unbounded();
     let cancel_token_concurrent = CancellationToken::new();
 
@@ -406,7 +405,7 @@ async fn test_concurrent_vs_singleton_comparison() {
     let temp_dir_singleton = TempDir::new().unwrap();
     let file_path_singleton = temp_dir_singleton.path().join("singleton.txt");
 
-    let mut singleton_task = TaskInstanceImpl::new(DownloadMode::Singleton, rt);
+    let mut singleton_task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
     let (event_tx_singleton, event_rx_singleton) = async_channel::unbounded();
     let cancel_token_singleton = CancellationToken::new();
 

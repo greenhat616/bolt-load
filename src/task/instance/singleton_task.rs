@@ -13,7 +13,7 @@ use super::{
 use crate::{
     adapter::AnyAdapter,
     runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskRunner, TaskRunnerGuard},
-    runtime::ThreadedRuntimeImpl,
+    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
         Progress, RunnerId,
         instance::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
@@ -25,15 +25,20 @@ use crate::{
 const STATIC_RUNNER_ID: RunnerId = 0;
 
 pub struct SingletonTask {
-    rt: ThreadedRuntimeImpl,
+    threaded_rt: ThreadedRuntimeImpl,
+    local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     task: Option<TaskControl>,
     progress: Progress,
 }
 
 impl SingletonTask {
-    pub fn new(rt: ThreadedRuntimeImpl) -> Self {
+    pub fn new(
+        threaded_rt: ThreadedRuntimeImpl,
+        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
+    ) -> Self {
         Self {
-            rt,
+            threaded_rt,
+            local_runtime_builder,
             task: None,
             progress: Progress::default(),
         }
@@ -53,59 +58,65 @@ impl TaskInstance for SingletonTask {
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let token = cancel_token.clone();
-        let rt = self.rt.clone();
+        let threaded_rt = self.threaded_rt.clone();
+        let local_rt_builder = self.local_runtime_builder.clone();
         trace!("[SINGLETON TASK] Attempting to spawn state machine task");
-        let task = async move {
-            trace!("[SINGLETON TASK] State machine starting");
-            let mut context = Context::default();
-            let mut state_machine = SingletonTaskInner::new(path, event_tx, rt)
-                .uninitialized_state_machine()
-                .init_with_context(&mut context)
-                .await;
-
-            trace!("[SINGLETON TASK] State machine initialized, handling Run event");
-            state_machine
-                .handle_with_context(
-                    &Event::Run(RunningPayload {
-                        adapter,
-                        cancel_token,
-                    }),
-                    &mut context,
-                )
-                .await;
-
-            trace!(
-                "[SINGLETON TASK] Run event handled, starting event loop with {} items in poll",
-                context.poll.len()
-            );
-            while context.poll.pop_front().is_some() {
-                trace!("[SINGLETON TASK] Processing Step event");
-                state_machine
-                    .handle_with_context(&Event::Step, &mut context)
+        let task = ::blocking::unblock(move || {
+            let local_rt = threaded_rt
+                .downcast_local(local_rt_builder)
+                .expect("failed to downcast the runtime");
+            let task = async move {
+                trace!("[SINGLETON TASK] State machine starting");
+                let mut context = Context::default();
+                let mut state_machine = SingletonTaskInner::new(path, event_tx, threaded_rt)
+                    .uninitialized_state_machine()
+                    .init_with_context(&mut context)
                     .await;
+
+                trace!("[SINGLETON TASK] State machine initialized, handling Run event");
+                state_machine
+                    .handle_with_context(
+                        &Event::Run(RunningPayload {
+                            adapter,
+                            cancel_token,
+                        }),
+                        &mut context,
+                    )
+                    .await;
+
                 trace!(
-                    "[SINGLETON TASK] Step event handled, {} items remaining in poll",
+                    "[SINGLETON TASK] Run event handled, starting event loop with {} items in poll",
                     context.poll.len()
                 );
-            }
-            trace!("[SINGLETON TASK] Event loop completed");
+                while context.poll.pop_front().is_some() {
+                    trace!("[SINGLETON TASK] Processing Step event");
+                    state_machine
+                        .handle_with_context(&Event::Step, &mut context)
+                        .await;
+                    trace!(
+                        "[SINGLETON TASK] Step event handled, {} items remaining in poll",
+                        context.poll.len()
+                    );
+                }
+                trace!("[SINGLETON TASK] Event loop completed");
 
-            debug_assert!(
-                matches!(state_machine.state(), State::Stopped { .. }),
-                "the task should be stopped after the state machine is finished"
+                debug_assert!(
+                    matches!(state_machine.state(), State::Stopped { .. }),
+                    "the task should be stopped after the state machine is finished"
+                );
+            };
+            #[cfg(feature = "tracing")]
+            let task = tracing::Instrument::instrument(
+                task,
+                tracing::trace_span!(
+                    parent: None,
+                    "SingletonTask::background_task",
+                ),
             );
-        };
-        #[cfg(feature = "tracing")]
-        let task = tracing::Instrument::instrument(
-            task,
-            tracing::trace_span!(
-                parent: None,
-                "SingletonTask::background_task",
-            ),
-        );
-        let handle = self.rt.spawn_with_handle(task).expect("Runtime is dropped");
+            local_rt.block_on(task)
+        });
         trace!("[SINGLETON TASK] State machine task spawned successfully");
-        self.task = Some(TaskControl::new(token, handle));
+        self.task = Some(TaskControl::new(token, task));
         trace!("[SINGLETON TASK] TaskControl created and stored");
         Ok(())
     }
@@ -290,6 +301,43 @@ impl SingletonTaskInner {
 
         Ok(())
     }
+
+    async fn before_transition(&mut self, _source: &State, target: &State, _context: &mut Context) {
+        match target {
+            State::Stopped { reason } => match reason.clone() {
+                Some(Ok(())) => {
+                    let progress = Progress {
+                        total: Some(self.total.unwrap_or(self.downloaded)),
+                        downloaded: self.downloaded,
+                        #[allow(clippy::single_range_in_vec_init)]
+                        downloaded_chunks: vec![0..self.downloaded],
+                    };
+                    let _ = self.event_tx.send(TaskEvent::Finished(progress)).await;
+                }
+                Some(Err(e)) => {
+                    let _ = self.event_tx.send(TaskEvent::Failed(e)).await;
+                }
+                None => unreachable!(),
+            },
+            State::Initializing { .. } => {
+                let _ = self.event_tx.send(TaskEvent::Initializing).await;
+            }
+            State::Downloading { .. } => {
+                let progress = Progress {
+                    total: self.total,
+                    downloaded: self.downloaded,
+                    #[allow(clippy::single_range_in_vec_init)]
+                    downloaded_chunks: vec![0..self.downloaded],
+                };
+                let _ = self
+                    .event_tx
+                    .send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                        progress, 0.0,
+                    )))
+                    .await;
+            }
+        }
+    }
 }
 
 enum Event {
@@ -306,7 +354,9 @@ struct Context {
 
 #[state_machine(
     initial = "State::stopped(None)",
-    on_transition = "Self::on_transition"
+    state(derive(Debug)),
+    superstate(derive(Debug)),
+    before_transition = "Self::before_transition"
 )]
 #[allow(unused_variables)]
 impl SingletonTaskInner {
@@ -316,7 +366,7 @@ impl SingletonTaskInner {
         context: &mut Context,
         reason: &mut Option<Result<()>>,
         event: &Event,
-    ) -> Response<State> {
+    ) -> Outcome<State> {
         match event {
             Event::Run(payload) => {
                 context.poll.push_back(());
@@ -328,7 +378,7 @@ impl SingletonTaskInner {
     }
 
     #[superstate]
-    fn running(event: &Event) -> Response<State> {
+    fn running(event: &Event) -> Outcome<State> {
         Super
     }
 
@@ -338,7 +388,7 @@ impl SingletonTaskInner {
         cancel_token: &mut CancellationToken,
         context: &mut Context,
         event: &Event,
-    ) -> Response<State> {
+    ) -> Outcome<State> {
         trace!(
             "[STATE MACHINE] initializing state entered, event: {:?}",
             match event {
@@ -396,7 +446,7 @@ impl SingletonTaskInner {
         cancel_token: &mut CancellationToken,
         context: &mut Context,
         event: &Event,
-    ) -> Response<State> {
+    ) -> Outcome<State> {
         trace!(
             "[STATE MACHINE] downloading state entered, event: {:?}",
             match event {
@@ -420,54 +470,6 @@ impl SingletonTaskInner {
                 }
             }
             _ => Super,
-        }
-    }
-
-    fn on_transition(&mut self, _source: &State, target: &State) {
-        match target {
-            State::Stopped { reason } => match reason.clone() {
-                Some(Ok(())) => {
-                    let progress = Progress {
-                        total: Some(self.total.unwrap_or(self.downloaded)),
-                        downloaded: self.downloaded,
-                        #[allow(clippy::single_range_in_vec_init)]
-                        downloaded_chunks: vec![0..self.downloaded],
-                    };
-                    let tx = self.event_tx.clone();
-                    let _ = self.rt.spawn(async move {
-                        let _ = tx.send(TaskEvent::Finished(progress)).await;
-                    });
-                }
-                Some(Err(e)) => {
-                    let tx = self.event_tx.clone();
-                    let _ = self.rt.spawn(async move {
-                        let _ = tx.send(TaskEvent::Failed(e)).await;
-                    });
-                }
-                None => unreachable!(),
-            },
-            State::Initializing { .. } => {
-                let tx = self.event_tx.clone();
-                let _ = self.rt.spawn(async move {
-                    let _ = tx.send(TaskEvent::Initializing).await;
-                });
-            }
-            State::Downloading { .. } => {
-                let progress = Progress {
-                    total: self.total,
-                    downloaded: self.downloaded,
-                    #[allow(clippy::single_range_in_vec_init)]
-                    downloaded_chunks: vec![0..self.downloaded],
-                };
-                let tx = self.event_tx.clone();
-                let _ = self.rt.spawn(async move {
-                    let _ = tx
-                        .send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                            progress, 0.0,
-                        )))
-                        .await;
-                });
-            }
         }
     }
 }

@@ -1,13 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
-use futures::future::RemoteHandle;
 use smol_cancellation_token::CancellationToken;
 
 use super::{DownloadMode, Progress};
 use crate::{
     adapter::{AnyAdapter, StreamError, UnretryableError},
     runner::TaskFailedKind,
-    runtime::ThreadedRuntimeImpl,
+    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
 };
 
 mod concurrent_task;
@@ -81,14 +80,14 @@ pub enum TaskEvent {
 
 struct TaskControl {
     token: CancellationToken,
-    handle: Option<RemoteHandle<()>>,
+    handle: Option<blocking::Task<()>>,
 }
 
 impl TaskControl {
-    pub fn new(token: CancellationToken, handle: RemoteHandle<()>) -> Self {
+    pub fn new(token: CancellationToken, task: blocking::Task<()>) -> Self {
         Self {
             token,
-            handle: Some(handle),
+            handle: Some(task),
         }
     }
 
@@ -176,10 +175,18 @@ pub(in crate::task) trait TaskInstance {
 }
 
 impl TaskInstanceImpl {
-    pub fn new(mode: DownloadMode, rt: ThreadedRuntimeImpl) -> Self {
+    pub fn new(
+        mode: DownloadMode,
+        threaded_rt: ThreadedRuntimeImpl,
+        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
+    ) -> Self {
         match mode {
-            DownloadMode::Singleton => Self::Singleton(SingletonTask::new(rt)),
-            DownloadMode::Concurrent => Self::Concurrent(ConcurrentTask::new(rt)),
+            DownloadMode::Singleton => {
+                Self::Singleton(SingletonTask::new(threaded_rt, local_runtime_builder))
+            }
+            DownloadMode::Concurrent => {
+                Self::Concurrent(ConcurrentTask::new(threaded_rt, local_runtime_builder))
+            }
         }
     }
 }
