@@ -47,6 +47,7 @@ bitvec = "1"                                           # for task id generation
 memmap2 = "0.9"                                        # for better random range write for files if machine is available
 backon = "1"                                           # for retry strategy
 oneshot = { version = "0.1", features = ["async"] }    # for cross runtime oneshot
+async-waitgroup = "0.1.3"                              # for cross runtime wait group
 async-lock = "3"                                       # for cross runtime async lock
 ranges = "0.4"                                         # for range set operation
 async-channel = "2"                                    # for async channel

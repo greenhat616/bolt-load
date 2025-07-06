@@ -1,7 +1,8 @@
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
-use async_fs::OpenOptions;
+use async_fs::{File, OpenOptions};
 use async_io::Timer;
+use async_waitgroup::WaitGroup;
 use futures::{AsyncWriteExt, FutureExt, StreamExt, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
@@ -28,7 +29,6 @@ pub struct SingletonTask {
     threaded_rt: ThreadedRuntimeImpl,
     local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     task: Option<TaskControl>,
-    progress: Progress,
 }
 
 impl SingletonTask {
@@ -40,7 +40,6 @@ impl SingletonTask {
             threaded_rt,
             local_runtime_builder,
             task: None,
-            progress: Progress::default(),
         }
     }
 }
@@ -193,6 +192,63 @@ impl SingletonTaskInner {
         Ok(())
     }
 
+    async fn handle_runner_message(
+        &mut self,
+        RunnerMessage(_, kind): RunnerMessage,
+        file: &mut File,
+        meter: &mut usize,
+        is_finished: &mut bool,
+    ) -> Result<()> {
+        match kind {
+            RunnerMessageKind::Stopped(reason) => match reason {
+                StoppedReason::Finished => {
+                    *is_finished = true;
+                    return Ok(());
+                }
+                StoppedReason::Failed(kind) => return Err(TaskInstanceError::Failed(kind)),
+            },
+            RunnerMessageKind::Downloaded(chunk) => {
+                trace!("[SINGLETON TASK] downloaded chunk: {:?}", chunk.len());
+                *meter += chunk.len();
+                self.downloaded += chunk.len() as u64;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(TaskInstanceError::new_write_chunk_failed)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::single_range_in_vec_init)]
+    fn handle_timer_tick(
+        &self,
+        wg: &WaitGroup,
+        speed: &mut f64,
+        sampler: &mut SpeedSampler,
+        meter: &mut usize,
+    ) {
+        let (_, ema_speed) = sampler.sample(meter);
+        *speed = ema_speed;
+        let progress = Progress {
+            total: self.total,
+            downloaded: self.downloaded,
+            downloaded_chunks: [0..self.downloaded].to_vec(),
+        };
+
+        let event_tx = self.event_tx.clone();
+        let speed = *speed;
+        let wg = wg.clone();
+        let _ = self.rt.spawn(async move {
+            let _wg = wg;
+            let _ = event_tx
+                .send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                    progress, speed,
+                )))
+                .await;
+        });
+    }
+
     /// Download the file
     async fn download(&mut self, cancel_token: &mut CancellationToken) -> Result<()> {
         trace!(
@@ -221,6 +277,7 @@ impl SingletonTaskInner {
                 .map_err(TaskInstanceError::new_write_chunk_failed)?;
         }
 
+        let wg = WaitGroup::new();
         let (control_tx, control_rx) = async_channel::unbounded();
         let guard = TaskRunnerGuard::new(STATIC_RUNNER_ID, cancel_token.clone(), control_tx);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -240,64 +297,48 @@ impl SingletonTaskInner {
         let mut sampler = SpeedSampler::new();
         let mut timer = Timer::interval(Duration::from_millis(DEFAULT_SAMPLE_INTERVAL));
 
-        let fut = runner.run().fuse();
-        futures::pin_mut!(fut);
-        loop {
-            futures::select_biased! {
-                _ = timer.next().fuse() => {
-                    let (_, ema_speed) = sampler.sample(&mut meter);
-                    speed = ema_speed;
-                }
-                _ = fut => (),
-                msg = runner_rx.recv().fuse() => {
-                    match msg {
-                        Ok(RunnerMessage(_, kind)) => {
-                            match kind {
-                                RunnerMessageKind::Stopped(reason) => {
-                                    match reason {
-                                        StoppedReason::Finished => {
-                                            if let Err(e) = file.flush().await {
-                                                error!("failed to flush file: {e:?}");
-                                            }
+        let result = async {
+            let mut is_finished = false;
+            let fut = runner.run().fuse();
+            futures::pin_mut!(fut);
+            loop {
+                futures::select_biased! {
+                    _ = timer.next().fuse() => {
+                        self.handle_timer_tick(&wg, &mut speed, &mut sampler, &mut meter);
+                    }
+                    _ = fut => (),
+                    msg = runner_rx.recv().fuse() => {
+                        match msg {
+                            Ok(msg) => {
+                                match self.handle_runner_message(msg, &mut file, &mut meter, &mut is_finished).await {
+                                    Ok(()) => {
+                                        if is_finished {
                                             break;
                                         }
-                                        StoppedReason::Failed(kind) => {
-                                            return Err(TaskInstanceError::Failed(kind))
-                                        }
+                                    }
+                                    Err(e) => {
+                                        return Err(e);
                                     }
                                 }
-                                RunnerMessageKind::Downloaded(chunk) => {
-                                    self.downloaded += chunk.len() as u64;
-                                    file.write_all(&chunk)
-                                        .await
-                                        .map_err(TaskInstanceError::new_write_chunk_failed)?;
-                                    let progress = Progress {
-                                        total: self.total,
-                                        downloaded: self.downloaded,
-                                        downloaded_chunks: vec![0..self.downloaded],
-                                    };
-                                    let tx = self.event_tx.clone();
-                                    let _ = self.rt.spawn(async move {
-                                        let _ = tx.send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                                            progress, speed,
-                                        )))
-                                        .await;
-                                    });
-                                }
-                                _ => {}
                             }
-                        }
-                        Err(e) => {
-                            error!("runner message error: {e:?}");
+                            Err(e) => {
+                                error!("runner message error: {e:?}");
+                            }
                         }
                     }
                 }
             }
+            Ok(())
         }
+        .await;
 
         if let Err(e) = file.flush().await {
             warn!("failed to flush file: {e:?}");
         }
+
+        wg.wait().await;
+
+        result?;
 
         Ok(())
     }
@@ -342,7 +383,6 @@ impl SingletonTaskInner {
 
 enum Event {
     Run(RunningPayload),
-    Stop(StoppedReason),
     /// Step the state machine to get the next state
     Step,
 }
@@ -394,7 +434,6 @@ impl SingletonTaskInner {
             match event {
                 Event::Step => "Step",
                 Event::Run(_) => "Run",
-                Event::Stop(_) => "Stop",
             }
         );
         match event {
@@ -452,7 +491,6 @@ impl SingletonTaskInner {
             match event {
                 Event::Step => "Step",
                 Event::Run(_) => "Run",
-                Event::Stop(_) => "Stop",
             }
         );
         match event {

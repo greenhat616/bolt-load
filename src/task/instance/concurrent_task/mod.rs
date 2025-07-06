@@ -9,6 +9,7 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use async_io::Timer;
+use async_waitgroup::WaitGroup;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
@@ -242,7 +243,8 @@ impl ConcurrentTaskInner {
     )]
     #[allow(clippy::too_many_arguments)]
     async fn split_task(
-        rt: &ThreadedRuntimeImpl,
+        threaded_rt: &ThreadedRuntimeImpl,
+        wg: &WaitGroup,
         chunk_planner: &mut ChunkPlanner,
         runner_id_generator: &mut Generator,
         runner_notification: &mut RunnerNotification,
@@ -273,7 +275,8 @@ impl ConcurrentTaskInner {
             panic!("failed to allocate chunk: {next_range:?}");
         }
         let (rx, _) = Self::create_background_range_runner(
-            rt,
+            threaded_rt,
+            wg,
             next_range,
             adapter.clone(),
             control_rx.clone(),
@@ -290,7 +293,8 @@ impl ConcurrentTaskInner {
         tracing::instrument(skip_all, fields(runner_id, range))
     )]
     async fn create_background_range_runner(
-        rt: &ThreadedRuntimeImpl,
+        threaded_rt: &ThreadedRuntimeImpl,
+        wg: &WaitGroup,
         range: Range<u64>,
         adapter: Arc<AnyAdapter>,
         notify: Receiver<ManagerMessage>,
@@ -299,7 +303,9 @@ impl ConcurrentTaskInner {
     ) -> Result<(Receiver<RunnerMessage>, RemoteHandle<()>)> {
         let (tx, rx) = oneshot::channel();
         let (start, end) = (range.start, range.end);
+        let wg = wg.clone();
         let fut = async move {
+            let _wg = wg;
             trace!("[TASK] create background range runner: id: {runner_id}, range: {range:?}");
             let mut runner = match TaskRunner::new_with_async_and_callback(
                 Some(end - start),
@@ -330,7 +336,7 @@ impl ConcurrentTaskInner {
                 range = ?start..end,
             ),
         );
-        let handle = rt
+        let handle = threaded_rt
             .spawn_with_handle(fut)
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
         let rx = rx
@@ -342,6 +348,7 @@ impl ConcurrentTaskInner {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn throughout_meter_tick(
         rt: &ThreadedRuntimeImpl,
+        wg: &WaitGroup,
         chunk_planner: &ChunkPlanner,
 
         meters: &mut HashMap<RunnerId, usize>,
@@ -364,7 +371,9 @@ impl ConcurrentTaskInner {
             .iter()
             .map(|r| r.end - r.start)
             .sum::<u64>();
+        let wg = wg.clone();
         let _ = rt.spawn(async move {
+            let _wg = wg;
             if let Err(e) = event_tx
                 .send(TaskEvent::Downloading(ProgressWithSpeed::new(
                     Progress {
@@ -389,10 +398,13 @@ impl ConcurrentTaskInner {
         dynamic_strategy: &mut DynamicStrategy,
         runner_id_generator: &mut Generator,
         max_concurrency: usize,
-        rt: &ThreadedRuntimeImpl,
+
+        threaded_rt: &ThreadedRuntimeImpl,
         adapter: &Arc<AnyAdapter>,
         control_channel: (&Sender<ManagerMessage>, &Receiver<ManagerMessage>),
         runners_cancel_token: &CancellationToken,
+        wg: &WaitGroup,
+
         current_speed: f64,
         per_runner_avg_speed: f64,
     ) -> Result<()> {
@@ -413,7 +425,8 @@ impl ConcurrentTaskInner {
                 }
 
                 let (rx, _) = Self::create_background_range_runner(
-                    rt,
+                    threaded_rt,
+                    wg,
                     chunk.clone(),
                     adapter.clone(),
                     control_rx.clone(),
@@ -452,7 +465,8 @@ impl ConcurrentTaskInner {
                                 panic!("failed to allocate chunk: {suggested_range:?}");
                             }
                             let (rx, _) = Self::create_background_range_runner(
-                                rt,
+                                threaded_rt,
+                                wg,
                                 suggested_range,
                                 adapter.clone(),
                                 control_rx.clone(),
@@ -481,7 +495,8 @@ impl ConcurrentTaskInner {
                                         for (runner_id, incomplete_range) in states {
                                             trace!("split task: {runner_id}, {incomplete_range:?}");
                                             Self::split_task(
-                                                rt,
+                                                threaded_rt,
+                                                wg,
                                                 chunk_planner,
                                                 runner_id_generator,
                                                 runner_notification,
@@ -502,7 +517,8 @@ impl ConcurrentTaskInner {
                                             .map(|s| s.incomplete_range())
                                             .expect("task id not found");
                                         Self::split_task(
-                                            rt,
+                                            threaded_rt,
+                                            wg,
                                             chunk_planner,
                                             runner_id_generator,
                                             runner_notification,
@@ -543,7 +559,8 @@ impl ConcurrentTaskInner {
     #[allow(clippy::too_many_arguments)]
     // #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn handle_runner_message(
-        rt: &ThreadedRuntimeImpl,
+        threaded_rt: &ThreadedRuntimeImpl,
+        wg: &WaitGroup,
         meters: &mut HashMap<RunnerId, usize>,
         chunk_planner: &mut ChunkPlanner,
         runner_notification: &mut RunnerNotification,
@@ -591,7 +608,9 @@ impl ConcurrentTaskInner {
                 bytes.truncate(picked_size as usize);
 
                 let file_writer_control = file_writer_control.clone();
-                let _ = rt.spawn(async move {
+                let wg = wg.clone();
+                let _ = threaded_rt.spawn(async move {
+                    let _wg = wg;
                     if let Err(e) = file_writer_control
                         .write(fixed_downloaded_range, bytes)
                         .await
@@ -627,6 +646,7 @@ impl ConcurrentTaskInner {
         let adapter = self.adapter.clone().unwrap();
         let rt = self.rt.clone();
         let event_tx = self.event_tx.clone();
+        let wg = WaitGroup::new();
         let runners_cancel_token = cancel_token.child_token();
         let _runner_cancel_guard = runners_cancel_token.clone().drop_guard();
 
@@ -672,10 +692,13 @@ impl ConcurrentTaskInner {
                             &mut dynamic_strategy,
                             &mut runner_id_generator,
                             max_concurrency,
+
                             &rt,
                             &adapter,
                             (&control_tx, &control_rx),
                             &runners_cancel_token,
+                            &wg,
+
                             current_speed,
                             per_runner_avg_speed,
                         ).await.inspect_err(|e| {
@@ -686,6 +709,7 @@ impl ConcurrentTaskInner {
                     _ = throughout_meter_timer.next().fuse() => {
                         Self::throughout_meter_tick(
                             &rt,
+                            &wg,
                             &chunk_planner,
                             &mut meters,
                             &mut sampler,
@@ -699,6 +723,7 @@ impl ConcurrentTaskInner {
                             let mut flag = false;
                             Self::handle_runner_message(
                                 &rt,
+                                &wg,
                                 &mut meters,
                                 &mut chunk_planner,
                                 &mut runner_notification,
@@ -724,6 +749,10 @@ impl ConcurrentTaskInner {
         }
         .await;
         self.sync_progress(&chunk_planner);
+
+        // Wait all message handlers to finish
+        wg.wait().await;
+
         drop(file_writer_control);
         fs_writer_handle
             .await
@@ -891,9 +920,10 @@ mod tests {
         let runner_id = 1;
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
-
+        let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
             &rt,
+            &wg,
             range.clone(),
             adapter.clone(),
             control_rx,
@@ -901,6 +931,7 @@ mod tests {
             cancel_token,
         )
         .await;
+        wg.wait().await;
 
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
@@ -964,8 +995,10 @@ mod tests {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
+        let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
             &rt,
+            &wg,
             range,
             adapter,
             control_rx,
@@ -973,6 +1006,7 @@ mod tests {
             cancel_token,
         )
         .await;
+        wg.wait().await;
 
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
@@ -1001,8 +1035,10 @@ mod tests {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
+        let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
             &rt,
+            &wg,
             range,
             adapter,
             control_rx,
@@ -1010,6 +1046,7 @@ mod tests {
             cancel_token.clone(),
         )
         .await;
+        wg.wait().await;
 
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
@@ -1056,8 +1093,10 @@ mod tests {
             .await
             .unwrap();
 
+        let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
             &rt,
+            &wg,
             range.clone(),
             adapter,
             control_rx,
@@ -1065,6 +1104,7 @@ mod tests {
             cancel_token,
         )
         .await;
+        wg.wait().await;
 
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
@@ -1108,8 +1148,10 @@ mod tests {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
+        let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
             &rt,
+            &wg,
             range.clone(),
             adapter.clone(),
             control_rx,
@@ -1117,6 +1159,7 @@ mod tests {
             cancel_token,
         )
         .await;
+        wg.wait().await;
 
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
@@ -1155,8 +1198,10 @@ mod tests {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
+        let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
             &rt,
+            &wg,
             range,
             adapter,
             control_rx,
@@ -1164,6 +1209,7 @@ mod tests {
             cancel_token,
         )
         .await;
+        wg.wait().await;
 
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
@@ -1206,8 +1252,10 @@ mod tests {
             let cancel_token = CancellationToken::new();
 
             let handle = tokio::spawn(async move {
+                let wg = WaitGroup::new();
                 let result = ConcurrentTaskInner::create_background_range_runner(
                     &rt_clone,
+                    &wg,
                     range.clone(),
                     adapter_clone,
                     control_rx,
@@ -1216,6 +1264,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                wg.wait().await;
 
                 let (msg_rx, runner_handle) = result;
 
@@ -1288,8 +1337,10 @@ mod tests {
         let (_control_tx, control_rx) = async_channel::unbounded();
         let cancel_token = CancellationToken::new();
 
+        let wg = WaitGroup::new();
         let result = ConcurrentTaskInner::create_background_range_runner(
             &rt,
+            &wg,
             range.clone(),
             adapter.clone(),
             control_rx,
@@ -1297,6 +1348,7 @@ mod tests {
             cancel_token,
         )
         .await;
+        wg.wait().await;
 
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();

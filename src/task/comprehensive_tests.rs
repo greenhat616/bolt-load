@@ -444,6 +444,12 @@ async fn test_small_file_download_with_hash_verification() {
 
     // Verify file exists and calculate hash
     assert!(save_path.exists(), "Downloaded file should exist");
+    let metadata = std::fs::metadata(&save_path).unwrap();
+    assert_eq!(
+        metadata.len(),
+        10240,
+        "Downloaded file should have correct size"
+    );
     let downloaded_content = std::fs::read(&save_path).unwrap();
     let actual_hash = calculate_blake3(&downloaded_content);
 

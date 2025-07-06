@@ -211,6 +211,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-waitgroup"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "791a1b086740830807a10e172c33a3f01778a61e24889e0c4d271a4f7a8b8399"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -475,6 +487,7 @@ dependencies = [
  "async-lock",
  "async-stream",
  "async-trait",
+ "async-waitgroup",
  "atomic_enum",
  "axum 0.8.4",
  "axum-extra",
