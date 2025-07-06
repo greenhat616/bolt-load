@@ -27,12 +27,7 @@ pub use singleton_task::*;
 /// The default capacity of the control channel
 ///
 /// It is used to control the task runner
-const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 1;
-
-/// The default capacity of the event channel
-///
-/// It is used to send the event to the manager
-const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 256;
+const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -159,7 +154,7 @@ impl TaskInstanceError {
 type Result<T, E = TaskInstanceError> = std::result::Result<T, E>;
 
 #[derive(Clone)]
-struct RunningPayload {
+pub struct RunningPayload {
     adapter: Arc<AnyAdapter>,
     cancel_token: CancellationToken,
 }

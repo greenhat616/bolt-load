@@ -126,7 +126,7 @@ impl TaskInstance for ConcurrentTask {
                     "ConcurrentTask::background_task",
                 ),
             );
-            local_rt.block_on(task)
+            local_rt.block_on(Box::pin(task))
         });
         self.task = Some(TaskControl::new(token, task));
         Ok(())
@@ -145,11 +145,6 @@ impl TaskInstance for ConcurrentTask {
         }
         Ok(())
     }
-}
-
-struct TaskSpeed {
-    pub current: u64,
-    pub avg: u64,
 }
 
 pub struct ConcurrentTaskInner {
@@ -176,6 +171,16 @@ pub enum Event {
 enum RunnerStatus {
     Running,
     Finished,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SplitTaskError {
+    #[error("failed to send control message: {0}")]
+    SendControlMessageFailed(#[from] async_broadcast::SendError<ManagerMessage>),
+    #[error("Send control message timeout")]
+    SendControlMessageTimeout,
+    #[error("task instance error: {0}")]
+    TaskInstanceError(#[from] TaskInstanceError),
 }
 
 impl ConcurrentTaskInner {
@@ -260,7 +265,7 @@ impl ConcurrentTaskInner {
         adapter: Arc<AnyAdapter>,
         control_channel: ControlChannelRef<'_>,
         runner_id: RunnerId,
-    ) -> Result<()> {
+    ) -> Result<(), SplitTaskError> {
         let (control_tx, control_rx) = control_channel;
         let half_size = (incomplete_range.end - incomplete_range.start) / 2;
         // Limit the total size of the runner
@@ -268,13 +273,16 @@ impl ConcurrentTaskInner {
             .resize_runner_state(runner_id, half_size)
             .expect("chunk planner should not fail");
 
-        control_tx
-            .broadcast_direct(ManagerMessage(
+        let mut timer = futures::FutureExt::fuse(Timer::after(Duration::from_millis(10)));
+        futures::select! {
+            res = control_tx.broadcast_direct(ManagerMessage(
                 runner_id,
                 ManagerMessagesVariant::LimitTotal(incomplete_range.start + half_size),
-            ))
-            .await
-            .expect("control channel should not fail");
+            )).fuse() => { res?; }
+            _ = timer => {
+                return Err(SplitTaskError::SendControlMessageTimeout);
+            }
+        }
 
         // Create a new runner for the remaining range
         let next_runner_id = runner_id_generator.next().expect("no more runner id");
@@ -354,6 +362,7 @@ impl ConcurrentTaskInner {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    #[allow(clippy::too_many_arguments)]
     fn throughout_meter_tick(
         rt: &ThreadedRuntimeImpl,
         wg: &WaitGroup,
@@ -502,7 +511,7 @@ impl ConcurrentTaskInner {
                                             .get_incomplete_states(Some(planned_chunk_size));
                                         for (runner_id, incomplete_range) in states {
                                             trace!("split task: {runner_id}, {incomplete_range:?}");
-                                            Self::split_task(
+                                            match Self::split_task(
                                                 threaded_rt,
                                                 wg,
                                                 chunk_planner,
@@ -514,7 +523,21 @@ impl ConcurrentTaskInner {
                                                 control_channel,
                                                 runner_id,
                                             )
-                                            .await?;
+                                            .await
+                                            {
+                                                Err(SplitTaskError::SendControlMessageTimeout) => {
+                                                    warn!("send control message timeout");
+                                                }
+                                                Err(SplitTaskError::SendControlMessageFailed(
+                                                    e,
+                                                )) => {
+                                                    panic!("failed to send control message: {e:?}");
+                                                }
+                                                Err(SplitTaskError::TaskInstanceError(e)) => {
+                                                    return Err(e);
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
                                     // Split the given task into two separate tasks
@@ -524,7 +547,7 @@ impl ConcurrentTaskInner {
                                             .get_runner_state(task_id)
                                             .map(|s| s.incomplete_range())
                                             .expect("task id not found");
-                                        Self::split_task(
+                                        match Self::split_task(
                                             threaded_rt,
                                             wg,
                                             chunk_planner,
@@ -536,7 +559,19 @@ impl ConcurrentTaskInner {
                                             control_channel,
                                             runner_id,
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Err(SplitTaskError::SendControlMessageTimeout) => {
+                                                warn!("send control message timeout");
+                                            }
+                                            Err(SplitTaskError::SendControlMessageFailed(e)) => {
+                                                panic!("failed to send control message: {e:?}");
+                                            }
+                                            Err(SplitTaskError::TaskInstanceError(e)) => {
+                                                return Err(e);
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                     // Change the max concurrency
                                     StrategyAction::ChangeMaxThread(new_max_concurrency) => {

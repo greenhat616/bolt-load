@@ -17,7 +17,7 @@ use memmap2::MmapMut;
 
 use crate::utils::logging::*;
 
-const FILE_WRITER_QUEUE_SIZE: usize = 1024;
+const FILE_WRITER_QUEUE_SIZE: usize = 2048;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FileWriterError {

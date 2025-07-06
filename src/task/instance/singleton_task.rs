@@ -115,7 +115,7 @@ impl TaskInstance for SingletonTask {
                     "SingletonTask::background_task",
                 ),
             );
-            local_rt.block_on(task)
+            local_rt.block_on(Box::pin(task))
         });
         trace!("[SINGLETON TASK] State machine task spawned successfully");
         self.task = Some(TaskControl::new(token, task));

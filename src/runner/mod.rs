@@ -5,6 +5,7 @@ use futures::{FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
 
 use crate::{
+    DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AnyBytesStream, StreamError},
     task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
     utils::{ShutdownGuardExt, logging::*},
@@ -112,7 +113,7 @@ impl TaskRunner {
         receiver: BroadcastReceiver<ManagerMessage>,
         cancel_token: CancellationToken,
     ) -> (Self, Receiver<RunnerMessage>) {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = async_channel::bounded(DEFAULT_EVENT_CHANNEL_CAPACITY);
         (
             TaskRunner {
                 total,
@@ -135,7 +136,7 @@ impl TaskRunner {
         cancel_token: CancellationToken,
         on_channel_created: impl FnOnce(Receiver<RunnerMessage>),
     ) -> Option<Self> {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = async_channel::bounded(DEFAULT_EVENT_CHANNEL_CAPACITY);
         on_channel_created(rx);
         let stream = match stream.await {
             Ok(stream) => stream,
@@ -237,13 +238,17 @@ impl TaskRunner {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _guard = shutdown_tx.shutdown_guard();
         self.shutdown_rx = Some(shutdown_rx);
+
         let result = loop {
             let control_signal = self.control_signal.recv().fuse();
             let download = self.stream.next().fuse();
             let cancelled = self.cancel_token.cancelled().fuse();
 
             futures::pin_mut!(control_signal, download, cancelled);
-            futures::select! {
+            futures::select_biased! {
+                _ = cancelled => {
+                    break Err(TaskRunError::Cancelled);
+                }
                 signal = control_signal => {
                     match signal {
                         Ok(signal) => {
@@ -290,9 +295,6 @@ impl TaskRunner {
                         break Ok(());
                     }
                 },
-                _ = cancelled => {
-                    break Err(TaskRunError::Cancelled);
-                }
             }
         };
         result?;

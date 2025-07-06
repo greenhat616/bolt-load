@@ -12,6 +12,7 @@ use smol_cancellation_token::CancellationToken;
 use tracing::Instrument;
 
 use crate::{
+    DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     utils::logging::*,
@@ -217,7 +218,7 @@ impl Task {
 
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub async fn run(&mut self) -> Result<(), TaskInstanceError> {
-        let (event_tx, event_rx) = async_channel::unbounded::<TaskEvent>();
+        let (event_tx, event_rx) = async_channel::bounded::<TaskEvent>(32);
         let cancel_token = self.cancel_token.clone();
         let on_task_state_changed = self.on_task_state_changed.clone();
         let task_state = self.task_state.clone();
