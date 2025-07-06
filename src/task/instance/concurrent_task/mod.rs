@@ -277,7 +277,7 @@ impl ConcurrentTaskInner {
         futures::select! {
             res = control_tx.broadcast_direct(ManagerMessage(
                 runner_id,
-                ManagerMessagesVariant::LimitTotal(incomplete_range.start + half_size),
+                ManagerMessagesVariant::LimitTotal(half_size),
             )).fuse() => { res?; }
             _ = timer => {
                 return Err(SplitTaskError::SendControlMessageTimeout);
@@ -609,7 +609,7 @@ impl ConcurrentTaskInner {
         runner_notification: &mut RunnerNotification,
         id_generator: &mut Generator,
         file_writer_control: &FileWriterControl,
-        on_all_chunks_finished: impl FnOnce(),
+        is_finished: &mut bool,
         msg: RunnerMessage,
     ) -> Result<()> {
         let RunnerMessage(runner_id, msg) = msg;
@@ -626,16 +626,30 @@ impl ConcurrentTaskInner {
 
                         if chunk_planner.is_complete() {
                             trace!("[TASK] all chunks finished");
-                            on_all_chunks_finished();
+                            *is_finished = true;
                         }
                     }
-                    StoppedReason::Failed(_kind) => {
-                        let unfinished_range = chunk_planner
-                            .mark_failed(runner_id)
-                            .expect("chunk planner should not fail");
-                        runner_notification.remove(runner_id);
-                        id_generator.release(runner_id);
-                        trace!("Runner {runner_id} failed, released range: {unfinished_range:?}");
+                    StoppedReason::Failed(kind) => {
+                        error!("runner {runner_id} failed: {kind:?}");
+                        match kind {
+                            TaskFailedKind::ExceededTotalSize => {
+                                chunk_planner
+                                    .mark_finished(runner_id)
+                                    .expect("chunk planner should not fail");
+                                id_generator.release(runner_id);
+                            }
+                            _ => {
+                                let unfinished_range = chunk_planner
+                                    .mark_failed(runner_id)
+                                    .expect("chunk planner should not fail");
+                                runner_notification.remove(runner_id);
+                                id_generator.release(runner_id);
+                                trace!(
+                                    "runner {runner_id} failed, released range: \
+                                     {unfinished_range:?}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -726,6 +740,7 @@ impl ConcurrentTaskInner {
             Timer::interval(Duration::from_millis(DEFAULT_STRATEGY_TICK_INTERVAL));
 
         let event_loop_result: Result<()> = async {
+            let mut is_finished = false;
             loop {
                 futures::select_biased! {
                     _ = strategy_timer.next().fuse() => {
@@ -763,7 +778,6 @@ impl ConcurrentTaskInner {
                     }
                     msg = runner_notification.next().fuse() => {
                         if let Some(msg) = msg {
-                            let mut flag = false;
                             Self::handle_runner_message(
                                 &rt,
                                 &wg,
@@ -772,16 +786,14 @@ impl ConcurrentTaskInner {
                                 &mut runner_notification,
                                 &mut runner_id_generator,
                                 &file_writer_control,
-                                || {
-                                    flag = true;
-                                },
+                                &mut is_finished,
                                 msg,
                             )
                             .await.inspect_err(|e| {
                                 error!("failed to handle runner message: {e:?}");
                                 self.sync_progress(&chunk_planner);
                             })?;
-                            if flag {
+                            if is_finished {
                                 break;
                             }
                         }

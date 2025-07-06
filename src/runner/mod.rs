@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use async_broadcast::Receiver as BroadcastReceiver;
 use async_channel::{Receiver, Sender};
 use bytes::{Bytes, BytesMut};
@@ -51,6 +53,16 @@ pub enum TaskFailedKind {
     Empty,
     /// The channel is closed
     ChannelClosed,
+    /// The task is exceeded the total size
+    ///
+    /// Possible reason:
+    /// - The total sized while the downloaded chunk is larger than the total size
+    ExceededTotalSize,
+    /// The task is smaller than the total size
+    ///
+    /// Possible reason:
+    /// - The total sized while the downloaded chunk is smaller than the total size
+    SmallerThanTotalSize,
     StreamError(StreamError),
     /// The other error
     Other(String),
@@ -201,6 +213,11 @@ impl TaskRunner {
     }
 
     /// Handle the control signal from the manager
+    #[cfg_attr(feature = "tracing", tracing::instrument(
+        skip(self),
+        name = "TaskRunner::handle_control_signal",
+        fields(runner_id = self.notify.runner_id())
+    ))]
     fn handle_control_signal(&mut self, signal: &ManagerMessage) -> Result<(), TaskFailedKind> {
         // Task layer owned the cancel token guard, ensure cancel token when manager is dropping
         match signal {
@@ -212,14 +229,11 @@ impl TaskRunner {
                                 trace!("runner: limit total to {new_total}");
                                 self.total = Some(*new_total);
                             } else {
-                                error!(
-                                    "runner: limit total is smaller than current total,
+                                warn!(
+                                    "runner: limit total is larger than current total,
                                     limit: {new_total}, current: {current_total}"
                                 );
-                                Err(TaskFailedKind::Other(format!(
-                                    "limit total is smaller than current total, limit: \
-                                     {new_total}, current: {current_total}"
-                                )))?;
+                                Err(TaskFailedKind::ExceededTotalSize)?;
                             }
                         }
                     }
@@ -231,17 +245,31 @@ impl TaskRunner {
     }
 
     async fn flush_buff(&mut self, buff: &mut BytesMut) -> Result<(), TaskFailedKind> {
-        self.downloaded += buff.len() as u64;
-        let chunk = buff.split().freeze();
-        self.notify
-            .send(RunnerMessageKind::Downloaded(chunk))
-            .await
-            .map_err(|_| TaskFailedKind::ChannelClosed)?;
-        buff.clear();
+        if !buff.is_empty() {
+            self.downloaded += buff.len() as u64;
+            let chunk = buff.split().freeze();
+            self.notify
+                .send(RunnerMessageKind::Downloaded(chunk))
+                .await
+                .map_err(|_| TaskFailedKind::ChannelClosed)?;
+            buff.clear();
+        }
         Ok(())
     }
 
-    async fn handle_download(
+    /// Handle the stream event
+    ///
+    /// This function will handle the stream event, and flush the buffer if needed
+    /// It will also check if the stream is finished, and set the is_finished flag if needed
+    ///
+    /// # Arguments
+    /// * `event` - The stream event
+    #[cfg_attr(feature = "tracing", tracing::instrument(
+        skip_all,
+        name = "TaskRunner::handle_stream_event",
+        fields(runner_id = self.notify.runner_id())
+    ))]
+    async fn handle_stream_event(
         &mut self,
         event: Option<Result<Bytes, StreamError>>,
         buff: &mut BytesMut,
@@ -250,21 +278,41 @@ impl TaskRunner {
         match event {
             // TODO: check boundary after
             Some(Ok(item)) => {
-                let size = match self.total {
-                    Some(total) => item.len().min(total as usize - self.downloaded as usize),
-                    None => item.len(),
+                if let Some(total) = self.total {
+                    let current_downloaded = self.downloaded + buff.len() as u64;
+                    if current_downloaded >= total {
+                        self.flush_buff(buff).await?;
+                        *is_finished = true;
+                        return Ok(());
+                    }
+                }
+
+                let bytes_to_write = if let Some(total) = self.total {
+                    let current_downloaded = self.downloaded + buff.len() as u64;
+                    let remaining = total.saturating_sub(current_downloaded);
+                    item.len().min(remaining as usize)
+                } else {
+                    item.len()
                 };
 
-                if buff.len() + item.len() > BUFFER_SIZE {
+                if bytes_to_write == 0 {
+                    self.flush_buff(buff).await?;
+                    *is_finished = true;
+                    return Ok(());
+                }
+
+                if buff.len() + bytes_to_write > BUFFER_SIZE {
                     self.flush_buff(buff).await?;
                 }
 
-                buff.extend_from_slice(&item[..size]);
+                buff.extend_from_slice(&item[..bytes_to_write]);
 
-                // Check if we've reached the total size limit
-                if self.total.is_some_and(|total| self.downloaded >= total) {
-                    self.flush_buff(buff).await?;
-                    *is_finished = true;
+                if let Some(total) = self.total {
+                    let current_downloaded = self.downloaded + buff.len() as u64;
+                    if current_downloaded >= total {
+                        self.flush_buff(buff).await?;
+                        *is_finished = true;
+                    }
                 }
             }
             // TODO: add a retry logic?
@@ -315,6 +363,7 @@ impl TaskRunner {
                             if let Err(err) = self.handle_control_signal(&signal) {
                                 break Err(err.into());
                             }
+                            trace!("current downloaded: {}", self.downloaded as usize + buff.len());
                         }
                         Err(_) => {
                             break Err(TaskFailedKind::ChannelClosed.into());
@@ -322,7 +371,7 @@ impl TaskRunner {
                     }
                 }
                 item = download => {
-                    match self.handle_download(item, &mut buff, &mut is_finished).await {
+                    match self.handle_stream_event(item, &mut buff, &mut is_finished).await {
                         Ok(_) => {
                             if is_finished {
                                 break Ok(());
@@ -339,23 +388,25 @@ impl TaskRunner {
 
         // TODO: handle the error
         match self.total {
-            Some(total) if total == self.downloaded => {}
-            Some(total) if self.downloaded > total => {
-                warn!(
-                    "runner: downloaded content is larger than the total size, total: {}, \
-                     downloaded: {}",
-                    total, self.downloaded
-                );
-            }
-            Some(total) => {
-                let msg = format!(
-                    "runner: downloaded content is smaller than the total size, total: {}, \
-                     downloaded: {}",
-                    total, self.downloaded
-                );
-                warn!("{msg}");
-                return Err(TaskFailedKind::Other(msg).into());
-            }
+            Some(total) => match total.cmp(&self.downloaded) {
+                Ordering::Equal => {}
+                Ordering::Greater => {
+                    warn!(
+                        "runner: downloaded content is smaller than the total size, total: {}, \
+                         downloaded: {}",
+                        total, self.downloaded
+                    );
+                    return Err(TaskFailedKind::SmallerThanTotalSize.into());
+                }
+                Ordering::Less => {
+                    warn!(
+                        "runner: downloaded content is larger than the total size, total: {}, \
+                         downloaded: {}",
+                        total, self.downloaded
+                    );
+                    return Err(TaskFailedKind::ExceededTotalSize.into());
+                }
+            },
             None if self.downloaded > 0 => {}
             None => {
                 return Err(TaskFailedKind::Empty.into());
@@ -579,21 +630,23 @@ mod tests {
         let cancel_token = CancellationToken::new();
         // Create a stream with known size
         let test_stream = stream! {
-            yield Ok(Bytes::from(vec![1; 10]));
+            yield Ok(Bytes::from(vec![1; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![2; 10]));
+            yield Ok(Bytes::from(vec![2; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![3; 10]));
+            yield Ok(Bytes::from(vec![3; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![4; 10]));
+            yield Ok(Bytes::from(vec![4; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![5; 10]));
+            yield Ok(Bytes::from(vec![5; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![6; 10]));
+            yield Ok(Bytes::from(vec![6; BUFFER_SIZE]));
         };
 
+        let expected_total = (BUFFER_SIZE as f64 * 5.5) as u64;
+
         let (mut runner, msg_rx) = TaskRunner::new(
-            Some(15), // Initially larger than first chunk to avoid early termination
+            Some(3 * BUFFER_SIZE as u64), // Initially larger than first chunk to avoid early termination
             Box::pin(test_stream),
             runner_id,
             control_rx,
@@ -620,7 +673,7 @@ mod tests {
                         control_tx
                             .broadcast_direct(ManagerMessage(
                                 runner_id,
-                                ManagerMessagesVariant::LimitTotal(60),
+                                ManagerMessagesVariant::LimitTotal(expected_total),
                             ))
                             .await
                             .unwrap();
@@ -644,32 +697,35 @@ mod tests {
     }
 
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn test_resize_total_smaller() {
         let (control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
 
-        // Create a stream with multiple chunks that would normally total 60 bytes
+        // Create a stream with multiple chunks that would normally total 6 chunks
         let test_stream = stream! {
-            yield Ok(Bytes::from(vec![1; 10]));
+            yield Ok(Bytes::from(vec![1; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![2; 10]));
+            yield Ok(Bytes::from(vec![2; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![3; 10]));
+            yield Ok(Bytes::from(vec![3; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![4; 10]));
+            yield Ok(Bytes::from(vec![4; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![5; 10]));
+            yield Ok(Bytes::from(vec![5; BUFFER_SIZE]));
             sleep(Duration::from_millis(10)).await;
-            yield Ok(Bytes::from(vec![6; 10]));
+            yield Ok(Bytes::from(vec![6; BUFFER_SIZE]));
         };
 
         let (mut runner, msg_rx) = TaskRunner::new(
-            Some(60), // Initially larger size
+            Some(6 * BUFFER_SIZE as u64), // Initially larger size
             Box::pin(test_stream),
             1,
             control_rx,
             cancel_token.clone(),
         );
+
+        let expected_total = (BUFFER_SIZE as f64 * 4.5) as u64;
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
@@ -683,23 +739,26 @@ mod tests {
         while let Ok(msg) = msg_rx.recv().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
+                    trace!("task started");
                     started = true;
                 }
                 RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
                     download_count += 1;
                     total_downloaded += bytes.len();
-                    // After downloading 2 chunks (20 bytes), resize to 25 bytes
+                    // After downloading 2 chunks (64 KB), resize to 4.5 chunks
                     if download_count == 2 {
+                        trace!("runner: resize total to {expected_total}");
                         control_tx
                             .broadcast_direct(ManagerMessage(
                                 1,
-                                ManagerMessagesVariant::LimitTotal(25),
+                                ManagerMessagesVariant::LimitTotal(expected_total),
                             ))
                             .await
                             .unwrap();
                     }
                 }
                 RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    trace!("task finished");
                     break;
                 }
                 _ => panic!("Unexpected message: {msg:?}"),
@@ -708,8 +767,102 @@ mod tests {
 
         runner_handle.await.unwrap();
         assert!(started);
-        // Should have downloaded exactly 25 bytes (2 full chunks + 5 bytes from 3rd chunk)
-        assert_eq!(total_downloaded, 25);
+        // Should have downloaded exactly 4.5 chunks
+        assert_eq!(total_downloaded, expected_total as usize);
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_resize_total_smaller_with_small_chunks() {
+        let (control_tx, control_rx) = async_broadcast::broadcast(1);
+        let cancel_token = CancellationToken::new();
+
+        // Create a stream with small chunks (50 bytes each) - these will accumulate in buffer
+        let test_stream = stream! {
+            for i in 0..20 {
+                sleep(Duration::from_millis(10)).await;
+                yield Ok(Bytes::from(vec![i as u8; 50])); // 50 bytes per chunk
+            }
+        };
+
+        let (mut runner, msg_rx) = TaskRunner::new(
+            Some(1000), // Initially allow 1000 bytes (20 chunks)
+            Box::pin(test_stream),
+            1,
+            control_rx,
+            cancel_token.clone(),
+        );
+
+        // Pre-schedule the control signal to be sent after 80ms
+        // This should happen while the runner is actively downloading
+        tokio::spawn({
+            let control_tx = control_tx.clone();
+            async move {
+                sleep(Duration::from_millis(80)).await;
+                let new_limit = 200; // 4 chunks worth
+                trace!("sending limit signal to reduce total to {new_limit} bytes after 80ms");
+                let _ = control_tx
+                    .broadcast_direct(ManagerMessage(
+                        1,
+                        ManagerMessagesVariant::LimitTotal(new_limit),
+                    ))
+                    .await;
+            }
+        });
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut started = false;
+        let mut total_downloaded = 0;
+
+        while let Ok(msg) = msg_rx.recv().await {
+            match msg {
+                RunnerMessage(_, RunnerMessageKind::Started) => {
+                    trace!("task started");
+                    started = true;
+                }
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                    total_downloaded += bytes.len();
+                    trace!("downloaded batch, total: {total_downloaded} bytes");
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                    trace!("task finished normally");
+                    break;
+                }
+                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(err))) => {
+                    trace!("task failed with error: {err:?}");
+                    break;
+                }
+            }
+        }
+
+        runner_handle.await.unwrap();
+        assert!(started);
+
+        // With small chunks and buffer mechanism, we expect:
+        // - Some data should be downloaded (at least a few chunks)
+        // - Should not download the entire 1000 bytes due to limit signal
+        // - Allow for timing variations in signal processing
+        let min_expected = 100; // At least 2 chunks should be downloaded
+        let max_expected = 800; // Should not download most of the stream
+
+        assert!(
+            total_downloaded >= min_expected,
+            "Should have downloaded at least {min_expected} bytes, got {total_downloaded}"
+        );
+        assert!(
+            total_downloaded <= max_expected,
+            "Should not have downloaded too much after limit signal, got {total_downloaded} bytes \
+             (limit was 200)"
+        );
+
+        println!("✓ Runner correctly handled resize to smaller limit with small chunks");
+        println!(
+            "  - Downloaded: {total_downloaded} bytes (limit was reduced to 200 bytes after 80ms)"
+        );
+        println!("  - Expected range: {min_expected}-{max_expected} bytes");
     }
 
     #[tokio::test]
@@ -951,7 +1104,7 @@ mod tests {
             stream! {
                 for i in 0..6 {
                     sleep(Duration::from_millis(10)).await;
-                    yield Ok(Bytes::from(vec![i as u8; 10]));
+                    yield Ok(Bytes::from(vec![i as u8; BUFFER_SIZE]));
                 }
             }
         };
@@ -962,7 +1115,7 @@ mod tests {
         let runner_id3 = 3;
 
         let (mut runner1, msg_rx1) = TaskRunner::new(
-            Some(60), // Total 60 bytes
+            Some(6 * BUFFER_SIZE as u64), // Total 6 chunks
             Box::pin(create_stream()),
             runner_id1,
             control_rx1,
@@ -970,7 +1123,7 @@ mod tests {
         );
 
         let (mut runner2, msg_rx2) = TaskRunner::new(
-            Some(60), // Total 60 bytes
+            Some(6 * BUFFER_SIZE as u64), // Total 6 chunks
             Box::pin(create_stream()),
             runner_id2,
             control_rx2,
@@ -978,7 +1131,7 @@ mod tests {
         );
 
         let (mut runner3, msg_rx3) = TaskRunner::new(
-            Some(60), // Total 60 bytes
+            Some(6 * BUFFER_SIZE as u64), // Total 6 chunks
             Box::pin(create_stream()),
             runner_id3,
             control_rx3,
@@ -1035,7 +1188,7 @@ mod tests {
                                     control_tx
                                         .broadcast_direct(ManagerMessage(
                                             runner_id2,
-                                            ManagerMessagesVariant::LimitTotal(35),
+                                            ManagerMessagesVariant::LimitTotal(3 * BUFFER_SIZE as u64),
                                         ))
                                         .await
                                         .unwrap();
@@ -1122,16 +1275,18 @@ mod tests {
         assert!(runner1_finished && runner2_finished && runner3_finished);
         assert!(limit_sent);
 
-        // Runner1 and Runner3 should have downloaded the full 60 bytes
-        assert_eq!(runner1_downloaded, 60);
-        assert_eq!(runner3_downloaded, 60);
+        // Runner1 and Runner3 should have downloaded the full 6 chunks
+        assert_eq!(runner1_downloaded, 6 * BUFFER_SIZE);
+        assert_eq!(runner3_downloaded, 6 * BUFFER_SIZE);
 
-        // Runner2 should have been limited to 35 bytes
-        assert_eq!(runner2_downloaded, 35);
+        // Runner2 should have been limited to 3 chunks
+        assert_eq!(runner2_downloaded, 3 * BUFFER_SIZE);
 
         println!("✓ Multiple runners correctly handled their own messages");
-        println!("  - Runner1 downloaded: {runner1_downloaded} bytes (expected: 60)");
-        println!("  - Runner2 downloaded: {runner2_downloaded} bytes (expected: 35, limited)");
-        println!("  - Runner3 downloaded: {runner3_downloaded} bytes (expected: 60)");
+        println!("  - Runner1 downloaded: {runner1_downloaded} bytes (expected: 6 chunks)");
+        println!(
+            "  - Runner2 downloaded: {runner2_downloaded} bytes (expected: 3 chunks, limited)"
+        );
+        println!("  - Runner3 downloaded: {runner3_downloaded} bytes (expected: 6 chunks)");
     }
 }
