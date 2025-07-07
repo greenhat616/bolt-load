@@ -378,7 +378,11 @@ impl ChunkPlanner {
     }
 
     /// Resize the runner state by the given size
-    pub fn resize_runner_state(&mut self, runner_id: RunnerId, new_size: u64) -> Result<(), Error> {
+    pub fn resize_runner_state(
+        &mut self,
+        runner_id: RunnerId,
+        new_size: u64,
+    ) -> Result<u64, Error> {
         let chunk = self
             .runner_to_chunk
             .remove(&runner_id)
@@ -387,11 +391,12 @@ impl ChunkPlanner {
             .chunks
             .remove(&chunk)
             .ok_or(Error::ChunkNotFound(runner_id))?;
+        let downloaded_size = state.downloaded.end - state.downloaded.start;
         state.allocated.end = state.downloaded.end + new_size;
         let new_chunk = GenericRange::from(state.allocated.clone());
         self.chunks.insert(new_chunk, state);
         self.runner_to_chunk.insert(runner_id, new_chunk);
-        Ok(())
+        Ok(downloaded_size)
     }
 
     /// Check if all chunks are finished

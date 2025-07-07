@@ -269,7 +269,7 @@ impl ConcurrentTaskInner {
         let (control_tx, control_rx) = control_channel;
         let half_size = (incomplete_range.end - incomplete_range.start) / 2;
         // Limit the total size of the runner
-        chunk_planner
+        let downloaded_size = chunk_planner
             .resize_runner_state(runner_id, half_size)
             .expect("chunk planner should not fail");
 
@@ -277,7 +277,7 @@ impl ConcurrentTaskInner {
         futures::select! {
             res = control_tx.broadcast_direct(ManagerMessage(
                 runner_id,
-                ManagerMessagesVariant::LimitTotal(half_size),
+                ManagerMessagesVariant::LimitTotal(downloaded_size + half_size),
             )).fuse() => { res?; }
             _ = timer => {
                 return Err(SplitTaskError::SendControlMessageTimeout);
