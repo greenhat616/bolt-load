@@ -5,7 +5,7 @@ version = "0.1.0"
 rust-version = "1.85.0" # the first version that supports 2024 edition
 
 [features]
-default = ["reqwest", "tokio", "serde", "tracing"]
+default = ["reqwest", "tokio", "serde", "tracing", "progressbar"]
 http = [
     "dep:headers",
     "dep:regex",
@@ -13,6 +13,9 @@ http = [
     "dep:percent-encoding",
     "dep:http",
 ]
+# terminal progress
+progressbar = ["dep:indicatif"]
+
 # adapter group
 reqwest = ["dep:reqwest", "http"]
 ureq2 = ["dep:ureq2", "http"]
@@ -77,6 +80,9 @@ smol = { version = "2", optional = true }
 
 # tracing
 tracing = { version = "0.1", optional = true }
+
+# terminal progress
+indicatif = { version = "0.18", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

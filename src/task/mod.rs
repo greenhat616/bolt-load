@@ -190,6 +190,50 @@ impl Task {
         self.task_state.load(Ordering::Acquire) != TaskState::Idle
     }
 
+    #[cfg(feature = "progressbar")]
+    pub fn with_progress_bar(&mut self) {
+        let cb = std::mem::take(&mut self.on_task_state_changed);
+        let mut cb =
+            Arc::into_inner(cb).expect("we should init the callback first before running the task");
+        let (tx, rx) = async_channel::bounded::<TaskEvent>(32);
+        cb.push(Box::new(move |event| {
+            tx.send_blocking(event).unwrap();
+        }));
+
+        std::thread::spawn(move || {
+            let mut pb = None;
+            while let Ok(event) = rx.recv_blocking() {
+                match &event {
+                    TaskEvent::Downloading(progress) => match &mut pb {
+                        None => {
+                            let content_size = progress.progress().total.unwrap_or(0);
+                            let p = indicatif::ProgressBar::new(content_size);
+                            p.set_style(
+                                indicatif::ProgressStyle::with_template(
+                                    "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
+                                     {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                                )
+                                .unwrap()
+                                .progress_chars("#>-"),
+                            );
+                            pb = Some(p);
+                        }
+                        Some(pb) => {
+                            pb.set_position(progress.progress().downloaded);
+                        }
+                    },
+                    TaskEvent::Finished(_) => {
+                        if let Some(pb) = pb.take() {
+                            pb.finish();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        self.on_task_state_changed = Arc::new(cb);
+    }
+
     /// cancel the task, and do the cleanup work
     pub async fn stop(&mut self) {
         self.cancel_token.cancel();
