@@ -2,6 +2,12 @@
     <img src="./.github/bolt-load-transparent.svg" alt="logo" width="200" height="200">
 </p>
 
+<div align="center">
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/greenhat616/bolt-load)
+
+</div>
+
 ### Thread control algroithm
 Split the process into 2 parts, slow start & max thread control
 
