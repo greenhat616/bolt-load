@@ -86,7 +86,7 @@ indicatif = { version = "0.18", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
-tracing-test = { git = "https://github.com/Frando/tracing-test.git", rev = "e81ec65", features = ["pretty-log-printing"] }
+tracing-test = { git = "https://github.com/Frando/tracing-test.git", rev = "5d645cb8ef31aee22023c4590b6ee14cbe7577a5", features = ["pretty-log-printing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1"
