@@ -8,12 +8,13 @@ use std::{
 };
 
 use async_broadcast::{Receiver as BroadcastReceiver, Sender as BroadcastSender};
-use async_channel::{Receiver, Sender};
+use async_channel::Receiver;
 use async_io::Timer;
 use async_waitgroup::WaitGroup;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
+use tracing::debug;
 
 use super::{Generator, Result, TaskInstance};
 use crate::{
@@ -378,6 +379,7 @@ impl ConcurrentTaskInner {
         let count = meters.len();
         let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
         let (_, ema_speed) = sampler.sample(&mut total_bytes);
+        debug!("ema speed {ema_speed} count {count}");
         *current_speed = ema_speed;
         *per_runner_avg_speed = ema_speed / count as f64;
 
@@ -462,7 +464,7 @@ impl ConcurrentTaskInner {
         // TODO: maybe move into the strategy?
         let planned_chunk_size = (current_speed * 2.0) as u64;
 
-        if active_runners < max_concurrency && current_speed > 0.0 {
+        if active_runners < max_concurrency && current_speed >= 0.0 {
             trace!(
                 "[TASK] current speed: {current_speed}, per runner avg speed: \
                  {per_runner_avg_speed}"

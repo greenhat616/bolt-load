@@ -195,6 +195,8 @@ pub mod tests {
         chunk_size: usize,
         call_count: Arc<AtomicUsize>,
         filename: Option<String>,
+        #[debug(ignore)]
+        delay_per_chunk: Option<std::time::Duration>,
     }
 
     impl SimpleTestAdapter {
@@ -207,6 +209,7 @@ pub mod tests {
                 chunk_size: self.chunk_size,
                 call_count: Arc::new(AtomicUsize::new(0)),
                 filename: self.filename.clone(),
+                delay_per_chunk: self.delay_per_chunk.clone(),
             }
         }
 
@@ -224,6 +227,7 @@ pub mod tests {
                 chunk_size: 8192, // 8KB chunks by default
                 call_count: Arc::new(AtomicUsize::new(0)),
                 filename: Some("test_file.bin".to_string()),
+                delay_per_chunk: None,
             }
         }
 
@@ -264,6 +268,12 @@ pub mod tests {
         /// Get call count
         pub fn call_count(&self) -> usize {
             self.call_count.load(Ordering::Relaxed)
+        }
+
+        /// Configure delay per chunk
+        pub fn with_delay_per_chunk(mut self, delay: std::time::Duration) -> Self {
+            self.delay_per_chunk = Some(delay);
+            self
         }
     }
 
@@ -316,13 +326,23 @@ pub mod tests {
 
             let content = self.content.clone();
             let chunk_size = self.chunk_size;
+            let delay_per_chunk = self.delay_per_chunk.clone();
+
             info!(
                 "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
                 chunk_size
             );
             let stream = async_stream::stream! {
-                for chunk in content.chunks(chunk_size) {
-                    yield Ok(Bytes::from(chunk.to_vec()));
+                if let Some(delay) = delay_per_chunk {
+                    let mut interval = tokio::time::interval(delay);
+                    for chunk in content.chunks(chunk_size) {
+                        interval.tick().await;
+                        yield Ok(Bytes::from(chunk.to_vec()));
+                    }
+                } else {
+                    for chunk in content.chunks(chunk_size) {
+                        yield Ok(Bytes::from(chunk.to_vec()));
+                    }
                 }
             };
             Ok(Box::pin(stream))
@@ -347,10 +367,19 @@ pub mod tests {
             let end = end as usize;
             let content = self.content[start..end.min(self.content.len())].to_vec();
             let chunk_size = self.chunk_size;
+            let delay_per_chunk = self.delay_per_chunk.clone();
 
             let stream = async_stream::stream! {
-                for chunk in content.chunks(chunk_size) {
-                    yield Ok(Bytes::from(chunk.to_vec()));
+                if let Some(delay) = delay_per_chunk {
+                    let mut interval = tokio::time::interval(delay);
+                    for chunk in content.chunks(chunk_size) {
+                        interval.tick().await;
+                        yield Ok(Bytes::from(chunk.to_vec()));
+                    }
+                } else {
+                    for chunk in content.chunks(chunk_size) {
+                        yield Ok(Bytes::from(chunk.to_vec()));
+                    }
                 }
             };
             Ok(Box::pin(stream))
