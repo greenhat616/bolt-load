@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_resize_total_larger() {
         let runner_id = 1;
         let (control_tx, control_rx) = async_broadcast::broadcast(1);
@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_resize_total_smaller() {
         let (control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_resize_total_smaller_with_small_chunks() {
         let (control_tx, control_rx) = async_broadcast::broadcast(1);
         let cancel_token = CancellationToken::new();
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_multiple_runners_handle_own_messages() {
         let (control_tx, control_rx1) = async_broadcast::broadcast(10);
         let control_rx2 = control_tx.new_receiver();

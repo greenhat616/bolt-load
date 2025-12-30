@@ -73,7 +73,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_singleton_basic_functionality() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
         let content_hash = simple_adapter.expected_hash().to_string();
@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_concurrent_basic_functionality() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
         let content_hash = simple_adapter.expected_hash().to_string();
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_task_cancellation() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
         let content_hash = simple_adapter.expected_hash().to_string();
@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_adapter_failure_handling() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE)
             .with_chunk_size(CHUNK_SIZE)
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_task_modes_comparison() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE)
             .with_chunk_size(CHUNK_SIZE)

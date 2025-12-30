@@ -86,7 +86,7 @@ indicatif = { version = "0.18", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
-tracing-test = { git = "https://github.com/Frando/tracing-test.git", rev = "e81ec65", features = ["pretty-log-printing"] }
+n0-tracing-test = { version = "0.3.0", features = ["pretty-log-printing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1"
@@ -101,34 +101,34 @@ rand = "0.9"
 blake3 = "1"
 
 # for http server test
-axum = "0.8.4"
-axum-extra = { version = "0.10", features = ["typed-header"] }
-axum-range = "0.5"
+axum = "0.8.8"
+axum-extra = { version = "0.12.5", features = ["typed-header"] }
+axum-range = "1.0.0"
 
 # Tracing and bench
 portpicker = "0.1"
 tracing-tracy = "0.11"
-console-subscriber = "0.4.1"
+console-subscriber = "0.5.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = { version = "0.31", features = [
+tracing-opentelemetry = { version = "0.32", features = [
     "metrics",
 ] }
-opentelemetry = { version = "0.30", features = [
+opentelemetry = { version = "0.31", features = [
     "trace",
     "metrics",
 ] }
-opentelemetry_sdk = { version = "0.30", features = [
+opentelemetry_sdk = { version = "0.31", features = [
     "trace",
     "rt-tokio",
 ] }
-opentelemetry-otlp = { version = "0.30", features = [
+opentelemetry-otlp = { version = "0.31", features = [
     "metrics",
     "grpc-tonic",
 ] }
-opentelemetry-semantic-conventions = { version = "0.30", features = [
+opentelemetry-semantic-conventions = { version = "0.31", features = [
     "semconv_experimental",
 ] }
-opentelemetry-stdout = { version = "0.30", features = [
+opentelemetry-stdout = { version = "0.31", features = [
     "trace",
     "metrics",
 ] }

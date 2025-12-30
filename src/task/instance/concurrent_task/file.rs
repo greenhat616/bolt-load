@@ -188,7 +188,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_mmap_file_writer() {
         let tmp_file = tempfile::tempdir().unwrap();
         let file_path = tmp_file.path().join("test.txt");
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_seek_write_file_writer() {
         let tmp_file = tempfile::tempdir().unwrap();
         let file_path = tmp_file.path().join("test.txt");

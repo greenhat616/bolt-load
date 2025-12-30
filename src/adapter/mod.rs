@@ -484,7 +484,7 @@ pub mod tests {
         use super::*;
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_simple_test_adapter_basic_functionality() {
             let size = 1024;
             let adapter = SimpleTestAdapter::new(size);
@@ -504,7 +504,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_retrieve_meta_success() {
             let size = 2048;
             let adapter = SimpleTestAdapter::new(size).with_filename("custom_test.bin".to_string());
@@ -517,7 +517,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_retrieve_meta_failure() {
             let adapter = SimpleTestAdapter::new(1024).with_failure(true);
 
@@ -535,7 +535,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_is_range_stream_available() {
             // Test range support enabled
             let adapter_with_range = SimpleTestAdapter::new(1024).with_range_support(true);
@@ -549,7 +549,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_full_stream_success_with_hash_verification() {
             let size = 4096;
             let adapter = SimpleTestAdapter::new(size);
@@ -577,7 +577,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_full_stream_failure() {
             let adapter = SimpleTestAdapter::new(1024).with_failure(true);
 
@@ -595,7 +595,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_range_stream_success_with_hash_verification() {
             let size = 8192;
             let adapter = SimpleTestAdapter::new(size).with_range_support(true);
@@ -627,7 +627,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_range_stream_not_supported() {
             let adapter = SimpleTestAdapter::new(1024).with_range_support(false);
 
@@ -645,7 +645,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_range_stream_edge_cases() {
             let size = 1000;
             let adapter = SimpleTestAdapter::new(size).with_range_support(true);
@@ -677,7 +677,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_large_adapter() {
             let adapter = SimpleTestAdapter::new_large();
             let expected_size = 100 * 1024 * 1024; // 100MB
@@ -709,7 +709,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_call_count_tracking() {
             let adapter = SimpleTestAdapter::new(1024);
 
@@ -730,7 +730,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_configuration_chain() {
             let adapter = SimpleTestAdapter::new(2048)
                 .with_range_support(false)
@@ -747,7 +747,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_deterministic_content_generation() {
             // Test that content generation is truly deterministic
             let content1 = create_deterministic_content(1000);
@@ -768,7 +768,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_chunk_size_behavior() {
             let adapter = SimpleTestAdapter::new(10000); // 10KB content
             let stream = adapter.full_stream().await.unwrap();
@@ -792,7 +792,7 @@ pub mod tests {
         }
 
         #[tokio::test]
-        #[tracing_test::traced_test]
+        #[n0_tracing_test::traced_test]
         async fn test_concurrent_access() {
             let adapter = SimpleTestAdapter::new(1024);
             let adapter = Arc::new(adapter);

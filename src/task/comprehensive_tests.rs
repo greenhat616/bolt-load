@@ -49,7 +49,7 @@ fn create_test_runtime() -> ThreadedRuntimeImpl {
 // ============================================================================
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_task_builder_basic_configuration() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024);
@@ -76,7 +76,7 @@ async fn test_task_builder_basic_configuration() {
 }
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_task_builder_validation_errors() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024);
@@ -169,7 +169,7 @@ async fn test_task_builder_validation_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_task_builder_with_mode_preference() {
     let runtime = create_test_runtime();
     let temp_dir = TempDir::new().unwrap();
@@ -210,7 +210,7 @@ async fn test_task_builder_with_mode_preference() {
 }
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_task_builder_callback_configuration() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024);
@@ -256,7 +256,7 @@ async fn test_task_builder_callback_configuration() {
 }
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_task_builder_meta_retrieval() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(5000).with_filename("custom_file.txt".to_string());
@@ -286,7 +286,7 @@ async fn test_task_builder_meta_retrieval() {
 // ============================================================================
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_task_basic_lifecycle() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(2048).with_range_support(false);
@@ -371,7 +371,7 @@ async fn test_task_basic_lifecycle() {
 }
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_task_cancellation() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(10000).with_range_support(false); // 10KB file
@@ -413,7 +413,7 @@ async fn test_task_cancellation() {
 // ============================================================================
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_small_file_download_with_hash_verification() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(10240).with_range_support(false); // 10KB
@@ -470,7 +470,7 @@ async fn test_small_file_download_with_hash_verification() {
 }
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_medium_file_download_with_hash_verification() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024 * 1024).with_range_support(false); // 1MB
@@ -516,7 +516,7 @@ async fn test_medium_file_download_with_hash_verification() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_large_file_download_with_hash_verification() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new_large().with_range_support(true); // 100MB
@@ -588,7 +588,7 @@ async fn test_large_file_download_with_hash_verification() {
 // ============================================================================
 
 #[tokio::test]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_adapter_failure_handling() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024).with_failure(true);
@@ -615,7 +615,7 @@ async fn test_adapter_failure_handling() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 #[ignore]
 // TODO: this test is not working, we need to fix it
 async fn test_zero_size_file_handling() {
@@ -647,7 +647,7 @@ async fn test_zero_size_file_handling() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_concurrent_vs_singleton_performance() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
@@ -753,7 +753,7 @@ async fn test_concurrent_vs_singleton_performance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_concurrent_performance_only() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
@@ -829,7 +829,7 @@ async fn test_concurrent_performance_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tracing_test::traced_test]
+#[n0_tracing_test::traced_test]
 async fn test_concurrent_task_with_range_stream() {
     let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024 * 1024).with_range_support(true);

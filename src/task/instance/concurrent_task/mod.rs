@@ -968,7 +968,7 @@ mod tests {
     };
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_success() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
@@ -1043,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_adapter_failure() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1024).with_failure(true))
@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_cancellation() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_small_range_runner_with_control_messages() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
@@ -1195,7 +1195,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_edge_ranges() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let content_size = 1000;
@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_zero_length_range() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1000))
@@ -1291,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_multiple_runners() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(4000))
@@ -1390,7 +1390,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_hash_verification() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(5000))
