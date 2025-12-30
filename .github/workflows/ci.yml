@@ -70,7 +70,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
+        timeout-minutes: 10
         run: cargo test --verbose
 
       - name: Build
+        timeout-minutes: 10
         run: cargo build --verbose
