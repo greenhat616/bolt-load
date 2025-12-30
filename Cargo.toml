@@ -113,22 +113,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = { version = "0.31", features = [
     "metrics",
 ] }
-opentelemetry = { version = "0.30", features = [
+opentelemetry = { version = "0.31", features = [
     "trace",
     "metrics",
 ] }
-opentelemetry_sdk = { version = "0.30", features = [
+opentelemetry_sdk = { version = "0.31", features = [
     "trace",
     "rt-tokio",
 ] }
-opentelemetry-otlp = { version = "0.30", features = [
+opentelemetry-otlp = { version = "0.31", features = [
     "metrics",
     "grpc-tonic",
 ] }
-opentelemetry-semantic-conventions = { version = "0.30", features = [
+opentelemetry-semantic-conventions = { version = "0.31", features = [
     "semconv_experimental",
 ] }
-opentelemetry-stdout = { version = "0.30", features = [
+opentelemetry-stdout = { version = "0.31", features = [
     "trace",
     "metrics",
 ] }
