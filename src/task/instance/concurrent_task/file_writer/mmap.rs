@@ -139,3 +139,144 @@ impl MmapWriterBuilder {
         Ok(MmapWriter { file, tx: chunk_tx })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_mmap_writer_builder_new() {
+        let builder = MmapWriterBuilder::new();
+        assert!(builder.file.is_none());
+    }
+
+    #[test]
+    fn test_mmap_writer_capability_is_supported() {
+        // 小文件应该被支持
+        assert!(MmapWriterBuilder::is_supported(1024));
+        assert!(MmapWriterBuilder::is_supported(1024 * 1024 * 1024)); // 1GB
+
+        // 大于 isize::MAX 的文件不应该被支持
+        assert!(!MmapWriterBuilder::is_supported(isize::MAX as u64 + 1));
+    }
+
+    #[test]
+    fn test_mmap_writer_builder_without_file() {
+        futures_lite::future::block_on(async {
+            let builder = MmapWriterBuilder::new();
+            let result = builder.build().await;
+            match result {
+                Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("Expected error, got Ok"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_mmap_writer_builder_with_file() {
+        futures_lite::future::block_on(async {
+            let temp_file = NamedTempFile::new().unwrap();
+            let file_size = 1024u64;
+
+            // 预先设置文件大小以便 mmap 工作
+            temp_file.as_file().set_len(file_size).unwrap();
+
+            let file = fs::File::open(temp_file.path()).unwrap();
+            let builder = MmapWriterBuilder::new().file(file);
+            assert!(builder.file.is_some());
+        });
+    }
+
+    #[test]
+    fn test_mmap_writer_write_and_finalize() {
+        futures_lite::future::block_on(async {
+            let temp_file = NamedTempFile::new().unwrap();
+            let file_size = 1024u64;
+
+            // 预先设置文件大小
+            temp_file.as_file().set_len(file_size).unwrap();
+
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp_file.path())
+                .unwrap();
+
+            let writer = MmapWriterBuilder::new().file(file).build().await.unwrap();
+
+            // 写入数据
+            let data = Bytes::from_static(b"Hello, Mmap!");
+            writer
+                .write_range(0..data.len() as u64, data.clone())
+                .await
+                .unwrap();
+
+            // 写入到不同位置
+            let data2 = Bytes::from_static(b"World!");
+            writer
+                .write_range(100..100 + data2.len() as u64, data2.clone())
+                .await
+                .unwrap();
+
+            // 完成写入
+            writer.finalize().await.unwrap();
+
+            // 验证写入的数据
+            let mut verify_file = std::fs::File::open(temp_file.path()).unwrap();
+            let mut buffer = vec![0u8; data.len()];
+            verify_file.read_exact(&mut buffer).unwrap();
+            assert_eq!(&buffer, &data[..]);
+
+            // 验证第二个位置的数据
+            verify_file.seek(SeekFrom::Start(100)).unwrap();
+            let mut buffer2 = vec![0u8; data2.len()];
+            verify_file.read_exact(&mut buffer2).unwrap();
+            assert_eq!(&buffer2, &data2[..]);
+        });
+    }
+
+    #[test]
+    fn test_mmap_writer_concurrent_writes() {
+        futures_lite::future::block_on(async {
+            let temp_file = NamedTempFile::new().unwrap();
+            let file_size = 4096u64;
+            temp_file.as_file().set_len(file_size).unwrap();
+
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp_file.path())
+                .unwrap();
+
+            let writer = MmapWriterBuilder::new().file(file).build().await.unwrap();
+
+            // 并发写入多个块
+            let write_tasks: Vec<_> = (0..10)
+                .map(|i| {
+                    let offset = i * 100;
+                    let data = Bytes::from(format!("chunk_{:03}", i));
+                    writer.write_range(offset..offset + data.len() as u64, data)
+                })
+                .collect();
+
+            for task in write_tasks {
+                task.await.unwrap();
+            }
+
+            writer.finalize().await.unwrap();
+
+            // 验证所有数据都已写入
+            let mut verify_file = std::fs::File::open(temp_file.path()).unwrap();
+            for i in 0..10u64 {
+                let offset = i * 100;
+                let expected = format!("chunk_{:03}", i);
+                verify_file.seek(SeekFrom::Start(offset)).unwrap();
+                let mut buffer = vec![0u8; expected.len()];
+                verify_file.read_exact(&mut buffer).unwrap();
+                assert_eq!(String::from_utf8(buffer).unwrap(), expected);
+            }
+        });
+    }
+}
