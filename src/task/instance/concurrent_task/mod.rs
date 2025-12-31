@@ -34,12 +34,12 @@ use crate::{
 };
 
 mod chunk_planner;
-mod file;
+mod file_writer;
 mod runner_notification;
 mod strategy;
 
 use chunk_planner::*;
-use file::*;
+use file_writer::*;
 use runner_notification::RunnerNotification;
 use strategy::*;
 
@@ -86,6 +86,8 @@ impl TaskInstance for ConcurrentTask {
         let token = cancel_token.clone();
         let threaded_rt = self.threaded_rt.clone();
         let local_rt_builder = self.local_runtime_builder.clone();
+        // TODO: replace the local task executor with global runtime executor while `-Zhigher-ranked-assumptions` is stable
+        // Ref:  https://github.com/rust-lang/rust/issues/100013.
         let task = ::blocking::unblock(move || {
             // TODO: handle the error
             let local_rt = threaded_rt
@@ -228,7 +230,8 @@ impl ConcurrentTaskInner {
         Ok(())
     }
 
-    fn create_file_writer(&self) -> Result<(PathBuf, FileWriter)> {
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    async fn create_file_writer(&self) -> Result<(PathBuf, FileWriter)> {
         let tmp_path = if self.path.ends_with(DOWNLOADING_TMP_EXTENSION) {
             Cow::Borrowed(&self.path)
         } else {
@@ -245,7 +248,9 @@ impl ConcurrentTaskInner {
                 "File writer creation called before meta retrieval".to_string(),
             ))
         })?;
-        let file_writer = FileWriter::new(tmp_path.as_ref(), total_size);
+        let file_writer = FileWriter::new(&tmp_path, total_size)
+            .await
+            .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
         Ok((tmp_path.into_owned(), file_writer))
     }
 
@@ -603,14 +608,14 @@ impl ConcurrentTaskInner {
 
     #[allow(clippy::too_many_arguments)]
     // #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    async fn handle_runner_message(
+    fn handle_runner_message(
         threaded_rt: &ThreadedRuntimeImpl,
         wg: &WaitGroup,
         meters: &mut HashMap<RunnerId, usize>,
         chunk_planner: &mut ChunkPlanner,
         runner_notification: &mut RunnerNotification,
         id_generator: &mut Generator,
-        file_writer_control: &FileWriterControl,
+        file_writer: &FileWriter,
         is_finished: &mut bool,
         msg: RunnerMessage,
     ) -> Result<()> {
@@ -666,25 +671,21 @@ impl ConcurrentTaskInner {
                 let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
                 bytes.truncate(picked_size as usize);
 
-                let file_writer_control = file_writer_control.clone();
+                let file_writer = file_writer.clone();
                 let wg = wg.clone();
                 let _ = threaded_rt.spawn(async move {
                     let _wg = wg;
-                    if let Err(e) = file_writer_control
-                        .write(fixed_downloaded_range, bytes)
-                        .await
-                    {
+                    if let Err(e) = file_writer.write_range(fixed_downloaded_range, bytes).await {
                         // TODO: notify the task to stop
                         match e {
-                            FileWriterError::Io(e) => {
-                                error!("failed to write to file: {e:?}");
-                            }
-                            FileWriterError::Send(e) => {
-                                error!("failed to send to file writer: {e:?}");
+                            FileWriterError::Io(e) => error!("failed to write to file: {e:?}"),
+                            FileWriterError::Write(e) => {
+                                error!("failed to send to file writer: {e:?}")
                             }
                             FileWriterError::Recv(e) => {
-                                error!("failed to receive from file writer: {e:?}");
+                                error!("failed to receive from file writer: {e:?}")
                             }
+                            FileWriterError::Finalize => error!("failed to finalize file writer"),
                         }
                     }
                 });
@@ -730,11 +731,7 @@ impl ConcurrentTaskInner {
         let mut current_speed = 0.0;
         let mut per_runner_avg_speed = 0.0;
 
-        let (tmp_path, file_writer) = self.create_file_writer()?;
-        let FileWriterGuard(fs_writer_handle, file_writer_control) = file_writer
-            .start()
-            .await
-            .map_err(|e| TaskInstanceError::AllocateFileSpaceFailed(Arc::new(e)))?;
+        let (tmp_path, file_writer) = self.create_file_writer().await?;
 
         let mut throughout_meter_timer =
             Timer::interval(Duration::from_millis(DEFAULT_SAMPLE_INTERVAL));
@@ -787,11 +784,11 @@ impl ConcurrentTaskInner {
                                 &mut chunk_planner,
                                 &mut runner_notification,
                                 &mut runner_id_generator,
-                                &file_writer_control,
+                                &file_writer,
                                 &mut is_finished,
                                 msg,
                             )
-                            .await.inspect_err(|e| {
+                            .inspect_err(|e| {
                                 error!("failed to handle runner message: {e:?}");
                                 self.sync_progress(&chunk_planner);
                             })?;
@@ -810,11 +807,14 @@ impl ConcurrentTaskInner {
         // Wait all message handlers to finish
         wg.wait().await;
 
-        drop(file_writer_control);
-        fs_writer_handle
+        event_loop_result?;
+
+        // TODO: add a finalizing state?
+        file_writer
+            .finalize()
             .await
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
-        event_loop_result?;
+
         async_fs::rename(&tmp_path, &self.path)
             .await
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
