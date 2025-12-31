@@ -89,12 +89,14 @@ fn mmap_writer_task(
                 #[cfg(unix)]
                 {
                     use memmap2::UncheckedAdvice;
-                    if let Err(e) = mmap.unchecked_advise_range(
-                        UncheckedAdvice::DontNeed,
-                        range.start as usize,
-                        (range.end - range.start) as usize,
-                    ) {
-                        error!("failed to advise range: {e:?}");
+                    unsafe {
+                        if let Err(e) = mmap.unchecked_advise_range(
+                            UncheckedAdvice::DontNeed,
+                            range.start as usize,
+                            (range.end - range.start) as usize,
+                        ) {
+                            error!("failed to advise range: {e:?}");
+                        }
                     }
                 }
                 #[cfg(windows)]
