@@ -72,7 +72,7 @@ fn mmap_writer_task(
     command_rx: &Receiver<Command>,
 ) {
     let mut mmap = unsafe {
-        match MmapMut::map_mut(&*file) {
+        match MmapMut::map_mut(file) {
             Ok(mmap) => mmap,
             Err(e) => {
                 error!("failed to map file: {e:?}");
@@ -97,6 +97,14 @@ fn mmap_writer_task(
                         error!("failed to advise range: {e:?}");
                     }
                 }
+                #[cfg(windows)]
+                {
+                    evict_working_set_range(
+                        &mut mmap,
+                        range.start as usize,
+                        (range.end - range.start) as usize,
+                    );
+                }
                 let _ = tx.send(Ok(()));
             }
             Command::Finalize(tx) => {
@@ -105,6 +113,26 @@ fn mmap_writer_task(
                     Err(e) => tx.send(Err(e)),
                 };
                 break;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn evict_working_set_range(mmap: &mut memmap2::MmapMut, start: usize, len: usize) {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_NOT_LOCKED, GetLastError},
+        System::Memory::VirtualUnlock,
+    };
+
+    unsafe {
+        let addr = mmap.as_mut_ptr().add(start) as *mut core::ffi::c_void;
+        let ok = VirtualUnlock(addr, len);
+
+        if ok == 0 {
+            let err = GetLastError();
+            if err != ERROR_NOT_LOCKED {
+                error!("failed to unlock range: {err:?}");
             }
         }
     }

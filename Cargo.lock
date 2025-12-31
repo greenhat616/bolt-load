@@ -486,6 +486,7 @@ dependencies = [
  "ureq 2.12.1",
  "ureq 3.1.4",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
