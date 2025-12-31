@@ -74,6 +74,7 @@ impl ChunkState {
 }
 
 /// Enhanced chunk planner that maintains unified state
+#[derive(Clone)]
 pub struct ChunkPlanner {
     /// Total size of the content
     pub total: u64,
@@ -336,11 +337,28 @@ impl ChunkPlanner {
         &self,
         required_size: u64,
     ) -> Option<(Option<RunnerId>, Range<u64>)> {
+        // If there are still range that is not being asigned to a runner
+        let mut available_range: Option<Range<u64>> = None;
         // First try to find a suitable available range
         for range in self.get_available_ranges() {
             if range.end - range.start >= required_size {
-                return Some((None, range.start..range.start + required_size));
+                available_range = Some(range.start..range.start + required_size);
+                break;
+            } else if let Some(previous_available_range) = available_range {
+                available_range = if previous_available_range.end - previous_available_range.start
+                    > range.end - range.start
+                {
+                    Some(previous_available_range)
+                } else {
+                    Some(range)
+                }
+            } else {
+                available_range = Some(range)
             }
+        }
+
+        if let Some(available_range) = available_range {
+            return Some((None, available_range));
         }
 
         // Find the chunk with the most remaining work
@@ -350,7 +368,7 @@ impl ChunkPlanner {
             .filter(|c| {
                 c.status == ChunkStatus::Running
                     && c.runner_id.is_some()
-                    && c.remaining() >= required_size.max(self.min_chunk_size)
+                    && c.remaining() >= self.min_chunk_size
             })
             .max_by_key(|c| c.remaining());
 
@@ -420,6 +438,39 @@ impl ChunkPlanner {
             .into_iter()
             .find(|r| r.end - r.start >= length)
             .map(|r| r.start..r.start + length)
+    }
+}
+
+pub struct PlannerGuard<'a> {
+    planner: &'a mut ChunkPlanner,
+    snapshot: ChunkPlanner,
+    committed: bool,
+}
+
+impl<'a> PlannerGuard<'a> {
+    pub fn new(planner: &'a mut ChunkPlanner) -> Self {
+        let snapshot = planner.clone();
+        Self {
+            planner,
+            snapshot,
+            committed: false,
+        }
+    }
+
+    pub fn planner(&mut self) -> &mut ChunkPlanner {
+        self.planner
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PlannerGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            *self.planner = self.snapshot.clone();
+        }
     }
 }
 

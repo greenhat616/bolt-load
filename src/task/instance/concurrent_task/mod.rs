@@ -274,8 +274,11 @@ impl ConcurrentTaskInner {
     ) -> Result<(), SplitTaskError> {
         let (control_tx, control_rx) = control_channel;
         let half_size = (incomplete_range.end - incomplete_range.start) / 2;
+
+        let mut guard = PlannerGuard::new(chunk_planner);
         // Limit the total size of the runner
-        let downloaded_size = chunk_planner
+        let downloaded_size = guard
+            .planner()
             .resize_runner_state(runner_id, half_size)
             .expect("chunk planner should not fail");
 
@@ -289,6 +292,7 @@ impl ConcurrentTaskInner {
                 return Err(SplitTaskError::SendControlMessageTimeout);
             }
         }
+        guard.commit();
 
         // Create a new runner for the remaining range
         let next_runner_id = runner_id_generator.next().expect("no more runner id");
@@ -479,7 +483,6 @@ impl ConcurrentTaskInner {
             {
                 if suggested_range.end - suggested_range.start >= planned_chunk_size {
                     match runner_id {
-                        //
                         None => {
                             // create a new runner
                             let runner_id = runner_id_generator.next().expect("no more runner id");
