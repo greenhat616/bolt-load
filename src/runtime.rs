@@ -198,7 +198,7 @@ where
 #[cfg(feature = "smol")]
 impl Spawn for SmolThreadedRuntime {
     fn spawn_obj(&self, future: futures::future::FutureObj<'static, ()>) -> Result<(), SpawnError> {
-        self.executor.spawn(future);
+        self.executor.spawn(future).detach();
         Ok(())
     }
 }
@@ -446,8 +446,50 @@ impl SmolLocalRuntime {
 #[cfg(feature = "smol")]
 impl LocalSpawn for SmolLocalRuntime {
     fn spawn_local_obj(&self, future: LocalFutureObj<'static, ()>) -> Result<(), SpawnError> {
-        self.rt.spawn(future);
+        self.rt.spawn(future).detach();
         Ok(())
+    }
+}
+
+// Ref: https://github.com/smol-rs/futures-lite/blob/329be16e987f947552d0c77785c662e3166e706a/src/future.rs#L216
+/// Wakes the current task and returns [`Poll::Pending`] once.
+///
+/// This function is useful when we want to cooperatively give time to the task scheduler. It is
+/// generally a good idea to yield inside loops because that way we make sure long-running tasks
+/// don't prevent other tasks from running.
+///
+/// # Examples
+///
+/// ```
+/// use futures_lite::future;
+///
+/// # spin_on::spin_on(async {
+/// future::yield_now().await;
+/// # })
+/// ```
+pub fn yield_now() -> YieldNow {
+    YieldNow(false)
+}
+
+/// Future for the [`yield_now()`] function.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if !self.0 {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
     }
 }
 

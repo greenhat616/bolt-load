@@ -15,6 +15,7 @@ use self::{
     mmap::{MmapWriter, MmapWriterBuilder},
     pool::{PoolWriter, PoolWriterBuilder},
 };
+use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
 
@@ -73,7 +74,7 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
                 Ok(inner) => break inner,
                 Err(arc) => {
                     self = arc;
-                    futures_lite::future::yield_now().await;
+                    yield_now().await;
                 }
             }
         };
@@ -214,154 +215,144 @@ mod tests {
         assert!(debug_str.contains("data"));
     }
 
-    #[test]
-    fn test_file_writer_new_creates_file() {
-        futures_lite::future::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let file_path = temp_dir.path().join("test_file.bin");
-            let file_size = 1024u64;
+    #[tokio::test]
+    async fn test_file_writer_new_creates_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_file.bin");
+        let file_size = 1024u64;
 
-            let writer = FileWriter::new(&file_path, file_size).await.unwrap();
+        let writer = FileWriter::new(&file_path, file_size).await.unwrap();
 
-            // 验证文件已创建
-            assert!(file_path.exists());
+        // Validate file is created
+        assert!(file_path.exists());
 
-            // 小文件应该使用 Mmap
-            assert_eq!(writer.kind, FileRangeWriterKind::Mmap);
+        // Small file should use Mmap
+        assert_eq!(writer.kind, FileRangeWriterKind::Mmap);
 
-            writer.finalize().await.unwrap();
-        });
+        writer.finalize().await.unwrap();
     }
 
-    #[test]
-    fn test_file_writer_write_and_read() {
-        futures_lite::future::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let file_path = temp_dir.path().join("test_write.bin");
-            let file_size = 1024u64;
+    #[tokio::test]
+    async fn test_file_writer_write_and_read() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_write.bin");
+        let file_size = 1024u64;
 
-            let writer = FileWriter::new(&file_path, file_size).await.unwrap();
+        let writer = FileWriter::new(&file_path, file_size).await.unwrap();
 
-            // 写入数据
-            let data = Bytes::from_static(b"Hello, FileWriter!");
-            writer
-                .write_range(0..data.len() as u64, data.clone())
-                .await
-                .unwrap();
+        // Write data
+        let data = Bytes::from_static(b"Hello, FileWriter!");
+        writer
+            .write_range(0..data.len() as u64, data.clone())
+            .await
+            .unwrap();
 
-            // 写入到不同位置
-            let data2 = Bytes::from_static(b"Test!");
-            writer
-                .write_range(500..500 + data2.len() as u64, data2.clone())
-                .await
-                .unwrap();
+        // Write to different position
+        let data2 = Bytes::from_static(b"Test!");
+        writer
+            .write_range(500..500 + data2.len() as u64, data2.clone())
+            .await
+            .unwrap();
 
-            writer.finalize().await.unwrap();
+        writer.finalize().await.unwrap();
 
-            // 验证数据
-            let mut file = std::fs::File::open(&file_path).unwrap();
-            let mut buffer = vec![0u8; data.len()];
-            file.read_exact(&mut buffer).unwrap();
-            assert_eq!(&buffer, &data[..]);
+        // Validate data
+        let mut file = std::fs::File::open(&file_path).unwrap();
+        let mut buffer = vec![0u8; data.len()];
+        file.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, &data[..]);
 
-            file.seek(SeekFrom::Start(500)).unwrap();
-            let mut buffer2 = vec![0u8; data2.len()];
-            file.read_exact(&mut buffer2).unwrap();
-            assert_eq!(&buffer2, &data2[..]);
-        });
+        file.seek(SeekFrom::Start(500)).unwrap();
+        let mut buffer2 = vec![0u8; data2.len()];
+        file.read_exact(&mut buffer2).unwrap();
+        assert_eq!(&buffer2, &data2[..]);
     }
 
-    #[test]
-    fn test_file_writer_concurrent_writes() {
-        futures_lite::future::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let file_path = temp_dir.path().join("test_concurrent.bin");
-            let file_size = 4096u64;
+    #[tokio::test]
+    async fn test_file_writer_concurrent_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_concurrent.bin");
+        let file_size = 4096u64;
 
-            let writer = FileWriter::new(&file_path, file_size).await.unwrap();
+        let writer = FileWriter::new(&file_path, file_size).await.unwrap();
 
-            // 并发写入多个块
-            let write_futures: Vec<_> = (0..10)
-                .map(|i| {
-                    let offset = i * 100;
-                    let data = Bytes::from(format!("block_{:03}", i));
-                    writer.write_range(offset..offset + data.len() as u64, data)
-                })
-                .collect();
-
-            for future in write_futures {
-                future.await.unwrap();
-            }
-
-            writer.finalize().await.unwrap();
-
-            // 验证所有数据
-            let mut file = std::fs::File::open(&file_path).unwrap();
-            for i in 0..10u64 {
+        // Concurrent write multiple blocks
+        let write_futures: Vec<_> = (0..10)
+            .map(|i| {
                 let offset = i * 100;
-                let expected = format!("block_{:03}", i);
-                file.seek(SeekFrom::Start(offset)).unwrap();
-                let mut buffer = vec![0u8; expected.len()];
-                file.read_exact(&mut buffer).unwrap();
-                assert_eq!(String::from_utf8(buffer).unwrap(), expected);
-            }
-        });
+                let data = Bytes::from(format!("block_{:03}", i));
+                writer.write_range(offset..offset + data.len() as u64, data)
+            })
+            .collect();
+
+        for future in write_futures {
+            future.await.unwrap();
+        }
+
+        writer.finalize().await.unwrap();
+
+        // Validate all data
+        let mut file = std::fs::File::open(&file_path).unwrap();
+        for i in 0..10u64 {
+            let offset = i * 100;
+            let expected = format!("block_{:03}", i);
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut buffer = vec![0u8; expected.len()];
+            file.read_exact(&mut buffer).unwrap();
+            assert_eq!(String::from_utf8(buffer).unwrap(), expected);
+        }
     }
 
-    #[test]
-    fn test_file_writer_clone() {
-        futures_lite::future::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let file_path = temp_dir.path().join("test_clone.bin");
-            let file_size = 1024u64;
+    #[tokio::test]
+    async fn test_file_writer_clone() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_clone.bin");
+        let file_size = 1024u64;
 
-            let writer = FileWriter::new(&file_path, file_size).await.unwrap();
-            let writer_clone = writer.clone();
+        let writer = FileWriter::new(&file_path, file_size).await.unwrap();
+        let writer_clone = writer.clone();
 
-            // 使用原始 writer 写入
-            let data1 = Bytes::from_static(b"From original");
-            writer
-                .write_range(0..data1.len() as u64, data1.clone())
-                .await
-                .unwrap();
+        // Write with original writer
+        let data1 = Bytes::from_static(b"From original");
+        writer
+            .write_range(0..data1.len() as u64, data1.clone())
+            .await
+            .unwrap();
 
-            // 使用克隆的 writer 写入
-            let data2 = Bytes::from_static(b"From clone");
-            writer_clone
-                .write_range(100..100 + data2.len() as u64, data2.clone())
-                .await
-                .unwrap();
+        // Write with cloned writer
+        let data2 = Bytes::from_static(b"From clone");
+        writer_clone
+            .write_range(100..100 + data2.len() as u64, data2.clone())
+            .await
+            .unwrap();
 
-            // 只能 finalize 一个，因为它们共享同一个 Arc
-            drop(writer_clone);
-            writer.finalize().await.unwrap();
+        // Only one can finalize, because they share the same Arc
+        drop(writer_clone);
+        writer.finalize().await.unwrap();
 
-            // 验证两个写入都成功了
-            let mut file = std::fs::File::open(&file_path).unwrap();
-            let mut buffer1 = vec![0u8; data1.len()];
-            file.read_exact(&mut buffer1).unwrap();
-            assert_eq!(&buffer1, &data1[..]);
+        // Validate both writes are successful
+        let mut file = std::fs::File::open(&file_path).unwrap();
+        let mut buffer1 = vec![0u8; data1.len()];
+        file.read_exact(&mut buffer1).unwrap();
+        assert_eq!(&buffer1, &data1[..]);
 
-            file.seek(SeekFrom::Start(100)).unwrap();
-            let mut buffer2 = vec![0u8; data2.len()];
-            file.read_exact(&mut buffer2).unwrap();
-            assert_eq!(&buffer2, &data2[..]);
-        });
+        file.seek(SeekFrom::Start(100)).unwrap();
+        let mut buffer2 = vec![0u8; data2.len()];
+        file.read_exact(&mut buffer2).unwrap();
+        assert_eq!(&buffer2, &data2[..]);
     }
 
-    #[test]
-    fn test_file_writer_error_file_exists() {
-        futures_lite::future::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let file_path = temp_dir.path().join("existing_file.bin");
+    #[tokio::test]
+    async fn test_file_writer_error_file_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("existing_file.bin");
 
-            // 先创建一个文件
-            std::fs::write(&file_path, b"existing content").unwrap();
+        // Create a file
+        std::fs::write(&file_path, b"existing content").unwrap();
 
-            // 尝试用 FileWriter 创建同名文件应该失败（使用 create_new）
-            let result = FileWriter::new(&file_path, 1024).await;
-            assert!(result.is_err());
-        });
+        // Try to create a file with the same name should fail (using create_new)
+        let result = FileWriter::new(&file_path, 1024).await;
+        assert!(result.is_err());
     }
 
     #[test]

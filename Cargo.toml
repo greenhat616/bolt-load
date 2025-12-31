@@ -35,8 +35,7 @@ path = "src/lib.rs"
 [dependencies]
 thiserror = "2"
 async-trait = "0.1"
-futures = { version = "0.3" } 
-futures-lite = "2"
+futures = { version = "0.3" }
 futures-concurrency = "7"
 pin-project-lite = "0.2"
 url = "2"

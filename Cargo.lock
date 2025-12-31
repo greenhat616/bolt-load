@@ -450,7 +450,6 @@ dependencies = [
  "fs-err",
  "futures",
  "futures-concurrency",
- "futures-lite",
  "headers",
  "http",
  "indicatif",
