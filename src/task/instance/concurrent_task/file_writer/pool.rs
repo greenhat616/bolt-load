@@ -80,7 +80,7 @@ fn file_writer_task(file: &File, command_rx: &Receiver<Command>) {
             Command::Finalize(tx) => {
                 // The `flush` on unix and windows is a no-op,
                 // and we can just use `sync_all` for synchronizing all data to disk.
-                match file.sync_all() {
+                let _ = match file.sync_all() {
                     Ok(_) => tx.send(Ok(())),
                     Err(e) => tx.send(Err(e)),
                 };

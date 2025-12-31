@@ -91,8 +91,8 @@ fn mmap_writer_task(
                     use memmap2::UncheckedAdvice;
                     if let Err(e) = mmap.unchecked_advise_range(
                         UncheckedAdvice::DontNeed,
-                        range.start,
-                        range.end - range.start,
+                        range.start as usize,
+                        (range.end - range.start) as usize,
                     ) {
                         error!("failed to advise range: {e:?}");
                     }
@@ -100,7 +100,7 @@ fn mmap_writer_task(
                 let _ = tx.send(Ok(()));
             }
             Command::Finalize(tx) => {
-                match mmap.flush() {
+                let _ = match mmap.flush() {
                     Ok(_) => tx.send(Ok(())),
                     Err(e) => tx.send(Err(e)),
                 };
@@ -142,9 +142,11 @@ impl MmapWriterBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::{Read, Seek, SeekFrom};
+
     use tempfile::NamedTempFile;
+
+    use super::*;
 
     #[test]
     fn test_mmap_writer_builder_new() {
