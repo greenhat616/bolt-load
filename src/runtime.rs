@@ -73,6 +73,7 @@ impl ThreadedRuntimeImpl {
 }
 
 impl Spawn for ThreadedRuntimeImpl {
+    #[track_caller]
     fn spawn_obj(&self, future: futures::future::FutureObj<'static, ()>) -> Result<(), SpawnError> {
         match self {
             #[cfg(feature = "tokio")]
@@ -142,6 +143,7 @@ impl SmolThreadedRuntime {
         }
     }
 
+    #[track_caller]
     pub fn spawn<T>(
         &self,
         future: impl std::future::Future<Output = T> + Send + 'static,
@@ -154,6 +156,7 @@ impl SmolThreadedRuntime {
         }
     }
 
+    #[track_caller]
     pub fn block_on<T>(&self, future: impl std::future::Future<Output = T> + Send + 'static) -> T
     where
         T: Send + 'static,
@@ -197,6 +200,7 @@ where
 
 #[cfg(feature = "smol")]
 impl Spawn for SmolThreadedRuntime {
+    #[track_caller]
     fn spawn_obj(&self, future: futures::future::FutureObj<'static, ()>) -> Result<(), SpawnError> {
         self.executor.spawn(future).detach();
         Ok(())
@@ -265,6 +269,7 @@ impl TokioThreadedRuntime {
 
 #[cfg(feature = "tokio")]
 impl Spawn for TokioThreadedRuntime {
+    #[track_caller]
     fn spawn_obj(
         &self,
         future: futures::future::FutureObj<'static, ()>,
@@ -324,6 +329,7 @@ pub trait DowncastLocalRuntime {
 
 impl LocalRuntimeImpl {
     #[inline]
+    #[track_caller]
     pub fn block_on(&self, future: impl std::future::Future<Output = ()> + 'static) {
         match self {
             #[cfg(feature = "tokio")]
@@ -397,6 +403,7 @@ impl LocalTokioRuntime {
     }
 
     /// Block on a future in the local context.
+    #[track_caller]
     pub fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
         let local = tokio::task::LocalSet::new();
         match &self.rt {
@@ -412,6 +419,7 @@ impl LocalTokioRuntime {
 
 #[cfg(feature = "tokio")]
 impl LocalSpawn for LocalTokioRuntime {
+    #[track_caller]
     fn spawn_local_obj(&self, future: LocalFutureObj<'static, ()>) -> Result<(), SpawnError> {
         // This is should be used only in local-set async context.
         assert!(tokio::runtime::Handle::try_current().is_ok());
@@ -435,6 +443,7 @@ impl SmolLocalRuntime {
         }
     }
 
+    #[track_caller]
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: std::future::Future,
@@ -445,6 +454,7 @@ impl SmolLocalRuntime {
 
 #[cfg(feature = "smol")]
 impl LocalSpawn for SmolLocalRuntime {
+    #[track_caller]
     fn spawn_local_obj(&self, future: LocalFutureObj<'static, ()>) -> Result<(), SpawnError> {
         self.rt.spawn(future).detach();
         Ok(())
@@ -469,6 +479,22 @@ impl LocalSpawn for SmolLocalRuntime {
 /// ```
 pub fn yield_now() -> YieldNow {
     YieldNow(false)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("timeout deadline exceeded")]
+pub struct TimeoutError;
+pub async fn timeout<T>(
+    duration: std::time::Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, TimeoutError> {
+    use futures::FutureExt;
+    use futures_concurrency::prelude::*;
+    let timer = async {
+        async_io::Timer::after(duration).await;
+        Err(TimeoutError)
+    };
+    (future.map(Ok), timer).race().await
 }
 
 /// Future for the [`yield_now()`] function.
@@ -500,6 +526,7 @@ mod tests {
 
     #[cfg(feature = "smol")]
     use super::SmolThreadedRuntime;
+    use super::*;
     use crate::utils::logging::*;
 
     #[test]
@@ -542,5 +569,20 @@ mod tests {
         rt.block_on(async move {
             assert_eq!(handle.abort().await, None);
         });
+    }
+
+    #[tokio::test]
+    async fn test_timeout() {
+        let result = timeout(std::time::Duration::from_secs(1), async {
+            async_io::Timer::after(std::time::Duration::from_secs(2)).await;
+        })
+        .await;
+        assert!(result.is_err());
+
+        let result = timeout(std::time::Duration::from_secs(2), async {
+            async_io::Timer::after(std::time::Duration::from_secs(1)).await;
+        })
+        .await;
+        assert!(result.is_ok());
     }
 }

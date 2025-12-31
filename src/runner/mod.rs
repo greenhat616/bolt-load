@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, time::Duration};
 
 use async_broadcast::Receiver as BroadcastReceiver;
 use async_channel::{Receiver, Sender};
@@ -9,6 +9,7 @@ use smol_cancellation_token::CancellationToken;
 use crate::{
     DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AnyBytesStream, StreamError},
+    runtime::{TimeoutError, timeout},
     task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
     utils::{ShutdownGuardExt, logging::*},
 };
@@ -18,6 +19,9 @@ pub use guard::*;
 
 // TODO: make it configurable or detect the local disk performance?
 const BUFFER_SIZE: usize = 32 * 1024; // 32KB
+
+/// The timeout for the slow stream
+const SLOW_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// messages for runner -> manager
 #[derive(Debug)]
@@ -118,6 +122,17 @@ pub struct TaskRunner {
     cancel_token: CancellationToken,
     /// the shutdown signal, used for ensure the task runner is stopped
     shutdown_rx: Option<oneshot::Receiver<()>>,
+}
+
+enum Event {
+    /// The task is cancelled
+    Cancelled,
+    /// The stream is too slow, and transfer 0 bytes in the last SLOW_STREAM_TIMEOUT
+    SlowTransfer,
+    /// The control signal is received
+    Control(Result<ManagerMessage, async_broadcast::RecvError>),
+    /// The download event is received
+    Download(Option<Result<Bytes, StreamError>>),
 }
 
 impl TaskRunner {
@@ -334,7 +349,12 @@ impl TaskRunner {
 
     /// The inner logic of the task runner
     /// Just wrap a Result<(), TaskFailedKind> to return the error kind
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), name = "TaskRunner::run_inner", fields(runner_id = self.notify.runner_id()))
+    )]
     async fn run_inner(&mut self) -> Result<(), TaskRunError> {
+        trace!("runner: started");
         self.notify
             .send(RunnerMessageKind::Started)
             .await
@@ -343,37 +363,71 @@ impl TaskRunner {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _guard = shutdown_tx.shutdown_guard();
         self.shutdown_rx = Some(shutdown_rx);
-
         let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
-
         let mut is_finished = false;
+        let mut timer = async_io::Timer::after(SLOW_STREAM_TIMEOUT);
+        let mut now = std::time::Instant::now();
         let result = loop {
-            let control_signal = self.control_signal.recv().fuse();
-            let download = self.stream.next().fuse();
-            let cancelled = self.cancel_token.cancelled().fuse();
+            let step: Event = async {
+                let control_signal = self.control_signal.recv().fuse();
+                let download = self.stream.next().fuse();
+                let cancelled = self.cancel_token.cancelled().fuse();
+                let slow_transfer = timer.next().fuse();
+                futures::pin_mut!(control_signal, download, cancelled, slow_transfer);
+                futures::select_biased! {
+                    _ = cancelled => {
+                        Event::Cancelled
+                    }
+                    signal = control_signal => {
+                        Event::Control(signal)
+                    }
+                    _ = slow_transfer => {
+                        timer.set_after(SLOW_STREAM_TIMEOUT);
+                        Event::SlowTransfer
+                    }
+                    result = download => {
+                        timer.set_after(SLOW_STREAM_TIMEOUT);
+                        Event::Download(result)
+                    },
+                }
+            }
+            .await;
 
-            futures::pin_mut!(control_signal, download, cancelled);
-            futures::select_biased! {
-                _ = cancelled => {
+            match step {
+                Event::Cancelled => {
+                    trace!("runner: cancelled");
                     break Err(TaskRunError::Cancelled);
                 }
-                signal = control_signal => {
-                    match signal {
-                        Ok(signal) => {
-                            if let Err(err) = self.handle_control_signal(&signal) {
-                                break Err(err.into());
-                            }
-                            trace!("current downloaded: {}", self.downloaded as usize + buff.len());
+                Event::Control(signal) => match signal {
+                    Ok(signal) => {
+                        trace!("runner: control signal: {signal:?}");
+                        if let Err(err) = self.handle_control_signal(&signal) {
+                            break Err(err.into());
                         }
-                        Err(_) => {
-                            break Err(TaskFailedKind::ChannelClosed.into());
-                        }
+                        trace!(
+                            "current downloaded: {}",
+                            self.downloaded as usize + buff.len()
+                        );
                     }
+                    Err(_) => {
+                        trace!("runner: control signal channel closed");
+                        break Err(TaskFailedKind::ChannelClosed.into());
+                    }
+                },
+                Event::SlowTransfer => {
+                    warn!(
+                        "runner: very slow stream, transfer 0 bytes in the last {} seconds",
+                        SLOW_STREAM_TIMEOUT.as_secs()
+                    );
                 }
-                item = download => {
-                    match self.handle_stream_event(item, &mut buff, &mut is_finished).await {
-                        Ok(_) => {
+                Event::Download(item) => {
+                    match self
+                        .handle_stream_event(item, &mut buff, &mut is_finished)
+                        .await
+                    {
+                        Ok(()) => {
                             if is_finished {
+                                trace!("runner: finished");
                                 break Ok(());
                             }
                         }
@@ -381,7 +435,7 @@ impl TaskRunner {
                             break Err(err.into());
                         }
                     }
-                },
+                }
             }
         };
         result?;

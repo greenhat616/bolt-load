@@ -753,8 +753,9 @@ async fn test_concurrent_vs_singleton_performance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[n0_tracing_test::traced_test]
 async fn test_concurrent_performance_only() {
+    crate::utils::test::init_tracing().await;
+
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 

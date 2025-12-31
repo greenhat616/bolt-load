@@ -1,13 +1,17 @@
 pub mod http;
 pub mod logging;
 pub mod reader;
+#[cfg(test)]
+pub(crate) mod test;
 
+use crate::utils::logging::*;
 /// A guard that ensures the task is shutdown
 pub struct ShutdownGuard(Option<oneshot::Sender<()>>);
 
 impl Drop for ShutdownGuard {
     fn drop(&mut self) {
         if let Some(sender) = self.0.take() {
+            trace!("shutdown guard: sending shutdown signal");
             let _ = sender.send(());
         }
     }

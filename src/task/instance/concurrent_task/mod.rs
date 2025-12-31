@@ -300,7 +300,7 @@ impl ConcurrentTaskInner {
         if !chunk_planner.allocate_chunk(next_range.clone(), Some(next_runner_id)) {
             panic!("failed to allocate chunk: {next_range:?}");
         }
-        let (rx, _) = Self::create_background_range_runner(
+        let (rx, rt) = Self::create_background_range_runner(
             threaded_rt,
             wg,
             next_range,
@@ -310,6 +310,7 @@ impl ConcurrentTaskInner {
             runners_cancel_token.clone(),
         )
         .await?;
+        rt.forget();
         runner_notification.add(next_runner_id, rx);
         Ok(())
     }
@@ -365,6 +366,7 @@ impl ConcurrentTaskInner {
         let handle = threaded_rt
             .spawn_with_handle(fut)
             .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
+
         let rx = rx
             .await
             .map_err(|_| TaskInstanceError::Failed(TaskFailedKind::Cancelled))?;
@@ -388,7 +390,7 @@ impl ConcurrentTaskInner {
         let count = meters.len();
         let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
         let (_, ema_speed) = sampler.sample(&mut total_bytes);
-        debug!("ema speed {ema_speed} count {count}");
+        // debug!("ema speed {ema_speed} count {count}");
         *current_speed = ema_speed;
         *per_runner_avg_speed = ema_speed / count as f64;
 
@@ -452,7 +454,7 @@ impl ConcurrentTaskInner {
                     continue;
                 }
 
-                let (rx, _) = Self::create_background_range_runner(
+                let (rx, rt) = Self::create_background_range_runner(
                     threaded_rt,
                     wg,
                     chunk.clone(),
@@ -462,6 +464,7 @@ impl ConcurrentTaskInner {
                     runners_cancel_token.clone(),
                 )
                 .await?;
+                rt.forget();
 
                 runner_notification.add(runner_id, rx);
             }
@@ -491,7 +494,7 @@ impl ConcurrentTaskInner {
                             {
                                 panic!("failed to allocate chunk: {suggested_range:?}");
                             }
-                            let (rx, _) = Self::create_background_range_runner(
+                            let (rx, rt) = Self::create_background_range_runner(
                                 threaded_rt,
                                 wg,
                                 suggested_range,
@@ -501,6 +504,7 @@ impl ConcurrentTaskInner {
                                 runners_cancel_token.clone(),
                             )
                             .await?;
+                            rt.forget();
                             runner_notification.add(runner_id, rx);
                         }
                         Some(runner_id) => {

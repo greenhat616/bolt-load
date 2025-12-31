@@ -3,7 +3,8 @@ use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 use async_fs::{File, OpenOptions};
 use async_io::Timer;
 use async_waitgroup::WaitGroup;
-use futures::{AsyncWriteExt, FutureExt, StreamExt, task::SpawnExt};
+use futures::{FutureExt, StreamExt, task::SpawnExt};
+use futures_lite::AsyncWriteExt;
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
 
