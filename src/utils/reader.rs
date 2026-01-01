@@ -6,8 +6,7 @@ use std::{
 
 use blocking::Unblock;
 use bytes::Bytes;
-use futures::Stream;
-use futures_lite::AsyncRead;
+use futures::{AsyncRead, Stream};
 
 pub struct CrossRuntimeStream {
     pub(crate) reader: Unblock<Box<dyn Read + Send>>,
