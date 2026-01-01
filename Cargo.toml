@@ -29,6 +29,7 @@ smol = ["dep:smol"]
 tracing = ["dep:tracing"]
 
 [lib]
+doctest = false
 name = "bolt_load"
 path = "src/lib.rs"
 
