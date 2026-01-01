@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use tracing::{level_filters::LevelFilter, *};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,

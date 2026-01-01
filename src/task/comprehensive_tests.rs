@@ -752,10 +752,86 @@ async fn test_concurrent_vs_singleton_performance() {
     info!("  - Both modes completed successfully with matching hashes");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_concurrent_performance_only() {
-    crate::utils::test::init_tracing().await;
+// #[tokio::test(flavor = "multi_thread")]
+// async fn test_concurrent_performance_only() {
+//     crate::utils::test::init_tracing().await;
 
+//     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
+//     let temp_dir = TempDir::new().unwrap();
+
+//     // Set up adapter with range support for concurrent downloading
+//     let adapter = SimpleTestAdapter::new(file_size)
+//         .with_range_support(true)
+//         .with_delay_per_chunk(std::time::Duration::from_millis(10));
+//     info!("adapter: {:?}", adapter);
+
+//     // Test concurrent mode
+//     let runtime = ThreadedRuntimeImpl::new_tokio_rt();
+//     let expected_hash = adapter.expected_hash().to_string();
+//     let save_path = temp_dir.path().join("concurrent_performance_test.bin");
+
+//     let mut concurrent_task = TaskBuilder::default()
+//         .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
+//         .save_path(save_path.clone())
+//         .prefer_mode(DownloadMode::Concurrent)
+//         .cancel_token(CancellationToken::new())
+//         .threaded_runtime(runtime.clone())
+//         .build()
+//         .await
+//         .unwrap();
+
+//     info!(
+//         "🏁 Starting concurrent performance test ({}MB)...",
+//         file_size / (1024 * 1024)
+//     );
+
+//     // Run the download and measure time
+//     let start_time = Instant::now();
+//     concurrent_task.run().await.unwrap();
+//     concurrent_task
+//         .wait()
+//         .await
+//         .expect("concurrent task should succeed");
+//     let concurrent_duration = start_time.elapsed();
+
+//     let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
+
+//     // Verify downloaded file
+//     let content = std::fs::read(&save_path).unwrap();
+//     let actual_hash = calculate_blake3(&content);
+//     assert_eq!(
+//         actual_hash, expected_hash,
+//         "Concurrent file hash should be correct"
+//     );
+
+//     info!("✓ Concurrent performance test completed");
+//     info!(
+//         "
+//     - Concurrent result:
+//         - Measured Speed: {} MB/s
+//         - Duration: {:?}
+//         - Hash: {}
+//         - File size: {} bytes",
+//         concurrent_speed / (1024.0 * 1024.0),
+//         concurrent_duration,
+//         actual_hash,
+//         file_size
+//     );
+
+//     // Additional assertions
+//     assert!(save_path.exists(), "Downloaded file should exist");
+//     assert_eq!(
+//         content.len(),
+//         file_size,
+//         "Downloaded file should have correct size"
+//     );
+
+//     info!("  - Concurrent mode completed successfully with matching hash");
+// }
+
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_concurrent_performance_only() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 
