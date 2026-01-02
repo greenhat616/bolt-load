@@ -5,7 +5,7 @@ version = "0.1.0"
 rust-version = "1.85.0" # the first version that supports 2024 edition
 
 [features]
-default = ["reqwest", "tokio", "serde", "tracing", "progressbar"]
+default = ["reqwest", "tokio", "serde", "tracing", "progressbar", "mmap"]
 http = [
     "dep:headers",
     "dep:regex",
@@ -21,6 +21,9 @@ reqwest = ["dep:reqwest", "http"]
 ureq2 = ["dep:ureq2", "http"]
 ureq3 = ["dep:ureq3", "http"]
 serde = ["dep:serde"]
+
+# file writer opts
+mmap = ["dep:memmap2"]
 
 # runtime group
 tokio = ["dep:tokio"]
@@ -59,19 +62,19 @@ tempfile = "3"
 smol-cancellation-token = "0.1"
 derive_more = { version = "2", features = ["debug"] }
 statig = { version = "0.4.1", features = ["async"] }
-fs-err = "3"                                           # for detailed io error message
-bitvec = "1"                                           # for task id generation
-memmap2 = "0.9"                                        # for better random range write for files if machine is available
-backon = "1"                                           # for retry strategy
-oneshot = { version = "0.1", features = ["async"] }    # for cross runtime oneshot
-async-waitgroup = "0.1.3"                              # for cross runtime wait group
-async-lock = "3"                                       # for cross runtime async lock
-ranges = "0.4"                                         # for range set operation
-async-channel = "2"                                    # for async channel
+fs-err = "3"                                          # for detailed io error message
+bitvec = "1"                                          # for task id generation
+memmap2 = { version = "0.9", optional = true }        # for better random range write for files if machine is available
+backon = "1"                                          # for retry strategy
+oneshot = { version = "0.1", features = ["async"] }   # for cross runtime oneshot
+async-waitgroup = "0.1.3"                             # for cross runtime wait group
+async-lock = "3"                                      # for cross runtime async lock
+ranges = "0.4"                                        # for range set operation
+async-channel = "2"                                   # for async channel
 async-broadcast = { version = "0.7" }
-async-fs = "2"                                         # for async file operation
-async-io = "2"                                         # for async timer
-blocking = "1"                                         # convert blocking io to async
+async-fs = "2"                                        # for async file operation
+async-io = "2"                                        # for async timer
+blocking = "1"                                        # convert blocking io to async
 
 serde = { version = "1", features = ["derive"], optional = true }
 
@@ -89,9 +92,16 @@ ureq2 = { version = "2", package = "ureq", optional = true }
 ureq3 = { version = "3", package = "ureq", optional = true }
 
 # runtime group
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "tracing"], optional = true }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "tracing",
+], optional = true }
 smol = { version = "2", optional = true }
-compio = { version = "0.17", optional = true, default-features = false, features = ["io-uring", "runtime"] }
+compio = { version = "0.17", optional = true, default-features = false, features = [
+    "io-uring",
+    "runtime",
+] }
 
 # tracing
 tracing = { version = "0.1", optional = true }
@@ -128,28 +138,14 @@ portpicker = "0.1"
 tracing-tracy = "0.11"
 console-subscriber = "0.5.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = { version = "0.32", features = [
-    "metrics",
-] }
-opentelemetry = { version = "0.31", features = [
-    "trace",
-    "metrics",
-] }
-opentelemetry_sdk = { version = "0.31", features = [
-    "trace",
-    "rt-tokio",
-] }
-opentelemetry-otlp = { version = "0.31", features = [
-    "metrics",
-    "grpc-tonic",
-] }
+tracing-opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
 opentelemetry-semantic-conventions = { version = "0.31", features = [
     "semconv_experimental",
 ] }
-opentelemetry-stdout = { version = "0.31", features = [
-    "trace",
-    "metrics",
-] }
+opentelemetry-stdout = { version = "0.31", features = ["trace", "metrics"] }
 
 # for benchmarks
 criterion = { version = "0.6", features = ["async_tokio"] }

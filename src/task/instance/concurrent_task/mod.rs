@@ -14,7 +14,6 @@ use async_waitgroup::WaitGroup;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
-use tracing::debug;
 
 use super::{Generator, Result, TaskInstance};
 use crate::{

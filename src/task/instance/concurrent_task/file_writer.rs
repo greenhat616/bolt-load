@@ -5,6 +5,7 @@
 
 #[cfg(feature = "compio")]
 mod compio;
+#[cfg(feature = "mmap")]
 mod mmap;
 mod null;
 mod pool;
@@ -20,9 +21,11 @@ use fs_err::{File, OpenOptions};
 
 #[cfg(feature = "compio")]
 pub use self::compio::CompioWriterBuilder;
-use self::{mmap::MmapWriter, null::NullWriter, pool::PoolWriter};
+#[cfg(feature = "mmap")]
+pub use self::mmap::MmapWriterBuilder;
+use self::{null::NullWriter, pool::PoolWriter};
 // Re-export builders for benchmarking and advanced usage
-pub use self::{mmap::MmapWriterBuilder, null::NullWriterBuilder, pool::PoolWriterBuilder};
+pub use self::{null::NullWriterBuilder, pool::PoolWriterBuilder};
 use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
@@ -63,7 +66,8 @@ trait FileWriterCapability {
 
 #[enum_dispatch::enum_dispatch]
 pub enum FileRangeWriterImpl {
-    Mmap(MmapWriter),
+    #[cfg(feature = "mmap")]
+    Mmap(self::mmap::MmapWriter),
     Pool(PoolWriter),
     Null(NullWriter),
     #[cfg(feature = "compio")]
@@ -73,6 +77,7 @@ pub enum FileRangeWriterImpl {
 impl FileRangeWriter for Arc<FileRangeWriterImpl> {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         match &**self {
+            #[cfg(feature = "mmap")]
             FileRangeWriterImpl::Mmap(writer) => writer.write_range(range, data).await,
             FileRangeWriterImpl::Pool(writer) => writer.write_range(range, data).await,
             FileRangeWriterImpl::Null(writer) => writer.write_range(range, data).await,
@@ -98,6 +103,7 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileRangeWriterKind {
+    #[cfg(feature = "mmap")]
     Mmap,
     Pool,
     /// Null writer for benchmarking - discards all data
@@ -107,13 +113,23 @@ pub enum FileRangeWriterKind {
 }
 
 impl FileRangeWriterKind {
-    // TODO: disable mmap on windows for default
+    #[cfg(feature = "compio")]
+    pub fn suggest_kind(_file_size: u64) -> Self {
+        Self::Compio
+    }
+
+    #[cfg(all(feature = "mmap", not(feature = "compio")))]
     pub fn suggest_kind(file_size: u64) -> Self {
         if file_size <= isize::MAX as u64 {
             Self::Mmap
         } else {
             Self::Pool
         }
+    }
+
+    #[cfg(not(all(feature = "mmap", feature = "compio")))]
+    pub fn suggest_kind(_file_size: u64) -> Self {
+        Self::Pool
     }
 }
 
@@ -159,6 +175,7 @@ impl FileWriter {
         let path = path.to_path_buf();
 
         let inner = match kind {
+            #[cfg(feature = "mmap")]
             FileRangeWriterKind::Mmap => {
                 let file = open_file(path, size).await?;
                 FileRangeWriterImpl::Mmap(MmapWriterBuilder::new().file(file).build().await?)
