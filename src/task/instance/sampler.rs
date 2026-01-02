@@ -67,3 +67,95 @@ impl SpeedSampler {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::time::{Duration, Instant};
+
+    use futures::StreamExt;
+
+    use crate::{
+        adapter::{BoltLoadAdapter, tests::SimpleTestAdapter},
+        task::instance::sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
+        utils::logging::*,
+    };
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_speed_sampler() {
+        crate::utils::test::init_tracing().await;
+
+        let file_size = 1024 * 1024; // 1MB for reasonable test time
+
+        // Set up adapter with range support for concurrent downloading
+        let adapter = SimpleTestAdapter::new(file_size)
+            .with_range_support(true)
+            .with_delay_per_chunk(std::time::Duration::from_millis(10));
+        info!("adapter: {:?}", adapter);
+        let mut stream = adapter.full_stream().await.expect("Failed to get full stream");
+
+        let mut sampler = SpeedSampler::new();
+        let mut bytes: usize = 0;
+
+        let sample_every = Duration::from_millis(DEFAULT_SAMPLE_INTERVAL);
+        let mut last_sample_check = Instant::now();
+
+        let mut prev_ema: Option<f64> = None;
+        let mut sample_count = 0usize;
+
+        while let Some(item) = stream.next().await {
+            // `full_stream()` is typically `Stream<Item = Result<Bytes, _>>`
+            let chunk = item.expect("stream error");
+            bytes += chunk.len();
+
+            if last_sample_check.elapsed() >= sample_every {
+                let (inst, ema) = sampler.sample(&mut bytes);
+
+                info!("speed: inst={:.2} B/s, ema={:.2} B/s", inst, ema);
+
+                // Basic sanity: speeds should be non-negative and EMA should be non-negative.
+                assert!(inst >= 0.0);
+                assert!(ema >= 0.0);
+
+                // EMA should lie between previous EMA and current instantaneous speed (convex combination),
+                // except for the first sample where ema == inst.
+                if let Some(prev) = prev_ema {
+                    let lo = prev.min(inst) - 1e-9;
+                    let hi = prev.max(inst) + 1e-9;
+                    assert!(
+                        (lo..=hi).contains(&ema),
+                        "ema={} not within [{}, {}] (prev_ema={}, inst={})",
+                        ema,
+                        lo,
+                        hi,
+                        prev,
+                        inst
+                    );
+
+                    // growth_rate should be defined when prev != 0
+                    let gr =
+                        SpeedSampler::growth_rate(prev, ema).expect("growth_rate should be Some");
+                    assert!(gr.is_finite());
+                } else {
+                    // growth_rate(None) case: prev == 0
+                    assert!(SpeedSampler::growth_rate(0.0, ema).is_none());
+                }
+
+                prev_ema = Some(ema);
+                sample_count += 1;
+                last_sample_check = Instant::now();
+            }
+        }
+
+        // Flush any remaining accumulated bytes in a final sample.
+        let (inst, ema) = sampler.sample(&mut bytes);
+        info!("final speed: inst={:.2} B/s, ema={:.2} B/s", inst, ema);
+        assert!(inst >= 0.0);
+        assert!(ema >= 0.0);
+
+        // We expect to have sampled multiple times given the per-chunk delay.
+        assert!(
+            sample_count >= 2,
+            "expected at least 2 samples, got {}",
+            sample_count
+        );
+    }
+}

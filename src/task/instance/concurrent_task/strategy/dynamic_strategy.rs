@@ -1,6 +1,7 @@
 use super::{Strategy, StrategyAction};
 use crate::task::{RunnerId, instance::concurrent_task::DEFAULT_MAX_CONCURRENCY};
 
+#[derive(Debug)]
 enum DynamicPlannerStage {
     QuickStart,
     Normal,
@@ -17,9 +18,9 @@ pub struct DynamicStrategy {
 impl Default for DynamicStrategy {
     fn default() -> Self {
         Self {
-            threashold1: 10.0,
+            threashold1: 1024.0 * 1024.0,
             // 1MB/s minimum speed threashold
-            threashold2: 1024.0 * 8.0,
+            threashold2: 1024.0 * 1024.0,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
             current_stage: DynamicPlannerStage::QuickStart,
             previous_total_download_speed: 0.0,
@@ -45,6 +46,7 @@ impl DynamicStrategy {
     }
 }
 
+#[derive(Debug)]
 pub struct DynamicStrategyContext {
     /// the total download speed of the task
     pub speed: f64,
@@ -60,6 +62,12 @@ impl Strategy for DynamicStrategy {
     type Context = DynamicStrategyContext;
 
     fn step(&mut self, context: &Self::Context) -> Vec<StrategyAction> {
+        tracing::trace!(
+            "Strategy context {:?}, current stage {:?}",
+            context,
+            self.current_stage
+        );
+
         let mut result = Vec::new();
         let total_download_speed = context.speed;
         while result.is_empty() {
