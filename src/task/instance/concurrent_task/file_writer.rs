@@ -3,13 +3,19 @@
 //! Use memmap to write random access file,
 //! and use seek write to write the file in large file.
 
+#[cfg(feature = "compio")]
+mod compio;
 mod mmap;
 mod pool;
 
-use std::{ops::Range, path::Path, sync::Arc};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use bytes::Bytes;
-use fs_err::OpenOptions;
+use fs_err::{File, OpenOptions};
 
 use self::{
     mmap::{MmapWriter, MmapWriterBuilder},
@@ -57,6 +63,8 @@ trait FileWriterCapability {
 pub enum FileRangeWriterImpl {
     Mmap(MmapWriter),
     Pool(PoolWriter),
+    #[cfg(feature = "compio")]
+    Compio(self::compio::CompioWriter),
 }
 
 impl FileRangeWriter for Arc<FileRangeWriterImpl> {
@@ -64,6 +72,8 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
         match &**self {
             FileRangeWriterImpl::Mmap(writer) => writer.write_range(range, data).await,
             FileRangeWriterImpl::Pool(writer) => writer.write_range(range, data).await,
+            #[cfg(feature = "compio")]
+            FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
         }
     }
 
@@ -86,6 +96,8 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
 pub enum FileRangeWriterKind {
     Mmap,
     Pool,
+    #[cfg(feature = "compio")]
+    Compio,
 }
 
 impl FileRangeWriterKind {
@@ -105,6 +117,22 @@ pub struct Chunk {
     pub data: Bytes,
 }
 
+async fn open_file(path: PathBuf, size: u64) -> Result<File, std::io::Error> {
+    let file = blocking::unblock(move || {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        // Pre-allocate the file size
+        // TODO: make pre-allocation transparent on upper layer
+        file.set_len(size)?;
+        Ok::<_, std::io::Error>(file)
+    })
+    .await?;
+    Ok(file)
+}
+
 #[derive(Clone)]
 pub struct FileWriter {
     pub kind: FileRangeWriterKind,
@@ -114,26 +142,29 @@ pub struct FileWriter {
 impl FileWriter {
     pub async fn new(path: &Path, size: u64) -> Result<Self, std::io::Error> {
         let kind = FileRangeWriterKind::suggest_kind(size);
+        Self::new_with_kind(path, size, kind).await
+    }
+
+    pub async fn new_with_kind(
+        path: &Path,
+        size: u64,
+        kind: FileRangeWriterKind,
+    ) -> Result<Self, std::io::Error> {
         let path = path.to_path_buf();
-        let file = blocking::unblock(move || {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(path)?;
-            // Pre-allocate the file size
-            // TODO: make pre-allocation transparent on upper layer
-            file.set_len(size)?;
-            Ok::<_, std::io::Error>(file)
-        })
-        .await?;
 
         let inner = match kind {
             FileRangeWriterKind::Mmap => {
+                let file = open_file(path, size).await?;
                 FileRangeWriterImpl::Mmap(MmapWriterBuilder::new().file(file).build().await?)
             }
             FileRangeWriterKind::Pool => {
+                let file = open_file(path, size).await?;
                 FileRangeWriterImpl::Pool(PoolWriterBuilder::new().file(file).build()?)
+            }
+            #[cfg(feature = "compio")]
+            FileRangeWriterKind::Compio => {
+                use self::compio::CompioWriterBuilder;
+                FileRangeWriterImpl::Compio(CompioWriterBuilder::new().path(path).build().await?)
             }
         };
         Ok(Self {
