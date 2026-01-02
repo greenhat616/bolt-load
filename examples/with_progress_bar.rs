@@ -1,21 +1,15 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Instant,
-};
+use std::time::Instant;
 
 use bolt_load::{
     adapter::{
-        AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError,
+        BoltLoadAdapter,
+        tests::{SimpleTestAdapter, calculate_blake3},
     },
     runtime::ThreadedRuntimeImpl,
     task::{DownloadMode, TaskBuilder},
 };
-use bytes::Bytes;
-use opentelemetry::{Key, KeyValue, Value, global};
-use opentelemetry_otlp::{ExportConfig, WithExportConfig};
+use opentelemetry::{KeyValue, global};
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     Resource,
     metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
@@ -23,9 +17,7 @@ use opentelemetry_sdk::{
 };
 use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
-    attribute::{
-        DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_NAME, SERVICE_VERSION, VCS_REF_BASE_REVISION,
-    },
+    attribute::{SERVICE_NAME, SERVICE_VERSION},
 };
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
@@ -125,213 +117,6 @@ pub async fn init_telemetry() -> OtelGuard {
     }
 }
 
-/// Calculate blake3 hash of the content
-#[cfg_attr(feature = "tracing", tracing::instrument(skip(content), ret))]
-pub fn calculate_blake3(content: &[u8]) -> String {
-    let hash = blake3::hash(content);
-    hash.to_hex().to_string()
-}
-
-/// Creates a deterministic test content with specified size for hash verification
-#[cfg_attr(feature = "tracing", tracing::instrument)]
-pub fn create_deterministic_content(size: usize) -> Vec<u8> {
-    let mut content = Vec::with_capacity(size);
-    let mut counter = 0u64;
-
-    unsafe {
-        let ptr: *mut u8 = content.as_mut_ptr();
-        let mut offset = 0;
-
-        while offset + 8 <= size {
-            std::ptr::write_unaligned(ptr.add(offset) as *mut u64, counter.to_le());
-            offset += 8;
-            counter += 1;
-        }
-
-        if offset < size {
-            let bytes = counter.to_le_bytes();
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), size - offset);
-        }
-
-        content.set_len(size);
-    }
-
-    content
-}
-
-/// Simple test adapter for testing Task and TaskBuilder
-#[derive(Clone, derive_more::Debug)]
-pub struct SimpleTestAdapter {
-    #[debug(ignore)]
-    content: Arc<Vec<u8>>,
-    expected_hash: String,
-    support_range: bool,
-    should_fail: bool,
-    chunk_size: usize,
-    call_count: Arc<AtomicUsize>,
-    filename: Option<String>,
-}
-
-impl SimpleTestAdapter {
-    pub fn clone_reset_count(&self) -> Self {
-        Self {
-            content: self.content.clone(),
-            expected_hash: self.expected_hash.clone(),
-            support_range: self.support_range,
-            should_fail: self.should_fail,
-            chunk_size: self.chunk_size,
-            call_count: Arc::new(AtomicUsize::new(0)),
-            filename: self.filename.clone(),
-        }
-    }
-
-    /// Create a new test adapter with deterministic content
-    #[cfg_attr(feature = "tracing", tracing::instrument)]
-    pub fn new(size: usize) -> Self {
-        let content = create_deterministic_content(size);
-        let expected_hash = calculate_blake3(&content);
-
-        Self {
-            content: Arc::new(content),
-            expected_hash,
-            support_range: true,
-            should_fail: false,
-            chunk_size: 8192, // 8KB chunks by default
-            call_count: Arc::new(AtomicUsize::new(0)),
-            filename: Some("test_file.bin".to_string()),
-        }
-    }
-
-    /// Create large test content (100MB)
-    pub fn new_large() -> Self {
-        Self::new(100 * 1024 * 1024) // 100MB
-    }
-
-    /// Configure range support
-    pub fn with_range_support(mut self, support: bool) -> Self {
-        self.support_range = support;
-        self
-    }
-
-    /// Configure failure simulation
-    pub fn with_failure(mut self, should_fail: bool) -> Self {
-        self.should_fail = should_fail;
-        self
-    }
-
-    /// Configure filename
-    pub fn with_filename(mut self, filename: String) -> Self {
-        self.filename = Some(filename);
-        self
-    }
-
-    /// Configure chunk size
-    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.chunk_size = chunk_size;
-        self
-    }
-
-    /// Get expected hash for verification
-    pub fn expected_hash(&self) -> &str {
-        &self.expected_hash
-    }
-
-    /// Get call count
-    pub fn call_count(&self) -> usize {
-        self.call_count.load(Ordering::Relaxed)
-    }
-}
-
-#[async_trait::async_trait]
-impl BoltLoadAdapter for SimpleTestAdapter {
-    async fn is_range_stream_available(&self) -> bool {
-        info!(
-            "[TEST ADAPTER] is_range_stream_available() called, returning: {}",
-            self.support_range
-        );
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-        self.support_range
-    }
-
-    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
-        info!("[TEST ADAPTER] retrieve_meta() called");
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-
-        if self.should_fail {
-            info!("[TEST ADAPTER] retrieve_meta() returning failure");
-            return Err(UnretryableError::Internal(
-                "Simulated meta retrieval failure".to_string(),
-            ));
-        }
-
-        info!(
-            "[TEST ADAPTER] retrieve_meta() success, size: {}",
-            self.content.len()
-        );
-
-        Ok(BoltLoadAdapterMeta {
-            content_size: self.content.len() as u64,
-            filename: self.filename.clone(),
-        })
-    }
-
-    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
-        info!(
-            "[TEST ADAPTER] full_stream() called, content size: {}",
-            self.content.len()
-        );
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-
-        if self.should_fail {
-            info!("[TEST ADAPTER] full_stream() returning failure");
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Simulated stream failure".to_string(),
-            )));
-        }
-
-        let content = self.content.clone();
-        let chunk_size = self.chunk_size;
-        info!(
-            "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
-            chunk_size
-        );
-        let stream = async_stream::stream! {
-            for chunk in content.chunks(chunk_size) {
-                yield Ok(Bytes::from(chunk.to_vec()));
-            }
-        };
-        Ok(Box::pin(stream))
-    }
-
-    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
-        self.call_count.fetch_add(1, Ordering::Relaxed);
-
-        if self.should_fail {
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Simulated range stream failure".to_string(),
-            )));
-        }
-
-        if !self.support_range {
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Range requests not supported".to_string(),
-            )));
-        }
-
-        let start = start as usize;
-        let end = end as usize;
-        let content = self.content[start..end.min(self.content.len())].to_vec();
-        let chunk_size = self.chunk_size;
-
-        let stream = async_stream::stream! {
-            for chunk in content.chunks(chunk_size) {
-                yield Ok(Bytes::from(chunk.to_vec()));
-            }
-        };
-        Ok(Box::pin(stream))
-    }
-}
-
 pub async fn init_tracing(opentelemetry_ptr: &mut *mut OtelGuard) {
     let current_crate = env!("CARGO_CRATE_NAME");
     let has_arg_spans = std::env::args().any(|arg| arg == "--spans");
@@ -393,7 +178,7 @@ async fn test_concurrent_vs_singleton_performance() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
 
-    // Set up adapters
+    // Set up adapters using library's SimpleTestAdapter
     let adapter1 = SimpleTestAdapter::new(file_size).with_range_support(true);
     info!("adapter1: {:?}", adapter1);
     let adapter2 = adapter1.clone_reset_count().with_range_support(false);
@@ -492,6 +277,9 @@ async fn test_concurrent_vs_singleton_performance() {
         "Concurrent file hash should be correct"
     );
     info!("  - Both modes completed successfully with matching hashes");
+
+    // Keep adapter2 for potential future use
+    let _ = adapter2;
 }
 
 fn main() {

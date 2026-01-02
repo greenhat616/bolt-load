@@ -833,12 +833,20 @@ async fn test_concurrent_vs_singleton_performance() {
 #[n0_tracing_test::traced_test]
 async fn test_concurrent_performance_only() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
+    let per_stream_speed = 10 * 1024 * 1024; // 10MB/s per stream
+    let max_speed = per_stream_speed * 10; // 100MB/s total speed
     let temp_dir = TempDir::new().unwrap();
 
     // Set up adapter with range support for concurrent downloading
-    let adapter = SimpleTestAdapter::new(file_size)
-        .with_range_support(true)
-        .with_delay_per_chunk(std::time::Duration::from_millis(10));
+    // Use max_per_stream_speed to simulate slow downloads (equivalent to ~10ms delay per 8KB chunk)
+    use crate::adapter::tests::SimpleTestAdapterBuilder;
+    let adapter = SimpleTestAdapterBuilder::new()
+        .content_size(file_size)
+        .support_range(true)
+        .max_per_stream_speed(per_stream_speed)
+        .max_speed(max_speed)
+        .build()
+        .expect("Failed to build adapter");
     info!("adapter: {:?}", adapter);
 
     // Test concurrent mode

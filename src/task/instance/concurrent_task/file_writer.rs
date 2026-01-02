@@ -43,6 +43,7 @@ pub enum FileWriterError {
 }
 
 #[enum_dispatch::enum_dispatch(FileRangeWriterImpl)]
+#[allow(async_fn_in_trait)] // Only for benchmarking and advanced usage
 pub trait FileRangeWriter {
     /// Write data to file
     ///

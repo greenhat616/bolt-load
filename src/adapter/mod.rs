@@ -131,21 +131,22 @@ pub type AnyAdapter = Box<dyn BoltLoadAdapter + Send>;
 // pub trait BoltLoaderAdapterAnyStream =
 //     BoltLoadAdapter<Box<dyn Stream<Item = Vec<u8>> + Send>, Vec<u8>>;
 
-#[cfg(test)]
+/// Test utilities module - available under `test` feature or during cargo test
+#[cfg(any(test, feature = "test"))]
 pub mod tests {
     use std::{
         io::{BufWriter, Seek, Write},
+        num::NonZeroU32,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
     };
 
-    use axum::response::IntoResponse;
     use bytes::Bytes;
+    use governor::{Quota, RateLimiter};
     use rand::Rng;
     use tempfile::tempfile;
-    use tokio::{io::AsyncSeekExt, net::TcpListener};
 
     use super::*;
     use crate::utils::logging::*;
@@ -185,10 +186,148 @@ pub mod tests {
     }
 
     /// Simple test adapter for testing Task and TaskBuilder
+    #[derive(Clone, Debug)]
+    pub struct SimpleTestAdapterBuilder {
+        content_size: Option<usize>,
+        support_range: Option<bool>,
+        should_fail: Option<bool>,
+        chunk_size: Option<usize>,
+        filename: Option<String>,
+        max_speed: Option<u64>,
+        max_per_stream_speed: Option<u64>,
+    }
+
+    pub type GlobalRateLimiter = Arc<
+        RateLimiter<
+            governor::state::direct::NotKeyed,
+            governor::state::InMemoryState,
+            governor::clock::DefaultClock,
+        >,
+    >;
+
+    impl Default for SimpleTestAdapterBuilder {
+        fn default() -> Self {
+            Self {
+                content_size: None,
+                support_range: None,
+                should_fail: None,
+                chunk_size: None,
+                filename: Some("test_file.bin".to_string()),
+                max_speed: None,
+                max_per_stream_speed: None,
+            }
+        }
+    }
+
+    /// Build error type for SimpleTestAdapterBuilder
+    #[derive(Debug, Clone, thiserror::Error)]
+    #[error("content size is not set")]
+    pub struct SimpleTestAdapterBuildError;
+
+    impl SimpleTestAdapterBuilder {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn large() -> Self {
+            Self {
+                content_size: Some(100 * 1024 * 1024), // 100MB
+                ..Self::default()
+            }
+        }
+
+        pub fn large_with_range_support() -> Self {
+            Self {
+                content_size: Some(100 * 1024 * 1024), // 100MB
+                support_range: Some(true),
+                ..Self::default()
+            }
+        }
+
+        pub fn content_size(mut self, content_size: usize) -> Self {
+            self.content_size = Some(content_size);
+            self
+        }
+
+        pub fn support_range(mut self, support_range: bool) -> Self {
+            self.support_range = Some(support_range);
+            self
+        }
+
+        pub fn should_fail(mut self, should_fail: bool) -> Self {
+            self.should_fail = Some(should_fail);
+            self
+        }
+
+        pub fn chunk_size(mut self, chunk_size: usize) -> Self {
+            self.chunk_size = Some(chunk_size);
+            self
+        }
+
+        pub fn filename(mut self, filename: String) -> Self {
+            self.filename = Some(filename);
+            self
+        }
+
+        pub fn without_filename(mut self) -> Self {
+            self.filename = None;
+            self
+        }
+
+        pub fn max_speed(mut self, max_speed: u64) -> Self {
+            self.max_speed = Some(max_speed);
+            self
+        }
+
+        pub fn max_per_stream_speed(mut self, max_per_stream_speed: u64) -> Self {
+            self.max_per_stream_speed = Some(max_per_stream_speed);
+            self
+        }
+
+        #[cfg_attr(feature = "tracing", tracing::instrument)]
+        pub fn build(self) -> Result<SimpleTestAdapter, SimpleTestAdapterBuildError> {
+            let Some(content_size) = self.content_size else {
+                return Err(SimpleTestAdapterBuildError);
+            };
+            let content = create_deterministic_content(content_size);
+            let expected_hash = calculate_blake3(&content);
+            let chunk_size = self.chunk_size.unwrap_or(8192);
+            let rate_limiter = self.max_speed.map(|speed| {
+                Arc::new(RateLimiter::direct(
+                    Quota::per_second(
+                        NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32"))
+                            .expect("speed must be non-zero"),
+                    )
+                    .allow_burst(
+                        NonZeroU32::new(
+                            chunk_size
+                                .try_into()
+                                .expect("chunk size must be lossless to u32"),
+                        )
+                        .expect("chunk size must be non-zero"),
+                    ),
+                ))
+            });
+
+            Ok(SimpleTestAdapter {
+                content: Bytes::from(content),
+                expected_hash,
+                support_range: self.support_range.unwrap_or(false),
+                should_fail: self.should_fail.unwrap_or(false),
+                chunk_size,
+                call_count: Arc::new(AtomicUsize::new(0)),
+                filename: self.filename,
+                rate_limiter,
+                max_per_stream_speed: self.max_per_stream_speed,
+            })
+        }
+    }
+
+    /// Simple test adapter for testing Task and TaskBuilder
     #[derive(Clone, derive_more::Debug)]
     pub struct SimpleTestAdapter {
         #[debug(ignore)]
-        content: Arc<Vec<u8>>,
+        content: Bytes,
         expected_hash: String,
         support_range: bool,
         should_fail: bool,
@@ -196,10 +335,26 @@ pub mod tests {
         call_count: Arc<AtomicUsize>,
         filename: Option<String>,
         #[debug(ignore)]
-        delay_per_chunk: Option<std::time::Duration>,
+        rate_limiter: Option<GlobalRateLimiter>,
+        /// the speed of the stream in bytes per second
+        max_per_stream_speed: Option<u64>,
     }
 
     impl SimpleTestAdapter {
+        /// Create a new test adapter with deterministic content
+        pub fn new(size: usize) -> Self {
+            SimpleTestAdapterBuilder::new()
+                .content_size(size)
+                .build()
+                .expect("Failed to build SimpleTestAdapter")
+        }
+
+        /// Create large test content (100MB)
+        pub fn new_large() -> Self {
+            SimpleTestAdapterBuilder::large().build().unwrap()
+        }
+
+        /// Clone and reset call count - useful for creating multiple adapters with same content
         pub fn clone_reset_count(&self) -> Self {
             Self {
                 content: self.content.clone(),
@@ -209,31 +364,9 @@ pub mod tests {
                 chunk_size: self.chunk_size,
                 call_count: Arc::new(AtomicUsize::new(0)),
                 filename: self.filename.clone(),
-                delay_per_chunk: self.delay_per_chunk.clone(),
+                rate_limiter: self.rate_limiter.clone(),
+                max_per_stream_speed: self.max_per_stream_speed,
             }
-        }
-
-        /// Create a new test adapter with deterministic content
-        #[cfg_attr(feature = "tracing", tracing::instrument)]
-        pub fn new(size: usize) -> Self {
-            let content = create_deterministic_content(size);
-            let expected_hash = calculate_blake3(&content);
-
-            Self {
-                content: Arc::new(content),
-                expected_hash,
-                support_range: true,
-                should_fail: false,
-                chunk_size: 8192, // 8KB chunks by default
-                call_count: Arc::new(AtomicUsize::new(0)),
-                filename: Some("test_file.bin".to_string()),
-                delay_per_chunk: None,
-            }
-        }
-
-        /// Create large test content (100MB)
-        pub fn new_large() -> Self {
-            Self::new(100 * 1024 * 1024) // 100MB
         }
 
         /// Configure range support
@@ -270,10 +403,9 @@ pub mod tests {
             self.call_count.load(Ordering::Relaxed)
         }
 
-        /// Configure delay per chunk
-        pub fn with_delay_per_chunk(mut self, delay: std::time::Duration) -> Self {
-            self.delay_per_chunk = Some(delay);
-            self
+        /// Get content reference
+        pub fn content(&self) -> &Bytes {
+            &self.content
         }
     }
 
@@ -325,26 +457,34 @@ pub mod tests {
             }
 
             let content = self.content.clone();
-            let chunk_size = self.chunk_size;
-            let delay_per_chunk = self.delay_per_chunk.clone();
+            let chunk_size = NonZeroU32::new(self.chunk_size as u32).unwrap();
+            let rate_limiter = self.rate_limiter.clone();
+            let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
+                let quota = Quota::per_second(
+                    NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32"))
+                        .unwrap(),
+                )
+                .allow_burst(chunk_size);
+                Arc::new(RateLimiter::direct(quota))
+            });
 
             info!(
                 "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
                 chunk_size
             );
             let stream = async_stream::stream! {
-                if let Some(delay) = delay_per_chunk {
-                    let mut interval = tokio::time::interval(delay);
-                    for chunk in content.chunks(chunk_size) {
-                        interval.tick().await;
-                        yield Ok(Bytes::from(chunk.to_vec()));
+                for chunk in content.chunks(chunk_size.get() as usize) {
+                    let chunk_len = NonZeroU32::new(chunk.len() as u32).unwrap();
+                    if let Some(rate_limiter) = rate_limiter.clone() {
+                        rate_limiter.until_n_ready(chunk_len).await.unwrap();
                     }
-                } else {
-                    for chunk in content.chunks(chunk_size) {
-                        yield Ok(Bytes::from(chunk.to_vec()));
+                    if let Some(stream_rate_limiter) = stream_rate_limiter.clone() {
+                        stream_rate_limiter.until_n_ready(chunk_len).await.unwrap();
                     }
+                    yield Ok(Bytes::from(chunk.to_vec()));
                 }
             };
+
             Ok(Box::pin(stream))
         }
 
@@ -365,28 +505,37 @@ pub mod tests {
 
             let start = start as usize;
             let end = end as usize;
-            let content = self.content[start..end.min(self.content.len())].to_vec();
-            let chunk_size = self.chunk_size;
-            let delay_per_chunk = self.delay_per_chunk.clone();
+            let content = self.content.slice(start..end.min(self.content.len()));
+            let chunk_size = NonZeroU32::new(self.chunk_size as u32).unwrap();
+            let rate_limiter = self.rate_limiter.clone();
+            let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
+                let quota = Quota::per_second(
+                    NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32"))
+                        .unwrap(),
+                )
+                .allow_burst(chunk_size);
+                Arc::new(RateLimiter::direct(quota))
+            });
 
             let stream = async_stream::stream! {
-                if let Some(delay) = delay_per_chunk {
-                    let mut interval = tokio::time::interval(delay);
-                    for chunk in content.chunks(chunk_size) {
-                        interval.tick().await;
-                        yield Ok(Bytes::from(chunk.to_vec()));
+                for chunk in content.chunks(chunk_size.get() as usize) {
+                    let chunk_len = NonZeroU32::new(chunk.len() as u32).unwrap();
+                    if let Some(rate_limiter) = rate_limiter.clone() {
+                        rate_limiter.until_n_ready(chunk_len).await.unwrap();
                     }
-                } else {
-                    for chunk in content.chunks(chunk_size) {
-                        yield Ok(Bytes::from(chunk.to_vec()));
+                    if let Some(stream_rate_limiter) = stream_rate_limiter.clone() {
+                        stream_rate_limiter.until_n_ready(chunk_len).await.unwrap();
                     }
+                    yield Ok(Bytes::from(chunk.to_vec()));
                 }
             };
+
             Ok(Box::pin(stream))
         }
     }
 
-    pub fn create_random_file(size: usize) -> anyhow::Result<std::fs::File> {
+    /// Create a random file with given size, useful for testing
+    pub fn create_random_file(size: usize) -> std::io::Result<std::fs::File> {
         let mut file = tempfile()?;
         let mut writer = BufWriter::new(file.try_clone()?);
         let mut rng = rand::rng();
@@ -403,85 +552,95 @@ pub mod tests {
         Ok(file)
     }
 
-    #[derive(Clone)]
-    struct FileHolder(Arc<tokio::sync::Mutex<tokio::fs::File>>);
+    // Re-export from unit tests module for other test modules
+    #[cfg(test)]
+    pub use simple_test_adapter_tests::create_http_server;
 
-    pub async fn create_http_server() -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
-        use axum::extract::State;
-        use axum_extra::TypedHeader;
-
-        let file = tokio::task::spawn_blocking(|| create_random_file(1024 * 1024)).await??;
-        let holder = FileHolder(Arc::new(tokio::sync::Mutex::new(
-            tokio::fs::File::from_std(file),
-        )));
-        let port = portpicker::pick_unused_port()
-            .ok_or(anyhow::anyhow!("Failed to pick an unused port"))?;
-        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-
-        /// a handler send without range
-        async fn no_range_handler(
-            State(holder): State<FileHolder>,
-        ) -> impl axum::response::IntoResponse {
-            let mut file = holder.0.lock().await;
-            match file.seek(std::io::SeekFrom::Start(0)).await {
-                Ok(_) => {
-                    let file_size = file.metadata().await.unwrap().len();
-                    let reader = tokio_util::io::ReaderStream::new(file.try_clone().await.unwrap());
-                    let body = axum::body::Body::from_stream(reader);
-                    let headers = [
-                        (
-                            axum::http::header::CONTENT_TYPE,
-                            "text/plain; charset=utf-8",
-                        ),
-                        (axum::http::header::CONTENT_LENGTH, &format!("{file_size}")),
-                        (
-                            axum::http::header::CONTENT_DISPOSITION,
-                            "attachment; filename=\"test.txt\"",
-                        ),
-                    ];
-                    (headers, body).into_response()
-                }
-                Err(e) => (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    e.to_string().into_response(),
-                )
-                    .into_response(),
-            }
-        }
-
-        /// a handler mock range stream
-        async fn range_handler(
-            State(holder): State<FileHolder>,
-            range: Option<TypedHeader<axum_extra::headers::Range>>,
-        ) -> impl axum::response::IntoResponse {
-            let file = holder.0.lock().await;
-            let mut file_cloned = file.try_clone().await.unwrap();
-            file_cloned.seek(std::io::SeekFrom::Start(0)).await.unwrap();
-            let body = axum_range::KnownSize::file(file_cloned).await.unwrap();
-            let range = range.map(|TypedHeader(range)| range);
-            let ranged = axum_range::Ranged::new(range, body);
-            ranged.into_response()
-        }
-
-        let app = axum::Router::new()
-            .route("/no_range", axum::routing::get(no_range_handler))
-            .route("/range", axum::routing::get(range_handler))
-            .with_state(holder);
-
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
-                .await
-                .unwrap()
-        });
-
-        Ok((port, handle))
-    }
-
+    // Unit tests - only available during cargo test
+    #[cfg(test)]
     mod simple_test_adapter_tests {
         use futures::StreamExt;
         use pretty_assertions::assert_eq;
+        use tokio::net::TcpListener;
 
         use super::*;
+
+        #[derive(Clone)]
+        struct FileHolder(Arc<tokio::sync::Mutex<tokio::fs::File>>);
+
+        #[allow(dead_code)]
+        pub async fn create_http_server() -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+            use axum::{extract::State, response::IntoResponse};
+            use axum_extra::TypedHeader;
+            use tokio::io::AsyncSeekExt;
+
+            let file = tokio::task::spawn_blocking(|| create_random_file(1024 * 1024)).await??;
+            let holder = FileHolder(Arc::new(tokio::sync::Mutex::new(
+                tokio::fs::File::from_std(file),
+            )));
+            let port = portpicker::pick_unused_port()
+                .ok_or(anyhow::anyhow!("Failed to pick an unused port"))?;
+            let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+
+            /// a handler send without range
+            async fn no_range_handler(
+                State(holder): State<FileHolder>,
+            ) -> impl axum::response::IntoResponse {
+                let mut file = holder.0.lock().await;
+                match file.seek(std::io::SeekFrom::Start(0)).await {
+                    Ok(_) => {
+                        let file_size = file.metadata().await.unwrap().len();
+                        let reader =
+                            tokio_util::io::ReaderStream::new(file.try_clone().await.unwrap());
+                        let body = axum::body::Body::from_stream(reader);
+                        let headers = [
+                            (
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; charset=utf-8",
+                            ),
+                            (axum::http::header::CONTENT_LENGTH, &format!("{file_size}")),
+                            (
+                                axum::http::header::CONTENT_DISPOSITION,
+                                "attachment; filename=\"test.txt\"",
+                            ),
+                        ];
+                        (headers, body).into_response()
+                    }
+                    Err(e) => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        e.to_string().into_response(),
+                    )
+                        .into_response(),
+                }
+            }
+
+            /// a handler mock range stream
+            async fn range_handler(
+                State(holder): State<FileHolder>,
+                range: Option<TypedHeader<axum_extra::headers::Range>>,
+            ) -> impl axum::response::IntoResponse {
+                let file = holder.0.lock().await;
+                let mut file_cloned = file.try_clone().await.unwrap();
+                file_cloned.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+                let body = axum_range::KnownSize::file(file_cloned).await.unwrap();
+                let range = range.map(|TypedHeader(range)| range);
+                let ranged = axum_range::Ranged::new(range, body);
+                ranged.into_response()
+            }
+
+            let app = axum::Router::new()
+                .route("/no_range", axum::routing::get(no_range_handler))
+                .route("/range", axum::routing::get(range_handler))
+                .with_state(holder);
+
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app.into_make_service())
+                    .await
+                    .unwrap()
+            });
+
+            Ok((port, handle))
+        }
 
         #[tokio::test]
         #[n0_tracing_test::traced_test]
@@ -679,7 +838,9 @@ pub mod tests {
         #[tokio::test]
         #[n0_tracing_test::traced_test]
         async fn test_large_adapter() {
-            let adapter = SimpleTestAdapter::new_large();
+            let adapter = SimpleTestAdapterBuilder::large_with_range_support()
+                .build()
+                .unwrap();
             let expected_size = 100 * 1024 * 1024; // 100MB
 
             assert_eq!(adapter.content.len(), expected_size);
@@ -794,7 +955,7 @@ pub mod tests {
         #[tokio::test]
         #[n0_tracing_test::traced_test]
         async fn test_concurrent_access() {
-            let adapter = SimpleTestAdapter::new(1024);
+            let adapter = SimpleTestAdapter::new(1024).with_range_support(true);
             let adapter = Arc::new(adapter);
 
             // Test concurrent access doesn't cause issues

@@ -80,15 +80,19 @@ mod test {
         utils::logging::*,
     };
     #[tokio::test(flavor = "multi_thread")]
+    #[n0_tracing_test::traced_test]
     async fn test_speed_sampler() {
-        crate::utils::test::init_tracing().await;
-
         let file_size = 1024 * 1024; // 1MB for reasonable test time
 
         // Set up adapter with range support for concurrent downloading
-        let adapter = SimpleTestAdapter::new(file_size)
-            .with_range_support(true)
-            .with_delay_per_chunk(std::time::Duration::from_millis(10));
+        // Use max_per_stream_speed to simulate slow downloads (equivalent to ~10ms delay per 8KB chunk)
+        use crate::adapter::tests::SimpleTestAdapterBuilder;
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(file_size)
+            .support_range(true)
+            .max_per_stream_speed(819200) // ~800KB/s per stream
+            .build()
+            .expect("Failed to build adapter");
         info!("adapter: {:?}", adapter);
         let mut stream = adapter
             .full_stream()

@@ -32,6 +32,19 @@ compio = ["dep:compio"]
 
 tracing = ["dep:tracing"]
 
+# test utilities - expose test adapters and helpers for examples and downstream crates
+test = [
+    "dep:async-stream",
+    "dep:governor",
+    "dep:blake3",
+    "dep:rand",
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:axum-range",
+    "dep:portpicker",
+    "dep:tokio-util",
+]
+
 [lib]
 doctest = false
 name = "bolt_load"
@@ -112,6 +125,17 @@ indicatif = { version = "0.18", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = "0.61"
 
+# Optional dependencies for test feature
+async-stream = { version = "0.3", optional = true }
+governor = { version = "0.10.4", optional = true }  # for rate limiting
+rand = { version = "0.9", optional = true }
+blake3 = { version = "1", optional = true }
+axum = { version = "0.8.8", optional = true }
+axum-extra = { version = "0.12.5", features = ["typed-header"], optional = true }
+axum-range = { version = "1.0.0", optional = true }
+portpicker = { version = "0.1", optional = true }
+tokio-util = { version = "0.7", optional = true }
+
 [dev-dependencies]
 pretty_assertions = "1"
 n0-tracing-test = { version = "0.3.0", features = ["pretty-log-printing"] }
@@ -121,6 +145,7 @@ anyhow = "1"
 
 # for stream test
 async-stream = "0.3"
+governor = "0.10.4"  # for rate limiting
 
 # for generate a random file
 rand = "0.9"
@@ -153,3 +178,11 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 [[bench]]
 name = "file_writer"
 harness = false
+
+[[example]]
+name = "bench_concurrent_and_singleton"
+required-features = ["test"]
+
+[[example]]
+name = "with_progress_bar"
+required-features = ["test"]

@@ -980,8 +980,10 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_success() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(10240).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
         let range = 1000u64..3000u64;
         let runner_id = 1;
         let (_control_tx, control_rx) =
@@ -1036,7 +1038,7 @@ mod tests {
         assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
 
         // 验证数据的确定性 - 创建相同的适配器获取相同范围的数据进行比较
-        let reference_adapter = SimpleTestAdapter::new(10240);
+        let reference_adapter = SimpleTestAdapter::new(10240).with_range_support(true);
         let reference_stream =
             BoltLoadAdapter::range_stream(&reference_adapter, range.start, range.end)
                 .await
@@ -1096,8 +1098,10 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_cancellation() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(10240).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
         let range = 0u64..5000u64;
         let runner_id = 3;
         let (_control_tx, control_rx) =
@@ -1144,8 +1148,10 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_small_range_runner_with_control_messages() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(10240))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(10240).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
         let old_total = 10240u64;
         let range = 0u64..old_total;
         let runner_id = 4;
@@ -1208,8 +1214,9 @@ mod tests {
     async fn test_create_background_range_runner_edge_ranges() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let content_size = 1000;
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(content_size))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = Arc::new(Box::new(
+            SimpleTestAdapter::new(content_size).with_range_support(true),
+        ) as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
 
         // 测试边界范围：从文件末尾开始
         let range = 900u64..1000u64;
@@ -1259,8 +1266,10 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_zero_length_range() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1000))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(1000).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
 
         // 测试零长度范围
         let range = 500u64..500u64;
@@ -1303,8 +1312,10 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_multiple_runners() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(4000))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(4000).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
 
         // 创建多个并发的范围运行器
         let ranges = vec![
@@ -1402,8 +1413,10 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_hash_verification() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(5000))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(5000).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
         let range = 1500u64..3500u64;
         let runner_id = 7;
         let (_control_tx, control_rx) =
@@ -1445,7 +1458,7 @@ mod tests {
         }
 
         // 使用相同的适配器直接获取相同范围的数据进行比较
-        let reference_adapter = SimpleTestAdapter::new(5000);
+        let reference_adapter = SimpleTestAdapter::new(5000).with_range_support(true);
         let reference_stream =
             BoltLoadAdapter::range_stream(&reference_adapter, range.start, range.end)
                 .await
