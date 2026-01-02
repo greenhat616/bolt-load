@@ -90,7 +90,10 @@ mod test {
             .with_range_support(true)
             .with_delay_per_chunk(std::time::Duration::from_millis(10));
         info!("adapter: {:?}", adapter);
-        let mut stream = adapter.full_stream().await.expect("Failed to get full stream");
+        let mut stream = adapter
+            .full_stream()
+            .await
+            .expect("Failed to get full stream");
 
         let mut sampler = SpeedSampler::new();
         let mut bytes: usize = 0;
