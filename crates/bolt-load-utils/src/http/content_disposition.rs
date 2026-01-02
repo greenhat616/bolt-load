@@ -447,7 +447,7 @@ impl Header for ContentDisposition {
             .ok_or(headers::Error::invalid())
     }
 
-    fn encode<E: Extend<HeaderValue>>(&self, values: &mut E) {
+    fn encode<E: Extend<HeaderValue>>(&self, _values: &mut E) {
         unimplemented!()
     }
 }
