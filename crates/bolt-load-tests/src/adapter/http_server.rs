@@ -33,11 +33,18 @@ struct FileHolder(Arc<tokio::sync::Mutex<tokio::fs::File>>);
 
 #[allow(dead_code)]
 pub async fn create_http_server() -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+    create_http_server_with_file_size(1024 * 1024).await
+}
+
+#[allow(dead_code)]
+pub async fn create_http_server_with_file_size(
+    file_size: usize,
+) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
     use axum::{extract::State, response::IntoResponse};
     use axum_extra::TypedHeader;
     use tokio::io::AsyncSeekExt;
 
-    let file = tokio::task::spawn_blocking(|| create_random_file(1024 * 1024)).await??;
+    let file = tokio::task::spawn_blocking(move || create_random_file(file_size)).await??;
     let holder = FileHolder(Arc::new(tokio::sync::Mutex::new(
         tokio::fs::File::from_std(file),
     )));

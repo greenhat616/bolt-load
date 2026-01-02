@@ -252,17 +252,26 @@ mod test {
 
     #[tokio::test]
     async fn test_get_content_size() {
-        let (port, _) = http_server::create_http_server().await.unwrap();
+        let content_size: u64 = 1024 * 1024;
+        let (port, _) = http_server::create_http_server_with_file_size(content_size as usize)
+            .await
+            .unwrap();
         let url = Url::parse(&format!("http://localhost:{port}/no_range")).unwrap();
         let client = reqwest::Client::new();
         let adapter = client
             .clone()
             .into_reqwest_adapter((reqwest::Method::GET, url));
-        assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
+        assert_eq!(
+            adapter.retrieve_meta().await.unwrap().content_size,
+            content_size
+        );
 
         let url = Url::parse(&format!("http://localhost:{port}/range")).unwrap();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
-        assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
+        assert_eq!(
+            adapter.retrieve_meta().await.unwrap().content_size,
+            content_size
+        );
     }
 
     #[tokio::test]
@@ -299,7 +308,10 @@ mod test {
 
     #[tokio::test]
     async fn test_full_stream() {
-        let (port, _) = http_server::create_http_server().await.unwrap();
+        let content_size: u64 = 1024 * 1024;
+        let (port, _) = http_server::create_http_server_with_file_size(content_size as usize)
+            .await
+            .unwrap();
         let url = Url::parse(&format!("http://localhost:{port}/no_range")).unwrap();
         let client = reqwest::Client::new();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
@@ -308,7 +320,7 @@ mod test {
         while let Some(item) = stream.next().await {
             bytes.extend_from_slice(&item.unwrap());
         }
-        assert_eq!(bytes.len(), 1040384);
+        assert_eq!(bytes.len(), content_size as usize);
     }
 
     #[tokio::test]
