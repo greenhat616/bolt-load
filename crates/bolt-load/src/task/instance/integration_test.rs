@@ -15,7 +15,9 @@
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use bolt_load_tests::adapter::simple::{SimpleTestAdapter, calculate_blake3};
+    use bolt_load_tests::adapter::simple::{
+        SimpleTestAdapter, SimpleTestAdapterBuilder, calculate_blake3,
+    };
     use bolt_load_utils::telemetry::*;
     use smol_cancellation_token::CancellationToken;
     use tempfile::TempDir;
@@ -136,7 +138,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_concurrent_basic_functionality() {
-        let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
+        let simple_adapter = SimpleTestAdapterBuilder::new()
+            .content_size(TEST_FILE_SIZE)
+            .chunk_size(CHUNK_SIZE)
+            .support_range(true)
+            .build()
+            .expect("Failed to build adapter");
         let content_hash = simple_adapter.expected_hash().to_string();
         let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
 

@@ -153,20 +153,10 @@ impl SimpleTestAdapterBuilder {
         let expected_hash = calculate_blake3(&content);
         let chunk_size = self.chunk_size.unwrap_or(8192);
         let rate_limiter = self.max_speed.map(|speed| {
-            Arc::new(RateLimiter::direct(
-                Quota::per_second(
-                    NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32"))
-                        .expect("speed must be non-zero"),
-                )
-                .allow_burst(
-                    NonZeroU32::new(
-                        chunk_size
-                            .try_into()
-                            .expect("chunk size must be lossless to u32"),
-                    )
-                    .expect("chunk size must be non-zero"),
-                ),
-            ))
+            Arc::new(RateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32"))
+                    .expect("speed must be non-zero"),
+            )))
         });
 
         Ok(SimpleTestAdapter {
@@ -322,8 +312,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
             let quota = Quota::per_second(
                 NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32")).unwrap(),
-            )
-            .allow_burst(chunk_size);
+            );
             Arc::new(RateLimiter::direct(quota))
         });
 
@@ -370,8 +359,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
             let quota = Quota::per_second(
                 NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32")).unwrap(),
-            )
-            .allow_burst(chunk_size);
+            );
             Arc::new(RateLimiter::direct(quota))
         });
 
