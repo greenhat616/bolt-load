@@ -1,13 +1,13 @@
 use std::ops::Range;
 
 use async_channel::{Receiver, Sender};
+use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use fs::File;
 use fs_err as fs;
 use memmap2::MmapMut;
 
 use super::{Chunk, FileRangeWriter, FileWriterCapability, FileWriterError};
-use bolt_load_utils::telemetry::*;
 
 pub struct MmapWriter {
     pub file: File,
