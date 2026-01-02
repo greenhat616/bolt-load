@@ -748,4 +748,281 @@ mod tests {
         // Call count should reflect all the range_stream calls
         assert_eq!(adapter.call_count(), 5);
     }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_global_speed_limit() {
+        use std::time::Instant;
+
+        // Set speed limit to 50KB/s (50 * 1024 bytes per second)
+        let speed_limit = 50 * 1024u64;
+        let content_size = 200 * 1024; // 200KB content
+        let chunk_size = 8192; // 8KB chunks
+
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(content_size)
+            .chunk_size(chunk_size)
+            .max_speed(speed_limit)
+            .build()
+            .unwrap();
+
+        let start_time = Instant::now();
+        let stream = adapter.full_stream().await.unwrap();
+
+        let mut downloaded_size = 0;
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            downloaded_size += chunk.len();
+        }
+
+        let elapsed = start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        // Verify all data was downloaded
+        assert_eq!(downloaded_size, content_size);
+
+        // Calculate actual speed
+        let actual_speed = downloaded_size as f64 / elapsed_secs;
+
+        // Expected minimum time: 200KB / 50KB/s = 4 seconds
+        // We allow for some overhead, so actual speed should be less than speed_limit * 1.3
+        // and greater than speed_limit * 0.7 (to account for burst and timing variance)
+        let min_expected_speed = speed_limit as f64 * 0.7;
+        let max_expected_speed = speed_limit as f64 * 1.3;
+
+        println!(
+            "Speed limit: {} B/s, Actual speed: {:.2} B/s, Elapsed: {:.2}s",
+            speed_limit, actual_speed, elapsed_secs
+        );
+
+        assert!(
+            actual_speed >= min_expected_speed && actual_speed <= max_expected_speed,
+            "Actual speed {:.2} B/s is outside expected range [{:.2}, {:.2}] B/s",
+            actual_speed,
+            min_expected_speed,
+            max_expected_speed
+        );
+    }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_per_stream_speed_limit() {
+        use std::time::Instant;
+
+        // Set per-stream speed limit to 40KB/s
+        let stream_speed_limit = 40 * 1024u64;
+        let content_size = 160 * 1024; // 160KB content
+        let chunk_size = 8192; // 8KB chunks
+
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(content_size)
+            .chunk_size(chunk_size)
+            .max_per_stream_speed(stream_speed_limit)
+            .build()
+            .unwrap();
+
+        let start_time = Instant::now();
+        let stream = adapter.full_stream().await.unwrap();
+
+        let mut downloaded_size = 0;
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            downloaded_size += chunk.len();
+        }
+
+        let elapsed = start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        // Verify all data was downloaded
+        assert_eq!(downloaded_size, content_size);
+
+        // Calculate actual speed
+        let actual_speed = downloaded_size as f64 / elapsed_secs;
+
+        // Expected minimum time: 160KB / 40KB/s = 4 seconds
+        let min_expected_speed = stream_speed_limit as f64 * 0.7;
+        let max_expected_speed = stream_speed_limit as f64 * 1.3;
+
+        println!(
+            "Stream speed limit: {} B/s, Actual speed: {:.2} B/s, Elapsed: {:.2}s",
+            stream_speed_limit, actual_speed, elapsed_secs
+        );
+
+        assert!(
+            actual_speed >= min_expected_speed && actual_speed <= max_expected_speed,
+            "Actual speed {:.2} B/s is outside expected range [{:.2}, {:.2}] B/s",
+            actual_speed,
+            min_expected_speed,
+            max_expected_speed
+        );
+    }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_range_stream_speed_limit() {
+        use std::time::Instant;
+
+        // Test speed limit with range streams
+        let speed_limit = 60 * 1024u64;
+        let content_size = 300 * 1024; // 300KB content
+        let chunk_size = 8192;
+
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(content_size)
+            .chunk_size(chunk_size)
+            .support_range(true)
+            .max_speed(speed_limit)
+            .build()
+            .unwrap();
+
+        // Download a range
+        let start = 50 * 1024u64; // Start at 50KB
+        let end = 200 * 1024u64; // End at 200KB (150KB total)
+        let expected_size = (end - start) as usize;
+
+        let start_time = Instant::now();
+        let stream = adapter.range_stream(start, end).await.unwrap();
+
+        let mut downloaded_size = 0;
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            downloaded_size += chunk.len();
+        }
+
+        let elapsed = start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        // Verify correct range was downloaded
+        assert_eq!(downloaded_size, expected_size);
+
+        // Calculate actual speed
+        let actual_speed = downloaded_size as f64 / elapsed_secs;
+
+        // Expected minimum time: 150KB / 60KB/s = 2.5 seconds
+        let min_expected_speed = speed_limit as f64 * 0.7;
+        let max_expected_speed = speed_limit as f64 * 1.3;
+
+        println!(
+            "Range stream speed limit: {} B/s, Actual speed: {:.2} B/s, Elapsed: {:.2}s",
+            speed_limit, actual_speed, elapsed_secs
+        );
+
+        assert!(
+            actual_speed >= min_expected_speed && actual_speed <= max_expected_speed,
+            "Actual speed {:.2} B/s is outside expected range [{:.2}, {:.2}] B/s",
+            actual_speed,
+            min_expected_speed,
+            max_expected_speed
+        );
+    }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_combined_speed_limits() {
+        use std::time::Instant;
+
+        // Test both global and per-stream speed limits together
+        // The effective limit should be the more restrictive one
+        let global_speed_limit = 80 * 1024u64; // 80KB/s
+        let stream_speed_limit = 50 * 1024u64; // 50KB/s (more restrictive)
+        let content_size = 200 * 1024; // 200KB content
+        let chunk_size = 8192;
+
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(content_size)
+            .chunk_size(chunk_size)
+            .max_speed(global_speed_limit)
+            .max_per_stream_speed(stream_speed_limit)
+            .build()
+            .unwrap();
+
+        let start_time = Instant::now();
+        let stream = adapter.full_stream().await.unwrap();
+
+        let mut downloaded_size = 0;
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            downloaded_size += chunk.len();
+        }
+
+        let elapsed = start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        assert_eq!(downloaded_size, content_size);
+
+        let actual_speed = downloaded_size as f64 / elapsed_secs;
+
+        // When both limits are applied, the more restrictive one (stream_speed_limit) should dominate
+        // However, both will contribute to the delay, so we expect speed closer to stream_speed_limit
+        let min_expected_speed = stream_speed_limit as f64 * 0.5; // More lenient due to combined limits
+        let max_expected_speed = stream_speed_limit as f64 * 1.3;
+
+        println!(
+            "Global limit: {} B/s, Stream limit: {} B/s, Actual speed: {:.2} B/s, Elapsed: {:.2}s",
+            global_speed_limit, stream_speed_limit, actual_speed, elapsed_secs
+        );
+
+        assert!(
+            actual_speed >= min_expected_speed && actual_speed <= max_expected_speed,
+            "Actual speed {:.2} B/s is outside expected range [{:.2}, {:.2}] B/s",
+            actual_speed,
+            min_expected_speed,
+            max_expected_speed
+        );
+    }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_no_speed_limit() {
+        use std::time::Instant;
+
+        // Test that without speed limit, download is fast
+        let content_size = 100 * 1024; // 100KB content
+        let chunk_size = 8192;
+
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(content_size)
+            .chunk_size(chunk_size)
+            .build()
+            .unwrap();
+
+        let start_time = Instant::now();
+        let stream = adapter.full_stream().await.unwrap();
+
+        let mut downloaded_size = 0;
+        let mut stream = std::pin::pin!(stream);
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            downloaded_size += chunk.len();
+        }
+
+        let elapsed = start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+
+        assert_eq!(downloaded_size, content_size);
+
+        // Without speed limit, download should be very fast (typically < 0.1s for 100KB in memory)
+        // We just verify it completes much faster than if there was a 50KB/s limit (which would take 2s)
+        assert!(
+            elapsed_secs < 1.0,
+            "Without speed limit, download took {:.2}s which is too slow",
+            elapsed_secs
+        );
+
+        let actual_speed = downloaded_size as f64 / elapsed_secs;
+        println!(
+            "No speed limit - Actual speed: {:.2} MB/s, Elapsed: {:.4}s",
+            actual_speed / 1024.0 / 1024.0,
+            elapsed_secs
+        );
+    }
 }
