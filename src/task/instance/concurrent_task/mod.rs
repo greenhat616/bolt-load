@@ -34,7 +34,10 @@ use crate::{
 };
 
 mod chunk_planner;
-mod file_writer;
+/// File writer implementations for concurrent downloads.
+///
+/// This module is public for benchmarking purposes.
+pub mod file_writer;
 mod runner_notification;
 mod strategy;
 

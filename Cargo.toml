@@ -150,3 +150,10 @@ opentelemetry-stdout = { version = "0.31", features = [
     "trace",
     "metrics",
 ] }
+
+# for benchmarks
+criterion = { version = "0.6", features = ["async_tokio"] }
+
+[[bench]]
+name = "file_writer"
+harness = false

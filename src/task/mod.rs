@@ -21,7 +21,8 @@ use crate::{
 mod builder;
 #[cfg(test)]
 mod comprehensive_tests;
-mod instance;
+/// Task instance implementations (singleton and concurrent).
+pub mod instance;
 
 pub use builder::*;
 use instance::*;

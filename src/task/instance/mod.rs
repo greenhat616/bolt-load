@@ -9,7 +9,8 @@ use crate::{
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
 };
 
-mod concurrent_task;
+/// Concurrent download task implementation.
+pub mod concurrent_task;
 mod id;
 mod sampler;
 mod singleton_task;

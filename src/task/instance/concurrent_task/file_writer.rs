@@ -6,6 +6,7 @@
 #[cfg(feature = "compio")]
 mod compio;
 mod mmap;
+mod null;
 mod pool;
 
 use std::{
@@ -17,10 +18,11 @@ use std::{
 use bytes::Bytes;
 use fs_err::{File, OpenOptions};
 
-use self::{
-    mmap::{MmapWriter, MmapWriterBuilder},
-    pool::{PoolWriter, PoolWriterBuilder},
-};
+#[cfg(feature = "compio")]
+pub use self::compio::CompioWriterBuilder;
+use self::{mmap::MmapWriter, null::NullWriter, pool::PoolWriter};
+// Re-export builders for benchmarking and advanced usage
+pub use self::{mmap::MmapWriterBuilder, null::NullWriterBuilder, pool::PoolWriterBuilder};
 use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
@@ -38,7 +40,7 @@ pub enum FileWriterError {
 }
 
 #[enum_dispatch::enum_dispatch(FileRangeWriterImpl)]
-pub(crate) trait FileRangeWriter {
+pub trait FileRangeWriter {
     /// Write data to file
     ///
     /// # Errors
@@ -63,6 +65,7 @@ trait FileWriterCapability {
 pub enum FileRangeWriterImpl {
     Mmap(MmapWriter),
     Pool(PoolWriter),
+    Null(NullWriter),
     #[cfg(feature = "compio")]
     Compio(self::compio::CompioWriter),
 }
@@ -72,6 +75,7 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
         match &**self {
             FileRangeWriterImpl::Mmap(writer) => writer.write_range(range, data).await,
             FileRangeWriterImpl::Pool(writer) => writer.write_range(range, data).await,
+            FileRangeWriterImpl::Null(writer) => writer.write_range(range, data).await,
             #[cfg(feature = "compio")]
             FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
         }
@@ -96,6 +100,8 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
 pub enum FileRangeWriterKind {
     Mmap,
     Pool,
+    /// Null writer for benchmarking - discards all data
+    Null,
     #[cfg(feature = "compio")]
     Compio,
 }
@@ -160,6 +166,10 @@ impl FileWriter {
             FileRangeWriterKind::Pool => {
                 let file = open_file(path, size).await?;
                 FileRangeWriterImpl::Pool(PoolWriterBuilder::new().file(file).build()?)
+            }
+            FileRangeWriterKind::Null => {
+                // For null writer, we don't need a file - just create the writer
+                FileRangeWriterImpl::Null(NullWriterBuilder::new().build().await?)
             }
             #[cfg(feature = "compio")]
             FileRangeWriterKind::Compio => {
