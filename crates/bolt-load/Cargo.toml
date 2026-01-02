@@ -1,0 +1,173 @@
+[package]
+name = "bolt-load"
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.85.0" # the first version that supports 2024 edition
+
+[features]
+default = ["tokio", "serde", "tracing", "progressbar", "mmap"]
+http = [
+    "dep:headers",
+    "dep:regex",
+    "dep:language-tags",
+    "dep:percent-encoding",
+    "dep:http",
+]
+# terminal progress
+progressbar = ["dep:indicatif"]
+
+# adapter group
+reqwest = ["bolt-load-adapter/reqwest"]
+ureq2 = ["bolt-load-adapter/ureq2"]
+ureq3 = ["bolt-load-adapter/ureq3"]
+
+serde = ["dep:serde"]
+
+# file writer opts
+mmap = ["dep:memmap2"]
+
+# runtime group
+tokio = ["dep:tokio"]
+smol = ["dep:smol"]
+compio = ["dep:compio"]
+
+tracing = ["dep:tracing", "bolt-load-utils/tracing"]
+
+# test utilities - expose test adapters and helpers for examples and downstream crates
+test = [
+    "dep:async-stream",
+    "dep:governor",
+    "dep:blake3",
+    "dep:rand",
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:axum-range",
+    "dep:portpicker",
+    "dep:tokio-util",
+]
+
+[lib]
+doctest = false
+name = "bolt_load"
+path = "src/lib.rs"
+
+
+[dependencies]
+bolt-load-core = { path = "../bolt-load-core", version = "0.1" }
+bolt-load-adapter = { path = "../bolt-load-adapter", version = "0.1" }
+bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
+
+thiserror = "2"
+async-trait = "0.1"
+futures = { workspace = true }
+futures-concurrency = "7"
+pin-project-lite = "0.2"
+url = "2"
+bytes = "1"
+enum_dispatch = "0.3"
+atomic_enum = "0.3"
+tempfile = "3"
+smol-cancellation-token = "0.1"
+derive_more = { version = "2", features = ["debug"] }
+statig = { version = "0.4.1", features = ["async"] }
+fs-err = "3"                                          # for detailed io error message
+bitvec = "1"                                          # for task id generation
+memmap2 = { version = "0.9", optional = true }        # for better random range write for files if machine is available
+backon = "1"                                          # for retry strategy
+oneshot = { version = "0.1", features = ["async"] }   # for cross runtime oneshot
+async-waitgroup = "0.1.3"                             # for cross runtime wait group
+async-lock = { workspace = true }                     # for cross runtime async lock
+ranges = "0.4"                                        # for range set operation
+async-channel = "2"                                   # for async channel
+async-broadcast = { version = "0.7" }
+async-fs = "2"                                        # for async file operation
+async-io = "2"                                        # for async timer
+blocking = "1"                                        # convert blocking io to async
+
+serde = { version = "1", features = ["derive"], optional = true }
+
+# for http content-disposition parsing
+http = { version = "1", optional = true }
+regex = { version = "1", optional = true }
+language-tags = { version = "0.3", optional = true }
+percent-encoding = { version = "2.3", optional = true }
+# for http headers
+headers = { version = "0.4", optional = true }
+
+# runtime group
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "tracing",
+], optional = true }
+smol = { version = "2", optional = true }
+compio = { version = "0.17", optional = true, default-features = false, features = [
+    "io-uring",
+    "runtime",
+] }
+
+# tracing
+tracing = { version = "0.1", optional = true }
+
+# terminal progress
+indicatif = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = "0.61"
+
+# Optional dependencies for test feature
+async-stream = { version = "0.3", optional = true }
+governor = { version = "0.10.4", optional = true } # for rate limiting
+rand = { version = "0.9", optional = true }
+blake3 = { version = "1", optional = true }
+axum = { version = "0.8.8", optional = true }
+axum-extra = { version = "0.12.5", features = [
+    "typed-header",
+], optional = true }
+axum-range = { version = "1.0.0", optional = true }
+portpicker = { version = "0.1", optional = true }
+tokio-util = { version = "0.7", optional = true }
+
+[dev-dependencies]
+bolt-load-tests = { path = "../bolt-load-tests", version = "0.1" }
+
+pretty_assertions = { workspace = true }
+n0-tracing-test = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+
+# for stream test
+async-stream = "0.3"
+governor = "0.10.4"  # for rate limiting
+
+# for generate a random file
+rand = "0.9"
+
+# for hash verification in tests
+blake3 = "1"
+
+# for http server test
+axum = "0.8.8"
+axum-extra = { version = "0.12.5", features = ["typed-header"] }
+axum-range = "1.0.0"
+
+# Tracing and bench
+tracing-tracy = "0.11"
+console-subscriber = "0.5.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = { version = "0.31", features = [
+    "semconv_experimental",
+] }
+opentelemetry-stdout = { version = "0.31", features = ["trace", "metrics"] }
+
+# for benchmarks
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+[[bench]]
+name = "file_writer"
+harness = false

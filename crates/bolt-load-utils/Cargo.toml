@@ -1,0 +1,37 @@
+[package]
+name = "bolt-load-utils"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tracing = ["dep:tracing"]
+http = [
+    "dep:http",
+    "dep:regex",
+    "dep:language-tags",
+    "dep:percent-encoding",
+    "dep:headers",
+]
+reader = ["dep:blocking", "dep:futures", "dep:bytes"]
+
+[dependencies]
+tracing = { workspace = true, optional = true }
+
+# HTTP Header
+http = { version = "1", optional = true }
+headers = { version = "0.4", optional = true }
+regex = { version = "1", optional = true }
+language-tags = { version = "0.3", optional = true }
+percent-encoding = { version = "2.3", optional = true }
+
+# Reader
+futures = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+blocking = { workspace = true, optional = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+n0-tracing-test = { workspace = true }
+tracing = { workspace = true }
+
+tokio = { workspace = true, features = ["full"] }

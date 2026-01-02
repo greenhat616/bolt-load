@@ -1,0 +1,50 @@
+[package]
+name = "bolt-load-tests"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tracing = ["bolt-load-utils/tracing", "dep:tracing"]
+
+[dependencies]
+bolt-load-core = { path = "../bolt-load-core", version = "0.1" }
+bolt-load-utils = { path = "../bolt-load-utils", version = "0.1", features = [
+    "tracing",
+] }
+
+tracing = { workspace = true, optional = true }
+
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["full"] }
+
+# for stream test
+async-stream = "0.3"
+governor = "0.10.4"  # for rate limiting
+
+# for generate a random file
+rand = "0.9"
+
+# for hash verification in tests
+blake3 = "1"
+
+# for http server test
+axum = "0.8.8"
+axum-extra = { version = "0.12.5", features = ["typed-header"] }
+axum-range = "1.0.0"
+portpicker = "0.1"
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tempfile = "3"
+bytes = { workspace = true }
+
+derive_more = { version = "2", features = ["debug"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+n0-tracing-test = { workspace = true }
+reqwest = "0.13"
+tracing = { workspace = true }

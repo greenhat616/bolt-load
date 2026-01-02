@@ -1,0 +1,43 @@
+[package]
+name = "bolt-load-adapter"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["reqwest"]
+reqwest = ["dep:reqwest", "bolt-load-utils/http"]
+ureq2 = [
+    "dep:ureq2",
+    "bolt-load-utils/reader",
+    "bolt-load-utils/http",
+    "dep:blocking",
+    "dep:http",
+]
+
+[dependencies]
+bolt-load-core = { path = "../bolt-load-core", version = "0.1" }
+bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
+
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+async-trait = { workspace = true }
+async-lock = { workspace = true }
+blocking = { workspace = true, optional = true }
+
+url = "2"
+bytes = { workspace = true }
+
+http = { version = "1", optional = true }
+
+# for reqwest adapter
+reqwest = { version = "0.12", optional = true, features = ["stream"] }
+# for ureq adapter
+ureq2 = { version = "2", package = "ureq", optional = true }
+ureq3 = { version = "3", package = "ureq", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+pretty_assertions = { workspace = true }
+n0-tracing-test = { workspace = true }
+bolt-load-tests = { path = "../bolt-load-tests", version = "0.1" }
