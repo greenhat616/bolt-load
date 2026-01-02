@@ -127,7 +127,7 @@ impl FileRangeWriterKind {
         }
     }
 
-    #[cfg(not(all(feature = "mmap", feature = "compio")))]
+    #[cfg(not(any(feature = "mmap", feature = "compio")))]
     pub fn suggest_kind(_file_size: u64) -> Self {
         Self::Pool
     }
