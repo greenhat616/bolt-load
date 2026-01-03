@@ -178,10 +178,10 @@ impl ChunkPlanner {
     pub fn mark_finished(&mut self, runner_id: RunnerId) -> Result<(), Error> {
         let range = self
             .runner_to_chunk
-            .get(&runner_id)
+            .remove(&runner_id)
             .ok_or(Error::RunnerNotFound(runner_id))?;
 
-        if let Some(chunk) = self.chunks.get_mut(range) {
+        if let Some(chunk) = self.chunks.get_mut(&range) {
             chunk.status = ChunkStatus::Finished;
             Ok(())
         } else {

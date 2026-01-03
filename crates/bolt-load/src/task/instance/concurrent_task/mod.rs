@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use async_broadcast::{Receiver as BroadcastReceiver, Sender as BroadcastSender};
+use async_broadcast::{
+    InactiveReceiver as BroadcastInactiveReceiver, Receiver as BroadcastReceiver,
+    Sender as BroadcastSender,
+};
 use async_channel::Receiver;
 use async_io::Timer;
 use async_waitgroup::WaitGroup;
@@ -49,7 +52,7 @@ static DEFAULT_MAX_CONCURRENCY: usize = 4;
 
 type ControlChannelRef<'a> = (
     &'a BroadcastSender<ManagerMessage>,
-    &'a BroadcastReceiver<ManagerMessage>,
+    &'a BroadcastInactiveReceiver<ManagerMessage>,
 );
 
 pub struct ConcurrentTask {
@@ -307,7 +310,7 @@ impl ConcurrentTaskInner {
             wg,
             next_range,
             adapter.clone(),
-            control_rx.clone(),
+            control_rx.activate_cloned(),
             next_runner_id,
             runners_cancel_token.clone(),
         )
@@ -461,7 +464,7 @@ impl ConcurrentTaskInner {
                     wg,
                     chunk.clone(),
                     adapter.clone(),
-                    control_rx.clone(),
+                    control_rx.activate_cloned(),
                     runner_id,
                     runners_cancel_token.clone(),
                 )
@@ -501,7 +504,7 @@ impl ConcurrentTaskInner {
                                 wg,
                                 suggested_range,
                                 adapter.clone(),
-                                control_rx.clone(),
+                                control_rx.activate_cloned(),
                                 runner_id,
                                 runners_cancel_token.clone(),
                             )
@@ -730,6 +733,7 @@ impl ConcurrentTaskInner {
         let mut chunk_planner = ChunkPlanner::new(total);
 
         let (control_tx, control_rx) = async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let control_rx = control_rx.deactivate();
         let mut runner_notification = RunnerNotification::new();
 
         let mut dynamic_strategy =
