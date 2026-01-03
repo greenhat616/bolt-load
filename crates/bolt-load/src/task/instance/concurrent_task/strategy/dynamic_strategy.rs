@@ -75,7 +75,7 @@ impl Strategy for DynamicStrategy {
                 DynamicPlannerStage::QuickStart => {
                     if (total_download_speed - 2.0 * self.previous_total_download_speed).abs()
                         > self.threashold1
-                        && context.current_concurrency * 2 < self.max_concurrency
+                        && context.current_concurrency.saturating_mul(2) < self.max_concurrency
                     {
                         result.push(StrategyAction::SplitAllTask);
                         self.previous_total_download_speed = total_download_speed;
@@ -88,7 +88,7 @@ impl Strategy for DynamicStrategy {
                         - (self.previous_total_download_speed + context.per_runner_speed))
                         .abs()
                         > self.threashold2
-                        && context.current_concurrency < self.max_concurrency
+                        && context.current_concurrency.saturating_add(1) < self.max_concurrency
                     {
                         // If the current thread download speed is faster than threashold2, split it into two task
                         result.push(StrategyAction::SplitGivenTask(
