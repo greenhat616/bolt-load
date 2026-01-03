@@ -639,7 +639,7 @@ impl ConcurrentTaskInner {
                         chunk_planner
                             .mark_finished(runner_id)
                             .expect("chunk planner should not fail");
-
+                        id_generator.release(runner_id);
                         if chunk_planner.is_complete() {
                             trace!("[TASK] all chunks finished");
                             *is_finished = true;
