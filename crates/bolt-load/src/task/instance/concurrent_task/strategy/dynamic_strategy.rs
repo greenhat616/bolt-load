@@ -75,7 +75,7 @@ impl Strategy for DynamicStrategy {
                 DynamicPlannerStage::QuickStart => {
                     if (total_download_speed - 2.0 * self.previous_total_download_speed).abs()
                         > self.threashold1
-                        && context.current_concurrency < self.max_concurrency
+                        && context.current_concurrency * 2 < self.max_concurrency
                     {
                         result.push(StrategyAction::SplitAllTask);
                         self.previous_total_download_speed = total_download_speed;
