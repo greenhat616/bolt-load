@@ -24,7 +24,7 @@ ureq3 = ["bolt-load-adapter/ureq3"]
 serde = ["dep:serde"]
 
 # file writer opts
-mmap = ["dep:memmap2"]
+mmap = ["dep:memmap2", "dep:windows-sys"]
 
 # runtime group
 tokio = ["dep:tokio"]
@@ -113,7 +113,7 @@ tracing = { version = "0.1", optional = true }
 indicatif = { version = "0.18", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = "0.61"
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"], optional = true }
 
 # Optional dependencies for test feature
 async-stream = { version = "0.3", optional = true }
