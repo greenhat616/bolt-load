@@ -551,11 +551,9 @@ mod tests {
 
         match result.err().unwrap() {
             AdapterError::Unretryable {
-                source: UnretryableError::Internal { message },
-            } => {
-                assert_eq!(message, "Range requests not supported");
-            }
-            _ => panic!("Expected Unretryable Internal error"),
+                source: UnretryableError::RangeStreamNotSupported,
+            } => {}
+            _ => panic!("Expected Unretryable RangeStreamNotSupported error"),
         }
 
         assert_eq!(adapter.call_count(), 1);

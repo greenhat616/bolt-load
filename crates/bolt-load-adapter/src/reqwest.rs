@@ -7,7 +7,7 @@ use bolt_load_core::adapter::error::unretryable::{
 };
 use bolt_load_utils::http::ContentDisposition;
 use futures::Stream;
-use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use snafu::IntoError;
 use url::Url;
 
@@ -229,22 +229,34 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
         .await
         .map_err(ReqwestError::from)?;
 
-    if let Ok(response) = response.error_for_status()
-        && let ContentSize::ContentRange(size) = ReqwestAdapter::get_content_size(&response)
-    {
-        return Ok(Context {
-            is_range_stream_available: true,
-            meta: BoltLoadAdapterMeta {
-                content_size: size,
-                filename: ReqwestAdapter::suggest_filename(&response).await,
-            },
-        });
+    let mut is_range_stream_available = false;
+
+    if let Ok(response) = response.error_for_status() {
+        match ReqwestAdapter::get_content_size(&response) {
+            ContentSize::ContentRange(size) => {
+                return Ok(Context {
+                    is_range_stream_available: true,
+                    meta: BoltLoadAdapterMeta {
+                        content_size: size,
+                        filename: ReqwestAdapter::suggest_filename(&response).await,
+                    },
+                });
+            }
+            ContentSize::ContentLength(0) => {
+                is_range_stream_available = true;
+            }
+            _ => {}
+        }
     }
 
     // Try to perform a `HEAD` request to get the meta
     let response = adapter.perform_head().await?;
+    if !is_range_stream_available && response.headers().get(ACCEPT_RANGES).is_some() {
+        is_range_stream_available = true;
+    }
+
     return Ok(Context {
-        is_range_stream_available: false,
+        is_range_stream_available,
         meta: BoltLoadAdapterMeta {
             content_size: ReqwestAdapter::get_content_size(&response)
                 .to_u64()
