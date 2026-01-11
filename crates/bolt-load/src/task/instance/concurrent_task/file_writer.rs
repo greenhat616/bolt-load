@@ -18,6 +18,7 @@ use std::{
 
 use bytes::Bytes;
 use fs_err::{File, OpenOptions};
+use snafu::prelude::*;
 
 #[cfg(feature = "compio")]
 pub use self::compio::CompioWriterBuilder;
@@ -30,16 +31,38 @@ use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Snafu)]
+pub enum CommandError {
+    #[snafu(transparent)]
+    Io { source: std::io::Error },
+    #[snafu(display("failed to receive command: channel closed"))]
+    Recv,
+    #[snafu(display("failed to send command: channel closed"))]
+    Send,
+}
+
+#[derive(Debug, Snafu)]
+pub enum FileWriterBuilderError {
+    #[snafu(display("validation failed: {message}"))]
+    Validation { message: String },
+    #[snafu(transparent)]
+    RangeWriter { source: FileWriterError },
+}
+
+#[derive(Debug, Snafu)]
 pub enum FileWriterError {
-    #[error(transparent)]
-    Io(std::io::Error),
-    #[error("failed to send chunk: {0:?}; channel closed")]
-    Write(Chunk),
-    #[error("failed to send finalize command; channel closed")]
-    Finalize,
-    #[error(transparent)]
-    Recv(oneshot::RecvError),
+    #[snafu(display("failed to open or create file {path:?}"))]
+    OpenOrCreateFile { source: CommandError, path: PathBuf },
+    #[snafu(display("failed to allocate file size {size}"))]
+    AllocateFile { source: CommandError, size: u64 },
+    #[snafu(display("failed to write range {chunk:?}, path: {path:?}"))]
+    WriteRange {
+        source: CommandError,
+        chunk: Option<Chunk>,
+        path: PathBuf,
+    },
+    #[snafu(display("failed to finalize, sync all data to disk etc, in path: {path:?}"))]
+    Finalize { source: CommandError, path: PathBuf },
 }
 
 #[enum_dispatch::enum_dispatch(FileRangeWriterImpl)]
@@ -134,23 +157,27 @@ impl FileRangeWriterKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(derive_more::Debug, Clone)]
 pub struct Chunk {
     pub range: Range<u64>,
+    #[debug("{} bytes", data.len())]
     pub data: Bytes,
 }
 
-async fn open_file(path: PathBuf, size: u64) -> Result<File, std::io::Error> {
+async fn open_file(path: PathBuf, size: u64) -> Result<File, FileWriterError> {
     let file = blocking::unblock(move || {
         let file = OpenOptions::new()
-            .create_new(true)
+            .create(true)
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(&path)
+            .map_err(CommandError::from)
+            .with_context(|_| OpenOrCreateFileSnafu { path: path.clone() })?;
         // Pre-allocate the file size
-        // TODO: make pre-allocation transparent on upper layer
-        file.set_len(size)?;
-        Ok::<_, std::io::Error>(file)
+        file.set_len(size)
+            .map_err(CommandError::from)
+            .with_context(|_| AllocateFileSnafu { size })?;
+        Ok::<_, FileWriterError>(file)
     })
     .await?;
     Ok(file)
@@ -163,7 +190,7 @@ pub struct FileWriter {
 }
 
 impl FileWriter {
-    pub async fn new(path: &Path, size: u64) -> Result<Self, std::io::Error> {
+    pub async fn new(path: &Path, size: u64) -> Result<Self, FileWriterBuilderError> {
         let kind = FileRangeWriterKind::suggest_kind(size);
         Self::new_with_kind(path, size, kind).await
     }
@@ -172,17 +199,17 @@ impl FileWriter {
         path: &Path,
         size: u64,
         kind: FileRangeWriterKind,
-    ) -> Result<Self, std::io::Error> {
+    ) -> Result<Self, FileWriterBuilderError> {
         let path = path.to_path_buf();
 
         let inner = match kind {
             #[cfg(feature = "mmap")]
             FileRangeWriterKind::Mmap => {
-                let file = open_file(path, size).await?;
+                let file = open_file(path.clone(), size).await?;
                 FileRangeWriterImpl::Mmap(MmapWriterBuilder::new().file(file).build().await?)
             }
             FileRangeWriterKind::Pool => {
-                let file = open_file(path, size).await?;
+                let file = open_file(path.clone(), size).await?;
                 FileRangeWriterImpl::Pool(PoolWriterBuilder::new().file(file).build()?)
             }
             FileRangeWriterKind::Null => {
@@ -192,7 +219,12 @@ impl FileWriter {
             #[cfg(feature = "compio")]
             FileRangeWriterKind::Compio => {
                 use self::compio::CompioWriterBuilder;
-                FileRangeWriterImpl::Compio(CompioWriterBuilder::new().path(path).build().await?)
+                FileRangeWriterImpl::Compio(
+                    CompioWriterBuilder::new()
+                        .path(path.clone())
+                        .build()
+                        .await?,
+                )
             }
         };
         Ok(Self {
@@ -221,6 +253,21 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "compio")]
+    fn test_file_range_writer_kind_suggest_kind_small_file() {
+        // With compio feature, always use Compio
+        assert_eq!(
+            FileRangeWriterKind::suggest_kind(1024),
+            FileRangeWriterKind::Compio
+        );
+        assert_eq!(
+            FileRangeWriterKind::suggest_kind(1024 * 1024 * 1024),
+            FileRangeWriterKind::Compio
+        ); // 1GB
+    }
+
+    #[test]
+    #[cfg(all(feature = "mmap", not(feature = "compio")))]
     fn test_file_range_writer_kind_suggest_kind_small_file() {
         // 小文件应该使用 Mmap
         assert_eq!(
@@ -234,6 +281,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compio")]
+    fn test_file_range_writer_kind_suggest_kind_large_file() {
+        // With compio feature, always use Compio
+        assert_eq!(
+            FileRangeWriterKind::suggest_kind(isize::MAX as u64 + 1),
+            FileRangeWriterKind::Compio
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "mmap", not(feature = "compio")))]
     fn test_file_range_writer_kind_suggest_kind_large_file() {
         // 大于 isize::MAX 的文件应该使用 Pool
         assert_eq!(
@@ -243,6 +301,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compio")]
+    fn test_file_range_writer_kind_suggest_kind_boundary() {
+        // With compio feature, always use Compio
+        assert_eq!(
+            FileRangeWriterKind::suggest_kind(isize::MAX as u64),
+            FileRangeWriterKind::Compio
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "mmap", not(feature = "compio")))]
     fn test_file_range_writer_kind_suggest_kind_boundary() {
         // 边界测试：恰好等于 isize::MAX 应该使用 Mmap
         assert_eq!(
@@ -285,7 +354,10 @@ mod tests {
         // Validate file is created
         assert!(file_path.exists());
 
-        // Small file should use Mmap
+        // Check the writer kind based on enabled features
+        #[cfg(feature = "compio")]
+        assert_eq!(writer.kind, FileRangeWriterKind::Compio);
+        #[cfg(all(feature = "mmap", not(feature = "compio")))]
         assert_eq!(writer.kind, FileRangeWriterKind::Mmap);
 
         writer.finalize().await.unwrap();
@@ -401,19 +473,6 @@ mod tests {
         assert_eq!(&buffer2, &data2[..]);
     }
 
-    #[tokio::test]
-    async fn test_file_writer_error_file_exists() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("existing_file.bin");
-
-        // Create a file
-        std::fs::write(&file_path, b"existing content").unwrap();
-
-        // Try to create a file with the same name should fail (using create_new)
-        let result = FileWriter::new(&file_path, 1024).await;
-        assert!(result.is_err());
-    }
-
     #[test]
     fn test_file_writer_kind_equality() {
         assert_eq!(FileRangeWriterKind::Mmap, FileRangeWriterKind::Mmap);
@@ -437,21 +496,39 @@ mod tests {
 
     #[test]
     fn test_file_writer_error_display() {
-        let io_err = std::io::Error::other("test error");
-        let err = FileWriterError::Io(io_err);
-        let display = format!("{}", err);
-        assert!(display.contains("test error"));
+        use std::path::PathBuf;
 
+        // Test WriteRange error display
         let chunk = Chunk {
             range: 0..10,
             data: Bytes::from_static(b"test"),
         };
-        let write_err = FileWriterError::Write(chunk);
+        let write_err = FileWriterError::WriteRange {
+            source: CommandError::Send,
+            chunk: Some(chunk),
+            path: PathBuf::from("/test/path"),
+        };
         let write_display = format!("{}", write_err);
-        assert!(write_display.contains("failed to send chunk"));
+        assert!(write_display.contains("failed to write range"));
+        assert!(write_display.contains("/test/path"));
 
-        let finalize_err = FileWriterError::Finalize;
+        // Test Finalize error display
+        let finalize_err = FileWriterError::Finalize {
+            source: CommandError::Recv,
+            path: PathBuf::from("/test/finalize"),
+        };
         let finalize_display = format!("{}", finalize_err);
         assert!(finalize_display.contains("finalize"));
+        assert!(finalize_display.contains("/test/finalize"));
+
+        // Test OpenOrCreateFile error display
+        let open_err = FileWriterError::OpenOrCreateFile {
+            source: CommandError::Io {
+                source: std::io::Error::other("test io error"),
+            },
+            path: PathBuf::from("/test/open"),
+        };
+        let open_display = format!("{}", open_err);
+        assert!(open_display.contains("failed to open or create file"));
     }
 }

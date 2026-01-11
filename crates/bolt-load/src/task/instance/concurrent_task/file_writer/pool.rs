@@ -4,8 +4,12 @@ use async_channel::{Receiver, Sender};
 use bytes::Bytes;
 use fs::File;
 use fs_err as fs;
+use snafu::prelude::*;
 
-use super::{Chunk, FileRangeWriter, FileWriterCapability, FileWriterError};
+use super::{
+    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
+    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+};
 
 pub struct PoolWriter {
     pub file: File,
@@ -23,32 +27,55 @@ impl FileRangeWriter for PoolWriter {
         self.tx
             .send(Command::Finalize(tx))
             .await
-            .map_err(|_| FileWriterError::Finalize)?;
+            .map_err(|_| CommandError::Send)
+            .with_context(|_| FinalizeSnafu {
+                path: self.file.path().to_path_buf(),
+            })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| FinalizeSnafu {
+                path: self.file.path().to_path_buf(),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| FinalizeSnafu {
+                path: self.file.path().to_path_buf(),
+            })?;
         self.tx.close();
         Ok(())
     }
 
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
+        let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(Chunk { range, data }, tx))
+            .send(Command::Write(chunk.clone(), tx))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
                     unreachable!()
                 };
-                FileWriterError::Write(chunk)
+                FileWriterError::WriteRange {
+                    source: CommandError::Send,
+                    chunk: Some(chunk),
+                    path: self.file.path().to_path_buf(),
+                }
             })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk.clone()),
+                path: self.file.path().to_path_buf(),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk),
+                path: self.file.path().to_path_buf(),
+            })?;
         Ok(())
     }
 }
 
+#[derive(Default)]
 pub struct PoolWriterBuilder {
     pub file: Option<File>,
     pub parallel: Option<usize>,
@@ -92,10 +119,7 @@ fn file_writer_task(file: &File, command_rx: &Receiver<Command>) {
 
 impl PoolWriterBuilder {
     pub fn new() -> Self {
-        Self {
-            file: None,
-            parallel: None,
-        }
+        Self::default()
     }
 
     pub fn file(mut self, file: File) -> Self {
@@ -108,19 +132,24 @@ impl PoolWriterBuilder {
         self
     }
 
-    pub fn build(self) -> Result<PoolWriter, std::io::Error> {
+    pub fn build(self) -> Result<PoolWriter, FileWriterBuilderError> {
         let Some(file) = self.file else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "file is not set",
-            ));
+            return ValidationSnafu {
+                message: "file is not set".to_string(),
+            }
+            .fail();
         };
         let parallel = self
             .parallel
             .unwrap_or(std::thread::available_parallelism().unwrap().get());
         let (tx, rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
         for _ in 0..parallel {
-            let file = file.try_clone()?;
+            let file = file
+                .try_clone()
+                .map_err(CommandError::from)
+                .with_context(|_| OpenOrCreateFileSnafu {
+                    path: file.path().to_path_buf(),
+                })?;
             let rx = rx.clone();
             blocking::unblock(move || file_writer_task(&file, &rx)).detach();
         }
@@ -160,7 +189,7 @@ mod tests {
         let builder = PoolWriterBuilder::new();
         let result = builder.build();
         match result {
-            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput),
+            Err(err) => assert!(matches!(err, FileWriterBuilderError::Validation { .. })),
             Ok(_) => panic!("Expected error, got Ok"),
         }
     }

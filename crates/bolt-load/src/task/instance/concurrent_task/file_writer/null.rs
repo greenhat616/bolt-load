@@ -5,12 +5,16 @@
 //! or NUL on Windows). This is useful for measuring pure framework
 //! overhead without actual I/O latency.
 
-use std::ops::Range;
+use std::{ops::Range, path::PathBuf};
 
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
+use snafu::prelude::*;
 
-use super::{Chunk, FileRangeWriter, FileWriterCapability, FileWriterError};
+use super::{
+    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
+    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, WriteRangeSnafu,
+};
 
 enum Command {
     Write(Chunk, oneshot::Sender<Result<(), std::io::Error>>),
@@ -25,21 +29,37 @@ pub struct NullWriter {
     tx: Sender<Command>,
 }
 
+/// A sentinel path used for NullWriter since it doesn't have an actual file.
+const NULL_PATH: &str = "<null>";
+
 impl FileRangeWriter for NullWriter {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
+        let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(Chunk { range, data }, tx))
+            .send(Command::Write(chunk.clone(), tx))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
                     unreachable!()
                 };
-                FileWriterError::Write(chunk)
+                FileWriterError::WriteRange {
+                    source: CommandError::Send,
+                    chunk: Some(chunk),
+                    path: PathBuf::from(NULL_PATH),
+                }
             })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk.clone()),
+                path: PathBuf::from(NULL_PATH),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk),
+                path: PathBuf::from(NULL_PATH),
+            })?;
         Ok(())
     }
 
@@ -48,10 +68,19 @@ impl FileRangeWriter for NullWriter {
         self.tx
             .send(Command::Finalize(tx))
             .await
-            .map_err(|_| FileWriterError::Finalize)?;
+            .map_err(|_| CommandError::Send)
+            .with_context(|_| FinalizeSnafu {
+                path: PathBuf::from(NULL_PATH),
+            })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| FinalizeSnafu {
+                path: PathBuf::from(NULL_PATH),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| FinalizeSnafu {
+                path: PathBuf::from(NULL_PATH),
+            })?;
         Ok(())
     }
 }
@@ -98,7 +127,7 @@ impl NullWriterBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<NullWriter, std::io::Error> {
+    pub async fn build(self) -> Result<NullWriter, FileWriterBuilderError> {
         let parallel = self.parallel.unwrap_or(1);
         let (tx, rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
 
@@ -106,9 +135,16 @@ impl NullWriterBuilder {
             let rx = rx.clone();
             let (ready_tx, ready_rx) = oneshot::channel();
             blocking::unblock(move || null_writer_task(ready_tx, &rx)).detach();
-            ready_rx.await.map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed")
-            })??;
+            ready_rx
+                .await
+                .map_err(|_| CommandError::Recv)
+                .with_context(|_| OpenOrCreateFileSnafu {
+                    path: NULL_PATH.to_string(),
+                })?
+                .map_err(CommandError::from)
+                .with_context(|_| OpenOrCreateFileSnafu {
+                    path: NULL_PATH.to_string(),
+                })?;
         }
 
         Ok(NullWriter { tx })

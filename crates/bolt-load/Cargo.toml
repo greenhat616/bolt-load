@@ -33,19 +33,6 @@ compio = ["dep:compio"]
 
 tracing = ["dep:tracing", "bolt-load-utils/tracing"]
 
-# test utilities - expose test adapters and helpers for examples and downstream crates
-test = [
-    "dep:async-stream",
-    "dep:governor",
-    "dep:blake3",
-    "dep:rand",
-    "dep:axum",
-    "dep:axum-extra",
-    "dep:axum-range",
-    "dep:portpicker",
-    "dep:tokio-util",
-]
-
 [lib]
 doctest = false
 name = "bolt_load"
@@ -58,6 +45,7 @@ bolt-load-adapter = { path = "../bolt-load-adapter", version = "0.1" }
 bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
 
 thiserror = "2"
+snafu = "0.8"
 async-trait = "0.1"
 futures = { workspace = true }
 futures-concurrency = "7"
@@ -113,20 +101,10 @@ tracing = { version = "0.1", optional = true }
 indicatif = { version = "0.18", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"], optional = true }
-
-# Optional dependencies for test feature
-async-stream = { version = "0.3", optional = true }
-governor = { version = "0.10.4", optional = true } # for rate limiting
-rand = { version = "0.9", optional = true }
-blake3 = { version = "1", optional = true }
-axum = { version = "0.8.8", optional = true }
-axum-extra = { version = "0.12.5", features = [
-    "typed-header",
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Memory",
 ], optional = true }
-axum-range = { version = "1.0.0", optional = true }
-portpicker = { version = "0.1", optional = true }
-tokio-util = { version = "0.7", optional = true }
+
 
 [dev-dependencies]
 bolt-load-tests = { path = "../bolt-load-tests", version = "0.1" }

@@ -6,8 +6,12 @@ use bytes::Bytes;
 use fs::File;
 use fs_err as fs;
 use memmap2::MmapMut;
+use snafu::prelude::*;
 
-use super::{Chunk, FileRangeWriter, FileWriterCapability, FileWriterError};
+use super::{
+    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
+    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+};
 
 pub struct MmapWriter {
     pub file: File,
@@ -20,33 +24,49 @@ impl FileRangeWriter for MmapWriter {
         self.tx
             .send(Command::Finalize(tx))
             .await
-            .map_err(|_| FileWriterError::Finalize)?;
+            .map_err(|_| CommandError::Send)
+            .with_context(|_| FinalizeSnafu {
+                path: self.file.path().to_path_buf(),
+            })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| FinalizeSnafu {
+                path: self.file.path().to_path_buf(),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| FinalizeSnafu {
+                path: self.file.path().to_path_buf(),
+            })?;
         Ok(())
     }
 
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
+        let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(
-                Chunk {
-                    range: range.clone(),
-                    data: data.clone(),
-                },
-                tx,
-            ))
+            .send(Command::Write(chunk.clone(), tx))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
                     unreachable!()
                 };
-                FileWriterError::Write(chunk)
+                FileWriterError::WriteRange {
+                    source: CommandError::Send,
+                    chunk: Some(chunk),
+                    path: self.file.path().to_path_buf(),
+                }
             })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk.clone()),
+                path: self.file.path().to_path_buf(),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk),
+                path: self.file.path().to_path_buf(),
+            })?;
         Ok(())
     }
 }
@@ -56,6 +76,7 @@ enum Command {
     Finalize(oneshot::Sender<Result<(), std::io::Error>>),
 }
 
+#[derive(Default)]
 pub struct MmapWriterBuilder {
     pub file: Option<File>,
 }
@@ -142,7 +163,7 @@ fn evict_working_set_range(mmap: &mut memmap2::MmapMut, start: usize, len: usize
 
 impl MmapWriterBuilder {
     pub fn new() -> Self {
-        Self { file: None }
+        Self::default()
     }
 
     pub fn file(mut self, file: File) -> Self {
@@ -150,22 +171,34 @@ impl MmapWriterBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<MmapWriter, std::io::Error> {
+    pub async fn build(self) -> Result<MmapWriter, FileWriterBuilderError> {
         let Some(file) = self.file else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "file is not set",
-            ));
+            return Err(ValidationSnafu {
+                message: "file is not set".to_string(),
+            }
+            .build());
         };
 
         let (chunk_tx, chunk_rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let file_clone = file.try_clone()?;
+        let file_clone = file
+            .try_clone()
+            .map_err(CommandError::from)
+            .with_context(|_| OpenOrCreateFileSnafu {
+                path: file.path().to_path_buf(),
+            })?;
         blocking::unblock(move || mmap_writer_task(ready_tx, &file_clone, &chunk_rx)).detach();
 
         ready_rx
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))??;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| OpenOrCreateFileSnafu {
+                path: file.path().to_path_buf(),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| OpenOrCreateFileSnafu {
+                path: file.path().to_path_buf(),
+            })?;
         Ok(MmapWriter { file, tx: chunk_tx })
     }
 }
@@ -199,7 +232,10 @@ mod tests {
         let builder = MmapWriterBuilder::new();
         let result = builder.build().await;
         match result {
-            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput),
+            Err(FileWriterBuilderError::Validation { message }) => {
+                assert!(message.contains("file is not set"));
+            }
+            Err(_) => panic!("Expected Validation error"),
             Ok(_) => panic!("Expected error, got Ok"),
         }
     }

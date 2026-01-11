@@ -4,8 +4,12 @@ use async_channel::{Receiver, Sender};
 use async_waitgroup::WaitGroup;
 use bytes::Bytes;
 use compio::{BufResult, fs::OpenOptions, io::AsyncWriteAt, runtime::Runtime};
+use snafu::prelude::*;
 
-use super::{Chunk, FileRangeWriter, FileWriterCapability, FileWriterError};
+use super::{
+    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
+    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+};
 
 enum Command {
     Write(Chunk, oneshot::Sender<Result<(), std::io::Error>>),
@@ -20,18 +24,31 @@ pub struct CompioWriter {
 impl FileRangeWriter for CompioWriter {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
+        let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(Chunk { range, data }, tx))
+            .send(Command::Write(chunk.clone(), tx))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
                     unreachable!()
                 };
-                FileWriterError::Write(chunk)
+                FileWriterError::WriteRange {
+                    source: CommandError::Send,
+                    chunk: Some(chunk),
+                    path: self.path.clone(),
+                }
             })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk.clone()),
+                path: self.path.clone(),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| WriteRangeSnafu {
+                chunk: Some(chunk),
+                path: self.path.clone(),
+            })?;
         Ok(())
     }
     async fn finalize(self) -> Result<(), FileWriterError> {
@@ -39,10 +56,19 @@ impl FileRangeWriter for CompioWriter {
         self.tx
             .send(Command::Finalize(tx))
             .await
-            .map_err(|_| FileWriterError::Finalize)?;
+            .map_err(|_| CommandError::Send)
+            .with_context(|_| FinalizeSnafu {
+                path: self.path.clone(),
+            })?;
         rx.await
-            .map_err(FileWriterError::Recv)?
-            .map_err(FileWriterError::Io)?;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| FinalizeSnafu {
+                path: self.path.clone(),
+            })?
+            .map_err(CommandError::from)
+            .with_context(|_| FinalizeSnafu {
+                path: self.path.clone(),
+            })?;
         Ok(())
     }
 }
@@ -111,6 +137,7 @@ fn compio_file_writer_task(
     });
 }
 
+#[derive(Default)]
 pub struct CompioWriterBuilder {
     path: Option<PathBuf>,
 }
@@ -119,7 +146,7 @@ impl FileWriterCapability for CompioWriterBuilder {}
 
 impl CompioWriterBuilder {
     pub fn new() -> Self {
-        Self { path: None }
+        Self::default()
     }
 
     pub fn path(mut self, path: PathBuf) -> Self {
@@ -127,12 +154,12 @@ impl CompioWriterBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<CompioWriter, std::io::Error> {
+    pub async fn build(self) -> Result<CompioWriter, FileWriterBuilderError> {
         let Some(path) = self.path else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path is not set",
-            ));
+            return ValidationSnafu {
+                message: "path is not set".to_string(),
+            }
+            .fail();
         };
         let (tx, rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -140,7 +167,10 @@ impl CompioWriterBuilder {
         blocking::unblock(move || compio_file_writer_task(path_clone, ready_tx, &rx)).detach();
         ready_rx
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Channel closed"))??;
+            .map_err(|_| CommandError::Recv)
+            .with_context(|_| OpenOrCreateFileSnafu { path: path.clone() })?
+            .map_err(CommandError::from)
+            .with_context(|_| OpenOrCreateFileSnafu { path: path.clone() })?;
         Ok(CompioWriter {
             path,
             tx: tx.clone(),
@@ -189,7 +219,7 @@ mod tests {
         let result = builder.build().await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(err, FileWriterBuilderError::Validation { .. }));
         assert!(err.to_string().contains("path is not set"));
     }
 
@@ -279,24 +309,10 @@ mod tests {
 
     use super::super::*;
 
-    /// Helper function to create a test file with pre-allocated size
-    fn create_test_file(path: &std::path::Path, size: u64) -> std::io::Result<()> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        file.set_len(size)?;
-        Ok(())
-    }
-
     #[tokio::test]
     async fn test_compio_writer_builder_build_success() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_build.bin");
-
-        // Pre-create file for compio to open
-        create_test_file(&file_path, 1024).unwrap();
 
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
@@ -312,10 +328,6 @@ mod tests {
     async fn test_compio_writer_write_range_single() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_write_single.bin");
-        let file_size = 1024u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -342,10 +354,6 @@ mod tests {
     async fn test_compio_writer_write_range_multiple() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_write_multiple.bin");
-        let file_size = 2048u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -394,10 +402,6 @@ mod tests {
     async fn test_compio_writer_write_range_overwrite() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_overwrite.bin");
-        let file_size = 1024u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -431,10 +435,6 @@ mod tests {
     async fn test_compio_writer_finalize() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_finalize.bin");
-        let file_size = 512u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -463,10 +463,6 @@ mod tests {
     async fn test_compio_writer_concurrent_writes() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_concurrent.bin");
-        let file_size = 4096u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -505,10 +501,6 @@ mod tests {
     async fn test_compio_writer_large_write() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_large_write.bin");
-        let file_size = 1024 * 1024u64; // 1MB
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -532,24 +524,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compio_writer_write_at_end_of_file() {
+    async fn test_compio_writer_write_at_high_offset() {
         let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test_write_end.bin");
-        let file_size = 1024u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
+        let file_path = temp_dir.path().join("test_write_high_offset.bin");
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
             .await
             .unwrap();
 
-        // Write at the end of the file
-        let data = Bytes::from_static(b"End of file");
-        let offset = file_size - data.len() as u64;
+        // Write at a high offset
+        let data = Bytes::from_static(b"High offset data");
+        let offset = 1000u64;
         writer
-            .write_range(offset..file_size, data.clone())
+            .write_range(offset..offset + data.len() as u64, data.clone())
             .await
             .unwrap();
 
@@ -567,10 +555,6 @@ mod tests {
     async fn test_compio_writer_empty_write() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_empty_write.bin");
-        let file_size = 1024u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -591,10 +575,6 @@ mod tests {
     async fn test_compio_writer_write_boundary_conditions() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_boundary.bin");
-        let file_size = 256u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()
@@ -608,11 +588,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Write at exact end
+        // Write at a later position
         let data2 = Bytes::from_static(b"END");
-        let offset = file_size - data2.len() as u64;
+        let offset = 250u64;
         writer
-            .write_range(offset..file_size, data2.clone())
+            .write_range(offset..offset + data2.len() as u64, data2.clone())
             .await
             .unwrap();
 
@@ -635,10 +615,6 @@ mod tests {
     async fn test_compio_writer_sequential_writes() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_sequential.bin");
-        let file_size = 1024u64;
-
-        create_test_file(&file_path, file_size).unwrap();
-
         let writer = CompioWriterBuilder::new()
             .path(file_path.clone())
             .build()

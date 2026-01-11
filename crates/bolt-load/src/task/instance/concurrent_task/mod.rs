@@ -689,16 +689,7 @@ impl ConcurrentTaskInner {
                     let _wg = wg;
                     if let Err(e) = file_writer.write_range(fixed_downloaded_range, bytes).await {
                         // TODO: notify the task to stop
-                        match e {
-                            FileWriterError::Io(e) => error!("failed to write to file: {e:?}"),
-                            FileWriterError::Write(e) => {
-                                error!("failed to send to file writer: {e:?}")
-                            }
-                            FileWriterError::Recv(e) => {
-                                error!("failed to receive from file writer: {e:?}")
-                            }
-                            FileWriterError::Finalize => error!("failed to finalize file writer"),
-                        }
+                        error!("failed to write to file: {e:?}");
                     }
                 });
             }
