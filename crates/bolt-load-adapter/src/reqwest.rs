@@ -1,9 +1,10 @@
 use std::{pin::Pin, sync::Arc};
 
+use async_once_cell::OnceCell;
 use async_trait::async_trait;
 use bolt_load_utils::http::ContentDisposition;
 use futures::Stream;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use url::Url;
 
 use super::{
@@ -12,15 +13,23 @@ use super::{
 };
 
 type BeforeRequestFn =
-    Box<dyn Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + Sync>;
+    Arc<dyn Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + Sync>;
+
+struct Context {
+    pub is_range_stream_available: bool,
+    pub meta: BoltLoadAdapterMeta,
+}
+
+#[derive(Clone)]
+struct Target(reqwest::Method, Url);
 
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ReqwestAdapter {
     client: reqwest::Client,
-    target: (reqwest::Method, Url),
-    head_response: Arc<async_lock::Mutex<Option<reqwest::Response>>>,
-    before_request: Arc<Option<BeforeRequestFn>>,
+    target: Target,
+    context: Arc<OnceCell<Context>>,
+    before_request: Option<BeforeRequestFn>,
 }
 
 pub trait IntoReqwestAdapter {
@@ -31,9 +40,9 @@ impl IntoReqwestAdapter for reqwest::Client {
     fn into_reqwest_adapter(self, target: (reqwest::Method, Url)) -> ReqwestAdapter {
         ReqwestAdapter {
             client: self,
-            target,
-            head_response: Arc::new(async_lock::Mutex::new(None)),
-            before_request: Arc::new(None),
+            target: Target(target.0, target.1),
+            context: Arc::new(OnceCell::new()),
+            before_request: None,
         }
     }
 }
@@ -101,7 +110,7 @@ impl ReqwestAdapter {
         &mut self,
         f: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder + Send + Sync + 'static,
     ) {
-        self.before_request = Arc::new(Some(Box::new(f)));
+        self.before_request = Some(Arc::new(f));
     }
 
     #[inline]
@@ -112,27 +121,41 @@ impl ReqwestAdapter {
         }
     }
 
-    fn get_content_size(&self, response: &reqwest::Response) -> std::io::Result<u64> {
-        Ok(response
-            .content_length()
-            .and_then(|len| if len > 0 { Some(len) } else { None })
-            // fallback to just parse the CONTENT_LENGTH header
-            .or_else(|| {
-                response
-                    .headers()
-                    .get(CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or_default())
+    fn get_content_size(response: &reqwest::Response) -> Option<u64> {
+        // First, try to parse the `Content-Range` header
+        let content_size: Option<u64> = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split_once('/'))
+            .and_then(|(_, end)| end.parse().ok());
+        // Then, try to parse the `Content-Length` header
+        match content_size {
+            Some(size) => Some(size),
+            None => response
+                .content_length()
+                .and_then(|len| if len > 0 { Some(len) } else { None })
+                // fallback to just parse the CONTENT_LENGTH header
+                .or_else(|| {
+                    response
+                        .headers()
+                        .get(CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse().ok())
+                }),
+        }
     }
 
-    async fn suggest_filename(&self, response: &reqwest::Response) -> Option<String> {
+    async fn suggest_filename(response: &reqwest::Response) -> Option<String> {
         response
             .headers()
             .get(CONTENT_DISPOSITION)
             .and_then(|v| ContentDisposition::from_raw(v).ok())
             .and_then(|d| d.get_filename().map(String::from))
+    }
+
+    async fn get_context(&self) -> Result<&Context, StreamError> {
+        self.context.get_or_try_init(fetch_remote_meta(self)).await
     }
 }
 
@@ -151,63 +174,59 @@ impl<'a> Stream for ReqwestStream<'a> {
     }
 }
 
+async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, StreamError> {
+    // Firstly, try to perform a `RANGE` GET request to test if the remote source supports range requests
+    let Target(method, url) = adapter.target.clone();
+    let response = adapter
+        .apply_before_request(
+            adapter
+                .client
+                .request(method.clone(), url.clone())
+                .header(RANGE, "bytes=0-0"),
+        )
+        .send()
+        .await
+        .map_err(ReqwestError::from)?;
+
+    if let Ok(response) = response.error_for_status()
+        && let Some(size) = ReqwestAdapter::get_content_size(&response)
+    {
+        return Ok(Context {
+            is_range_stream_available: true,
+            meta: BoltLoadAdapterMeta {
+                content_size: size,
+                filename: ReqwestAdapter::suggest_filename(&response).await,
+            },
+        });
+    }
+
+    // Try to perform a `HEAD` request to get the meta
+    let response = adapter.perform_head().await?;
+    return Ok(Context {
+        is_range_stream_available: false,
+        meta: BoltLoadAdapterMeta {
+            content_size: ReqwestAdapter::get_content_size(&response).unwrap_or_default(),
+            filename: ReqwestAdapter::suggest_filename(&response).await,
+        },
+    });
+}
+
 #[async_trait]
 impl BoltLoadAdapter for ReqwestAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
-        let mut response = self.head_response.lock().await;
-        if response.is_none() {
-            match self.perform_head().await {
-                Ok(res) => *response = Some(res),
-                Err(e) => match e {
-                    StreamError::Retryable(e) => {
-                        return Err(UnretryableError::from_retryable_error(e));
-                    }
-                    StreamError::Unretryable(e) => {
-                        return Err(e);
-                    }
-                },
-            }
-        }
+        let context = self.get_context().await?;
 
         Ok(BoltLoadAdapterMeta {
-            content_size: self.get_content_size(response.as_ref().unwrap())?,
-            filename: self.suggest_filename(response.as_ref().unwrap()).await,
+            content_size: context.meta.content_size,
+            filename: context.meta.filename.clone(),
         })
     }
 
     async fn is_range_stream_available(&self) -> bool {
-        let mut response = self.head_response.lock().await;
-        if response.is_none() {
-            match self.perform_head().await {
-                Ok(res) => *response = Some(res),
-                Err(_) => return false,
-            }
+        match self.get_context().await {
+            Ok(context) => context.is_range_stream_available,
+            Err(_) => false,
         }
-        // check Accept-Ranges header
-        let mut is_range_supported = response
-            .as_ref()
-            .unwrap()
-            .headers()
-            .get(ACCEPT_RANGES)
-            .is_some_and(|v| v == "bytes");
-        // try to send a real range request to test
-        if !is_range_supported {
-            is_range_supported = self
-                .apply_before_request(
-                    self.client
-                        .request(self.target.0.clone(), self.target.1.clone())
-                        .header(RANGE, "bytes=0-8"),
-                )
-                .send()
-                .await
-                .and_then(|res| res.error_for_status())
-                .map(|res| {
-                    res.headers().get(CONTENT_RANGE).is_some()
-                        && res.content_length().unwrap_or(0) > 1
-                })
-                .unwrap_or_default();
-        }
-        is_range_supported
     }
 
     async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {

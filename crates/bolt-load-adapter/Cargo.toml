@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = ["reqwest"]
-reqwest = ["dep:reqwest", "bolt-load-utils/http"]
+reqwest = ["dep:reqwest", "bolt-load-utils/http", "dep:async-once-cell"]
 ureq2 = [
     "dep:ureq2",
     "bolt-load-utils/reader",
@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 
 async-trait = { workspace = true }
 async-lock = { workspace = true }
+async-once-cell = { version = "0.5.4", optional = true }
 blocking = { workspace = true, optional = true }
 
 url = "2"
