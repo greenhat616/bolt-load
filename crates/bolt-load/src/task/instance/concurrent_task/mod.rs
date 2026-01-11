@@ -758,26 +758,35 @@ impl ConcurrentTaskInner {
                         throughout_meter_timer = Timer::after(DEFAULT_SAMPLE_INTERVAL);
                     }
                     msg = runner_notification.next().fuse() => {
-                        if let Some(msg) = msg {
-                            Self::handle_runner_message(
-                                &rt,
-                                &wg,
-                                &mut meters,
-                                &mut chunk_planner,
-                                &mut runner_notification,
-                                &mut runner_id_generator,
-                                &file_writer,
-                                &mut is_finished,
-                                msg,
-                            )
-                            .inspect_err(|e| {
-                                error!("failed to handle runner message: {e:?}");
-                                self.sync_progress(&chunk_planner);
-                            })?;
-                            if is_finished {
-                                break;
+                        match msg {
+                            Some(msg) => {
+                                Self::handle_runner_message(
+                                    &rt,
+                                    &wg,
+                                    &mut meters,
+                                    &mut chunk_planner,
+                                    &mut runner_notification,
+                                    &mut runner_id_generator,
+                                    &file_writer,
+                                    &mut is_finished,
+                                    msg,
+                                )
+                                .inspect_err(|e| {
+                                    error!("failed to handle runner message: {e:?}");
+                                    self.sync_progress(&chunk_planner);
+                                })?;
+                                if is_finished {
+                                    break;
+                                }
+                            }
+                            // TODO: handle the case when the runner notification is closed
+                            None => {
+                                if runner_notification.is_closed() {
+                                    break;
+                                }
                             }
                         }
+
                     }
                 }
             }

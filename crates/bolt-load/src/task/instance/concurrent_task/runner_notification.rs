@@ -5,32 +5,34 @@ use std::{
 };
 
 use async_channel::Receiver;
-use futures::{Stream, StreamExt, stream::BoxStream};
+use futures::{Stream, StreamExt, stream::BoxStream, task::AtomicWaker};
 use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
 use crate::{runner::RunnerMessage, task::RunnerId};
 
+// FIXME: handle potential rx closed error?
 pin_project! {
     pub struct RunnerNotification {
         #[pin]
         group: StreamGroup<BoxStream<'static, RunnerMessage>>,
         map: HashMap<RunnerId, Key>,
+        is_closed: bool,
+        waker: AtomicWaker,
     }
 }
 
 impl RunnerNotification {
     pub fn new() -> Self {
-        Self {
-            group: StreamGroup::new(),
-            map: HashMap::new(),
-        }
+        Self::with_capacity(0)
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             group: StreamGroup::with_capacity(capacity),
             map: HashMap::with_capacity(capacity),
+            is_closed: false,
+            waker: AtomicWaker::new(),
         }
     }
 
@@ -44,6 +46,20 @@ impl RunnerNotification {
             self.group.remove(key);
         }
     }
+
+    pub fn is_closed(&self) -> bool {
+        self.is_closed
+    }
+
+    pub fn close(&mut self) {
+        self.is_closed = true;
+        self.waker.wake();
+    }
+
+    pub fn reopen(&mut self) {
+        self.is_closed = false;
+        self.waker.wake();
+    }
 }
 
 impl Stream for RunnerNotification {
@@ -51,6 +67,22 @@ impl Stream for RunnerNotification {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
-        this.group.poll_next(cx)
+        this.waker.register(cx.waker());
+
+        if this.map.is_empty() {
+            return Poll::Pending;
+        }
+
+        match this.group.poll_next(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(None) => {
+                if *this.is_closed {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
