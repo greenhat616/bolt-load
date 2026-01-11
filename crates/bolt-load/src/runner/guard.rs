@@ -29,14 +29,10 @@ impl TaskRunnerGuard {
         self.cancel_token.cancel();
     }
 
-    pub async fn send_message(&self, message: ManagerMessagesVariant) {
-        if let Err(e) = self
-            .control_signal
-            .broadcast_direct(ManagerMessage(self.runner_id, message))
-            .await
-        {
-            warn!("Failed to send message to task runner: {e:?}");
-        }
+    pub fn send_message(&self, message: ManagerMessagesVariant) {
+        self.control_signal
+            .try_broadcast(ManagerMessage(self.runner_id, message))
+            .expect("Manager control channel should never full or closed");
     }
 }
 impl Drop for TaskRunnerGuard {

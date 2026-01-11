@@ -4,7 +4,6 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
 use async_broadcast::{
@@ -184,10 +183,6 @@ enum RunnerStatus {
 
 #[derive(Debug, thiserror::Error)]
 enum SplitTaskError {
-    #[error("failed to send control message: {0}")]
-    SendControlMessageFailed(#[from] async_broadcast::SendError<ManagerMessage>),
-    #[error("Send control message timeout")]
-    SendControlMessageTimeout,
     #[error("task instance error: {0}")]
     TaskInstanceError(#[from] TaskInstanceError),
 }
@@ -292,16 +287,12 @@ impl ConcurrentTaskInner {
             .resize_runner_state(runner_id, half_size)
             .expect("chunk planner should not fail");
 
-        let mut timer = futures::FutureExt::fuse(Timer::after(Duration::from_millis(10)));
-        futures::select! {
-            res = control_tx.broadcast_direct(ManagerMessage(
+        control_tx
+            .try_broadcast(ManagerMessage(
                 runner_id,
                 ManagerMessagesVariant::LimitTotal(downloaded_size + half_size),
-            )).fuse() => { res?; }
-            _ = timer => {
-                return Err(SplitTaskError::SendControlMessageTimeout);
-            }
-        }
+            ))
+            .expect("Manager control channel should never full or closed");
         guard.commit();
 
         // Create a new runner for the remaining range
@@ -535,7 +526,34 @@ impl ConcurrentTaskInner {
                                             .get_incomplete_states(Some(planned_chunk_size));
                                         for (runner_id, incomplete_range) in states {
                                             trace!("split task: {runner_id}, {incomplete_range:?}");
-                                            match Self::split_task(
+                                            if let Err(SplitTaskError::TaskInstanceError(e)) =
+                                                Self::split_task(
+                                                    threaded_rt,
+                                                    wg,
+                                                    chunk_planner,
+                                                    runner_id_generator,
+                                                    runner_notification,
+                                                    runners_cancel_token,
+                                                    incomplete_range,
+                                                    adapter.clone(),
+                                                    control_channel,
+                                                    runner_id,
+                                                )
+                                                .await
+                                            {
+                                                return Err(e);
+                                            }
+                                        }
+                                    }
+                                    // Split the given task into two separate tasks
+                                    StrategyAction::SplitGivenTask(task_id) => {
+                                        trace!("[TASK] Strategy: split given task: {task_id}");
+                                        let incomplete_range = chunk_planner
+                                            .get_runner_state(task_id)
+                                            .map(|s| s.incomplete_range())
+                                            .expect("task id not found");
+                                        if let Err(SplitTaskError::TaskInstanceError(e)) =
+                                            Self::split_task(
                                                 threaded_rt,
                                                 wg,
                                                 chunk_planner,
@@ -548,53 +566,8 @@ impl ConcurrentTaskInner {
                                                 runner_id,
                                             )
                                             .await
-                                            {
-                                                Err(SplitTaskError::SendControlMessageTimeout) => {
-                                                    warn!("send control message timeout");
-                                                }
-                                                Err(SplitTaskError::SendControlMessageFailed(
-                                                    e,
-                                                )) => {
-                                                    panic!("failed to send control message: {e:?}");
-                                                }
-                                                Err(SplitTaskError::TaskInstanceError(e)) => {
-                                                    return Err(e);
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                    // Split the given task into two separate tasks
-                                    StrategyAction::SplitGivenTask(task_id) => {
-                                        trace!("[TASK] Strategy: split given task: {task_id}");
-                                        let incomplete_range = chunk_planner
-                                            .get_runner_state(task_id)
-                                            .map(|s| s.incomplete_range())
-                                            .expect("task id not found");
-                                        match Self::split_task(
-                                            threaded_rt,
-                                            wg,
-                                            chunk_planner,
-                                            runner_id_generator,
-                                            runner_notification,
-                                            runners_cancel_token,
-                                            incomplete_range,
-                                            adapter.clone(),
-                                            control_channel,
-                                            runner_id,
-                                        )
-                                        .await
                                         {
-                                            Err(SplitTaskError::SendControlMessageTimeout) => {
-                                                warn!("send control message timeout");
-                                            }
-                                            Err(SplitTaskError::SendControlMessageFailed(e)) => {
-                                                panic!("failed to send control message: {e:?}");
-                                            }
-                                            Err(SplitTaskError::TaskInstanceError(e)) => {
-                                                return Err(e);
-                                            }
-                                            _ => {}
+                                            return Err(e);
                                         }
                                     }
                                     // Change the max concurrency
@@ -742,10 +715,8 @@ impl ConcurrentTaskInner {
 
         let (tmp_path, file_writer) = self.create_file_writer().await?;
 
-        let mut throughout_meter_timer =
-            Timer::interval(Duration::from_millis(DEFAULT_SAMPLE_INTERVAL));
-        let mut strategy_timer =
-            Timer::interval(Duration::from_millis(DEFAULT_STRATEGY_TICK_INTERVAL));
+        let mut throughout_meter_timer = Timer::after(DEFAULT_SAMPLE_INTERVAL);
+        let mut strategy_timer = Timer::after(DEFAULT_STRATEGY_TICK_INTERVAL);
 
         let event_loop_result: Result<()> = async {
             let mut is_finished = false;
@@ -771,6 +742,7 @@ impl ConcurrentTaskInner {
                             error!("failed to download strategy timer tick: {e:?}");
                             self.sync_progress(&chunk_planner);
                         })?;
+                        strategy_timer = Timer::after(DEFAULT_STRATEGY_TICK_INTERVAL);
                     }
                     _ = throughout_meter_timer.next().fuse() => {
                         Self::throughout_meter_tick(
@@ -783,6 +755,7 @@ impl ConcurrentTaskInner {
                             &mut per_runner_avg_speed,
                             &event_tx,
                         );
+                        throughout_meter_timer = Timer::after(DEFAULT_SAMPLE_INTERVAL);
                     }
                     msg = runner_notification.next().fuse() => {
                         if let Some(msg) = msg {

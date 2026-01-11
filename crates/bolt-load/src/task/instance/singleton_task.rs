@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
 use async_fs::{File, OpenOptions};
 use async_io::Timer;
@@ -299,7 +299,7 @@ impl SingletonTaskInner {
         let mut meter = 0;
         let mut speed = 0.0;
         let mut sampler = SpeedSampler::new();
-        let mut timer = Timer::interval(Duration::from_millis(DEFAULT_SAMPLE_INTERVAL));
+        let mut timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
 
         let result = async {
             let mut is_finished = false;

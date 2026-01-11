@@ -171,14 +171,13 @@ impl TaskRunner {
         let stream = match stream.await {
             Ok(stream) => stream,
             Err(e) => {
-                let _ = tx
-                    .send(RunnerMessage(
-                        runner_id,
-                        RunnerMessageKind::Stopped(StoppedReason::Failed(
-                            TaskFailedKind::StreamError(e),
-                        )),
-                    ))
-                    .await;
+                tx.try_send(RunnerMessage(
+                    runner_id,
+                    RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(
+                        e,
+                    ))),
+                ))
+                .expect("Manager broadcast channel should never full or closed");
                 return None;
             }
         };

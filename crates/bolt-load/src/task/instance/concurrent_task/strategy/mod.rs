@@ -1,6 +1,8 @@
 mod dynamic_strategy;
 
-pub const DEFAULT_STRATEGY_TICK_INTERVAL: u64 = 1500; // 1.5 seconds
+pub const DEFAULT_STRATEGY_TICK_INTERVAL: Duration = Duration::from_millis(1500); // 1.5 seconds
+
+use std::time::Duration;
 
 pub use dynamic_strategy::*;
 

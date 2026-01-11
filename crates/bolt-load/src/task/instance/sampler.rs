@@ -1,6 +1,7 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-pub const DEFAULT_SAMPLE_INTERVAL: u64 = 250; // 250 milliseconds
+pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
 #[allow(dead_code)]
 const DEFAULT_EMA_ALPHA: f64 = 0.33;
 
@@ -106,7 +107,7 @@ mod test {
         let mut sampler = SpeedSampler::new();
         let mut bytes: usize = 0;
 
-        let sample_every = Duration::from_millis(DEFAULT_SAMPLE_INTERVAL);
+        let sample_every = DEFAULT_SAMPLE_INTERVAL;
         let mut last_sample_check = Instant::now();
 
         let mut prev_ema: Option<f64> = None;
@@ -209,7 +210,7 @@ mod test {
             let mut bytes_accumulated: usize = 0;
             let mut total_bytes: usize = 0;
 
-            let sample_every = Duration::from_millis(DEFAULT_SAMPLE_INTERVAL);
+            let sample_every = DEFAULT_SAMPLE_INTERVAL;
             let mut last_sample_check = Instant::now();
 
             let start_time = Instant::now();
@@ -340,7 +341,7 @@ mod test {
             let mut sampler = SpeedSampler::with_alpha(alpha);
             let mut bytes_accumulated: usize = 0;
 
-            let sample_every = Duration::from_millis(DEFAULT_SAMPLE_INTERVAL);
+            let sample_every = DEFAULT_SAMPLE_INTERVAL;
             let mut last_sample_check = Instant::now();
 
             let mut ema_variance = 0.0f64;
