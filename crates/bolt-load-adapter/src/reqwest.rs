@@ -30,6 +30,7 @@ struct Context {
 #[derive(Clone)]
 struct Target(reqwest::Method, Url);
 
+#[derive(Debug, Clone, Copy)]
 enum ContentSize {
     ContentRange(u64),
     ContentLength(u64),

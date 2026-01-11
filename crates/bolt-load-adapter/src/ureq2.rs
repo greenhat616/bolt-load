@@ -246,7 +246,7 @@ impl BoltLoadAdapter for UreqAdapter {
 
 #[cfg(test)]
 mod test {
-    use bolt_load_tests::adapter::http_server;
+    use bolt_load_tests::adapter::http_server::{self, DEFAULT_FILE_SIZE};
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use url::Url;
@@ -259,11 +259,17 @@ mod test {
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
         let agent = ureq2::Agent::new();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
-        assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
+        assert_eq!(
+            adapter.retrieve_meta().await.unwrap().content_size,
+            DEFAULT_FILE_SIZE as u64
+        );
 
         let url = Url::parse(&format!("http://localhost:{}/range", port)).unwrap();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
-        assert_eq!(adapter.retrieve_meta().await.unwrap().content_size, 1040384);
+        assert_eq!(
+            adapter.retrieve_meta().await.unwrap().content_size,
+            DEFAULT_FILE_SIZE as u64
+        );
     }
 
     #[tokio::test]
@@ -308,7 +314,7 @@ mod test {
         while let Some(item) = stream.next().await {
             bytes.extend_from_slice(&item.unwrap());
         }
-        assert_eq!(bytes.len(), 1040384);
+        assert_eq!(bytes.len(), DEFAULT_FILE_SIZE);
     }
 
     #[tokio::test]
