@@ -30,6 +30,22 @@ struct Context {
 #[derive(Clone)]
 struct Target(reqwest::Method, Url);
 
+enum ContentSize {
+    ContentRange(u64),
+    ContentLength(u64),
+    Unknown,
+}
+
+impl ContentSize {
+    fn to_u64(self) -> Option<u64> {
+        match self {
+            ContentSize::ContentRange(size) => Some(size),
+            ContentSize::ContentLength(size) => Some(size),
+            ContentSize::Unknown => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ReqwestAdapter {
@@ -134,7 +150,7 @@ impl ReqwestAdapter {
         }
     }
 
-    fn get_content_size(response: &reqwest::Response) -> Option<u64> {
+    fn get_content_size(response: &reqwest::Response) -> ContentSize {
         // First, try to parse the `Content-Range` header
         let content_size: Option<u64> = response
             .headers()
@@ -144,18 +160,24 @@ impl ReqwestAdapter {
             .and_then(|(_, end)| end.parse().ok());
         // Then, try to parse the `Content-Length` header
         match content_size {
-            Some(size) => Some(size),
-            None => response
-                .content_length()
-                .and_then(|len| if len > 0 { Some(len) } else { None })
-                // fallback to just parse the CONTENT_LENGTH header
-                .or_else(|| {
-                    response
-                        .headers()
-                        .get(CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse().ok())
-                }),
+            Some(size) if size > 0 => ContentSize::ContentRange(size),
+            _ => {
+                let content_length: Option<u64> = response
+                    .content_length()
+                    .and_then(|len| if len > 0 { Some(len) } else { None })
+                    // fallback to just parse the CONTENT_LENGTH header
+                    .or_else(|| {
+                        response
+                            .headers()
+                            .get(CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse().ok())
+                    });
+                match content_length {
+                    Some(size) => ContentSize::ContentLength(size),
+                    None => ContentSize::Unknown,
+                }
+            }
         }
     }
 
@@ -168,7 +190,12 @@ impl ReqwestAdapter {
     }
 
     async fn get_context(&self) -> Result<&Context, AdapterError> {
-        self.context.get_or_try_init(fetch_remote_meta(self)).await
+        self.context
+            .get_or_try_init(fetch_remote_meta(self))
+            .await
+            .inspect_err(|e| {
+                bolt_load_utils::telemetry::error!("failed to get context: {}", e);
+            })
     }
 }
 
@@ -202,7 +229,7 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
         .map_err(ReqwestError::from)?;
 
     if let Ok(response) = response.error_for_status()
-        && let Some(size) = ReqwestAdapter::get_content_size(&response)
+        && let ContentSize::ContentRange(size) = ReqwestAdapter::get_content_size(&response)
     {
         return Ok(Context {
             is_range_stream_available: true,
@@ -218,7 +245,9 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
     return Ok(Context {
         is_range_stream_available: false,
         meta: BoltLoadAdapterMeta {
-            content_size: ReqwestAdapter::get_content_size(&response).unwrap_or_default(),
+            content_size: ReqwestAdapter::get_content_size(&response)
+                .to_u64()
+                .unwrap_or_default(),
             filename: ReqwestAdapter::suggest_filename(&response).await,
         },
     });

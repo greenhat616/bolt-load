@@ -185,4 +185,40 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn no_range_endpoint_ignores_range_header() -> Result<()> {
+        let (port, handle) = create_http_server().await?;
+        let _guard = ServerGuard(handle);
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/no_range"))
+            .header(RANGE, "bytes=0-99")
+            .send()
+            .await?;
+
+        // Should return 200 OK, not 206 Partial Content
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers();
+        // Should not have Content-Range header
+        assert!(
+            headers.get(CONTENT_RANGE).is_none(),
+            "no_range endpoint should not return Content-Range header"
+        );
+
+        // Should return full content length
+        assert_eq!(
+            headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+            Some("1048576")
+        );
+
+        // Should return full content, not just the requested range
+        let body = resp.bytes().await?;
+        assert_eq!(body.len(), 1024 * 1024);
+
+        Ok(())
+    }
 }
