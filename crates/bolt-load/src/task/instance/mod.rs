@@ -4,7 +4,7 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{DownloadMode, Progress};
 use crate::{
-    adapter::{AnyAdapter, StreamError, UnretryableError},
+    adapter::{AdapterError, AnyAdapter, UnretryableError},
     runner::TaskFailedKind,
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
 };
@@ -119,11 +119,11 @@ pub enum TaskInstanceImpl {
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum TaskInstanceError {
     #[error("retrieve meta failed: {0}")]
-    RetrieveMetaFailed(UnretryableError),
+    RetrieveMetaFailed(AdapterError),
     #[error("failed to allocate file size: {0}")]
     AllocateFileSpaceFailed(Arc<std::io::Error>),
     #[error("failed to fetch stream failed: {0}")]
-    StreamFailed(StreamError),
+    StreamFailed(AdapterError),
     #[error("task failed: {0:?}")]
     Failed(TaskFailedKind),
     #[error("failed to write chunk: {0}")]
@@ -131,11 +131,11 @@ pub enum TaskInstanceError {
 }
 
 impl TaskInstanceError {
-    pub fn new_retrieve_meta_failed(e: UnretryableError) -> Self {
+    pub fn new_retrieve_meta_failed(e: AdapterError) -> Self {
         Self::RetrieveMetaFailed(e)
     }
 
-    pub fn new_stream_failed(e: StreamError) -> Self {
+    pub fn new_stream_failed(e: AdapterError) -> Self {
         Self::StreamFailed(e)
     }
 

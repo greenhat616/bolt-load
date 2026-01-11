@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_lock::OnceCell;
+use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
 use smol_cancellation_token::CancellationToken;
 
@@ -50,7 +51,8 @@ pub enum TaskManagerBuildError {
     FieldValidationFailed(String),
     #[error(transparent)]
     /// The error is unretryable, just returned by the adapter
-    UnretryableError(#[from] UnretryableError),
+    // TODO: mapping to UnretryableError
+    AdapterError(#[from] AdapterError),
     #[error(transparent)]
     IOError(#[from] std::io::Error),
 }

@@ -20,6 +20,7 @@ bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
 
 futures = { workspace = true }
 thiserror = { workspace = true }
+snafu = { workspace = true }
 
 async-trait = { workspace = true }
 async-lock = { workspace = true }

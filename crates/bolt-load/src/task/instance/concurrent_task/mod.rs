@@ -14,6 +14,7 @@ use async_broadcast::{
 use async_channel::Receiver;
 use async_io::Timer;
 use async_waitgroup::WaitGroup;
+use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
 use futures::{FutureExt, StreamExt, future::RemoteHandle, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
@@ -219,9 +220,13 @@ impl ConcurrentTaskInner {
             .map_err(TaskInstanceError::RetrieveMetaFailed)?;
         let total = if meta.content_size == 0 {
             return Err(TaskInstanceError::RetrieveMetaFailed(
-                UnretryableError::ExceededRequestLimits(
-                    "content size is 0; concurrent task does not support 0-size file".to_string(),
-                ),
+                AdapterError::Unretryable {
+                    source: UnretryableError::Whatever {
+                        message: "content size is 0; concurrent task does not support 0-size file"
+                            .to_string(),
+                        source: None,
+                    },
+                },
             ));
         } else {
             meta.content_size

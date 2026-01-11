@@ -38,6 +38,7 @@ portpicker = "0.1"
 
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+snafu = { workspace = true }
 tempfile = "3"
 bytes = { workspace = true }
 

@@ -1,13 +1,19 @@
 use std::{convert::AsRef, sync::Arc};
 
 use blocking::unblock;
+use bolt_load_core::adapter::error::{
+    retryable::IoSnafu as RetryableIoSnafu,
+    unretryable::{
+        IoSnafu as UnretryableIoSnafu, NotFoundSnafu, ServiceUnavailableSnafu, UnauthorizedSnafu,
+    },
+};
 use bolt_load_utils::{http::ContentDisposition, reader::CrossRuntimeStream};
 use futures::Stream;
+use snafu::IntoError;
 use ureq2::{Agent, Request};
 
 use super::{
-    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError, StreamError,
-    UnretryableError,
+    AdapterError, AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError,
 };
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
@@ -45,39 +51,42 @@ impl IntoUreqAdapter for ureq2::Agent {
 #[repr(transparent)]
 pub struct UreqError(#[from] ureq2::Error);
 
-impl From<UreqError> for StreamError {
+impl From<UreqError> for AdapterError {
     fn from(UreqError(e): UreqError) -> Self {
         match e {
-            ureq2::Error::Transport(_) => StreamError::Retryable(RetryableError::new_io_error(
-                std::io::Error::new(std::io::ErrorKind::NetworkDown, e.to_string()),
-            )),
-            ureq2::Error::Status(404, _) => StreamError::Unretryable(UnretryableError::NotFound),
-            ureq2::Error::Status(401, _) | ureq2::Error::Status(403, _) => {
-                StreamError::Unretryable(UnretryableError::Unauthorized(format!(
-                    "http status code: {}",
-                    401
-                )))
+            ureq2::Error::Transport(_) => RetryableError::Io {
+                source: Arc::new(std::io::Error::new(
+                    std::io::ErrorKind::NetworkDown,
+                    e.to_string(),
+                )),
             }
+            .into(),
+            ureq2::Error::Status(404, _) => NotFoundSnafu {}.build().into(),
+            ureq2::Error::Status(401, _) | ureq2::Error::Status(403, _) => UnauthorizedSnafu {
+                message: format!("http status code: {}", 401),
+            }
+            .build()
+            .into(),
             ureq2::Error::Status(503, _) | ureq2::Error::Status(429, _) => {
-                StreamError::Unretryable(UnretryableError::new_exceeded_request_limits(format!(
+                ServiceUnavailableSnafu {
+                    status: format!("{}", 503),
+                    description: e.to_string(),
+                }
+                .build()
+                .into()
+            }
+            ureq2::Error::Status(status, _) if status < 500 => UnretryableIoSnafu {}
+                .into_error(Arc::new(std::io::Error::other(format!(
+                    "http client error, status code: {}",
+                    status
+                ))))
+                .into(),
+            ureq2::Error::Status(status, _) => RetryableIoSnafu {}
+                .into_error(Arc::new(std::io::Error::other(format!(
                     "http status code: {}",
-                    503
-                )))
-            }
-            ureq2::Error::Status(status, _) if status < 500 => {
-                StreamError::Unretryable(UnretryableError::from_retryable_error(
-                    RetryableError::new_io_error(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("http client error, status code: {}", status),
-                    )),
-                ))
-            }
-            ureq2::Error::Status(status, _) => {
-                StreamError::Retryable(RetryableError::new_io_error(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("http status code: {}", status),
-                )))
-            }
+                    status
+                ))))
+                .into(),
         }
     }
 }
@@ -117,12 +126,12 @@ impl UreqAdapter {
         }
     }
 
-    async fn perform_head(&self) -> Result<ureq2::Response, StreamError> {
+    async fn perform_head(&self) -> Result<ureq2::Response, AdapterError> {
         let request = self.apply_before_request(self.agent.head(self.target.1.as_str()));
         let call = self.call.clone();
         unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
             .await
-            .map_err(StreamError::from)
+            .map_err(AdapterError::from)
     }
 
     fn get_content_size(&self, response: &ureq2::Response) -> u64 {
@@ -146,7 +155,7 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 struct UreqStream(AnyStream<'static, Result<bytes::Bytes, std::io::Error>>);
 
 impl Stream for UreqStream {
-    type Item = Result<bytes::Bytes, StreamError>;
+    type Item = Result<bytes::Bytes, AdapterError>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -154,13 +163,13 @@ impl Stream for UreqStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.get_mut().0)
             .poll_next(cx)
-            .map_err(|e| UnretryableError::new_io_error(e).into())
+            .map_err(|e| UnretryableIoSnafu {}.into_error(Arc::new(e)).into())
     }
 }
 
 #[async_trait::async_trait]
 impl BoltLoadAdapter for UreqAdapter {
-    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         let response = self.perform_head().await?;
         let content_size = self.get_content_size(&response);
         let filename = self.suggest_filename(&response);
@@ -170,20 +179,20 @@ impl BoltLoadAdapter for UreqAdapter {
         })
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
         let request =
             self.apply_before_request(self.agent.request_url(&self.target.0, &self.target.1));
         let call = self.call.clone();
         let res = unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
             .await
-            .map_err(StreamError::from)?;
+            .map_err(AdapterError::from)?;
         let reader = res.into_reader();
         let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
         let ureq_stream = UreqStream(Box::pin(stream));
         Ok(Box::pin(ureq_stream))
     }
 
-    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
         let request =
             self.apply_before_request(self.agent.request_url(&self.target.0, &self.target.1).set(
                 http::header::RANGE.as_str(),
@@ -192,7 +201,7 @@ impl BoltLoadAdapter for UreqAdapter {
         let call = self.call.clone();
         let res = unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
             .await
-            .map_err(StreamError::from)?;
+            .map_err(AdapterError::from)?;
         let reader = res.into_reader();
         let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
         let ureq_stream = UreqStream(Box::pin(stream));

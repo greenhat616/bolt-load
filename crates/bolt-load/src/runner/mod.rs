@@ -9,7 +9,7 @@ use smol_cancellation_token::CancellationToken;
 
 use crate::{
     DEFAULT_EVENT_CHANNEL_CAPACITY,
-    adapter::{AnyBytesStream, StreamError},
+    adapter::{AdapterError, AnyBytesStream},
     task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
     utils::ShutdownGuardExt,
 };
@@ -67,7 +67,7 @@ pub enum TaskFailedKind {
     /// Possible reason:
     /// - The total sized while the downloaded chunk is smaller than the total size
     SmallerThanTotalSize,
-    StreamError(StreamError),
+    StreamError(AdapterError),
     /// The other error
     Other(String),
 }
@@ -132,7 +132,7 @@ enum Event {
     /// The control signal is received
     Control(Result<ManagerMessage, async_broadcast::RecvError>),
     /// The download event is received
-    Download(Option<Result<Bytes, StreamError>>),
+    Download(Option<Result<Bytes, AdapterError>>),
 }
 
 impl TaskRunner {
@@ -160,7 +160,7 @@ impl TaskRunner {
 
     pub async fn new_with_async_and_callback(
         total: Option<u64>,
-        stream: impl Future<Output = Result<AnyBytesStream, StreamError>>,
+        stream: impl Future<Output = Result<AnyBytesStream, AdapterError>>,
         runner_id: RunnerId,
         receiver: BroadcastReceiver<ManagerMessage>,
         cancel_token: CancellationToken,
@@ -286,7 +286,7 @@ impl TaskRunner {
     ))]
     async fn handle_stream_event(
         &mut self,
-        event: Option<Result<Bytes, StreamError>>,
+        event: Option<Result<Bytes, AdapterError>>,
         buff: &mut BytesMut,
         is_finished: &mut bool,
     ) -> Result<(), TaskFailedKind> {
@@ -488,7 +488,7 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
-    use crate::adapter::{StreamError, UnretryableError};
+    use crate::adapter::{AdapterError, UnretryableError};
 
     #[tokio::test]
     async fn test_normal_download() {
@@ -605,9 +605,11 @@ mod tests {
         // Create a stream that yields an error
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
-            yield Err(StreamError::Unretryable(UnretryableError::Io(
-                Arc::new(std::io::Error::other("Network error")),
-            )));
+            yield Err(AdapterError::Unretryable{
+                source: UnretryableError::Io {
+                    source: Arc::new(std::io::Error::other("Network error")),
+                },
+            });
         };
 
         let (mut runner, msg_rx) = TaskRunner::new(
@@ -1030,7 +1032,7 @@ mod tests {
                 yield Ok(Bytes::from(vec![1; 10]));
                 yield Ok(Bytes::from(vec![2; 10]));
             };
-            Ok::<AnyBytesStream, StreamError>(Box::pin(test_stream))
+            Ok::<AnyBytesStream, AdapterError>(Box::pin(test_stream))
         };
 
         // Capture the receiver from the callback
@@ -1100,9 +1102,11 @@ mod tests {
 
         // Create a failing stream future
         let stream_future = async {
-            Err::<AnyBytesStream, StreamError>(StreamError::Unretryable(UnretryableError::Io(
-                Arc::new(std::io::Error::other("Mock network error")),
-            )))
+            Err::<AnyBytesStream, AdapterError>(AdapterError::Unretryable {
+                source: UnretryableError::Io {
+                    source: Arc::new(std::io::Error::other("Mock network error")),
+                },
+            })
         };
 
         // Capture the receiver from the callback

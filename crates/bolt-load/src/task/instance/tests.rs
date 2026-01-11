@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use super::{TaskEvent, TaskInstance, TaskInstanceImpl};
 use crate::{
     adapter::{
-        AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, StreamError, UnretryableError,
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, UnretryableError,
     },
     runtime::ThreadedRuntimeImpl,
     task::DownloadMode,
@@ -66,20 +66,24 @@ impl BoltLoadAdapter for MockAdapter {
         self.support_range
     }
 
-    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         if self.should_fail {
-            return Err(UnretryableError::Internal(
-                "Mock adapter failure".to_string(),
-            ));
+            return Err(AdapterError::Unretryable {
+                source: UnretryableError::Internal {
+                    message: "Mock adapter failure".to_string(),
+                },
+            });
         }
         Ok(self.meta.clone())
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
         if self.should_fail {
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Stream failure".to_string(),
-            )));
+            return Err(AdapterError::Unretryable {
+                source: UnretryableError::Internal {
+                    message: "Mock adapter failure".to_string(),
+                },
+            });
         }
 
         let content = self.content.clone();
@@ -91,11 +95,13 @@ impl BoltLoadAdapter for MockAdapter {
         Ok(Box::pin(stream))
     }
 
-    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
         if !self.support_range {
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Range not supported".to_string(),
-            )));
+            return Err(AdapterError::Unretryable {
+                source: UnretryableError::Internal {
+                    message: "Range not supported".to_string(),
+                },
+            });
         }
 
         let start = start as usize;

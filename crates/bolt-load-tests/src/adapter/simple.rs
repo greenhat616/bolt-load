@@ -6,7 +6,10 @@ use std::{
     },
 };
 
-use bolt_load_core::adapter::*;
+use bolt_load_core::adapter::{
+    AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta,
+    error::unretryable::{InternalSnafu, RangeStreamNotSupportedSnafu},
+};
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use governor::{Quota, RateLimiter};
@@ -270,15 +273,17 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         self.support_range
     }
 
-    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         info!("[TEST ADAPTER] retrieve_meta() called");
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
         if self.should_fail {
             info!("[TEST ADAPTER] retrieve_meta() returning failure");
-            return Err(UnretryableError::Internal(
-                "Simulated meta retrieval failure".to_string(),
-            ));
+            return Err(InternalSnafu {
+                message: "Simulated meta retrieval failure".to_string(),
+            }
+            .build()
+            .into());
         }
 
         info!(
@@ -292,7 +297,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         })
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
         info!(
             "[TEST ADAPTER] full_stream() called, content size: {}",
             self.content.len()
@@ -301,9 +306,11 @@ impl BoltLoadAdapter for SimpleTestAdapter {
 
         if self.should_fail {
             info!("[TEST ADAPTER] full_stream() returning failure");
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Simulated stream failure".to_string(),
-            )));
+            return Err(InternalSnafu {
+                message: "Simulated stream failure".to_string(),
+            }
+            .build()
+            .into());
         }
 
         let content = self.content.clone();
@@ -336,19 +343,19 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         Ok(Box::pin(stream))
     }
 
-    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
         if self.should_fail {
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Simulated range stream failure".to_string(),
-            )));
+            return Err(InternalSnafu {
+                message: "Simulated range stream failure".to_string(),
+            }
+            .build()
+            .into());
         }
 
         if !self.support_range {
-            return Err(StreamError::Unretryable(UnretryableError::Internal(
-                "Range requests not supported".to_string(),
-            )));
+            return Err(RangeStreamNotSupportedSnafu {}.build().into());
         }
 
         let start = start as usize;
@@ -382,6 +389,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
 
 #[cfg(test)]
 mod tests {
+    use bolt_load_core::adapter::error::UnretryableError;
     use futures::StreamExt;
 
     use super::*;
@@ -428,8 +436,10 @@ mod tests {
         assert!(result.is_err());
 
         match result.unwrap_err() {
-            UnretryableError::Internal(msg) => {
-                assert_eq!(msg, "Simulated meta retrieval failure");
+            AdapterError::Unretryable {
+                source: UnretryableError::Internal { message },
+            } => {
+                assert_eq!(message, "Simulated meta retrieval failure");
             }
             _ => panic!("Expected Internal error"),
         }
@@ -488,8 +498,10 @@ mod tests {
         assert!(result.is_err());
 
         match result.err().unwrap() {
-            StreamError::Unretryable(UnretryableError::Internal(msg)) => {
-                assert_eq!(msg, "Simulated stream failure");
+            AdapterError::Unretryable {
+                source: UnretryableError::Internal { message },
+            } => {
+                assert_eq!(message, "Simulated stream failure");
             }
             _ => panic!("Expected Unretryable Internal error"),
         }
@@ -538,8 +550,10 @@ mod tests {
         assert!(result.is_err());
 
         match result.err().unwrap() {
-            StreamError::Unretryable(UnretryableError::Internal(msg)) => {
-                assert_eq!(msg, "Range requests not supported");
+            AdapterError::Unretryable {
+                source: UnretryableError::Internal { message },
+            } => {
+                assert_eq!(message, "Range requests not supported");
             }
             _ => panic!("Expected Unretryable Internal error"),
         }

@@ -2,14 +2,21 @@ use std::{pin::Pin, sync::Arc};
 
 use async_once_cell::OnceCell;
 use async_trait::async_trait;
+use bolt_load_core::adapter::error::unretryable::{
+    NotFoundSnafu, ServiceUnavailableSnafu, UnauthorizedSnafu,
+};
 use bolt_load_utils::http::ContentDisposition;
 use futures::Stream;
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use snafu::IntoError;
 use url::Url;
 
 use super::{
-    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError, StreamError,
-    UnretryableError,
+    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta,
+    error::{
+        AdapterError, RetryableError, retryable::IoSnafu as RetryableIoSnafu,
+        unretryable::IoSnafu as UnretryableIoSnafu,
+    },
 };
 
 type BeforeRequestFn =
@@ -52,52 +59,58 @@ impl IntoReqwestAdapter for reqwest::Client {
 #[repr(transparent)]
 pub struct ReqwestError(#[from] reqwest::Error);
 
-impl From<ReqwestError> for StreamError {
+impl From<ReqwestError> for AdapterError {
     fn from(ReqwestError(e): ReqwestError) -> Self {
         if let Some(status_code) = e.status()
             && status_code.is_client_error()
         {
             match status_code {
                 reqwest::StatusCode::NOT_FOUND => {
-                    return UnretryableError::new_io_error(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        e.to_string(),
-                    ))
-                    .into();
+                    return NotFoundSnafu {}.build().into();
                 }
                 reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
-                    return UnretryableError::new_io_error(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        e.to_string(),
-                    ))
+                    return UnauthorizedSnafu {
+                        message: e.to_string(),
+                    }
+                    .build()
                     .into();
                 }
                 reqwest::StatusCode::TOO_MANY_REQUESTS
                 | reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-                    return UnretryableError::new_exceeded_request_limits(format!(
-                        "HTTP Status Code: {} {}",
-                        status_code,
-                        status_code.canonical_reason().unwrap_or("unknown")
-                    ))
+                    return ServiceUnavailableSnafu {
+                        status: format!(
+                            "{} {}",
+                            status_code,
+                            status_code.canonical_reason().unwrap_or("unknown")
+                        ),
+                        description: e.to_string(),
+                    }
+                    .build()
                     .into();
                 }
                 _ => {
-                    return RetryableError::new_io_error(std::io::Error::other(e.to_string()))
-                        .into();
+                    return RetryableError::Io {
+                        source: Arc::new(std::io::Error::other(e.to_string())),
+                    }
+                    .into();
                 }
             }
         }
         if e.is_builder() || e.is_body() {
-            return UnretryableError::new_io_error(std::io::Error::other(e.to_string())).into();
+            return UnretryableIoSnafu {}
+                .into_error(Arc::new(std::io::Error::other(e.to_string())))
+                .into();
         }
 
         // fallback to other errors
-        RetryableError::new_io_error(std::io::Error::other(e.to_string())).into()
+        RetryableIoSnafu {}
+            .into_error(Arc::new(std::io::Error::other(e.to_string())))
+            .into()
     }
 }
 
 impl ReqwestAdapter {
-    async fn perform_head(&self) -> Result<reqwest::Response, StreamError> {
+    async fn perform_head(&self) -> Result<reqwest::Response, AdapterError> {
         let response = self
             .apply_before_request(self.client.head(self.target.1.clone()))
             .send()
@@ -154,7 +167,7 @@ impl ReqwestAdapter {
             .and_then(|d| d.get_filename().map(String::from))
     }
 
-    async fn get_context(&self) -> Result<&Context, StreamError> {
+    async fn get_context(&self) -> Result<&Context, AdapterError> {
         self.context.get_or_try_init(fetch_remote_meta(self)).await
     }
 }
@@ -162,7 +175,7 @@ impl ReqwestAdapter {
 struct ReqwestStream<'a>(AnyStream<'a, Result<bytes::Bytes, reqwest::Error>>);
 
 impl<'a> Stream for ReqwestStream<'a> {
-    type Item = Result<bytes::Bytes, super::StreamError>;
+    type Item = Result<bytes::Bytes, AdapterError>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -170,11 +183,11 @@ impl<'a> Stream for ReqwestStream<'a> {
     ) -> std::task::Poll<Option<Self::Item>> {
         Pin::new(&mut self.get_mut().0)
             .poll_next(cx)
-            .map(|opt| opt.map(|res| res.map_err(ReqwestError::from).map_err(StreamError::from)))
+            .map(|opt| opt.map(|res| res.map_err(ReqwestError::from).map_err(AdapterError::from)))
     }
 }
 
-async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, StreamError> {
+async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterError> {
     // Firstly, try to perform a `RANGE` GET request to test if the remote source supports range requests
     let Target(method, url) = adapter.target.clone();
     let response = adapter
@@ -213,7 +226,7 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, StreamEr
 
 #[async_trait]
 impl BoltLoadAdapter for ReqwestAdapter {
-    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, UnretryableError> {
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         let context = self.get_context().await?;
 
         Ok(BoltLoadAdapterMeta {
@@ -229,7 +242,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
         }
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, StreamError> {
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
         let response = self
             .apply_before_request(
                 self.client
@@ -244,7 +257,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
         Ok(Box::pin(stream))
     }
 
-    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, StreamError> {
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
         let response = self
             .apply_before_request(
                 self.client
