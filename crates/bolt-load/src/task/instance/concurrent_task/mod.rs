@@ -307,7 +307,7 @@ impl ConcurrentTaskInner {
             wg,
             next_range,
             adapter.clone(),
-            control_rx.activate_cloned(),
+            control_rx.clone(),
             next_runner_id,
             runners_cancel_token.clone(),
         )
@@ -326,7 +326,7 @@ impl ConcurrentTaskInner {
         wg: &WaitGroup,
         range: Range<u64>,
         adapter: Arc<AnyAdapter>,
-        notify: BroadcastReceiver<ManagerMessage>,
+        notify: BroadcastInactiveReceiver<ManagerMessage>,
         runner_id: RunnerId,
         cancel_token: CancellationToken,
     ) -> Result<(Receiver<RunnerMessage>, RemoteHandle<()>)> {
@@ -340,7 +340,7 @@ impl ConcurrentTaskInner {
                 Some(end - start),
                 async { adapter.range_stream(start, end).await },
                 runner_id,
-                notify,
+                notify.activate_cloned(),
                 cancel_token.clone(),
                 move |rx| {
                     let _ = tx.send(rx);
@@ -461,7 +461,7 @@ impl ConcurrentTaskInner {
                     wg,
                     chunk.clone(),
                     adapter.clone(),
-                    control_rx.activate_cloned(),
+                    control_rx.clone(),
                     runner_id,
                     runners_cancel_token.clone(),
                 )
@@ -501,7 +501,7 @@ impl ConcurrentTaskInner {
                                 wg,
                                 suggested_range,
                                 adapter.clone(),
-                                control_rx.activate_cloned(),
+                                control_rx.clone(),
                                 runner_id,
                                 runners_cancel_token.clone(),
                             )
@@ -977,7 +977,7 @@ mod tests {
             &wg,
             range.clone(),
             adapter.clone(),
-            control_rx,
+            control_rx.deactivate(),
             runner_id,
             cancel_token,
         )
@@ -1053,7 +1053,7 @@ mod tests {
             &wg,
             range,
             adapter,
-            control_rx,
+            control_rx.deactivate(),
             runner_id,
             cancel_token,
         )
@@ -1096,7 +1096,7 @@ mod tests {
             &wg,
             range,
             adapter,
-            control_rx,
+            control_rx.deactivate(),
             runner_id,
             cancel_token.clone(),
         )
@@ -1156,7 +1156,7 @@ mod tests {
             &wg,
             range.clone(),
             adapter,
-            control_rx,
+            control_rx.deactivate(),
             runner_id,
             cancel_token,
         )
@@ -1213,7 +1213,7 @@ mod tests {
             &wg,
             range.clone(),
             adapter.clone(),
-            control_rx,
+            control_rx.deactivate(),
             runner_id,
             cancel_token,
         )
@@ -1266,7 +1266,7 @@ mod tests {
             &wg,
             range,
             adapter,
-            control_rx,
+            control_rx.deactivate(),
             runner_id,
             cancel_token,
         )
@@ -1323,7 +1323,7 @@ mod tests {
                     &wg,
                     range.clone(),
                     adapter_clone,
-                    control_rx,
+                    control_rx.deactivate(),
                     runner_id,
                     cancel_token,
                 )
@@ -1411,7 +1411,7 @@ mod tests {
             &wg,
             range.clone(),
             adapter.clone(),
-            control_rx,
+            control_rx.deactivate(),
             runner_id,
             cancel_token,
         )
