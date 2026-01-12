@@ -776,14 +776,13 @@ impl ConcurrentTaskInner {
                                     self.sync_progress(&chunk_planner);
                                 })?;
                                 if is_finished {
+                                    runner_notification.close();
                                     break;
                                 }
                             }
                             // TODO: handle the case when the runner notification is closed
                             None => {
-                                if runner_notification.is_closed() {
-                                    break;
-                                }
+                                debug_assert!(runner_notification.is_closed());
                             }
                         }
 
