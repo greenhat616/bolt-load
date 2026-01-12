@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use async_broadcast::Receiver as BroadcastReceiver;
-use async_channel::{Receiver, Sender};
+use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
 use bolt_load_utils::telemetry::*;
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, StreamExt};
@@ -72,24 +72,33 @@ pub enum TaskFailedKind {
     Other(String),
 }
 
-#[derive(Clone)]
-/// a wrapper of the task message sender
-struct RunnerMessageSender(RunnerId, Sender<RunnerMessage>);
+/// a wrapper of the task message sender using ring buffer
+struct RunnerMessageSender {
+    runner_id: RunnerId,
+    producer: AsyncHeapProd<RunnerMessage>,
+}
 
 impl RunnerMessageSender {
-    pub fn new(task_id: RunnerId, sender: Sender<RunnerMessage>) -> Self {
-        Self(task_id, sender)
+    pub fn new(runner_id: RunnerId, producer: AsyncHeapProd<RunnerMessage>) -> Self {
+        Self {
+            runner_id,
+            producer,
+        }
     }
 
     fn runner_id(&self) -> RunnerId {
-        self.0
+        self.runner_id
     }
 
-    pub async fn send(
-        &self,
-        message: RunnerMessageKind,
-    ) -> Result<(), async_channel::SendError<RunnerMessage>> {
-        self.1.send(RunnerMessage(self.0, message)).await
+    pub async fn send(&mut self, message: RunnerMessageKind) -> Result<(), RunnerMessage> {
+        self.producer
+            .push(RunnerMessage(self.runner_id, message))
+            .await
+    }
+
+    pub fn try_send(&mut self, message: RunnerMessageKind) -> Result<(), RunnerMessage> {
+        self.producer
+            .try_push(RunnerMessage(self.runner_id, message))
     }
 }
 
@@ -135,6 +144,9 @@ enum Event {
     Download(Option<Result<Bytes, AdapterError>>),
 }
 
+/// Type alias for the ring buffer consumer of runner messages
+pub type RunnerMessageConsumer = AsyncHeapCons<RunnerMessage>;
+
 impl TaskRunner {
     pub fn new(
         total: Option<u64>,
@@ -142,19 +154,20 @@ impl TaskRunner {
         runner_id: RunnerId,
         receiver: BroadcastReceiver<ManagerMessage>,
         cancel_token: CancellationToken,
-    ) -> (Self, Receiver<RunnerMessage>) {
-        let (tx, rx) = async_channel::bounded(DEFAULT_EVENT_CHANNEL_CAPACITY);
+    ) -> (Self, RunnerMessageConsumer) {
+        let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (prod, cons) = rb.split();
         (
             TaskRunner {
                 total,
                 downloaded: 0,
                 stream,
-                notify: RunnerMessageSender::new(runner_id, tx),
+                notify: RunnerMessageSender::new(runner_id, prod),
                 control_signal: receiver,
                 cancel_token,
                 shutdown_rx: None,
             },
-            rx,
+            cons,
         )
     }
 
@@ -164,20 +177,21 @@ impl TaskRunner {
         runner_id: RunnerId,
         receiver: BroadcastReceiver<ManagerMessage>,
         cancel_token: CancellationToken,
-        on_channel_created: impl FnOnce(Receiver<RunnerMessage>),
+        on_channel_created: impl FnOnce(RunnerMessageConsumer),
     ) -> Option<Self> {
-        let (tx, rx) = async_channel::bounded(DEFAULT_EVENT_CHANNEL_CAPACITY);
-        on_channel_created(rx);
+        let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (mut prod, cons) = rb.split();
+        on_channel_created(cons);
         let stream = match stream.await {
             Ok(stream) => stream,
             Err(e) => {
-                tx.try_send(RunnerMessage(
+                prod.try_push(RunnerMessage(
                     runner_id,
                     RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(
                         e,
                     ))),
                 ))
-                .expect("Manager broadcast channel should never full or closed");
+                .expect("Manager ring buffer should never full or closed");
                 return None;
             }
         };
@@ -185,7 +199,7 @@ impl TaskRunner {
             total,
             downloaded: 0,
             stream,
-            notify: RunnerMessageSender::new(runner_id, tx),
+            notify: RunnerMessageSender::new(runner_id, prod),
             control_signal: receiver,
             cancel_token,
             shutdown_rx: None,
@@ -266,7 +280,7 @@ impl TaskRunner {
                 .send(RunnerMessageKind::Downloaded(chunk))
                 .await
                 .map_err(|_| TaskFailedKind::ChannelClosed)?;
-            buff.clear();
+            // Note: BytesMut::split() already leaves the buffer empty, but we clear for clarity
         }
         Ok(())
     }
@@ -479,7 +493,7 @@ impl TaskRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{pin::pin, sync::Arc, time::Duration};
 
     use async_stream::stream;
     use oneshot;
@@ -519,7 +533,8 @@ mod tests {
         let mut started = false;
         let mut finished = false;
 
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             debug!("msg: {msg:?}");
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
@@ -569,7 +584,8 @@ mod tests {
 
         // Wait for the Started message
         let mut started = false;
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
                 started = true;
                 break;
@@ -581,7 +597,7 @@ mod tests {
 
         // Wait for cancelled message
         let mut cancelled = false;
-        while let Ok(msg) = msg_rx.recv().await {
+        while let Some(msg) = msg_rx.next().await {
             if let RunnerMessage(
                 _,
                 RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Cancelled)),
@@ -624,7 +640,8 @@ mod tests {
         });
 
         let mut got_error = false;
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             if let RunnerMessage(
                 _,
                 RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_))),
@@ -661,7 +678,8 @@ mod tests {
         });
 
         let mut got_empty_error = false;
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             error!("msg: {msg:?}");
             if let RunnerMessage(
                 _,
@@ -717,7 +735,8 @@ mod tests {
         let mut finished = false;
         let mut resize_sent = false;
 
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
@@ -791,7 +810,8 @@ mod tests {
         let mut download_count = 0;
         let mut total_downloaded = 0;
 
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     trace!("task started");
@@ -872,7 +892,8 @@ mod tests {
         let mut started = false;
         let mut total_downloaded = 0;
 
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     trace!("task started");
@@ -947,7 +968,8 @@ mod tests {
         let mut finished = false;
         let mut total_downloaded = 0;
 
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
@@ -996,7 +1018,8 @@ mod tests {
         });
 
         // Wait for start then drop the control channel
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
                 drop(control_tx);
                 break;
@@ -1004,7 +1027,7 @@ mod tests {
         }
 
         let mut got_channel_closed = false;
-        while let Ok(msg) = msg_rx.recv().await {
+        while let Some(msg) = msg_rx.next().await {
             if let RunnerMessage(
                 _,
                 RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::ChannelClosed)),
@@ -1034,9 +1057,9 @@ mod tests {
             Ok::<AnyBytesStream, AdapterError>(Box::pin(test_stream))
         };
 
-        // Capture the receiver from the callback
+        // Capture the consumer from the callback
         let (callback_tx, callback_rx) = oneshot::channel();
-        let on_channel_created = move |rx: Receiver<RunnerMessage>| {
+        let on_channel_created = move |rx: RunnerMessageConsumer| {
             let _ = callback_tx.send(rx);
         };
 
@@ -1055,7 +1078,7 @@ mod tests {
         assert!(result.is_some());
         let mut runner = result.unwrap();
 
-        // The callback should have been called with a receiver
+        // The callback should have been called with a consumer
         let msg_rx = callback_rx.await.unwrap();
 
         // Spawn the runner to test it works
@@ -1068,7 +1091,8 @@ mod tests {
         let mut finished = false;
         let mut total_downloaded = 0;
 
-        while let Ok(msg) = msg_rx.recv().await {
+        let mut msg_rx = pin!(msg_rx);
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(id, RunnerMessageKind::Started) => {
                     assert_eq!(id, runner_id);
@@ -1108,9 +1132,9 @@ mod tests {
             })
         };
 
-        // Capture the receiver from the callback
+        // Capture the consumer from the callback
         let (callback_tx, callback_rx) = oneshot::channel();
-        let on_channel_created = move |rx: Receiver<RunnerMessage>| {
+        let on_channel_created = move |rx: RunnerMessageConsumer| {
             let _ = callback_tx.send(rx);
         };
 
@@ -1128,11 +1152,12 @@ mod tests {
         // Should return None due to stream failure
         assert!(result.is_none());
 
-        // The callback should still have been called with a receiver
+        // The callback should still have been called with a consumer
         let msg_rx = callback_rx.await.unwrap();
 
         // Should receive a stopped message with stream error
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         match msg {
             RunnerMessage(
                 id,
@@ -1143,8 +1168,8 @@ mod tests {
             _ => panic!("Expected stopped message with stream error, got: {msg:?}"),
         }
 
-        // Channel should be closed after the error message
-        assert!(msg_rx.recv().await.is_err());
+        // Ring buffer consumer returns None when producer is dropped and buffer is empty
+        assert!(msg_rx.next().await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1223,19 +1248,24 @@ mod tests {
 
         let mut limit_sent = false;
 
+        // Pin the consumers for use with tokio::select!
+        let mut msg_rx1 = pin!(msg_rx1);
+        let mut msg_rx2 = pin!(msg_rx2);
+        let mut msg_rx3 = pin!(msg_rx3);
+
         // Use timeout to prevent infinite waiting
         let timeout_duration = Duration::from_secs(10);
         let result = tokio::time::timeout(timeout_duration, async {
             // Use select to handle messages from all runners
             loop {
                 tokio::select! {
-                    msg = msg_rx1.recv(), if !runner1_finished => {
+                    msg = msg_rx1.next(), if !runner1_finished => {
                         match msg {
-                            Ok(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Started)) => {
                                 assert_eq!(id, runner_id1);
                                 runner1_started = true;
                             }
-                            Ok(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
                                 assert_eq!(id, runner_id1);
                                 runner1_downloaded += bytes.len();
 
@@ -1252,55 +1282,55 @@ mod tests {
                                     limit_sent = true;
                                 }
                             }
-                            Ok(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
                                 assert_eq!(id, runner_id1);
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner1_finished = true;
                             }
-                            Err(_) => {
-                                // Channel closed, treat as finished
+                            None => {
+                                // Stream ended, treat as finished
                                 runner1_finished = true;
                             }
                         }
                     }
-                    msg = msg_rx2.recv(), if !runner2_finished => {
+                    msg = msg_rx2.next(), if !runner2_finished => {
                         match msg {
-                            Ok(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Started)) => {
                                 assert_eq!(id, runner_id2);
                                 runner2_started = true;
                             }
-                            Ok(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
                                 assert_eq!(id, runner_id2);
                                 runner2_downloaded += bytes.len();
                             }
-                            Ok(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
                                 assert_eq!(id, runner_id2);
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner2_finished = true;
                             }
-                            Err(_) => {
-                                // Channel closed, treat as finished
+                            None => {
+                                // Stream ended, treat as finished
                                 runner2_finished = true;
                             }
                         }
                     }
-                    msg = msg_rx3.recv(), if !runner3_finished => {
+                    msg = msg_rx3.next(), if !runner3_finished => {
                         match msg {
-                            Ok(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Started)) => {
                                 assert_eq!(id, runner_id3);
                                 runner3_started = true;
                             }
-                            Ok(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
                                 assert_eq!(id, runner_id3);
                                 runner3_downloaded += bytes.len();
                             }
-                            Ok(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
                                 assert_eq!(id, runner_id3);
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner3_finished = true;
                             }
-                            Err(_) => {
-                                // Channel closed, treat as finished
+                            None => {
+                                // Stream ended, treat as finished
                                 runner3_finished = true;
                             }
                         }

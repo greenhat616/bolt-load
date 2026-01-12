@@ -6,11 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use async_broadcast::{
-    InactiveReceiver as BroadcastInactiveReceiver, Receiver as BroadcastReceiver,
-    Sender as BroadcastSender,
-};
-use async_channel::Receiver;
+use async_broadcast::{InactiveReceiver as BroadcastInactiveReceiver, Sender as BroadcastSender};
 use async_waitgroup::WaitGroup;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
@@ -22,7 +18,10 @@ use super::{Generator, Result, TaskInstance};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
-    runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskFailedKind, TaskRunner},
+    runner::{
+        RunnerMessage, RunnerMessageConsumer, RunnerMessageKind, StoppedReason, TaskFailedKind,
+        TaskRunner,
+    },
     runtime::{
         LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl, Timer, TimerBuilder,
     },
@@ -329,7 +328,7 @@ impl ConcurrentTaskInner {
         notify: BroadcastInactiveReceiver<ManagerMessage>,
         runner_id: RunnerId,
         cancel_token: CancellationToken,
-    ) -> Result<(Receiver<RunnerMessage>, RemoteHandle<()>)> {
+    ) -> Result<(RunnerMessageConsumer, RemoteHandle<()>)> {
         let (tx, rx) = oneshot::channel();
         let (start, end) = (range.start, range.end);
         let wg = wg.clone();
@@ -943,7 +942,7 @@ impl ConcurrentTaskInner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{pin::pin, sync::Arc};
 
     use bolt_load_tests::adapter::simple::{SimpleTestAdapter, calculate_blake3};
     use bolt_load_utils::telemetry::*;
@@ -988,7 +987,8 @@ mod tests {
         let (msg_rx, _handle) = result.unwrap();
 
         // 验证能收到 Started 消息
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         match msg {
             RunnerMessage(id, RunnerMessageKind::Started) => {
                 assert_eq!(id, runner_id);
@@ -1000,7 +1000,7 @@ mod tests {
         let mut total_downloaded = 0;
         let mut downloaded_data = Vec::new();
 
-        while let Ok(msg) = msg_rx.recv().await {
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(id, RunnerMessageKind::Downloaded(bytes)) => {
                     assert_eq!(id, runner_id);
@@ -1064,7 +1064,8 @@ mod tests {
         let (msg_rx, _handle) = result.unwrap();
 
         // 应该收到失败消息，因为 range_stream 失败
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         match msg {
             RunnerMessage(
                 id,
@@ -1107,14 +1108,15 @@ mod tests {
         let (msg_rx, _handle) = result.unwrap();
 
         // 等待开始消息
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
         // 取消任务
         cancel_token.cancel();
 
         // 等待取消消息
-        while let Ok(msg) = msg_rx.recv().await {
+        while let Some(msg) = msg_rx.next().await {
             if let RunnerMessage(
                 id,
                 RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Cancelled)),
@@ -1167,12 +1169,13 @@ mod tests {
         let (msg_rx, _handle) = result.unwrap();
 
         // 等待开始消息
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
         // 收集下载数据
         let mut total_downloaded = 0;
-        while let Ok(msg) = msg_rx.recv().await {
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
                     total_downloaded += bytes.len();
@@ -1224,12 +1227,13 @@ mod tests {
         let (msg_rx, _handle) = result.unwrap();
 
         // 等待开始
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
         // 收集所有数据
         let mut downloaded_data = Vec::new();
-        while let Ok(msg) = msg_rx.recv().await {
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
                     downloaded_data.extend_from_slice(&bytes);
@@ -1277,11 +1281,12 @@ mod tests {
         let (msg_rx, _handle) = result.unwrap();
 
         // 等待开始
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
         // 应该立即完成，没有下载任何数据
-        let msg = msg_rx.recv().await.unwrap();
+        let msg = msg_rx.next().await.unwrap();
         match msg {
             RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
                 assert_eq!(id, runner_id);
@@ -1337,14 +1342,15 @@ mod tests {
                 let _control_tx = control_tx;
 
                 // 等待开始
-                let msg = msg_rx.recv().await.unwrap();
+                let mut msg_rx = pin!(msg_rx);
+                let msg = msg_rx.next().await.unwrap();
                 assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
                 // 收集所有数据
                 let mut downloaded_size = 0;
                 let mut finished = false;
 
-                while let Ok(msg) = msg_rx.recv().await {
+                while let Some(msg) = msg_rx.next().await {
                     match msg {
                         RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
                             downloaded_size += bytes.len();
@@ -1422,12 +1428,13 @@ mod tests {
         let (msg_rx, _handle) = result.unwrap();
 
         // 等待开始消息
-        let msg = msg_rx.recv().await.unwrap();
+        let mut msg_rx = pin!(msg_rx);
+        let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
         // 收集所有下载的数据
         let mut downloaded_data = Vec::new();
-        while let Ok(msg) = msg_rx.recv().await {
+        while let Some(msg) = msg_rx.next().await {
             match msg {
                 RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
                     downloaded_data.extend_from_slice(&bytes);

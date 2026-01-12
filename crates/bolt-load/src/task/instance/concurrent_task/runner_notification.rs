@@ -4,12 +4,14 @@ use std::{
     task::{Context, Poll},
 };
 
-use async_channel::Receiver;
 use futures::{Stream, StreamExt, stream::BoxStream, task::AtomicWaker};
 use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
-use crate::{runner::RunnerMessage, task::RunnerId};
+use crate::{
+    runner::{RunnerMessage, RunnerMessageConsumer},
+    task::RunnerId,
+};
 
 // FIXME: handle potential rx closed error?
 pin_project! {
@@ -36,8 +38,8 @@ impl RunnerNotification {
         }
     }
 
-    pub fn add(&mut self, runner_id: RunnerId, receiver: Receiver<RunnerMessage>) {
-        let key = self.group.insert(receiver.boxed());
+    pub fn add(&mut self, runner_id: RunnerId, consumer: RunnerMessageConsumer) {
+        let key = self.group.insert(consumer.boxed());
         self.map.insert(runner_id, key);
     }
 

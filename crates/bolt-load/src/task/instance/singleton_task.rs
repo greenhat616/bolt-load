@@ -305,15 +305,16 @@ impl SingletonTaskInner {
             let mut is_finished = false;
             let fut = runner.run().fuse();
             futures::pin_mut!(fut);
+            futures::pin_mut!(runner_rx);
             loop {
                 futures::select_biased! {
                     _ = timer.next().fuse() => {
                         self.handle_timer_tick(&wg, &mut speed, &mut sampler, &mut meter);
                     }
                     _ = fut => (),
-                    msg = runner_rx.recv().fuse() => {
+                    msg = runner_rx.next().fuse() => {
                         match msg {
-                            Ok(msg) => {
+                            Some(msg) => {
                                 match self.handle_runner_message(msg, &mut file, &mut meter, &mut is_finished).await {
                                     Ok(()) => {
                                         if is_finished {
@@ -325,8 +326,8 @@ impl SingletonTaskInner {
                                     }
                                 }
                             }
-                            Err(e) => {
-                                error!("runner message error: {e:?}");
+                            None => {
+                                warn!("runner message stream ended unexpectedly");
                             }
                         }
                     }
