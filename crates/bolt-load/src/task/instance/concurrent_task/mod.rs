@@ -11,7 +11,6 @@ use async_broadcast::{
     Sender as BroadcastSender,
 };
 use async_channel::Receiver;
-use async_io::Timer;
 use async_waitgroup::WaitGroup;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
@@ -24,7 +23,9 @@ use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
     runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskFailedKind, TaskRunner},
-    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
+    runtime::{
+        LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl, Timer, TimerBuilder,
+    },
     task::{
         ManagerMessage, ManagerMessagesVariant, Progress, RunnerId,
         instance::{
@@ -715,14 +716,14 @@ impl ConcurrentTaskInner {
 
         let (tmp_path, file_writer) = self.create_file_writer().await?;
 
-        let mut throughout_meter_timer = Timer::after(DEFAULT_SAMPLE_INTERVAL);
-        let mut strategy_timer = Timer::after(DEFAULT_STRATEGY_TICK_INTERVAL);
+        let mut throughout_meter_timer = rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
+        let mut strategy_timer = rt.create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
 
         let event_loop_result: Result<()> = async {
             let mut is_finished = false;
             loop {
                 futures::select_biased! {
-                    _ = strategy_timer.next().fuse() => {
+                    _ = strategy_timer.tick().fuse() => {
                         Self::download_strategy_timer_tick(
                             &mut chunk_planner,
                             &mut runner_notification,
@@ -742,9 +743,8 @@ impl ConcurrentTaskInner {
                             error!("failed to download strategy timer tick: {e:?}");
                             self.sync_progress(&chunk_planner);
                         })?;
-                        strategy_timer = Timer::after(DEFAULT_STRATEGY_TICK_INTERVAL);
                     }
-                    _ = throughout_meter_timer.next().fuse() => {
+                    _ = throughout_meter_timer.tick().fuse() => {
                         Self::throughout_meter_tick(
                             &rt,
                             &wg,
@@ -755,7 +755,6 @@ impl ConcurrentTaskInner {
                             &mut per_runner_avg_speed,
                             &event_tx,
                         );
-                        throughout_meter_timer = Timer::after(DEFAULT_SAMPLE_INTERVAL);
                     }
                     msg = runner_notification.next().fuse() => {
                         match msg {
