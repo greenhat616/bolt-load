@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
 
-use async_broadcast::Receiver as BroadcastReceiver;
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
 use bolt_load_utils::telemetry::*;
 use bytes::{Bytes, BytesMut};
@@ -10,9 +9,13 @@ use smol_cancellation_token::CancellationToken;
 use crate::{
     DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AdapterError, AnyBytesStream},
-    task::{ManagerMessage, ManagerMessagesVariant, RunnerId},
+    task::{ControlEvent, RunnerId},
     utils::ShutdownGuardExt,
 };
+
+/// Type alias for the control signal receiver
+/// Using async_channel for point-to-point communication instead of broadcast
+pub type ControlSignalReceiver = async_channel::Receiver<ControlEvent>;
 
 mod guard;
 pub use guard::*;
@@ -123,8 +126,8 @@ pub struct TaskRunner {
     downloaded: u64,
     /// the adapter of the task
     stream: AnyBytesStream,
-    /// the receiver of the manager messages
-    control_signal: BroadcastReceiver<ManagerMessage>,
+    /// the receiver of the manager messages (point-to-point channel)
+    control_signal: ControlSignalReceiver,
     /// the sender of the task messages
     notify: RunnerMessageSender,
     /// the cancel token
@@ -138,8 +141,8 @@ enum Event {
     Cancelled,
     /// The stream is too slow, and transfer 0 bytes in the last SLOW_STREAM_TIMEOUT
     SlowTransfer,
-    /// The control signal is received
-    Control(Result<ManagerMessage, async_broadcast::RecvError>),
+    /// The control signal is received (point-to-point, no need for RunnerId filtering)
+    Control(Result<ControlEvent, async_channel::RecvError>),
     /// The download event is received
     Download(Option<Result<Bytes, AdapterError>>),
 }
@@ -152,7 +155,7 @@ impl TaskRunner {
         total: Option<u64>,
         stream: AnyBytesStream,
         runner_id: RunnerId,
-        receiver: BroadcastReceiver<ManagerMessage>,
+        receiver: ControlSignalReceiver,
         cancel_token: CancellationToken,
     ) -> (Self, RunnerMessageConsumer) {
         let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
@@ -175,7 +178,7 @@ impl TaskRunner {
         total: Option<u64>,
         stream: impl Future<Output = Result<AnyBytesStream, AdapterError>>,
         runner_id: RunnerId,
-        receiver: BroadcastReceiver<ManagerMessage>,
+        receiver: ControlSignalReceiver,
         cancel_token: CancellationToken,
         on_channel_created: impl FnOnce(RunnerMessageConsumer),
     ) -> Option<Self> {
@@ -241,33 +244,29 @@ impl TaskRunner {
     }
 
     /// Handle the control signal from the manager
+    ///
+    /// Since we now use point-to-point channels, the signal is guaranteed to be for this runner.
     #[cfg_attr(feature = "tracing", tracing::instrument(
         skip(self),
         name = "TaskRunner::handle_control_signal",
         fields(runner_id = self.notify.runner_id())
     ))]
-    fn handle_control_signal(&mut self, signal: &ManagerMessage) -> Result<(), TaskFailedKind> {
-        // Task layer owned the cancel token guard, ensure cancel token when manager is dropping
+    fn handle_control_signal(&mut self, signal: &ControlEvent) -> Result<(), TaskFailedKind> {
         match signal {
-            ManagerMessage(runner_id, variant) if *runner_id == self.notify.runner_id() => {
-                match variant {
-                    ManagerMessagesVariant::LimitTotal(new_total) => {
-                        if let Some(current_total) = self.total {
-                            if current_total > *new_total {
-                                trace!("runner: limit total to {new_total}");
-                                self.total = Some(*new_total);
-                            } else {
-                                warn!(
-                                    "runner: limit total is larger than current total,
-                                    limit: {new_total}, current: {current_total}"
-                                );
-                                Err(TaskFailedKind::ExceededTotalSize)?;
-                            }
-                        }
+            ControlEvent::LimitTotal(new_total) => {
+                if let Some(current_total) = self.total {
+                    if current_total > *new_total {
+                        trace!("runner: limit total to {new_total}");
+                        self.total = Some(*new_total);
+                    } else {
+                        warn!(
+                            "runner: limit total is larger than current total,
+                            limit: {new_total}, current: {current_total}"
+                        );
+                        Err(TaskFailedKind::ExceededTotalSize)?;
                     }
                 }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -412,9 +411,9 @@ impl TaskRunner {
                     break Err(TaskRunError::Cancelled);
                 }
                 Event::Control(signal) => match signal {
-                    Ok(signal) => {
-                        trace!("runner: control signal: {signal:?}");
-                        if let Err(err) = self.handle_control_signal(&signal) {
+                    Ok(variant) => {
+                        trace!("runner: control signal: {variant:?}");
+                        if let Err(err) = self.handle_control_signal(&variant) {
                             break Err(err.into());
                         }
                         trace!(
@@ -423,6 +422,7 @@ impl TaskRunner {
                         );
                     }
                     Err(_) => {
+                        // Control channel closed - manager has released this runner
                         trace!("runner: control signal channel closed");
                         break Err(TaskFailedKind::ChannelClosed.into());
                     }
@@ -505,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_normal_download() {
-        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (_control_tx, control_rx) = async_channel::bounded(1);
         let token = CancellationToken::new();
 
         // Create a stream that emits 3 chunks
@@ -559,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_download() {
-        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
 
         // Create an infinite stream that we'll cancel
@@ -615,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_network_error() {
-        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
         // Create a stream that yields an error
         let test_stream = stream! {
@@ -658,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_stream() {
-        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
         // Create an empty stream
         let test_stream = stream! {
@@ -699,7 +699,7 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_resize_total_larger() {
         let runner_id = 1;
-        let (control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
         // Create a stream with known size
         let test_stream = stream! {
@@ -745,10 +745,7 @@ mod tests {
                     // Send resize message immediately after first download (only once)
                     if !resize_sent {
                         control_tx
-                            .broadcast_direct(ManagerMessage(
-                                runner_id,
-                                ManagerMessagesVariant::LimitTotal(expected_total),
-                            ))
+                            .send(ControlEvent::LimitTotal(expected_total))
                             .await
                             .unwrap();
                         resize_sent = true;
@@ -773,7 +770,7 @@ mod tests {
     #[tokio::test]
     #[n0_tracing_test::traced_test]
     async fn test_resize_total_smaller() {
-        let (control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
 
         // Create a stream with multiple chunks that would normally total 6 chunks
@@ -824,10 +821,7 @@ mod tests {
                     if download_count == 2 {
                         trace!("runner: resize total to {expected_total}");
                         control_tx
-                            .broadcast_direct(ManagerMessage(
-                                1,
-                                ManagerMessagesVariant::LimitTotal(expected_total),
-                            ))
+                            .send(ControlEvent::LimitTotal(expected_total))
                             .await
                             .unwrap();
                     }
@@ -849,7 +843,7 @@ mod tests {
     #[tokio::test]
     #[n0_tracing_test::traced_test]
     async fn test_resize_total_smaller_with_small_chunks() {
-        let (control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
 
         // Create a stream with small chunks (50 bytes each) - these will accumulate in buffer
@@ -877,10 +871,7 @@ mod tests {
                 let new_limit = 200; // 4 chunks worth
                 trace!("sending limit signal to reduce total to {new_limit} bytes after 80ms");
                 let _ = control_tx
-                    .broadcast_direct(ManagerMessage(
-                        1,
-                        ManagerMessagesVariant::LimitTotal(new_limit),
-                    ))
+                    .send(ControlEvent::LimitTotal(new_limit))
                     .await;
             }
         });
@@ -943,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_size_mismatch() {
-        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
 
         // Create a stream that produces more data than expected
@@ -994,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_channel_closed() {
-        let (control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
 
         // Create a stream that will never complete
@@ -1044,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_with_async_and_callback_success() {
-        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
 
@@ -1119,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_with_async_and_callback_stream_failure() {
-        let (_control_tx, control_rx) = async_broadcast::broadcast(1);
+        let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
 
@@ -1174,14 +1165,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
-    async fn test_multiple_runners_handle_own_messages() {
-        let (control_tx, control_rx1) = async_broadcast::broadcast(10);
-        let control_rx2 = control_tx.new_receiver();
-        let control_rx3 = control_tx.new_receiver();
+    async fn test_multiple_runners_with_independent_channels() {
+        // Each runner now has its own independent control channel (point-to-point)
+        let (control_tx1, control_rx1) = async_channel::bounded(10);
+        let (control_tx2, control_rx2) = async_channel::bounded(10);
+        let (control_tx3, control_rx3) = async_channel::bounded(10);
 
         let cancel_token = CancellationToken::new();
 
-        // Create streams for all runners - each will yield 6 chunks of 10 bytes
+        // Create streams for all runners - each will yield 6 chunks
         let create_stream = || {
             stream! {
                 for i in 0..6 {
@@ -1269,14 +1261,11 @@ mod tests {
                                 assert_eq!(id, runner_id1);
                                 runner1_downloaded += bytes.len();
 
-                                // Send limit message to runner2 only after some downloads
+                                // Send limit message ONLY to runner2's channel after some downloads
                                 if !limit_sent && runner1_downloaded >= 20 && runner2_downloaded >= 20 {
-                                    // Limit runner2 to 35 bytes (should stop after 3.5 chunks)
-                                    control_tx
-                                        .broadcast_direct(ManagerMessage(
-                                            runner_id2,
-                                            ManagerMessagesVariant::LimitTotal(3 * BUFFER_SIZE as u64),
-                                        ))
+                                    // Limit runner2 to 3 chunks - message goes directly to runner2
+                                    control_tx2
+                                        .send(ControlEvent::LimitTotal(3 * BUFFER_SIZE as u64))
                                         .await
                                         .unwrap();
                                     limit_sent = true;
@@ -1357,6 +1346,10 @@ mod tests {
         runner2_handle.await.unwrap();
         runner3_handle.await.unwrap();
 
+        // Keep control channels alive until runners complete
+        drop(control_tx1);
+        drop(control_tx3);
+
         // Verify results
         assert!(runner1_started && runner2_started && runner3_started);
         assert!(runner1_finished && runner2_finished && runner3_finished);
@@ -1369,7 +1362,7 @@ mod tests {
         // Runner2 should have been limited to 3 chunks
         assert_eq!(runner2_downloaded, 3 * BUFFER_SIZE);
 
-        println!("✓ Multiple runners correctly handled their own messages");
+        println!("✓ Multiple runners with independent channels work correctly");
         println!("  - Runner1 downloaded: {runner1_downloaded} bytes (expected: 6 chunks)");
         println!(
             "  - Runner2 downloaded: {runner2_downloaded} bytes (expected: 3 chunks, limited)"

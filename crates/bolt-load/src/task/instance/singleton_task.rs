@@ -18,10 +18,7 @@ use crate::{
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
         Progress, RunnerId,
-        instance::{
-            DEFAULT_CONTROL_CHANNEL_CAPACITY, ProgressWithSpeed, RunningPayload, TaskControl,
-            TaskEvent,
-        },
+        instance::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
     },
     utils::ShutdownGuardExt,
 };
@@ -282,7 +279,7 @@ impl SingletonTaskInner {
         }
 
         let wg = WaitGroup::new();
-        let (control_tx, control_rx) = async_broadcast::broadcast(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (control_tx, control_rx) = TaskRunnerGuard::create_control_channel();
         let guard = TaskRunnerGuard::new(STATIC_RUNNER_ID, cancel_token.clone(), control_tx);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _shutdown_guard = shutdown_tx.shutdown_guard();

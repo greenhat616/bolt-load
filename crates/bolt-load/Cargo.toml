@@ -112,7 +112,7 @@ bolt-load-tests = { path = "../bolt-load-tests", version = "0.1" }
 
 pretty_assertions = { workspace = true }
 n0-tracing-test = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-util = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
 
