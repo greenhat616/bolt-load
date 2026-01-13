@@ -278,11 +278,11 @@ mod tests {
 
         let writer = PoolWriterBuilder::new()
             .file(file)
-            .parallel(4) // 使用 4 个并行写入线程
+            .parallel(4) // Use 4 parallel write threads
             .build()
             .unwrap();
 
-        // Concurrent write multiple blocks
+        // Concurrently write multiple blocks
         let write_tasks: Vec<_> = (0..10)
             .map(|i| {
                 let offset = i * 100;
@@ -297,7 +297,7 @@ mod tests {
 
         writer.finalize().await.unwrap();
 
-        // Validate all data are written
+        // Validate that all data are written
         let mut verify_file = std::fs::File::open(temp_file.path()).unwrap();
         for i in 0..10u64 {
             let offset = i * 100;
@@ -322,7 +322,7 @@ mod tests {
         // Without setting parallel, the default value should be used
         let writer = PoolWriterBuilder::new().file(file).build().unwrap();
 
-        // If it can be created successfully, it means the default parallelism is set correctly
+        // If creation succeeds, it means the default parallelism is set correctly
         writer.finalize().await.unwrap();
     }
 
@@ -338,7 +338,7 @@ mod tests {
             .open(temp_file.path())
             .unwrap();
 
-        // Use single thread
+        // Use a single thread
         let writer = PoolWriterBuilder::new()
             .file(file)
             .parallel(1)

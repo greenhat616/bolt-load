@@ -269,7 +269,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "mmap", not(feature = "compio")))]
     fn test_file_range_writer_kind_suggest_kind_small_file() {
-        // 小文件应该使用 Mmap
+        // Small files should use Mmap
         assert_eq!(
             FileRangeWriterKind::suggest_kind(1024),
             FileRangeWriterKind::Mmap
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "mmap", not(feature = "compio")))]
     fn test_file_range_writer_kind_suggest_kind_large_file() {
-        // 大于 isize::MAX 的文件应该使用 Pool
+        // Files larger than isize::MAX should use Pool
         assert_eq!(
             FileRangeWriterKind::suggest_kind(isize::MAX as u64 + 1),
             FileRangeWriterKind::Pool
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     #[cfg(all(feature = "mmap", not(feature = "compio")))]
     fn test_file_range_writer_kind_suggest_kind_boundary() {
-        // 边界测试：恰好等于 isize::MAX 应该使用 Mmap
+        // Boundary test: exactly equal to isize::MAX should use Mmap
         assert_eq!(
             FileRangeWriterKind::suggest_kind(isize::MAX as u64),
             FileRangeWriterKind::Mmap

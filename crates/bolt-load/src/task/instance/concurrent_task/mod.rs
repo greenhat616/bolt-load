@@ -965,7 +965,7 @@ mod tests {
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
 
-        // 验证能收到 Started 消息
+        // Verify that Started message is received
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         match msg {
@@ -975,7 +975,7 @@ mod tests {
             _ => panic!("Expected Started message, got: {:?}", msg),
         }
 
-        // 验证能收到下载数据
+        // Verify that downloaded data is received
         let mut total_downloaded = 0;
         let mut downloaded_data = Vec::new();
 
@@ -994,11 +994,11 @@ mod tests {
             }
         }
 
-        // 验证下载的数据量
+        // Verify the amount of downloaded data
         assert_eq!(total_downloaded, (range.end - range.start) as usize);
         assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
 
-        // 验证数据的确定性 - 创建相同的适配器获取相同范围的数据进行比较
+        // Verify data determinism - create the same adapter to get data from the same range for comparison
         let reference_adapter = SimpleTestAdapter::new(10240).with_range_support(true);
         let reference_stream =
             BoltLoadAdapter::range_stream(&reference_adapter, range.start, range.end)
@@ -1041,7 +1041,7 @@ mod tests {
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
 
-        // 应该收到失败消息，因为 range_stream 失败
+        // Should receive failure message because range_stream fails
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         match msg {
@@ -1084,15 +1084,15 @@ mod tests {
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
 
-        // 等待开始消息
+        // Wait for start message
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
-        // 取消任务
+        // Cancel the task
         cancel_token.cancel();
 
-        // 等待取消消息
+        // Wait for cancellation message
         while let Some(msg) = msg_rx.next().await {
             if let RunnerMessage(
                 id,
@@ -1119,7 +1119,7 @@ mod tests {
         let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
 
-        // 在创建运行器之前预先发送控制消息
+        // Send control message before creating the runner
         let new_total = 1000u64;
         control_tx
             .send(ControlEvent::LimitTotal(new_total))
@@ -1142,12 +1142,12 @@ mod tests {
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
 
-        // 等待开始消息
+        // Wait for start message
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
-        // 收集下载数据
+        // Collect downloaded data
         let mut total_downloaded = 0;
         while let Some(msg) = msg_rx.next().await {
             match msg {
@@ -1161,7 +1161,7 @@ mod tests {
             }
         }
 
-        // 验证下载量应该是调整后的大小
+        // Verify that downloaded amount is the adjusted size
         if total_downloaded != new_total as usize {
             error!("total_downloaded: {total_downloaded}, new_total: {new_total}");
         }
@@ -1177,7 +1177,7 @@ mod tests {
             SimpleTestAdapter::new(content_size).with_range_support(true),
         ) as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
 
-        // 测试边界范围：从文件末尾开始
+        // Test boundary range: start from end of file
         let range = 900u64..1000u64;
         let runner_id = 5;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -1199,12 +1199,12 @@ mod tests {
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
 
-        // 等待开始
+        // Wait for start
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
-        // 收集所有数据
+        // Collect all data
         let mut downloaded_data = Vec::new();
         while let Some(msg) = msg_rx.next().await {
             match msg {
@@ -1230,7 +1230,7 @@ mod tests {
                 as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
         );
 
-        // 测试零长度范围
+        // Test zero-length range
         let range = 500u64..500u64;
         let runner_id = 6;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -1252,12 +1252,12 @@ mod tests {
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
 
-        // 等待开始
+        // Wait for start
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
-        // 应该立即完成，没有下载任何数据
+        // Should finish immediately without downloading any data
         let msg = msg_rx.next().await.unwrap();
         match msg {
             RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
@@ -1276,7 +1276,7 @@ mod tests {
                 as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
         );
 
-        // 创建多个并发的范围运行器
+        // Create multiple concurrent range runners
         let ranges = vec![
             (1, 0u64..1000u64),
             (2, 1000u64..2000u64),
@@ -1309,15 +1309,15 @@ mod tests {
 
                 let (msg_rx, runner_handle) = result;
 
-                // 保持控制通道发送端活跃
+                // Keep the control channel sender alive
                 let _control_tx = control_tx;
 
-                // 等待开始
+                // Wait for start
                 let mut msg_rx = pin!(msg_rx);
                 let msg = msg_rx.next().await.unwrap();
                 assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
-                // 收集所有数据
+                // Collect all data
                 let mut downloaded_size = 0;
                 let mut finished = false;
 
@@ -1341,12 +1341,12 @@ mod tests {
                     }
                 }
 
-                // 确保运行器正确完成
+                // Ensure the runner completed correctly
                 if !finished {
                     panic!("Runner {runner_id} did not finish properly");
                 }
 
-                // 等待运行器完全完成
+                // Wait for the runner to fully complete
                 runner_handle.await;
 
                 (runner_id, downloaded_size, range.end - range.start)
@@ -1355,7 +1355,7 @@ mod tests {
             handles.push(handle);
         }
 
-        // 等待所有任务完成
+        // Wait for all tasks to complete
         let results = futures::future::join_all(handles).await;
 
         for result in results {
@@ -1397,12 +1397,12 @@ mod tests {
         assert!(result.is_ok());
         let (msg_rx, _handle) = result.unwrap();
 
-        // 等待开始消息
+        // Wait for start message
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
 
-        // 收集所有下载的数据
+        // Collect all downloaded data
         let mut downloaded_data = Vec::new();
         while let Some(msg) = msg_rx.next().await {
             match msg {
@@ -1416,7 +1416,7 @@ mod tests {
             }
         }
 
-        // 使用相同的适配器直接获取相同范围的数据进行比较
+        // Use the same adapter to directly get data from the same range for comparison
         let reference_adapter = SimpleTestAdapter::new(5000).with_range_support(true);
         let reference_stream =
             BoltLoadAdapter::range_stream(&reference_adapter, range.start, range.end)
@@ -1429,11 +1429,11 @@ mod tests {
             reference_data.extend_from_slice(&chunk);
         }
 
-        // 验证数据完整性
+        // Verify data integrity
         assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
         assert_eq!(downloaded_data, reference_data);
 
-        // 计算并比较 hash
+        // Calculate and compare hash
         let downloaded_hash = calculate_blake3(&downloaded_data);
         let reference_hash = calculate_blake3(&reference_data);
         assert_eq!(downloaded_hash, reference_hash);

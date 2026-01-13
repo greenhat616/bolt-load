@@ -219,11 +219,11 @@ mod tests {
 
     #[test]
     fn test_mmap_writer_capability_is_supported() {
-        // 小文件应该被支持
+        // Small files should be supported
         assert!(MmapWriterBuilder::is_supported(1024));
         assert!(MmapWriterBuilder::is_supported(1024 * 1024 * 1024)); // 1GB
 
-        // 大于 isize::MAX 的文件不应该被支持
+        // Files larger than isize::MAX should not be supported
         assert!(!MmapWriterBuilder::is_supported(isize::MAX as u64 + 1));
     }
 
@@ -313,7 +313,7 @@ mod tests {
 
         let writer = MmapWriterBuilder::new().file(file).build().await.unwrap();
 
-        // Concurrent write multiple blocks
+        // Concurrently write multiple blocks
         let write_tasks: Vec<_> = (0..10)
             .map(|i| {
                 let offset = i * 100;
@@ -328,7 +328,7 @@ mod tests {
 
         writer.finalize().await.unwrap();
 
-        // Validate all data are written
+        // Validate that all data are written
         let mut verify_file = std::fs::File::open(temp_file.path()).unwrap();
         for i in 0..10u64 {
             let offset = i * 100;

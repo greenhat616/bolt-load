@@ -1,10 +1,10 @@
-//! Runner Manager - 统一管理 runner 的生命周期和通信
+//! Runner Manager - Unified management of runner lifecycle and communication
 //!
-//! 这个模块提供了一个统一的接口来管理：
-//! - Runner ID 的分配和回收 (IdGenerator)
-//! - Chunk 的分配和进度跟踪 (ChunkPlanner)
-//! - Runner 消息的聚合接收 (RunnerNotification)
-//! - 向特定 runner 发送控制消息的通道
+//! This module provides a unified interface to manage:
+//! - Runner ID allocation and recycling (IdGenerator)
+//! - Chunk allocation and progress tracking (ChunkPlanner)
+//! - Aggregated reception of runner messages (RunnerNotification)
+//! - Channels for sending control messages to specific runners
 
 use std::{collections::HashMap, ops::Range};
 
@@ -16,16 +16,16 @@ use crate::{
     task::{ControlEvent, RunnerId, instance::Generator},
 };
 
-/// 控制通道的默认容量
+/// Default capacity for control channels
 const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
 
-/// 控制消息发送端的类型别名
+/// Type alias for control message sender
 pub type ControlSender = Sender<ControlEvent>;
 
-/// 控制消息接收端的类型别名
+/// Type alias for control message receiver
 pub type ControlReceiver = Receiver<ControlEvent>;
 
-/// 发送消息时可能遇到的错误
+/// Errors that may occur when sending messages
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
     #[error("Runner {0} not found")]
@@ -60,32 +60,32 @@ impl<T> From<TrySendError<T>> for SendError {
     }
 }
 
-/// Runner 注册信息
+/// Runner registration information
 pub struct RunnerRegistration {
     /// Runner ID
     pub runner_id: RunnerId,
-    /// 控制消息接收端
+    /// Control message receiver
     pub control_rx: ControlReceiver,
 }
 
-/// Runner Manager - 统一管理 runner 的生命周期和通信
+/// Runner Manager - Unified management of runner lifecycle and communication
 pub struct RunnerManager {
-    /// ID 生成器，用于管理 runner ID 的分配和回收
+    /// ID generator for managing runner ID allocation and recycling
     id_generator: Generator,
-    /// Chunk 规划器，用于管理 chunk 的分配和进度
+    /// Chunk planner for managing chunk allocation and progress
     chunk_planner: ChunkPlanner,
-    /// Runner 通知聚合器，用于接收来自 runner 的消息
+    /// Runner notification aggregator for receiving messages from runners
     runner_notification: RunnerNotification,
-    /// 控制通道映射，用于向特定 runner 发送消息
+    /// Control channel mapping for sending messages to specific runners
     control_channels: HashMap<RunnerId, ControlSender>,
 }
 
 impl RunnerManager {
-    /// 创建一个新的 RunnerManager
+    /// Creates a new RunnerManager
     ///
     /// # Arguments
-    /// * `total` - 下载文件的总大小
-    /// * `max_concurrency` - 最大并发数
+    /// * `total` - Total size of the file to download
+    /// * `max_concurrency` - Maximum concurrency level
     pub fn new(total: u64, max_concurrency: usize) -> Self {
         Self {
             id_generator: Generator::new(max_concurrency),
@@ -95,13 +95,13 @@ impl RunnerManager {
         }
     }
 
-    // ==================== ID Generator 相关方法 ====================
+    // ==================== ID Generator Related Methods ====================
 
-    /// 分配一个新的 runner ID 和对应的控制通道
+    /// Allocates a new runner ID and corresponding control channel
     ///
     /// # Returns
-    /// * `Some(RunnerRegistration)` - 如果成功分配
-    /// * `None` - 如果已达到最大并发数
+    /// * `Some(RunnerRegistration)` - If allocation is successful
+    /// * `None` - If maximum concurrency has been reached
     pub fn allocate_runner(&mut self) -> Option<RunnerRegistration> {
         let runner_id = self.id_generator.next()?;
         let (tx, rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -112,54 +112,54 @@ impl RunnerManager {
         })
     }
 
-    /// 释放一个 runner ID 及其相关资源
+    /// Releases a runner ID and its associated resources
     ///
-    /// 这会：
-    /// - 关闭并移除控制通道
-    /// - 从 RunnerNotification 中移除
-    /// - 回收 runner ID
+    /// This will:
+    /// - Close and remove the control channel
+    /// - Remove from RunnerNotification
+    /// - Recycle the runner ID
     pub fn release_runner(&mut self, runner_id: RunnerId) {
-        // 关闭控制通道（发送端 drop 后接收端会收到关闭信号）
+        // Close control channel (receiver will get closed signal after sender is dropped)
         self.control_channels.remove(&runner_id);
         self.runner_notification.remove(runner_id);
         self.id_generator.release(runner_id);
     }
 
-    /// 检查指定 ID 是否已分配
+    /// Checks if the specified ID is allocated
     #[inline]
     pub fn is_runner_allocated(&self, runner_id: RunnerId) -> bool {
         self.id_generator.is_allocated(runner_id)
     }
 
-    /// 获取当前已分配的 runner 数量
+    /// Gets the number of currently allocated runners
     #[inline]
     pub fn allocated_runner_count(&self) -> usize {
         self.id_generator.allocated_count()
     }
 
-    /// 检查是否已达到最大并发数
+    /// Checks if maximum concurrency has been reached
     #[inline]
     pub fn is_full(&self) -> bool {
         self.id_generator.is_full()
     }
 
-    /// 检查是否没有任何 runner
+    /// Checks if there are no runners
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.id_generator.is_empty()
     }
 
-    // ==================== 控制通道相关方法 ====================
+    // ==================== Control Channel Related Methods ====================
 
-    /// 向指定 runner 发送控制消息
+    /// Sends a control message to the specified runner
     ///
     /// # Arguments
-    /// * `runner_id` - 目标 runner 的 ID
-    /// * `message` - 要发送的消息
+    /// * `runner_id` - ID of the target runner
+    /// * `message` - Message to send
     ///
     /// # Returns
-    /// * `Ok(())` - 如果成功发送
-    /// * `Err(SendError)` - 如果发送失败
+    /// * `Ok(())` - If the message is sent successfully
+    /// * `Err(SendError)` - If sending fails
     pub fn send_message(
         &self,
         runner_id: RunnerId,
@@ -168,73 +168,73 @@ impl RunnerManager {
         self.control_channels.send_message(runner_id, message)
     }
 
-    /// 获取指定 runner 的控制通道发送端（克隆）
+    /// Gets the control channel sender for the specified runner (cloned)
     ///
-    /// 这个方法用于需要持有发送端引用的场景
+    /// This method is used for scenarios that need to hold a sender reference
     pub fn get_control_sender(&self, runner_id: RunnerId) -> Option<ControlSender> {
         self.control_channels.get(&runner_id).cloned()
     }
 
-    // ==================== Runner Notification 相关方法 ====================
+    // ==================== Runner Notification Related Methods ====================
 
-    /// 注册一个 runner 的消息消费者
+    /// Registers a message consumer for a runner
     pub fn register_notification(&mut self, runner_id: RunnerId, consumer: RunnerMessageConsumer) {
         self.runner_notification.add(runner_id, consumer);
     }
 
-    /// 获取 RunnerNotification 的可变引用
+    /// Gets a mutable reference to RunnerNotification
     ///
-    /// 用于在事件循环中轮询消息
+    /// Used for polling messages in the event loop
     #[inline]
     pub fn notification_mut(&mut self) -> &mut RunnerNotification {
         &mut self.runner_notification
     }
 
-    /// 关闭 RunnerNotification
+    /// Closes RunnerNotification
     #[inline]
     pub fn close_notification(&mut self) {
         self.runner_notification.close();
     }
 
-    /// 检查 RunnerNotification 是否已关闭
+    /// Checks if RunnerNotification is closed
     #[inline]
     pub fn is_notification_closed(&self) -> bool {
         self.runner_notification.is_closed()
     }
 
-    // ==================== Chunk Planner 相关方法 ====================
+    // ==================== Chunk Planner Related Methods ====================
 
-    /// 获取 ChunkPlanner 的不可变引用
+    /// Gets an immutable reference to ChunkPlanner
     #[inline]
     pub fn chunk_planner(&self) -> &ChunkPlanner {
         &self.chunk_planner
     }
 
-    /// 获取 ChunkPlanner 的可变引用
+    /// Gets a mutable reference to ChunkPlanner
     #[inline]
     pub fn chunk_planner_mut(&mut self) -> &mut ChunkPlanner {
         &mut self.chunk_planner
     }
 
-    /// 创建一个 PlannerGuard 用于事务性操作
+    /// Creates a PlannerGuard for transactional operations
     #[inline]
     pub fn planner_guard(&mut self) -> PlannerGuard<'_> {
         PlannerGuard::new(&mut self.chunk_planner)
     }
 
-    /// 获取文件总大小
+    /// Gets the total file size
     #[inline]
     pub fn total(&self) -> u64 {
         self.chunk_planner.total
     }
 
-    /// 分配一个 chunk 给指定的 runner
+    /// Allocates a chunk to the specified runner
     #[inline]
     pub fn allocate_chunk(&mut self, range: Range<u64>, runner_id: RunnerId) -> bool {
         self.chunk_planner.allocate_chunk(range, Some(runner_id))
     }
 
-    /// 更新 runner 的下载进度
+    /// Updates the download progress of a runner
     #[inline]
     pub fn update_progress(
         &mut self,
@@ -245,7 +245,7 @@ impl RunnerManager {
             .update_progress(runner_id, bytes_downloaded)
     }
 
-    /// 标记 runner 已完成
+    /// Marks a runner as finished
     #[inline]
     pub fn mark_finished(
         &mut self,
@@ -254,7 +254,7 @@ impl RunnerManager {
         self.chunk_planner.mark_finished(runner_id)
     }
 
-    /// 标记 runner 已失败
+    /// Marks a runner as failed
     #[inline]
     pub fn mark_failed(
         &mut self,
@@ -263,43 +263,43 @@ impl RunnerManager {
         self.chunk_planner.mark_failed(runner_id)
     }
 
-    /// 检查下载是否完成
+    /// Checks if the download is complete
     #[inline]
     pub fn is_complete(&self) -> bool {
         self.chunk_planner.is_complete()
     }
 
-    /// 获取总下载量
+    /// Gets the total amount downloaded
     #[inline]
     pub fn get_total_downloaded(&self) -> u64 {
         self.chunk_planner.get_total_downloaded()
     }
 
-    /// 获取已下载的范围
+    /// Gets the downloaded ranges
     #[inline]
     pub fn get_downloaded_ranges(&self) -> Vec<Range<u64>> {
         self.chunk_planner.get_downloaded_ranges()
     }
 
-    /// 获取可用的范围
+    /// Gets the available ranges
     #[inline]
     pub fn get_available_ranges(&self) -> Vec<Range<u64>> {
         self.chunk_planner.get_available_ranges()
     }
 
-    /// 获取活跃 runner 数量
+    /// Gets the number of active runners
     #[inline]
     pub fn get_active_runners_count(&self) -> usize {
         self.chunk_planner.get_active_runners_count()
     }
 
-    /// 获取指定 runner 的状态
+    /// Gets the state of the specified runner
     #[inline]
     pub fn get_runner_state(&self, runner_id: RunnerId) -> Option<&ChunkState> {
         self.chunk_planner.get_runner_state(runner_id)
     }
 
-    /// 查找可以拆分的 chunk
+    /// Finds a chunk that can be split
     #[inline]
     pub fn find_chunk_to_split(
         &self,
@@ -308,13 +308,13 @@ impl RunnerManager {
         self.chunk_planner.find_chunk_to_split(required_size)
     }
 
-    /// 尝试按长度安排一个 chunk
+    /// Attempts to arrange a chunk by length
     #[inline]
     pub fn try_arrange_chunk_by_length(&self, length: u64) -> Option<Range<u64>> {
         self.chunk_planner.try_arrange_chunk_by_length(length)
     }
 
-    /// 获取未完成的状态
+    /// Gets incomplete states
     #[inline]
     pub fn get_incomplete_states(
         &self,
@@ -323,7 +323,7 @@ impl RunnerManager {
         self.chunk_planner.get_incomplete_states(min_chunk_size)
     }
 
-    /// 拆分 chunk
+    /// Splits a chunk
     #[inline]
     pub fn split_chunk(
         &mut self,
@@ -335,7 +335,7 @@ impl RunnerManager {
             .split_chunk(runner_id, split_pos, new_runner_id)
     }
 
-    /// 调整 runner 状态的大小
+    /// Resizes the runner state
     #[inline]
     pub fn resize_runner_state(
         &mut self,
@@ -345,18 +345,18 @@ impl RunnerManager {
         self.chunk_planner.resize_runner_state(runner_id, new_size)
     }
 
-    // ==================== 组合操作 ====================
+    // ==================== Combined Operations ====================
 
-    /// 分配一个新的 runner 并分配 chunk
+    /// Allocates a new runner and assigns a chunk
     ///
-    /// 这是一个便捷方法，组合了 `allocate_runner` 和 `allocate_chunk`
+    /// This is a convenience method that combines `allocate_runner` and `allocate_chunk`
     ///
     /// # Arguments
-    /// * `range` - 要分配的 chunk 范围
+    /// * `range` - The chunk range to allocate
     ///
     /// # Returns
-    /// * `Some((RunnerRegistration, bool))` - runner 注册信息和 chunk 是否成功分配
-    /// * `None` - 如果无法分配 runner ID
+    /// * `Some((RunnerRegistration, bool))` - Runner registration info and whether chunk was successfully allocated
+    /// * `None` - If unable to allocate a runner ID
     pub fn allocate_runner_with_chunk(&mut self, range: Range<u64>) -> Option<RunnerRegistration> {
         let registration = self.allocate_runner()?;
         if !self.allocate_chunk(range, registration.runner_id) {
@@ -366,15 +366,15 @@ impl RunnerManager {
         Some(registration)
     }
 
-    /// 完全释放一个 runner（包括 chunk 标记为完成）
+    /// Fully releases a runner (including marking chunk as complete)
     ///
     /// # Arguments
-    /// * `runner_id` - 要释放的 runner ID
-    /// * `finished` - runner 是否成功完成
+    /// * `runner_id` - The runner ID to release
+    /// * `finished` - Whether the runner completed successfully
     ///
     /// # Returns
-    /// * `Ok(Option<Range<u64>>)` - 如果 runner 失败，返回未完成的范围
-    /// * `Err` - 如果操作失败
+    /// * `Ok(Option<Range<u64>>)` - If runner failed, returns the unfinished range
+    /// * `Err` - If the operation fails
     pub fn release_runner_full(
         &mut self,
         runner_id: RunnerId,
@@ -433,46 +433,46 @@ mod tests {
     fn test_allocate_and_release_runner() {
         let mut manager = RunnerManager::new(1000, 2);
 
-        // 分配第一个 runner
+        // Allocate the first runner
         let reg1 = manager.allocate_runner().unwrap();
         assert_eq!(reg1.runner_id, 0);
         assert_eq!(manager.allocated_runner_count(), 1);
 
-        // 分配第二个 runner
+        // Allocate the second runner
         let reg2 = manager.allocate_runner().unwrap();
         assert_eq!(reg2.runner_id, 1);
         assert_eq!(manager.allocated_runner_count(), 2);
         assert!(manager.is_full());
 
-        // 无法分配更多
+        // Cannot allocate more
         assert!(manager.allocate_runner().is_none());
 
-        // 释放第一个 runner
+        // Release the first runner
         manager.release_runner(reg1.runner_id);
         assert_eq!(manager.allocated_runner_count(), 1);
         assert!(!manager.is_full());
 
-        // 可以再次分配
+        // Can allocate again
         let reg3 = manager.allocate_runner().unwrap();
-        assert_eq!(reg3.runner_id, 0); // 复用释放的 ID
+        assert_eq!(reg3.runner_id, 0); // Reuse released ID
     }
 
     #[test]
     fn test_send_message() {
         let mut manager = RunnerManager::new(1000, 2);
 
-        // 分配 runner
+        // Allocate runner
         let reg = manager.allocate_runner().unwrap();
 
-        // 发送消息
+        // Send message
         let result = manager.send_message(reg.runner_id, ControlEvent::LimitTotal(500));
         assert!(result.is_ok());
 
-        // 接收消息
+        // Receive message
         let msg = reg.control_rx.try_recv().unwrap();
         assert!(matches!(msg, ControlEvent::LimitTotal(500)));
 
-        // 向不存在的 runner 发送消息
+        // Send message to non-existent runner
         let result = manager.send_message(999, ControlEvent::LimitTotal(500));
         assert!(matches!(result, Err(SendError::RunnerNotFound(999))));
     }
@@ -481,12 +481,12 @@ mod tests {
     fn test_allocate_runner_with_chunk() {
         let mut manager = RunnerManager::new(1000, 2);
 
-        // 分配 runner 和 chunk
+        // Allocate runner and chunk
         let reg = manager.allocate_runner_with_chunk(0..500).unwrap();
 
         assert_eq!(reg.runner_id, 0);
 
-        // 验证 chunk 已分配
+        // Verify chunk is allocated
         let state = manager.get_runner_state(reg.runner_id).unwrap();
         assert_eq!(state.allocated, 0..500);
     }
@@ -495,17 +495,17 @@ mod tests {
     fn test_release_runner_full() {
         let mut manager = RunnerManager::new(1000, 2);
 
-        // 分配 runner 和 chunk
+        // Allocate runner and chunk
         let reg = manager.allocate_runner_with_chunk(0..500).unwrap();
 
-        // 更新进度
+        // Update progress
         manager.update_progress(reg.runner_id, 200).unwrap();
 
-        // 释放（失败场景）
+        // Release (failure scenario)
         let result = manager.release_runner_full(reg.runner_id, false).unwrap();
         assert_eq!(result, Some(200..500));
 
-        // runner 应该已被释放
+        // Runner should have been released
         assert!(manager.is_empty());
     }
 }
