@@ -870,9 +870,7 @@ mod tests {
                 sleep(Duration::from_millis(80)).await;
                 let new_limit = 200; // 4 chunks worth
                 trace!("sending limit signal to reduce total to {new_limit} bytes after 80ms");
-                let _ = control_tx
-                    .send(ControlEvent::LimitTotal(new_limit))
-                    .await;
+                let _ = control_tx.send(ControlEvent::LimitTotal(new_limit)).await;
             }
         });
 
