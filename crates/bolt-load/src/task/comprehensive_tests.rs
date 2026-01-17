@@ -28,6 +28,8 @@ use crate::{
 };
 
 /// Create test runtime
+#[allow(clippy::needless_return)]
+#[allow(unreachable_code)]
 fn create_test_runtime() -> ThreadedRuntimeImpl {
     #[cfg(feature = "tokio")]
     {

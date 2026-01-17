@@ -841,7 +841,12 @@ mod tests {
     use smol_cancellation_token::CancellationToken;
 
     use super::*;
-    use crate::{adapter::BoltLoadAdapter, runtime::ThreadedRuntimeImpl, task::ControlEvent};
+    use crate::{
+        adapter::BoltLoadAdapter,
+        runner::{RunnerMessage, RunnerMessageKind, StoppedReason},
+        runtime::ThreadedRuntimeImpl,
+        task::ControlEvent,
+    };
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]

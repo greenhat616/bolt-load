@@ -586,6 +586,7 @@ impl RunnerManager {
 #[cfg(test)]
 mod tests {
     use super::{super::chunk_planner::ChunkStatus, *};
+    use crate::runner::RunnerConnectorError;
 
     #[test]
     fn test_runner_manager_creation() {
