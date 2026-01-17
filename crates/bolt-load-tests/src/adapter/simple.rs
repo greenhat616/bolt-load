@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use bolt_load_core::adapter::{
@@ -58,6 +59,8 @@ pub struct SimpleTestAdapterBuilder {
     filename: Option<String>,
     max_speed: Option<u64>,
     max_per_stream_speed: Option<u64>,
+    /// Delay before creating a stream (simulates connection time)
+    connecting_delay: Option<Duration>,
 }
 
 pub type GlobalRateLimiter = Arc<
@@ -78,6 +81,7 @@ impl Default for SimpleTestAdapterBuilder {
             filename: Some("test_file.bin".to_string()),
             max_speed: None,
             max_per_stream_speed: None,
+            connecting_delay: None,
         }
     }
 }
@@ -147,6 +151,11 @@ impl SimpleTestAdapterBuilder {
         self
     }
 
+    pub fn connecting_delay(mut self, delay: Duration) -> Self {
+        self.connecting_delay = Some(delay);
+        self
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub fn build(self) -> Result<SimpleTestAdapter, SimpleTestAdapterBuildError> {
         let Some(content_size) = self.content_size else {
@@ -172,6 +181,7 @@ impl SimpleTestAdapterBuilder {
             filename: self.filename,
             rate_limiter,
             max_per_stream_speed: self.max_per_stream_speed,
+            connecting_delay: self.connecting_delay,
         })
     }
 }
@@ -191,6 +201,8 @@ pub struct SimpleTestAdapter {
     rate_limiter: Option<GlobalRateLimiter>,
     /// the speed of the stream in bytes per second
     max_per_stream_speed: Option<u64>,
+    /// Delay before creating a stream (simulates connection time)
+    connecting_delay: Option<Duration>,
 }
 
 impl SimpleTestAdapter {
@@ -219,6 +231,7 @@ impl SimpleTestAdapter {
             filename: self.filename.clone(),
             rate_limiter: self.rate_limiter.clone(),
             max_per_stream_speed: self.max_per_stream_speed,
+            connecting_delay: self.connecting_delay,
         }
     }
 
@@ -243,6 +256,12 @@ impl SimpleTestAdapter {
     /// Configure chunk size
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.chunk_size = chunk_size;
+        self
+    }
+
+    /// Configure connecting delay
+    pub fn with_connecting_delay(mut self, delay: Duration) -> Self {
+        self.connecting_delay = Some(delay);
         self
     }
 
@@ -304,6 +323,15 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         );
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
+        // Simulate connection delay
+        if let Some(delay) = self.connecting_delay {
+            info!(
+                "[TEST ADAPTER] full_stream() simulating connection delay: {:?}",
+                delay
+            );
+            tokio::time::sleep(delay).await;
+        }
+
         if self.should_fail {
             info!("[TEST ADAPTER] full_stream() returning failure");
             return Err(InternalSnafu {
@@ -345,6 +373,15 @@ impl BoltLoadAdapter for SimpleTestAdapter {
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
+
+        // Simulate connection delay
+        if let Some(delay) = self.connecting_delay {
+            info!(
+                "[TEST ADAPTER] range_stream() simulating connection delay: {:?}",
+                delay
+            );
+            tokio::time::sleep(delay).await;
+        }
 
         if self.should_fail {
             return Err(InternalSnafu {
@@ -1023,6 +1060,104 @@ mod tests {
             "No speed limit - Actual speed: {:.2} MB/s, Elapsed: {:.4}s",
             actual_speed / 1024.0 / 1024.0,
             elapsed_secs
+        );
+    }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_connecting_delay() {
+        use std::time::Instant;
+
+        let delay = Duration::from_millis(200);
+        let content_size = 1024;
+
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(content_size)
+            .connecting_delay(delay)
+            .build()
+            .unwrap();
+
+        let start_time = Instant::now();
+        let stream = adapter.full_stream().await.unwrap();
+        let connection_elapsed = start_time.elapsed();
+
+        // Verify the connection delay was applied
+        assert!(
+            connection_elapsed >= delay,
+            "Connection should take at least {:?}, but took {:?}",
+            delay,
+            connection_elapsed
+        );
+
+        // Collect all data
+        let mut downloaded_data = Vec::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            downloaded_data.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(downloaded_data.len(), content_size);
+    }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_range_stream_connecting_delay() {
+        use std::time::Instant;
+
+        let delay = Duration::from_millis(150);
+        let content_size = 4096;
+
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(content_size)
+            .support_range(true)
+            .connecting_delay(delay)
+            .build()
+            .unwrap();
+
+        let start = 1000u64;
+        let end = 2000u64;
+
+        let start_time = Instant::now();
+        let stream = adapter.range_stream(start, end).await.unwrap();
+        let connection_elapsed = start_time.elapsed();
+
+        // Verify the connection delay was applied
+        assert!(
+            connection_elapsed >= delay,
+            "Connection should take at least {:?}, but took {:?}",
+            delay,
+            connection_elapsed
+        );
+
+        // Collect all data
+        let mut downloaded_data = Vec::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            downloaded_data.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(downloaded_data.len(), (end - start) as usize);
+    }
+
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn test_with_connecting_delay_method() {
+        use std::time::Instant;
+
+        let delay = Duration::from_millis(100);
+        let adapter = SimpleTestAdapter::new(1024).with_connecting_delay(delay);
+
+        let start_time = Instant::now();
+        let _ = adapter.full_stream().await.unwrap();
+        let elapsed = start_time.elapsed();
+
+        assert!(
+            elapsed >= delay,
+            "Connection should take at least {:?}, but took {:?}",
+            delay,
+            elapsed
         );
     }
 }

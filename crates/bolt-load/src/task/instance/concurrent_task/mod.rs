@@ -855,7 +855,7 @@ mod tests {
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
-        let result = ConcurrentTaskInner::create_background_range_runner(
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
             &rt,
             &wg,
             range.clone(),
@@ -863,12 +863,11 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
-        )
-        .await;
-        wg.wait().await;
-
+        );
+        let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (msg_rx, _handle) = result.unwrap();
+        let msg_rx = result.unwrap();
+        wg.wait().await;
 
         // Verify that Started message is received
         let mut msg_rx = pin!(msg_rx);
@@ -922,6 +921,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_adapter_failure() {
+        use crate::runner::RunnerConnectorError;
+
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1024).with_failure(true))
             as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
@@ -931,7 +932,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let result = ConcurrentTaskInner::create_background_range_runner(
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
             &rt,
             &wg,
             range,
@@ -939,24 +940,16 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
-        )
-        .await;
+        );
+        let result = receiver.await.expect("receiver closed");
         wg.wait().await;
 
-        assert!(result.is_ok());
-        let (msg_rx, _handle) = result.unwrap();
-
-        // Should receive failure message because range_stream fails
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        match msg {
-            RunnerMessage(
-                id,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_))),
-            ) => {
-                assert_eq!(id, runner_id);
-            }
-            _ => panic!("Expected StreamError failure message, got: {:?}", msg),
+        // Connection should fail because range_stream fails
+        assert!(result.is_err());
+        match result {
+            Ok(_) => panic!("Expected Connection error, got cons rx"),
+            Err(RunnerConnectorError::Connection { .. }) => {}
+            Err(e) => panic!("Expected Connection error, got: {:?}", e),
         }
     }
 
@@ -974,7 +967,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let result = ConcurrentTaskInner::create_background_range_runner(
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
             &rt,
             &wg,
             range,
@@ -982,12 +975,11 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token.clone(),
-        )
-        .await;
-        wg.wait().await;
-
+        );
+        let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (msg_rx, _handle) = result.unwrap();
+        let msg_rx = result.unwrap();
+        wg.wait().await;
 
         // Wait for start message
         let mut msg_rx = pin!(msg_rx);
@@ -1032,7 +1024,7 @@ mod tests {
             .unwrap();
 
         let wg = WaitGroup::new();
-        let result = ConcurrentTaskInner::create_background_range_runner(
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
             &rt,
             &wg,
             range.clone(),
@@ -1040,12 +1032,11 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
-        )
-        .await;
-        wg.wait().await;
-
+        );
+        let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (msg_rx, _handle) = result.unwrap();
+        let msg_rx = result.unwrap();
+        wg.wait().await;
 
         // Wait for start message
         let mut msg_rx = pin!(msg_rx);
@@ -1089,7 +1080,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let result = ConcurrentTaskInner::create_background_range_runner(
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
             &rt,
             &wg,
             range.clone(),
@@ -1097,12 +1088,11 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
-        )
-        .await;
-        wg.wait().await;
-
+        );
+        let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (msg_rx, _handle) = result.unwrap();
+        let msg_rx = result.unwrap();
+        wg.wait().await;
 
         // Wait for start
         let mut msg_rx = pin!(msg_rx);
@@ -1142,7 +1132,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let result = ConcurrentTaskInner::create_background_range_runner(
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
             &rt,
             &wg,
             range,
@@ -1150,12 +1140,11 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
-        )
-        .await;
-        wg.wait().await;
-
+        );
+        let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (msg_rx, _handle) = result.unwrap();
+        let msg_rx = result.unwrap();
+        wg.wait().await;
 
         // Wait for start
         let mut msg_rx = pin!(msg_rx);
@@ -1199,7 +1188,7 @@ mod tests {
 
             let handle = tokio::spawn(async move {
                 let wg = WaitGroup::new();
-                let result = ConcurrentTaskInner::create_background_range_runner(
+                let receiver = ConcurrentTaskInner::create_background_range_runner(
                     &rt_clone,
                     &wg,
                     range.clone(),
@@ -1207,12 +1196,10 @@ mod tests {
                     control_rx,
                     runner_id,
                     cancel_token,
-                )
-                .await
-                .unwrap();
+                );
+                let result = receiver.await.expect("receiver closed");
+                let msg_rx = result.expect("connection failed");
                 wg.wait().await;
-
-                let (msg_rx, runner_handle) = result;
 
                 // Keep the control channel sender alive
                 let _control_tx = control_tx;
@@ -1251,9 +1238,6 @@ mod tests {
                     panic!("Runner {runner_id} did not finish properly");
                 }
 
-                // Wait for the runner to fully complete
-                runner_handle.await;
-
                 (runner_id, downloaded_size, range.end - range.start)
             });
 
@@ -1287,7 +1271,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let result = ConcurrentTaskInner::create_background_range_runner(
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
             &rt,
             &wg,
             range.clone(),
@@ -1295,12 +1279,11 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
-        )
-        .await;
-        wg.wait().await;
-
+        );
+        let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (msg_rx, _handle) = result.unwrap();
+        let msg_rx = result.unwrap();
+        wg.wait().await;
 
         // Wait for start message
         let mut msg_rx = pin!(msg_rx);

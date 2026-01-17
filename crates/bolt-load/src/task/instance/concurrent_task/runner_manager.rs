@@ -592,7 +592,7 @@ impl RunnerManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::chunk_planner::ChunkStatus, *};
 
     #[test]
     fn test_runner_manager_creation() {
@@ -681,5 +681,132 @@ mod tests {
 
         // Runner should have been released
         assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn test_allocate_pending_runner_with_chunk() {
+        let mut manager = RunnerManager::new(1000, 2);
+
+        // Allocate pending runner with chunk
+        let result =
+            manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _control_rx| {
+                assert_eq!(runner_id, 0);
+                // Return a receiver that will resolve later
+                let (_, rx) =
+                    oneshot::channel::<Result<RunnerMessageConsumer, RunnerConnectorError>>();
+                rx
+            });
+
+        assert!(result.is_some());
+        assert_eq!(manager.allocated_runner_count(), 1);
+
+        // Verify chunk is allocated with pending status
+        let state = manager.get_runner_state(0).unwrap();
+        assert_eq!(state.allocated, 0..500);
+        assert_eq!(state.status, ChunkStatus::Pending);
+    }
+
+    #[test]
+    fn test_multiple_pending_runners() {
+        let mut manager = RunnerManager::new(1000, 4);
+
+        // Allocate multiple pending runners
+        for i in 0..4 {
+            let start = (i * 250) as u64;
+            let end = ((i + 1) * 250) as u64;
+            let result = manager.allocate_pending_runner_with_chunk(start..end, |_runner_id, _| {
+                let (_, rx) =
+                    oneshot::channel::<Result<RunnerMessageConsumer, RunnerConnectorError>>();
+                rx
+            });
+            assert!(result.is_some());
+        }
+
+        assert_eq!(manager.allocated_runner_count(), 4);
+        assert!(manager.is_full());
+
+        // Cannot allocate more
+        let result = manager.allocate_pending_runner_with_chunk(0..100, |_, _| {
+            let (_, rx) = oneshot::channel();
+            rx
+        });
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pending_to_running_via_tick() {
+        use async_ringbuf::{AsyncHeapRb, traits::Split};
+
+        use crate::{
+            DEFAULT_EVENT_CHANNEL_CAPACITY,
+            runner::{RunnerMessage, RunnerMessageKind},
+        };
+
+        let mut manager = RunnerManager::new(1000, 2);
+
+        // Create a channel to send the consumer
+        let (tx, rx) = oneshot::channel();
+
+        // Allocate pending runner
+        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _control_rx| {
+            assert_eq!(runner_id, 0);
+            rx
+        });
+
+        // Verify initial state is pending
+        let state = manager.get_runner_state(0).unwrap();
+        assert_eq!(state.status, ChunkStatus::Pending);
+
+        // Create a mock consumer
+        let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (_prod, cons) = rb.split();
+
+        // Send the consumer through the channel
+        tx.send(Ok(cons)).unwrap();
+
+        // Tick to process the pending runner
+        let mut meters = HashMap::new();
+        let state = manager.tick(&mut meters, |_, _| {}).await;
+
+        assert_eq!(state, TaskState::Downloading);
+
+        // Verify state is now running
+        let chunk_state = manager.get_runner_state(0).unwrap();
+        assert_eq!(chunk_state.status, ChunkStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_pending_connection_failure_via_tick() {
+        use crate::runner::RunnerConnectorError;
+
+        let mut manager = RunnerManager::new(1000, 2);
+
+        // Create a channel to send the error
+        let (tx, rx) = oneshot::channel();
+
+        // Allocate pending runner
+        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _control_rx| {
+            assert_eq!(runner_id, 0);
+            rx
+        });
+
+        // Verify initial state is pending
+        let state = manager.get_runner_state(0).unwrap();
+        assert_eq!(state.status, ChunkStatus::Pending);
+
+        // Send connection error
+        tx.send(Err(RunnerConnectorError::Build {
+            source: crate::runner::TaskRunnerBuilderError::StreamNotSet,
+        }))
+        .unwrap();
+
+        // Tick to process the pending runner
+        let mut meters = HashMap::new();
+        let state = manager.tick(&mut meters, |_, _| {}).await;
+
+        assert_eq!(state, TaskState::Downloading);
+
+        // Verify runner state is removed (failed)
+        assert!(manager.get_runner_state(0).is_none());
     }
 }

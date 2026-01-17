@@ -627,10 +627,13 @@ mod tests {
     fn test_basic_allocation() {
         let mut planner = ChunkPlanner::new(1000);
 
-        // Normal allocation
+        // Normal allocation (creates Pending state)
         assert!(planner.allocate_chunk(0..300, Some(1)));
         assert_eq!(planner.get_chunks_count(), 1);
         assert_eq!(planner.get_active_runners_count(), 1);
+
+        // Transition to running
+        assert!(planner.mark_running(1).is_ok());
 
         // Allocate to idle state
         assert!(planner.allocate_chunk(300..600, None));
@@ -647,8 +650,9 @@ mod tests {
     fn test_unified_progress_tracking() {
         let mut planner = ChunkPlanner::new(1000);
 
-        // Allocate chunk with runner
+        // Allocate chunk with runner and mark as running
         assert!(planner.allocate_chunk(0..500, Some(1)));
+        assert!(planner.mark_running(1).is_ok());
 
         // Update progress
         assert!(planner.update_progress(1, 100).is_ok());
@@ -667,8 +671,11 @@ mod tests {
     fn test_chunk_splitting() {
         let mut planner = ChunkPlanner::new(1000);
 
-        // Allocate and partially download
+        // Allocate and mark as running
         assert!(planner.allocate_chunk(0..600, Some(1)));
+        assert!(planner.mark_running(1).is_ok());
+
+        // Partially download
         assert!(planner.update_progress(1, 200).is_ok());
 
         // Split the chunk
@@ -691,8 +698,9 @@ mod tests {
     fn test_failure_handling() {
         let mut planner = ChunkPlanner::new(1000);
 
-        // Allocate and partially download
+        // Allocate, mark as running and partially download
         assert!(planner.allocate_chunk(100..500, Some(1)));
+        assert!(planner.mark_running(1).is_ok());
         assert!(planner.update_progress(1, 150).is_ok());
 
         // Mark as failed
@@ -1061,7 +1069,9 @@ mod tests {
         // Allocate some chunks, leaving gaps
         let chunk_size = 3 * 1024 * 1024; // 3MB
         assert!(planner.allocate_chunk(0..chunk_size, Some(1)));
+        assert!(planner.mark_running(1).is_ok());
         assert!(planner.allocate_chunk(2 * chunk_size..3 * chunk_size, Some(2)));
+        assert!(planner.mark_running(2).is_ok());
 
         // Should return available range when available ranges exist
         let result = planner.find_chunk_to_split(100);
@@ -1073,7 +1083,9 @@ mod tests {
 
         // Allocate all available space
         assert!(planner.allocate_chunk(chunk_size..2 * chunk_size, Some(3)));
+        assert!(planner.mark_running(3).is_ok());
         assert!(planner.allocate_chunk(3 * chunk_size..10 * 1024 * 1024, Some(4)));
+        assert!(planner.mark_running(4).is_ok());
 
         // Add small download progress, retain large space for splitting
         assert!(planner.update_progress(1, 500 * 1024).is_ok()); // 500KB
@@ -1292,5 +1304,112 @@ mod tests {
         // Check statistics
         assert!(planner.get_total_downloaded() > 0);
         assert!(planner.get_active_runners_count() < num_chunks);
+    }
+
+    #[test]
+    fn test_pending_chunk_allocation() {
+        let mut planner = ChunkPlanner::new(1000);
+
+        // Allocate pending chunk
+        assert!(planner.allocate_pending_chunk(0..300, 1));
+        assert_eq!(planner.get_chunks_count(), 1);
+        assert_eq!(planner.get_active_runners_count(), 1);
+
+        // Check state is pending
+        let state = planner.get_runner_state(1).unwrap();
+        assert_eq!(state.allocated, 0..300);
+        assert_eq!(state.status, ChunkStatus::Pending);
+    }
+
+    #[test]
+    fn test_pending_to_running_transition() {
+        let mut planner = ChunkPlanner::new(1000);
+
+        // Allocate pending chunk
+        assert!(planner.allocate_pending_chunk(0..500, 1));
+        let state = planner.get_runner_state(1).unwrap();
+        assert_eq!(state.status, ChunkStatus::Pending);
+
+        // Mark as running
+        assert!(planner.mark_running(1).is_ok());
+
+        // Check state is now running
+        let state = planner.get_runner_state(1).unwrap();
+        assert_eq!(state.status, ChunkStatus::Running);
+        assert_eq!(state.allocated, 0..500);
+    }
+
+    #[test]
+    fn test_pending_chunk_failure() {
+        let mut planner = ChunkPlanner::new(1000);
+
+        // Allocate pending chunk
+        assert!(planner.allocate_pending_chunk(100..500, 1));
+
+        // Mark as failed (simulating connection failure)
+        let unfinished = planner.mark_failed(1).unwrap();
+        assert_eq!(unfinished, 100..500);
+
+        // Chunk should be removed
+        assert!(planner.get_runner_state(1).is_none());
+        assert_eq!(planner.get_chunks_count(), 0);
+    }
+
+    #[test]
+    fn test_multiple_pending_chunks() {
+        let mut planner = ChunkPlanner::new(1000);
+
+        // Allocate multiple pending chunks
+        assert!(planner.allocate_pending_chunk(0..250, 1));
+        assert!(planner.allocate_pending_chunk(250..500, 2));
+        assert!(planner.allocate_pending_chunk(500..750, 3));
+        assert!(planner.allocate_pending_chunk(750..1000, 4));
+
+        assert_eq!(planner.get_chunks_count(), 4);
+        assert_eq!(planner.get_active_runners_count(), 4);
+
+        // Transition some to running
+        assert!(planner.mark_running(1).is_ok());
+        assert!(planner.mark_running(3).is_ok());
+
+        // Check states
+        assert_eq!(
+            planner.get_runner_state(1).unwrap().status,
+            ChunkStatus::Running
+        );
+        assert_eq!(
+            planner.get_runner_state(2).unwrap().status,
+            ChunkStatus::Pending
+        );
+        assert_eq!(
+            planner.get_runner_state(3).unwrap().status,
+            ChunkStatus::Running
+        );
+        assert_eq!(
+            planner.get_runner_state(4).unwrap().status,
+            ChunkStatus::Pending
+        );
+
+        // Active count should still be 4 (pending is also active)
+        assert_eq!(planner.get_active_runners_count(), 4);
+    }
+
+    #[test]
+    fn test_pending_then_progress_update() {
+        let mut planner = ChunkPlanner::new(1000);
+
+        // Allocate pending chunk
+        assert!(planner.allocate_pending_chunk(0..500, 1));
+
+        // Mark as running
+        assert!(planner.mark_running(1).is_ok());
+
+        // Update progress
+        assert!(planner.update_progress(1, 100).is_ok());
+        assert!(planner.update_progress(1, 200).is_ok());
+
+        let state = planner.get_runner_state(1).unwrap();
+        assert_eq!(state.downloaded, 0..300);
+        assert_eq!(state.status, ChunkStatus::Running);
     }
 }
