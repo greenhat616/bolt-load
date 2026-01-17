@@ -4,7 +4,7 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{DownloadMode, Progress};
 use crate::{
-    adapter::{AdapterError, AnyAdapter, UnretryableError},
+    adapter::{AdapterError, AnyAdapter},
     runner::TaskFailedKind,
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
 };

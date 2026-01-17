@@ -9,25 +9,18 @@
 use std::{collections::HashMap, ops::Range};
 
 use async_channel::{Receiver, Sender, TrySendError};
-use async_waitgroup::WaitGroup;
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt, task::SpawnExt};
+use futures::{FutureExt, StreamExt};
 use pending::{
     PendingRunnerContext, PendingRunnerGroup, PendingRunnerOutput, PendingRunnerReceiver,
 };
 
-use super::{
-    ChunkPlanner, PlannerGuard,
-    chunk_planner::ChunkState,
-    file_writer::{FileRangeWriter, FileWriter},
-};
+use super::{ChunkPlanner, PlannerGuard, chunk_planner::ChunkState};
 use crate::{
     runner::{
-        RunnerConnectorError, RunnerMessage, RunnerMessageConsumer, RunnerMessageKind,
-        StoppedReason, TaskFailedKind,
+        RunnerMessage, RunnerMessageConsumer, RunnerMessageKind, StoppedReason, TaskFailedKind,
     },
-    runtime::ThreadedRuntimeImpl,
     task::{ControlEvent, RunnerId, instance::Generator},
 };
 

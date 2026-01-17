@@ -24,6 +24,12 @@ pin_project! {
     }
 }
 
+impl Default for RunnerNotification {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunnerNotification {
     pub fn new() -> Self {
         Self::with_capacity(0)

@@ -391,7 +391,7 @@ impl TaskRunner {
         let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
         let mut is_finished = false;
         let mut timer = async_io::Timer::after(SLOW_STREAM_TIMEOUT);
-        let mut now = std::time::Instant::now();
+        let _now = std::time::Instant::now();
         let result = loop {
             let step: Event = async {
                 let control_signal = self.control_signal.recv().fuse();

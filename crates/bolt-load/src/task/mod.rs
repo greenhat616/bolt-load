@@ -13,7 +13,6 @@ use smol_cancellation_token::CancellationToken;
 use tracing::Instrument;
 
 use crate::{
-    DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
 };

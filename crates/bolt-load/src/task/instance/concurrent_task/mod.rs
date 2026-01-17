@@ -19,8 +19,7 @@ use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
     runner::{
-        RunnerConnector, RunnerConnectorError, RunnerMessage, RunnerMessageConsumer,
-        RunnerMessageKind, StoppedReason, TaskFailedKind, TaskRunner,
+        RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskFailedKind, TaskRunner,
     },
     runtime::{
         LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl, Timer, TimerBuilder,
@@ -741,6 +740,7 @@ impl ConcurrentTaskInner {
 impl ConcurrentTaskInner {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     #[state]
+    #[allow(unused_variables)]
     fn stopped(
         &mut self,
         context: &mut Context,
@@ -758,6 +758,7 @@ impl ConcurrentTaskInner {
     }
 
     #[superstate]
+    #[allow(unused_variables)]
     async fn running(event: &Event) -> Outcome<State> {
         Super
     }
