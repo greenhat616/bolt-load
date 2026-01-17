@@ -5,7 +5,7 @@ use smol_cancellation_token::CancellationToken;
 use super::{DownloadMode, Progress};
 use crate::{
     adapter::{AdapterError, AnyAdapter},
-    runner::TaskFailedKind,
+    runner::TaskError,
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
 };
 
@@ -125,7 +125,7 @@ pub enum TaskInstanceError {
     #[error("failed to fetch stream failed: {0}")]
     StreamFailed(AdapterError),
     #[error("task failed: {0:?}")]
-    Failed(TaskFailedKind),
+    Failed(Arc<TaskError>),
     #[error("failed to write chunk: {0}")]
     WriteChunkFailed(Arc<std::io::Error>),
 }
@@ -139,8 +139,8 @@ impl TaskInstanceError {
         Self::StreamFailed(e)
     }
 
-    pub fn new_failed(e: TaskFailedKind) -> Self {
-        Self::Failed(e)
+    pub fn new_failed(e: TaskError) -> Self {
+        Self::Failed(Arc::new(e))
     }
 
     pub fn new_write_chunk_failed(e: std::io::Error) -> Self {

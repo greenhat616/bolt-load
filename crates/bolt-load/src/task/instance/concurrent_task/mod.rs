@@ -18,9 +18,7 @@ use super::{Result, TaskInstance};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
-    runner::{
-        RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskFailedKind, TaskRunner,
-    },
+    runner::{RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskError, TaskRunner},
     runtime::{
         LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl, Timer, TimerBuilder,
     },
@@ -197,9 +195,9 @@ impl ConcurrentTaskInner {
     async fn retrieve_meta(&mut self) -> Result<()> {
         // TODO: use backon to retry
         let adapter = self.adapter.as_ref().ok_or_else(|| {
-            TaskInstanceError::Failed(TaskFailedKind::Other(
-                "Adapter not set before meta retrieval".to_string(),
-            ))
+            TaskInstanceError::new_failed(TaskError::Other {
+                message: "Adapter not set before meta retrieval".to_string(),
+            })
         })?;
         let meta = adapter
             .retrieve_meta()
@@ -241,13 +239,15 @@ impl ConcurrentTaskInner {
             )))
         };
         let total_size = self.progress.total.ok_or_else(|| {
-            TaskInstanceError::Failed(TaskFailedKind::Other(
-                "File writer creation called before meta retrieval".to_string(),
-            ))
+            TaskInstanceError::new_failed(TaskError::Other {
+                message: "File writer creation called before meta retrieval".to_string(),
+            })
         })?;
-        let file_writer = FileWriter::new(&tmp_path, total_size)
-            .await
-            .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
+        let file_writer = FileWriter::new(&tmp_path, total_size).await.map_err(|e| {
+            TaskInstanceError::new_failed(TaskError::Other {
+                message: e.to_string(),
+            })
+        })?;
         Ok((tmp_path.into_owned(), file_writer))
     }
 
@@ -627,14 +627,17 @@ impl ConcurrentTaskInner {
         event_loop_result?;
 
         // TODO: add a finalizing state?
-        file_writer
-            .finalize()
-            .await
-            .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
+        file_writer.finalize().await.map_err(|e| {
+            TaskInstanceError::new_failed(TaskError::Other {
+                message: e.to_string(),
+            })
+        })?;
 
-        async_fs::rename(&tmp_path, &self.path)
-            .await
-            .map_err(|e| TaskInstanceError::Failed(TaskFailedKind::Other(e.to_string())))?;
+        async_fs::rename(&tmp_path, &self.path).await.map_err(|e| {
+            TaskInstanceError::new_failed(TaskError::Other {
+                message: e.to_string(),
+            })
+        })?;
 
         Ok(())
     }
@@ -729,7 +732,7 @@ impl ConcurrentTaskInner {
                 futures::select_biased! {
                     _ = cancel => {
                         Transition(State::stopped(Some(Err(
-                            TaskInstanceError::Failed(TaskFailedKind::Cancelled),
+                            TaskInstanceError::new_failed(TaskError::Cancelled),
                         ))))
                     }
                     res = task => { res }
@@ -760,7 +763,7 @@ impl ConcurrentTaskInner {
                 futures::select_biased! {
                     _ = cancel => {
                         Transition(State::stopped(Some(Err(
-                            TaskInstanceError::Failed(TaskFailedKind::Cancelled),
+                            TaskInstanceError::new_failed(TaskError::Cancelled),
                         ))))
                     }
                     res = task => { res }
@@ -938,10 +941,8 @@ mod tests {
 
         // Wait for cancellation message
         while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(
-                id,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Cancelled)),
-            ) = msg
+            if let RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg
+                && e.is_cancelled()
             {
                 assert_eq!(id, runner_id);
                 break;

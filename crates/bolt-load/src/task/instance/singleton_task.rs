@@ -206,7 +206,7 @@ impl SingletonTaskInner {
                     *is_finished = true;
                     return Ok(());
                 }
-                StoppedReason::Failed(kind) => return Err(TaskInstanceError::Failed(kind)),
+                StoppedReason::Failed(kind) => return Err(TaskInstanceError::new_failed(kind)),
             },
             RunnerMessageKind::Downloaded(chunk) => {
                 trace!("[SINGLETON TASK] downloaded chunk: {:?}", chunk.len());
@@ -463,8 +463,8 @@ impl SingletonTaskInner {
                 futures::select_biased! {
                     _ = cancel_token.cancelled().fuse() => {
                         trace!("[STATE MACHINE] initializing cancelled");
-                        Transition(State::stopped(Some(Err(TaskInstanceError::Failed(
-                            crate::runner::TaskFailedKind::Cancelled,
+                        Transition(State::stopped(Some(Err(TaskInstanceError::new_failed(
+                            crate::runner::TaskError::Cancelled,
                         )))))
                     }
                     res = task => {

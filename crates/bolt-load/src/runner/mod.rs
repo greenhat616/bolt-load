@@ -44,39 +44,109 @@ pub enum RunnerMessageKind {
     Downloaded(Bytes),
 }
 
+impl RunnerMessageKind {
+    #[inline]
+    pub fn failed(e: TaskError) -> Self {
+        Self::Stopped(StoppedReason::Failed(e))
+    }
+
+    #[inline]
+    pub fn finished() -> Self {
+        Self::Stopped(StoppedReason::Finished)
+    }
+
+    #[inline]
+    pub fn downloaded(chunk: Bytes) -> Self {
+        Self::Downloaded(chunk)
+    }
+
+    #[inline]
+    pub fn started() -> Self {
+        Self::Started
+    }
+
+    #[inline]
+    pub const fn is_finished(&self) -> bool {
+        matches!(self, Self::Stopped(StoppedReason::Finished))
+    }
+
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Stopped(StoppedReason::Failed(e)) => e.is_cancelled(),
+            _ => false,
+        }
+    }
+}
+
 /// The reason why the task is stopped
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum StoppedReason {
     /// The task is finished
     Finished,
     /// The task is failed
-    Failed(TaskFailedKind),
+    Failed(TaskError),
 }
 
 /// The kind of the task failed
-#[derive(Debug, Clone)]
-pub enum TaskFailedKind {
+#[derive(Debug, snafu::Snafu)]
+pub enum TaskError {
     /// The task is cancelled
+    #[snafu(display("task is cancelled"))]
     Cancelled,
     /// The task is timeout, only happen when a stream is not sent in a period
+    #[snafu(display("task is timeout"))]
     Timeout,
     /// The task is empty
+    #[snafu(display("task is empty"))]
     Empty,
     /// The channel is closed
+    #[snafu(display("channel is closed"))]
     ChannelClosed,
     /// The task is exceeded the total size
     ///
     /// Possible reason:
     /// - The total sized while the downloaded chunk is larger than the total size
+    #[snafu(display("task is exceeded the total size"))]
     ExceededTotalSize,
     /// The task is smaller than the total size
     ///
     /// Possible reason:
     /// - The total sized while the downloaded chunk is smaller than the total size
+    #[snafu(display("task is smaller than the total size"))]
     SmallerThanTotalSize,
-    StreamError(AdapterError),
+    #[snafu(display("stream error: {source}"))]
+    StreamError { source: AdapterError },
     /// The other error
-    Other(String),
+    #[snafu(display("other error: {message}"))]
+    Other { message: String },
+}
+
+impl TaskError {
+    #[inline]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::StreamError {
+                source: AdapterError::Retryable { .. }
+            } | Self::Timeout
+        )
+    }
+
+    #[inline]
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    #[inline]
+    pub const fn is_stream_error(&self) -> bool {
+        matches!(self, Self::StreamError { .. })
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
 }
 
 /// a wrapper of the task message sender using ring buffer
@@ -112,11 +182,11 @@ impl RunnerMessageSender {
 #[derive(Debug)]
 enum TaskRunError {
     Cancelled,
-    Failed(TaskFailedKind),
+    Failed(TaskError),
 }
 
-impl From<TaskFailedKind> for TaskRunError {
-    fn from(value: TaskFailedKind) -> Self {
+impl From<TaskError> for TaskRunError {
+    fn from(value: TaskError) -> Self {
         Self::Failed(value)
     }
 }
@@ -198,9 +268,7 @@ impl TaskRunner {
             Err(e) => {
                 prod.try_push(RunnerMessage(
                     runner_id,
-                    RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(
-                        e,
-                    ))),
+                    RunnerMessageKind::failed(TaskError::StreamError { source: e }),
                 ))
                 .expect("Manager ring buffer should never full or closed");
                 return None;
@@ -230,27 +298,17 @@ impl TaskRunner {
     pub async fn run(&mut self) {
         match self.run_inner().await {
             Ok(_) => {
-                let _ = self
-                    .notify
-                    .send(RunnerMessageKind::Stopped(StoppedReason::Finished))
-                    .await;
+                let _ = self.notify.send(RunnerMessageKind::finished()).await;
             }
             Err(err) => match err {
                 TaskRunError::Cancelled => {
                     let _ = self
                         .notify
-                        .send(RunnerMessageKind::Stopped(StoppedReason::Failed(
-                            TaskFailedKind::Cancelled,
-                        )))
+                        .send(RunnerMessageKind::failed(TaskError::Cancelled))
                         .await;
                 }
-                TaskRunError::Failed(failed_kind) => {
-                    let _ = self
-                        .notify
-                        .send(RunnerMessageKind::Stopped(StoppedReason::Failed(
-                            failed_kind,
-                        )))
-                        .await;
+                TaskRunError::Failed(task_err) => {
+                    let _ = self.notify.send(RunnerMessageKind::failed(task_err)).await;
                 }
             },
         }
@@ -264,7 +322,7 @@ impl TaskRunner {
         name = "TaskRunner::handle_control_signal",
         fields(runner_id = self.notify.runner_id())
     ))]
-    fn handle_control_signal(&mut self, signal: &ControlEvent) -> Result<(), TaskFailedKind> {
+    fn handle_control_signal(&mut self, signal: &ControlEvent) -> Result<(), TaskError> {
         match signal {
             ControlEvent::LimitTotal(new_total) => {
                 if let Some(current_total) = self.total {
@@ -276,7 +334,7 @@ impl TaskRunner {
                             "runner: limit total is larger than current total,
                             limit: {new_total}, current: {current_total}"
                         );
-                        Err(TaskFailedKind::ExceededTotalSize)?;
+                        Err(TaskError::ExceededTotalSize)?;
                     }
                 }
             }
@@ -284,14 +342,14 @@ impl TaskRunner {
         Ok(())
     }
 
-    async fn flush_buff(&mut self, buff: &mut BytesMut) -> Result<(), TaskFailedKind> {
+    async fn flush_buff(&mut self, buff: &mut BytesMut) -> Result<(), TaskError> {
         if !buff.is_empty() {
             self.downloaded += buff.len() as u64;
             let chunk = buff.split().freeze();
             self.notify
                 .send(RunnerMessageKind::Downloaded(chunk))
                 .await
-                .map_err(|_| TaskFailedKind::ChannelClosed)?;
+                .map_err(|_| TaskError::ChannelClosed)?;
             // Note: BytesMut::split() already leaves the buffer empty, but we clear for clarity
         }
         Ok(())
@@ -314,7 +372,7 @@ impl TaskRunner {
         event: Option<Result<Bytes, AdapterError>>,
         buff: &mut BytesMut,
         is_finished: &mut bool,
-    ) -> Result<(), TaskFailedKind> {
+    ) -> Result<(), TaskError> {
         match event {
             // TODO: check boundary after
             Some(Ok(item)) => {
@@ -361,7 +419,7 @@ impl TaskRunner {
             // If it is not, we should just return the error, and terminate the task
             Some(Err(err)) => {
                 self.flush_buff(buff).await?;
-                return Err(TaskFailedKind::StreamError(err));
+                return Err(TaskError::StreamError { source: err }.into());
             }
             // In this case, the download is closed, which means the stream is finished
             None => {
@@ -383,7 +441,7 @@ impl TaskRunner {
         self.notify
             .send(RunnerMessageKind::Started)
             .await
-            .map_err(|_| TaskRunError::Failed(TaskFailedKind::ChannelClosed))?;
+            .map_err(|_| TaskRunError::Failed(TaskError::ChannelClosed))?;
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _guard = shutdown_tx.shutdown_guard();
@@ -437,7 +495,7 @@ impl TaskRunner {
                     Err(_) => {
                         // Control channel closed - manager has released this runner
                         trace!("runner: control signal channel closed");
-                        break Err(TaskFailedKind::ChannelClosed.into());
+                        break Err(TaskError::ChannelClosed.into());
                     }
                 },
                 Event::SlowTransfer => {
@@ -476,7 +534,7 @@ impl TaskRunner {
                          downloaded: {}",
                         total, self.downloaded
                     );
-                    return Err(TaskFailedKind::SmallerThanTotalSize.into());
+                    return Err(TaskError::SmallerThanTotalSize.into());
                 }
                 Ordering::Less => {
                     warn!(
@@ -484,12 +542,12 @@ impl TaskRunner {
                          downloaded: {}",
                         total, self.downloaded
                     );
-                    return Err(TaskFailedKind::ExceededTotalSize.into());
+                    return Err(TaskError::ExceededTotalSize.into());
                 }
             },
             None if self.downloaded > 0 => {}
             None => {
-                return Err(TaskFailedKind::Empty.into());
+                return Err(TaskError::Empty.into());
             }
         }
         Ok(())
@@ -610,12 +668,8 @@ mod tests {
 
         // Wait for cancelled message
         let mut cancelled = false;
-        while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(
-                _,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Cancelled)),
-            ) = msg
-            {
+        while let Some(RunnerMessage(_, msg)) = msg_rx.next().await {
+            if msg.is_cancelled() {
                 cancelled = true;
                 break;
             }
@@ -655,13 +709,11 @@ mod tests {
         let mut got_error = false;
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(
-                _,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_))),
-            ) = msg
-            {
-                got_error = true;
-                break;
+            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg {
+                if e.is_stream_error() {
+                    got_error = true;
+                    break;
+                }
             }
         }
 
@@ -694,13 +746,11 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
             error!("msg: {msg:?}");
-            if let RunnerMessage(
-                _,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::Empty)),
-            ) = msg
-            {
-                got_empty_error = true;
-                break;
+            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg {
+                if e.is_empty() {
+                    got_empty_error = true;
+                    break;
+                }
             }
         }
 
@@ -1030,13 +1080,11 @@ mod tests {
 
         let mut got_channel_closed = false;
         while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(
-                _,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::ChannelClosed)),
-            ) = msg
-            {
-                got_channel_closed = true;
-                break;
+            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg {
+                if matches!(e, TaskError::ChannelClosed) {
+                    got_channel_closed = true;
+                    break;
+                }
             }
         }
 
@@ -1161,10 +1209,9 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         match msg {
-            RunnerMessage(
-                id,
-                RunnerMessageKind::Stopped(StoppedReason::Failed(TaskFailedKind::StreamError(_))),
-            ) => {
+            RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Failed(e)))
+                if e.is_stream_error() =>
+            {
                 assert_eq!(id, runner_id);
             }
             _ => panic!("Expected stopped message with stream error, got: {msg:?}"),

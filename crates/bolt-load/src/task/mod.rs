@@ -303,9 +303,9 @@ impl Task {
 
         let handle = self.threaded_rt.spawn_with_handle(fut).map_err(|e| {
             error!("failed to spawn the task: {e:?}");
-            TaskInstanceError::new_failed(crate::runner::TaskFailedKind::Other(
-                "failed to spawn the task".to_string(),
-            ))
+            TaskInstanceError::new_failed(crate::runner::TaskError::Other {
+                message: "failed to spawn the task".to_string(),
+            })
         })?;
         self.event_handler_handle = Some(handle);
 

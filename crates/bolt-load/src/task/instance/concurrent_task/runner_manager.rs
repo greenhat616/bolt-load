@@ -21,9 +21,7 @@ use super::{
     ChunkPlanner, PlannerGuard, chunk_planner::ChunkState, strategy::RunnerOutcomeSampler,
 };
 use crate::{
-    runner::{
-        RunnerMessage, RunnerMessageConsumer, RunnerMessageKind, StoppedReason, TaskFailedKind,
-    },
+    runner::{RunnerMessage, RunnerMessageConsumer, RunnerMessageKind, StoppedReason, TaskError},
     task::{
         ControlEvent, RunnerId,
         instance::{Generator, concurrent_task::strategy::RunnerFailureKind},
@@ -415,7 +413,7 @@ impl RunnerManager {
                     StoppedReason::Failed(kind) => {
                         error!("runner {runner_id} failed: {kind:?}");
                         match kind {
-                            TaskFailedKind::ExceededTotalSize => {
+                            TaskError::ExceededTotalSize => {
                                 self.chunk_planner
                                     .mark_finished(runner_id)
                                     .expect("chunk planner should not fail");
@@ -426,9 +424,13 @@ impl RunnerManager {
                                     .chunk_planner
                                     .mark_failed(runner_id)
                                     .expect("chunk planner should not fail");
-                                // TODO: check if the error is retryable
-                                self.runner_outcome_sampler
-                                    .record_stream_closed(RunnerFailureKind::Retryable);
+                                if kind.is_retryable() {
+                                    self.runner_outcome_sampler
+                                        .record_stream_closed(RunnerFailureKind::Retryable);
+                                } else {
+                                    self.runner_outcome_sampler
+                                        .record_stream_closed(RunnerFailureKind::Unretryable);
+                                }
                                 trace!(
                                     "runner {runner_id} failed, released range: \
                                      {unfinished_range:?}"

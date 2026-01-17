@@ -50,7 +50,6 @@ async-trait = "0.1"
 futures = { workspace = true }
 futures-concurrency = "7"
 pin-project-lite = "0.2"
-bon = "3"
 url = "2"
 bytes = "1"
 enum_dispatch = "0.3"
