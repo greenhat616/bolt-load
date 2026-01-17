@@ -9,7 +9,7 @@ use std::{
 use async_waitgroup::WaitGroup;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
-use futures::{FutureExt, StreamExt, task::SpawnExt};
+use futures::{FutureExt, task::SpawnExt};
 use runner_manager::TaskState;
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
@@ -177,12 +177,6 @@ pub enum Event {
 enum RunnerStatus {
     Running,
     Finished,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum SplitTaskError {
-    #[error("task instance error: {0}")]
-    TaskInstanceError(#[from] TaskInstanceError),
 }
 
 impl ConcurrentTaskInner {
@@ -421,12 +415,12 @@ impl ConcurrentTaskInner {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    #[inline]
     fn handle_strategy_action(
         runner_manager: &mut RunnerManager,
-        action: StrategyAction,
+        max_concurrency: &mut usize,
 
-        current_speed: f64,
-        planned_chunk_size: u64,
+        action: StrategyAction,
 
         threaded_rt: &ThreadedRuntimeImpl,
         wg: &WaitGroup,
@@ -435,7 +429,7 @@ impl ConcurrentTaskInner {
     ) -> Result<()> {
         match action {
             // Split current all task into two separate tasks
-            StrategyAction::SplitAllTask if current_speed > 0.0 => {
+            StrategyAction::SplitAllTask(planned_chunk_size) => {
                 trace!("[TASK] Strategy: split all task");
                 let states = runner_manager.get_incomplete_states(Some(planned_chunk_size));
                 for (runner_id, incomplete_range) in states {
@@ -469,21 +463,37 @@ impl ConcurrentTaskInner {
                 );
             }
             // Change the max concurrency
-            StrategyAction::ChangeMaxThread(new_max_concurrency) => {
+            StrategyAction::ChangeMaxConcurrency(new_max_concurrency) => {
                 trace!("[TASK] Strategy: change max concurrency: {new_max_concurrency}");
-                todo!("change max concurrency");
+                *max_concurrency = new_max_concurrency;
             }
-            _ => {}
+            // Create background runners for specific range
+            StrategyAction::CreateTask(range) => {
+                trace!("[TASK] Strategy: create task: {range:?}");
+                runner_manager
+                    .allocate_pending_runner_with_chunk(range.clone(), |runner_id, control_rx| {
+                        Self::create_background_range_runner(
+                            threaded_rt,
+                            wg,
+                            range,
+                            adapter.clone(),
+                            control_rx,
+                            runner_id,
+                            runners_cancel_token.clone(),
+                        )
+                    })
+                    .expect("failed to allocate runner with chunk");
+            }
         }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    async fn download_strategy_timer_tick(
+    async fn strategy_control_timer_tick(
         runner_manager: &mut RunnerManager,
-        dynamic_strategy: &mut DynamicStrategy,
-        max_concurrency: usize,
+        strategy_control: &mut StrategyControl,
+        max_concurrency: &mut usize,
 
         threaded_rt: &ThreadedRuntimeImpl,
         adapter: &Arc<AnyAdapter>,
@@ -493,91 +503,25 @@ impl ConcurrentTaskInner {
         current_speed: f64,
         per_runner_avg_speed: f64,
     ) -> Result<()> {
-        // get the available ranges, and create background runners for them
-        let available_ranges = runner_manager.get_available_ranges();
-        // TODO: move it to a new strategy for error and concurrency control
-        if !available_ranges.is_empty() {
-            trace!("[TASK] create background runners for available ranges: {available_ranges:?}");
-            for chunk in available_ranges.iter() {
-                trace!("[TASK] create background runner for chunk: {chunk:?}");
-                runner_manager
-                    .allocate_pending_runner_with_chunk(chunk.clone(), |runner_id, control_rx| {
-                        Self::create_background_range_runner(
-                            threaded_rt,
-                            wg,
-                            chunk.clone(),
-                            adapter.clone(),
-                            control_rx,
-                            runner_id,
-                            runners_cancel_token.clone(),
-                        )
-                    })
-                    .expect("failed to allocate runner with chunk");
-            }
-
-            return Ok(());
-        }
-        let active_runners = runner_manager.get_active_runners_count();
-
-        // TODO: maybe move into the strategy?
-        let planned_chunk_size = (current_speed * 2.0) as u64;
-
-        if active_runners < max_concurrency && current_speed >= 0.0 {
-            trace!(
-                "[TASK] current speed: {current_speed}, per runner avg speed: \
-                 {per_runner_avg_speed}"
-            );
-            if let Some((runner_id, suggested_range)) =
-                runner_manager.find_chunk_to_split(planned_chunk_size)
-            {
-                if suggested_range.end - suggested_range.start >= planned_chunk_size {
-                    match runner_id {
-                        None => {
-                            // create a new runner
-                            runner_manager
-                                .allocate_pending_runner_with_chunk(
-                                    suggested_range.clone(),
-                                    |runner_id, control_rx| {
-                                        Self::create_background_range_runner(
-                                            threaded_rt,
-                                            wg,
-                                            suggested_range.clone(),
-                                            adapter.clone(),
-                                            control_rx,
-                                            runner_id,
-                                            runners_cancel_token.clone(),
-                                        )
-                                    },
-                                )
-                                .expect("failed to allocate runner with chunk");
-                        }
-                        Some(runner_id) => {
-                            // split the chunk
-                            let strategy_context = DynamicStrategyContext {
-                                speed: current_speed,
-                                per_runner_speed: per_runner_avg_speed,
-                                current_concurrency: active_runners,
-                                remaining_largest_runner_id: runner_id,
-                            };
-                            let actions = dynamic_strategy.step(&strategy_context);
-                            for action in actions {
-                                Self::handle_strategy_action(
-                                    runner_manager,
-                                    action,
-                                    current_speed,
-                                    planned_chunk_size,
-                                    threaded_rt,
-                                    wg,
-                                    runners_cancel_token,
-                                    adapter,
-                                )?;
-                            }
-                        }
-                    }
-                }
+        if let Some((strategy_name, actions)) = strategy_control.execute(
+            *max_concurrency,
+            current_speed,
+            per_runner_avg_speed,
+            runner_manager,
+        ) {
+            for action in actions {
+                trace!("[TASK] applying strategy: {strategy_name}, action: {action:?}");
+                Self::handle_strategy_action(
+                    runner_manager,
+                    max_concurrency,
+                    action,
+                    threaded_rt,
+                    wg,
+                    runners_cancel_token,
+                    adapter,
+                )?;
             }
         }
-
         Ok(())
     }
 
@@ -605,12 +549,9 @@ impl ConcurrentTaskInner {
             .map(|t| t.get())
             .unwrap_or(DEFAULT_MAX_CONCURRENCY);
         // The max concurrency should follows 1 <= max_concurrency <= initial_max_concurrency
-        let max_concurrency = initial_max_concurrency;
-
+        let mut max_concurrency = initial_max_concurrency;
         let mut runner_manager = RunnerManager::new(total, initial_max_concurrency);
-
-        let mut dynamic_strategy =
-            DynamicStrategy::new_with_max_concurrency(initial_max_concurrency);
+        let mut strategy_control = StrategyControl::new(initial_max_concurrency);
         // TODO: make meters removal more efficient
         let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
         let mut sampler = SpeedSampler::new();
@@ -626,10 +567,10 @@ impl ConcurrentTaskInner {
             loop {
                 futures::select_biased! {
                     _ = strategy_timer.tick().fuse() => {
-                        Self::download_strategy_timer_tick(
+                        Self::strategy_control_timer_tick(
                             &mut runner_manager,
-                            &mut dynamic_strategy,
-                            max_concurrency,
+                            &mut strategy_control,
+                            &mut max_concurrency,
 
                             &rt,
                             &adapter,

@@ -13,15 +13,21 @@ use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use pending::{
-    PendingRunnerContext, PendingRunnerGroup, PendingRunnerOutput, PendingRunnerReceiver,
+    PendingRunnerContext, PendingRunnerError, PendingRunnerGroup, PendingRunnerOutput,
+    PendingRunnerReceiver,
 };
 
-use super::{ChunkPlanner, PlannerGuard, chunk_planner::ChunkState};
+use super::{
+    ChunkPlanner, PlannerGuard, chunk_planner::ChunkState, strategy::RunnerOutcomeSampler,
+};
 use crate::{
     runner::{
         RunnerMessage, RunnerMessageConsumer, RunnerMessageKind, StoppedReason, TaskFailedKind,
     },
-    task::{ControlEvent, RunnerId, instance::Generator},
+    task::{
+        ControlEvent, RunnerId,
+        instance::{Generator, concurrent_task::strategy::RunnerFailureKind},
+    },
 };
 
 mod notification;
@@ -103,6 +109,8 @@ pub struct RunnerManager {
     control_channels: HashMap<RunnerId, ControlSender>,
     /// Pending runners for creating runners
     pending_runners: PendingRunnerGroup,
+    /// Sampler for tracking the outcome of the runners
+    runner_outcome_sampler: RunnerOutcomeSampler,
 }
 
 impl RunnerManager {
@@ -118,7 +126,12 @@ impl RunnerManager {
             runner_notification: RunnerNotification::with_capacity(max_concurrency),
             control_channels: HashMap::with_capacity(max_concurrency),
             pending_runners: PendingRunnerGroup::new(),
+            runner_outcome_sampler: RunnerOutcomeSampler::with_defaults(),
         }
+    }
+
+    pub fn runner_outcome_sampler_mut(&mut self) -> &mut RunnerOutcomeSampler {
+        &mut self.runner_outcome_sampler
     }
 
     // ==================== ID Generator Related Methods ====================
@@ -149,12 +162,6 @@ impl RunnerManager {
         self.control_channels.remove(&runner_id);
         self.runner_notification.remove(runner_id);
         self.id_generator.release(runner_id);
-    }
-
-    /// Checks if the specified ID is allocated
-    #[inline]
-    pub fn is_runner_allocated(&self, runner_id: RunnerId) -> bool {
-        self.id_generator.is_allocated(runner_id)
     }
 
     /// Gets the number of currently allocated runners
@@ -194,58 +201,11 @@ impl RunnerManager {
         self.control_channels.send_message(runner_id, message)
     }
 
-    /// Gets the control channel sender for the specified runner (cloned)
-    ///
-    /// This method is used for scenarios that need to hold a sender reference
-    pub fn get_control_sender(&self, runner_id: RunnerId) -> Option<ControlSender> {
-        self.control_channels.get(&runner_id).cloned()
-    }
-
     // ==================== Runner Notification Related Methods ====================
 
     /// Registers a message consumer for a runner
     pub fn register_notification(&mut self, runner_id: RunnerId, consumer: RunnerMessageConsumer) {
         self.runner_notification.add(runner_id, consumer);
-    }
-
-    /// Gets a mutable reference to RunnerNotification
-    ///
-    /// Used for polling messages in the event loop
-    #[inline]
-    pub fn notification_mut(&mut self) -> &mut RunnerNotification {
-        &mut self.runner_notification
-    }
-
-    /// Closes RunnerNotification
-    #[inline]
-    pub fn close_notification(&mut self) {
-        self.runner_notification.close();
-    }
-
-    /// Checks if RunnerNotification is closed
-    #[inline]
-    pub fn is_notification_closed(&self) -> bool {
-        self.runner_notification.is_closed()
-    }
-
-    // ==================== Chunk Planner Related Methods ====================
-
-    /// Gets an immutable reference to ChunkPlanner
-    #[inline]
-    pub fn chunk_planner(&self) -> &ChunkPlanner {
-        &self.chunk_planner
-    }
-
-    /// Gets a mutable reference to ChunkPlanner
-    #[inline]
-    pub fn chunk_planner_mut(&mut self) -> &mut ChunkPlanner {
-        &mut self.chunk_planner
-    }
-
-    /// Creates a PlannerGuard for transactional operations
-    #[inline]
-    pub fn planner_guard(&mut self) -> PlannerGuard<'_> {
-        PlannerGuard::new(&mut self.chunk_planner)
     }
 
     /// Gets the total file size
@@ -289,12 +249,6 @@ impl RunnerManager {
         self.chunk_planner.mark_failed(runner_id)
     }
 
-    /// Checks if the download is complete
-    #[inline]
-    pub fn is_complete(&self) -> bool {
-        self.chunk_planner.is_complete()
-    }
-
     /// Gets the total amount downloaded
     #[inline]
     pub fn get_total_downloaded(&self) -> u64 {
@@ -334,12 +288,6 @@ impl RunnerManager {
         self.chunk_planner.find_chunk_to_split(required_size)
     }
 
-    /// Attempts to arrange a chunk by length
-    #[inline]
-    pub fn try_arrange_chunk_by_length(&self, length: u64) -> Option<Range<u64>> {
-        self.chunk_planner.try_arrange_chunk_by_length(length)
-    }
-
     /// Gets incomplete states
     #[inline]
     pub fn get_incomplete_states(
@@ -347,28 +295,6 @@ impl RunnerManager {
         min_chunk_size: Option<u64>,
     ) -> Vec<(RunnerId, Range<u64>)> {
         self.chunk_planner.get_incomplete_states(min_chunk_size)
-    }
-
-    /// Splits a chunk
-    #[inline]
-    pub fn split_chunk(
-        &mut self,
-        runner_id: RunnerId,
-        split_pos: u64,
-        new_runner_id: RunnerId,
-    ) -> Result<Range<u64>, super::chunk_planner::Error> {
-        self.chunk_planner
-            .split_chunk(runner_id, split_pos, new_runner_id)
-    }
-
-    /// Resizes the runner state
-    #[inline]
-    pub fn resize_runner_state(
-        &mut self,
-        runner_id: RunnerId,
-        new_size: u64,
-    ) -> Result<u64, super::chunk_planner::Error> {
-        self.chunk_planner.resize_runner_state(runner_id, new_size)
     }
 
     // ==================== Combined Operations ====================
@@ -479,6 +405,7 @@ impl RunnerManager {
                         self.chunk_planner
                             .mark_finished(runner_id)
                             .expect("chunk planner should not fail");
+                        self.runner_outcome_sampler.record_completed();
 
                         if self.chunk_planner.is_complete() {
                             trace!("[TASK] all chunks finished");
@@ -492,12 +419,16 @@ impl RunnerManager {
                                 self.chunk_planner
                                     .mark_finished(runner_id)
                                     .expect("chunk planner should not fail");
+                                self.runner_outcome_sampler.record_completed();
                             }
                             _ => {
                                 let unfinished_range = self
                                     .chunk_planner
                                     .mark_failed(runner_id)
                                     .expect("chunk planner should not fail");
+                                // TODO: check if the error is retryable
+                                self.runner_outcome_sampler
+                                    .record_stream_closed(RunnerFailureKind::Retryable);
                                 trace!(
                                     "runner {runner_id} failed, released range: \
                                      {unfinished_range:?}"
@@ -541,6 +472,17 @@ impl RunnerManager {
                 self.chunk_planner
                     .mark_failed(pending.context.runner_id)
                     .expect("chunk planner should not fail");
+                self.runner_outcome_sampler
+                    .record_connect_failed(match error {
+                        PendingRunnerError::ReceiverClosed => RunnerFailureKind::Retryable,
+                        PendingRunnerError::Connector { source } => {
+                            if source.is_retryable() {
+                                RunnerFailureKind::Retryable
+                            } else {
+                                RunnerFailureKind::Unretryable
+                            }
+                        }
+                    });
             }
         }
     }
@@ -731,10 +673,7 @@ mod tests {
     async fn test_pending_to_running_via_tick() {
         use async_ringbuf::{AsyncHeapRb, traits::Split};
 
-        use crate::{
-            DEFAULT_EVENT_CHANNEL_CAPACITY,
-            runner::{RunnerMessage, RunnerMessageKind},
-        };
+        use crate::{DEFAULT_EVENT_CHANNEL_CAPACITY, runner::RunnerMessage};
 
         let mut manager = RunnerManager::new(1000, 2);
 

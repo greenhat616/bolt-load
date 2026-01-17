@@ -17,6 +17,17 @@ pub enum RunnerConnectorError {
     Connection { source: AdapterError },
 }
 
+impl RunnerConnectorError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Connection {
+                source: AdapterError::Retryable { .. }
+            }
+        )
+    }
+}
+
 impl<F> From<F> for StreamConnector
 where
     F: Future<Output = Result<AnyBytesStream, AdapterError>> + Send + 'static,

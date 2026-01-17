@@ -1,5 +1,5 @@
 use super::{Strategy, StrategyAction};
-use crate::task::{RunnerId, instance::concurrent_task::DEFAULT_MAX_CONCURRENCY};
+use crate::task::RunnerId;
 
 #[derive(Debug)]
 enum DynamicPlannerStage {
@@ -10,7 +10,6 @@ enum DynamicPlannerStage {
 pub struct DynamicStrategy {
     threashold1: f64,
     threashold2: f64,
-    max_concurrency: usize,
     current_stage: DynamicPlannerStage,
     previous_total_download_speed: f64,
 }
@@ -21,7 +20,6 @@ impl Default for DynamicStrategy {
             threashold1: 1024.0 * 1024.0,
             // 1MB/s minimum speed threashold
             threashold2: 1024.0 * 1024.0,
-            max_concurrency: DEFAULT_MAX_CONCURRENCY,
             current_stage: DynamicPlannerStage::QuickStart,
             previous_total_download_speed: 0.0,
         }
@@ -29,18 +27,10 @@ impl Default for DynamicStrategy {
 }
 
 impl DynamicStrategy {
-    pub fn new(threashold1: f64, threashold2: f64, max_concurrency: usize) -> Self {
+    pub fn new(threashold1: f64, threashold2: f64) -> Self {
         Self {
             threashold1,
             threashold2,
-            max_concurrency,
-            ..Self::default()
-        }
-    }
-
-    pub fn new_with_max_concurrency(max_concurrency: usize) -> Self {
-        Self {
-            max_concurrency,
             ..Self::default()
         }
     }
@@ -54,14 +44,22 @@ pub struct DynamicStrategyContext {
     pub per_runner_speed: f64,
     /// the current concurrency of the task
     pub current_concurrency: usize,
+    /// the maximum concurrency of the task
+    pub max_concurrency: usize,
+    /// the planned chunk size of the task
+    pub planned_chunk_size: u64,
     /// The largest remaining download bytes of a runner
     pub remaining_largest_runner_id: RunnerId,
 }
 
 impl Strategy for DynamicStrategy {
-    type Context = DynamicStrategyContext;
+    type Context<'a> = DynamicStrategyContext;
 
-    fn step(&mut self, context: &Self::Context) -> Vec<StrategyAction> {
+    fn name() -> &'static str {
+        "dynamic"
+    }
+
+    fn step(&mut self, context: &mut Self::Context<'static>) -> Vec<StrategyAction> {
         tracing::trace!(
             "Strategy context {:?}, current stage {:?}",
             context,
@@ -75,9 +73,9 @@ impl Strategy for DynamicStrategy {
                 DynamicPlannerStage::QuickStart => {
                     if (total_download_speed - 2.0 * self.previous_total_download_speed).abs()
                         > self.threashold1
-                        && context.current_concurrency.saturating_mul(2) < self.max_concurrency
+                        && context.current_concurrency.saturating_mul(2) < context.max_concurrency
                     {
-                        result.push(StrategyAction::SplitAllTask);
+                        result.push(StrategyAction::SplitAllTask(context.planned_chunk_size));
                         self.previous_total_download_speed = total_download_speed;
                     } else {
                         self.current_stage = DynamicPlannerStage::Normal;
@@ -88,7 +86,7 @@ impl Strategy for DynamicStrategy {
                         - (self.previous_total_download_speed + context.per_runner_speed))
                         .abs()
                         > self.threashold2
-                        && context.current_concurrency.saturating_add(1) < self.max_concurrency
+                        && context.current_concurrency.saturating_add(1) < context.max_concurrency
                     {
                         // If the current thread download speed is faster than threashold2, split it into two task
                         result.push(StrategyAction::SplitGivenTask(
