@@ -27,10 +27,19 @@ pub enum ChunkStatus {
     Idle,
     /// Runner is actively downloading
     Running,
+    /// Chunk is pending for creation of a runner, connecting to the server, etc.
+    Pending,
     /// Runner finished downloading this chunk
     Finished,
     /// Runner failed, chunk may be reassigned
     Failed,
+}
+
+impl ChunkStatus {
+    #[inline]
+    pub const fn is_active(&self) -> bool {
+        matches!(self, ChunkStatus::Running | ChunkStatus::Pending)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,17 +53,40 @@ pub enum Error {
 }
 
 impl ChunkState {
-    fn new(allocated: Range<u64>, runner_id: Option<RunnerId>) -> Self {
+    fn from_runner_id(allocated: Range<u64>, runner_id: Option<RunnerId>) -> Self {
+        match runner_id {
+            Some(runner_id) => Self::new_running(allocated, runner_id),
+            None => Self::new_idle(allocated),
+        }
+    }
+
+    pub fn new(allocated: Range<u64>, runner_id: Option<RunnerId>, status: ChunkStatus) -> Self {
         Self {
             allocated: allocated.clone(),
             downloaded: allocated.start..allocated.start,
             runner_id,
-            status: if runner_id.is_some() {
-                ChunkStatus::Running
-            } else {
-                ChunkStatus::Idle
-            },
+            status,
         }
+    }
+
+    /// Create a new chunk state with the idle status
+    fn new_idle(allocated: Range<u64>) -> Self {
+        Self::new(allocated, None, ChunkStatus::Idle)
+    }
+
+    /// Create a new chunk state with the running status
+    fn new_running(allocated: Range<u64>, runner_id: RunnerId) -> Self {
+        Self::new(allocated, Some(runner_id), ChunkStatus::Running)
+    }
+
+    /// Create a new chunk state with the pending status
+    fn new_pending(allocated: Range<u64>, runner_id: RunnerId) -> Self {
+        Self::new(allocated, Some(runner_id), ChunkStatus::Pending)
+    }
+
+    /// Update the status of the chunk
+    fn update_status(&mut self, new_status: ChunkStatus) -> ChunkStatus {
+        std::mem::replace(&mut self.status, new_status)
     }
 
     /// Get the remaining bytes to download
@@ -108,12 +140,39 @@ impl ChunkPlanner {
     pub fn get_active_runners_count(&self) -> usize {
         self.chunks
             .values()
-            .filter(|c| c.status == ChunkStatus::Running)
+            .filter(|c| c.status.is_active())
             .count()
     }
 
-    /// Allocate a new chunk
+    /// Allocate a pending chunk or idle chunk based on the runner id
+    #[inline]
     pub fn allocate_chunk(&mut self, range: Range<u64>, runner_id: Option<RunnerId>) -> bool {
+        match runner_id {
+            Some(runner_id) => self.allocate_pending_chunk(range, runner_id),
+            None => self.allocate_idle_chunk(range),
+        }
+    }
+
+    #[inline]
+    /// Allocate a pending chunk
+    pub fn allocate_pending_chunk(&mut self, range: Range<u64>, runner_id: RunnerId) -> bool {
+        self.allocate_chunk_inner(range, Some(runner_id), ChunkStatus::Pending)
+    }
+
+    #[inline]
+    /// Allocate an idle chunk
+    pub fn allocate_idle_chunk(&mut self, range: Range<u64>) -> bool {
+        self.allocate_chunk_inner(range, None, ChunkStatus::Idle)
+    }
+
+    /// Allocate a new chunk inner
+    #[inline]
+    fn allocate_chunk_inner(
+        &mut self,
+        range: Range<u64>,
+        runner_id: Option<RunnerId>,
+        status: ChunkStatus,
+    ) -> bool {
         if range.start >= range.end || range.end > self.total {
             return false;
         }
@@ -135,7 +194,7 @@ impl ChunkPlanner {
         }
 
         // Create new chunk state
-        let chunk_state = ChunkState::new(range, runner_id);
+        let chunk_state = ChunkState::new(range, runner_id, status);
         self.chunks.insert(generic_range, chunk_state);
 
         // Update runner mapping
@@ -172,6 +231,25 @@ impl ChunkPlanner {
         }
 
         Ok(previous_end..new_end)
+    }
+
+    /// Mark a runner as running
+    pub fn mark_running(&mut self, runner_id: RunnerId) -> Result<(), Error> {
+        let range = self
+            .runner_to_chunk
+            .get(&runner_id)
+            .ok_or(Error::RunnerNotFound(runner_id))?;
+
+        if let Some(chunk) = self.chunks.get_mut(range) {
+            debug_assert!(
+                chunk.status == ChunkStatus::Pending,
+                "chunk should be pending"
+            );
+            chunk.status = ChunkStatus::Running;
+            Ok(())
+        } else {
+            Err(Error::ChunkNotFound(runner_id))
+        }
     }
 
     /// Mark a runner as finished
@@ -253,7 +331,7 @@ impl ChunkPlanner {
         first_chunk.allocated = first_range.clone();
 
         // Second chunk starts fresh
-        let second_chunk = ChunkState::new(second_range.clone(), Some(new_runner_id));
+        let second_chunk = ChunkState::from_runner_id(second_range.clone(), Some(new_runner_id));
 
         // Insert both chunks
         let first_generic_range = GenericRange::from(first_range);
@@ -531,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_chunk_state_creation() {
-        let state = ChunkState::new(100..500, Some(1));
+        let state = ChunkState::from_runner_id(100..500, Some(1));
         assert_eq!(state.allocated, 100..500);
         assert_eq!(state.downloaded, 100..100);
         assert_eq!(state.runner_id, Some(1));
@@ -540,7 +618,7 @@ mod tests {
         assert_eq!(state.incomplete_range(), 100..500);
         assert!(!state.is_complete());
 
-        let state_idle = ChunkState::new(0..100, None);
+        let state_idle = ChunkState::from_runner_id(0..100, None);
         assert_eq!(state_idle.status, ChunkStatus::Idle);
         assert_eq!(state_idle.runner_id, None);
     }

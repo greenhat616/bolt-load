@@ -10,7 +10,7 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{AtomicTaskState, DownloadMode, Task, TaskInstanceImpl, TaskState};
 use crate::{
-    adapter::{AnyAdapter, BoltLoadAdapterMeta, UnretryableError},
+    adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     task::{TaskStateChangedCallback, instance::TaskEvent},
 };

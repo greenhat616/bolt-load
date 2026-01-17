@@ -50,6 +50,7 @@ async-trait = "0.1"
 futures = { workspace = true }
 futures-concurrency = "7"
 pin-project-lite = "0.2"
+bon = "3"
 url = "2"
 bytes = "1"
 enum_dispatch = "0.3"
@@ -114,22 +115,9 @@ pretty_assertions = { workspace = true }
 n0-tracing-test = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-util = { workspace = true, features = ["full"] }
-anyhow = { workspace = true }
 
 # for stream test
 async-stream = "0.3"
-governor = "0.10.4"  # for rate limiting
-
-# for generate a random file
-rand = "0.9"
-
-# for hash verification in tests
-blake3 = "1"
-
-# for http server test
-axum = "0.8.8"
-axum-extra = { version = "0.12.5", features = ["typed-header"] }
-axum-range = "1.0.0"
 
 # Tracing and bench
 tracing-tracy = "0.11"

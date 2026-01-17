@@ -17,7 +17,11 @@ use crate::{
 /// Using async_channel for point-to-point communication instead of broadcast
 pub type ControlSignalReceiver = async_channel::Receiver<ControlEvent>;
 
+mod builder;
+mod connector;
 mod guard;
+pub use builder::*;
+pub use connector::*;
 pub use guard::*;
 
 // TODO: make it configurable or detect the local disk performance?
@@ -76,7 +80,7 @@ pub enum TaskFailedKind {
 }
 
 /// a wrapper of the task message sender using ring buffer
-struct RunnerMessageSender {
+pub(crate) struct RunnerMessageSender {
     runner_id: RunnerId,
     producer: AsyncHeapProd<RunnerMessage>,
 }
@@ -118,6 +122,7 @@ impl From<TaskFailedKind> for TaskRunError {
 }
 
 /// runner for each chunk, or single file, responsible for downloading each chunk
+#[derive(derive_more::Debug)]
 pub struct TaskRunner {
     /// The total size of the this chunk or file
     /// possible None if the total size is unknown
@@ -125,10 +130,13 @@ pub struct TaskRunner {
     /// the downloaded size
     downloaded: u64,
     /// the adapter of the task
+    #[debug(skip)]
     stream: AnyBytesStream,
     /// the receiver of the manager messages (point-to-point channel)
+    #[debug(skip)]
     control_signal: ControlSignalReceiver,
     /// the sender of the task messages
+    #[debug(skip)]
     notify: RunnerMessageSender,
     /// the cancel token
     cancel_token: CancellationToken,
@@ -207,6 +215,11 @@ impl TaskRunner {
             cancel_token,
             shutdown_rx: None,
         })
+    }
+
+    /// Get the builder of the task runner
+    pub fn builder() -> TaskRunnerBuilder {
+        TaskRunnerBuilder::default()
     }
 
     /// run the task runner

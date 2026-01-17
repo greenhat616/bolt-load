@@ -9,12 +9,32 @@
 use std::{collections::HashMap, ops::Range};
 
 use async_channel::{Receiver, Sender, TrySendError};
+use async_waitgroup::WaitGroup;
+use bolt_load_utils::telemetry::*;
+use bytes::Bytes;
+use futures::{FutureExt, StreamExt, task::SpawnExt};
+use pending::{
+    PendingRunnerContext, PendingRunnerGroup, PendingRunnerOutput, PendingRunnerReceiver,
+};
 
-use super::{ChunkPlanner, PlannerGuard, RunnerNotification, chunk_planner::ChunkState};
+use super::{
+    ChunkPlanner, PlannerGuard,
+    chunk_planner::ChunkState,
+    file_writer::{FileRangeWriter, FileWriter},
+};
 use crate::{
-    runner::RunnerMessageConsumer,
+    runner::{
+        RunnerConnectorError, RunnerMessage, RunnerMessageConsumer, RunnerMessageKind,
+        StoppedReason, TaskFailedKind,
+    },
+    runtime::ThreadedRuntimeImpl,
     task::{ControlEvent, RunnerId, instance::Generator},
 };
+
+mod notification;
+mod pending;
+
+pub use notification::RunnerNotification;
 
 /// Default capacity for control channels
 const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
@@ -68,6 +88,16 @@ pub struct RunnerRegistration {
     pub control_rx: ControlReceiver,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    /// The task is downloading
+    Downloading,
+    /// No runner is allocated or running
+    Paused,
+    /// The task is finished
+    Finished,
+}
+
 /// Runner Manager - Unified management of runner lifecycle and communication
 pub struct RunnerManager {
     /// ID generator for managing runner ID allocation and recycling
@@ -78,6 +108,8 @@ pub struct RunnerManager {
     runner_notification: RunnerNotification,
     /// Control channel mapping for sending messages to specific runners
     control_channels: HashMap<RunnerId, ControlSender>,
+    /// Pending runners for creating runners
+    pending_runners: PendingRunnerGroup,
 }
 
 impl RunnerManager {
@@ -92,6 +124,7 @@ impl RunnerManager {
             chunk_planner: ChunkPlanner::new(total),
             runner_notification: RunnerNotification::with_capacity(max_concurrency),
             control_channels: HashMap::with_capacity(max_concurrency),
+            pending_runners: PendingRunnerGroup::new(),
         }
     }
 
@@ -366,6 +399,25 @@ impl RunnerManager {
         Some(registration)
     }
 
+    pub fn allocate_pending_runner_with_chunk(
+        &mut self,
+        range: Range<u64>,
+        f: impl FnOnce(RunnerId, ControlReceiver) -> PendingRunnerReceiver,
+    ) -> Option<()> {
+        let registration = self.allocate_runner()?;
+        if !self
+            .chunk_planner
+            .allocate_pending_chunk(range.clone(), registration.runner_id)
+        {
+            self.release_runner(registration.runner_id);
+            return None;
+        }
+        let rx = f(registration.runner_id, registration.control_rx);
+        let context = PendingRunnerContext::new(registration.runner_id, range);
+        self.pending_runners.insert(context, rx);
+        Some(())
+    }
+
     /// Fully releases a runner (including marking chunk as complete)
     ///
     /// # Arguments
@@ -413,6 +465,128 @@ impl RunnerManager {
             .expect("Manager control channel should never full or closed");
 
         guard.commit();
+    }
+
+    fn handle_notification(
+        &mut self,
+        msg: RunnerMessage,
+        meters: &mut HashMap<RunnerId, usize>,
+        on_downloaded: impl FnOnce(Range<u64>, Bytes),
+    ) -> bool {
+        let RunnerMessage(runner_id, msg) = msg;
+
+        match msg {
+            RunnerMessageKind::Stopped(reason) => {
+                meters.remove(&runner_id);
+                // Remove control channel when runner stops
+                self.release_runner(runner_id);
+                match reason {
+                    StoppedReason::Finished => {
+                        trace!("runner {runner_id} finished");
+                        self.chunk_planner
+                            .mark_finished(runner_id)
+                            .expect("chunk planner should not fail");
+
+                        if self.chunk_planner.is_complete() {
+                            trace!("[TASK] all chunks finished");
+                            return true;
+                        }
+                    }
+                    StoppedReason::Failed(kind) => {
+                        error!("runner {runner_id} failed: {kind:?}");
+                        match kind {
+                            TaskFailedKind::ExceededTotalSize => {
+                                self.chunk_planner
+                                    .mark_finished(runner_id)
+                                    .expect("chunk planner should not fail");
+                            }
+                            _ => {
+                                let unfinished_range = self
+                                    .chunk_planner
+                                    .mark_failed(runner_id)
+                                    .expect("chunk planner should not fail");
+                                trace!(
+                                    "runner {runner_id} failed, released range: \
+                                     {unfinished_range:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            RunnerMessageKind::Downloaded(mut bytes) => {
+                let bytes_len = bytes.len();
+                *meters.entry(runner_id).or_insert(0) += bytes_len;
+
+                // update the chunk planner progress
+                let fixed_downloaded_range = self
+                    .chunk_planner
+                    .update_progress(runner_id, bytes_len as u64)
+                    .expect("chunk planner should not fail");
+                let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
+                bytes.truncate(picked_size as usize);
+
+                on_downloaded(fixed_downloaded_range, bytes);
+            }
+            RunnerMessageKind::Started => {
+                trace!("runner {runner_id} started");
+            }
+        }
+        false
+    }
+
+    fn handle_pending(&mut self, pending: PendingRunnerOutput) {
+        match pending.result {
+            Ok(consumer) => {
+                self.chunk_planner
+                    .mark_running(pending.context.runner_id)
+                    .expect("chunk planner should not fail");
+                self.register_notification(pending.context.runner_id, consumer);
+            }
+            Err(error) => {
+                error!("failed to create runner: {error:?}");
+                self.chunk_planner
+                    .mark_failed(pending.context.runner_id)
+                    .expect("chunk planner should not fail");
+            }
+        }
+    }
+
+    pub async fn tick(
+        &mut self,
+        meters: &mut HashMap<RunnerId, usize>,
+        on_downloaded: impl FnOnce(Range<u64>, Bytes),
+    ) -> TaskState {
+        let next_notification = self.runner_notification.next().fuse();
+        let pending = self.pending_runners.next().fuse();
+        futures::pin_mut!(next_notification, pending);
+        futures::select! {
+            msg = next_notification => {
+                match msg {
+                    Some(msg) => {
+                        if self.handle_notification(msg, meters, on_downloaded) {
+                            return TaskState::Finished;
+                        }
+                    }
+                    None => {
+                        assert!(self.runner_notification.is_closed());
+                        return TaskState::Finished;
+                    }
+                }
+            }
+            pending = pending => {
+                match pending {
+                    Some(pending) => {
+                        self.handle_pending(pending);
+                    }
+                    None => {
+                        assert!(self.chunk_planner.is_complete());
+                        return TaskState::Finished;
+                    }
+                }
+            }
+        }
+        TaskState::Downloading
     }
 }
 
