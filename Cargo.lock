@@ -610,6 +610,7 @@ dependencies = [
  "pretty_assertions",
  "rand 0.9.2",
  "reqwest 0.13.1",
+ "scopeguard",
  "snafu",
  "tempfile",
  "thiserror 2.0.17",

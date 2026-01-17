@@ -52,15 +52,24 @@ pub fn calculate_blake3(content: &[u8]) -> String {
 /// Simple test adapter for testing Task and TaskBuilder
 #[derive(Clone, Debug)]
 pub struct SimpleTestAdapterBuilder {
+    /// The size of the content to be downloaded
     content_size: Option<usize>,
+    /// Whether the adapter supports range requests
     support_range: Option<bool>,
+    /// Whether the adapter should fail
     should_fail: Option<bool>,
+    /// The size of the chunks to be downloaded
     chunk_size: Option<usize>,
+    /// The filename of the content
     filename: Option<String>,
+    /// The maximum speed of the content
     max_speed: Option<u64>,
+    /// The maximum speed of the content per stream
     max_per_stream_speed: Option<u64>,
     /// Delay before creating a stream (simulates connection time)
     connecting_delay: Option<Duration>,
+    /// Maximum number of concurrent streams
+    max_concurrent_streams: Option<usize>,
 }
 
 pub type GlobalRateLimiter = Arc<
@@ -82,6 +91,7 @@ impl Default for SimpleTestAdapterBuilder {
             max_speed: None,
             max_per_stream_speed: None,
             connecting_delay: None,
+            max_concurrent_streams: None,
         }
     }
 }
@@ -156,6 +166,11 @@ impl SimpleTestAdapterBuilder {
         self
     }
 
+    pub fn max_concurrent_streams(mut self, max_concurrent_streams: usize) -> Self {
+        self.max_concurrent_streams = Some(max_concurrent_streams);
+        self
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub fn build(self) -> Result<SimpleTestAdapter, SimpleTestAdapterBuildError> {
         let Some(content_size) = self.content_size else {
@@ -182,6 +197,8 @@ impl SimpleTestAdapterBuilder {
             rate_limiter,
             max_per_stream_speed: self.max_per_stream_speed,
             connecting_delay: self.connecting_delay,
+            max_concurrent_streams: self.max_concurrent_streams,
+            current_concurrency: Arc::new(AtomicUsize::new(0)),
         })
     }
 }
@@ -203,6 +220,10 @@ pub struct SimpleTestAdapter {
     max_per_stream_speed: Option<u64>,
     /// Delay before creating a stream (simulates connection time)
     connecting_delay: Option<Duration>,
+    /// Maximum number of concurrent streams
+    max_concurrent_streams: Option<usize>,
+    /// Current number of concurrent streams
+    current_concurrency: Arc<AtomicUsize>,
 }
 
 impl SimpleTestAdapter {
@@ -232,6 +253,8 @@ impl SimpleTestAdapter {
             rate_limiter: self.rate_limiter.clone(),
             max_per_stream_speed: self.max_per_stream_speed,
             connecting_delay: self.connecting_delay,
+            max_concurrent_streams: self.max_concurrent_streams,
+            current_concurrency: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -341,6 +364,27 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             .into());
         }
 
+        let current_concurrency = self.current_concurrency.fetch_add(1, Ordering::Relaxed);
+        let current_concurrency_clone = self.current_concurrency.clone();
+        let guard = scopeguard::guard((), move |()| {
+            current_concurrency_clone.fetch_sub(1, Ordering::Relaxed);
+        });
+
+        trace!(
+            "[TEST ADAPTER] full_stream() current concurrency: {}",
+            current_concurrency
+        );
+
+        if let Some(max_concurrent_streams) = self.max_concurrent_streams
+            && current_concurrency >= max_concurrent_streams
+        {
+            return Err(InternalSnafu {
+                message: "Max concurrent streams reached".to_string(),
+            }
+            .build()
+            .into());
+        }
+
         let content = self.content.clone();
         let chunk_size = NonZeroU32::new(self.chunk_size as u32).unwrap();
         let rate_limiter = self.rate_limiter.clone();
@@ -355,7 +399,9 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
             chunk_size
         );
+
         let stream = async_stream::stream! {
+            let _guard = guard;
             for chunk in content.chunks(chunk_size.get() as usize) {
                 let chunk_len = NonZeroU32::new(chunk.len() as u32).unwrap();
                 if let Some(rate_limiter) = rate_limiter.clone() {
@@ -395,6 +441,27 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             return Err(RangeStreamNotSupportedSnafu {}.build().into());
         }
 
+        let current_concurrency = self.current_concurrency.fetch_add(1, Ordering::Relaxed);
+        let current_concurrency_clone = self.current_concurrency.clone();
+        let guard = scopeguard::guard((), move |()| {
+            current_concurrency_clone.fetch_sub(1, Ordering::Relaxed);
+        });
+
+        trace!(
+            "[TEST ADAPTER] full_stream() current concurrency: {}",
+            current_concurrency
+        );
+
+        if let Some(max_concurrent_streams) = self.max_concurrent_streams
+            && current_concurrency >= max_concurrent_streams
+        {
+            return Err(InternalSnafu {
+                message: "Max concurrent streams reached".to_string(),
+            }
+            .build()
+            .into());
+        }
+
         let start = start as usize;
         let end = end as usize;
         let content = self.content.slice(start..end.min(self.content.len()));
@@ -408,6 +475,8 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         });
 
         let stream = async_stream::stream! {
+            let _guard = guard;
+
             for chunk in content.chunks(chunk_size.get() as usize) {
                 let chunk_len = NonZeroU32::new(chunk.len() as u32).unwrap();
                 if let Some(rate_limiter) = rate_limiter.clone() {

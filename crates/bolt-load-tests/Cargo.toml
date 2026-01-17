@@ -12,6 +12,8 @@ bolt-load-utils = { path = "../bolt-load-utils", version = "0.1", features = [
     "tracing",
 ] }
 
+scopeguard = "1.2.0"
+
 tracing = { workspace = true, optional = true }
 
 futures = { workspace = true }
