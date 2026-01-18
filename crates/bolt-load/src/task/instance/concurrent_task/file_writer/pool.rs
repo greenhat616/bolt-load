@@ -7,13 +7,15 @@ use fs_err as fs;
 use snafu::prelude::*;
 
 use super::{
-    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    metrics::FileWriterMetrics, Chunk, CommandError, FileRangeWriter, FileWriterBuilderError,
+    FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu,
+    WriteRangeSnafu,
 };
 
 pub struct PoolWriter {
     pub file: File,
     tx: Sender<Command>,
+    metrics: FileWriterMetrics,
 }
 
 enum Command {
@@ -46,7 +48,15 @@ impl FileRangeWriter for PoolWriter {
 
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
-        let chunk = Chunk { range, data };
+        let chunk = Chunk {
+            range: range.clone(),
+            data: data.clone(),
+        };
+        let data_len = data.len() as u64;
+
+        // Update queue depth before sending
+        self.metrics.set_queue_depth(self.tx.len());
+
         self.tx
             .send(Command::Write(chunk.clone(), tx))
             .await
@@ -60,6 +70,8 @@ impl FileRangeWriter for PoolWriter {
                     path: self.file.path().to_path_buf(),
                 }
             })?;
+
+        // Wait for write to complete
         rx.await
             .map_err(|_| CommandError::Recv)
             .with_context(|_| WriteRangeSnafu {
@@ -71,6 +83,10 @@ impl FileRangeWriter for PoolWriter {
                 chunk: Some(chunk),
                 path: self.file.path().to_path_buf(),
             })?;
+
+        // Update bytes written after successful write
+        self.metrics.add_bytes_written(data_len);
+
         Ok(())
     }
 }
@@ -79,6 +95,7 @@ impl FileRangeWriter for PoolWriter {
 pub struct PoolWriterBuilder {
     pub file: Option<File>,
     pub parallel: Option<usize>,
+    pub metrics: Option<FileWriterMetrics>,
 }
 
 impl FileWriterCapability for PoolWriterBuilder {}
@@ -132,6 +149,11 @@ impl PoolWriterBuilder {
         self
     }
 
+    pub fn metrics(mut self, metrics: FileWriterMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     pub fn build(self) -> Result<PoolWriter, FileWriterBuilderError> {
         let Some(file) = self.file else {
             return ValidationSnafu {
@@ -142,6 +164,7 @@ impl PoolWriterBuilder {
         let parallel = self
             .parallel
             .unwrap_or(std::thread::available_parallelism().unwrap().get());
+        let metrics = self.metrics.unwrap_or_default();
         let (tx, rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
         for _ in 0..parallel {
             let file = file
@@ -156,6 +179,7 @@ impl PoolWriterBuilder {
         Ok(PoolWriter {
             file,
             tx: tx.clone(),
+            metrics,
         })
     }
 }

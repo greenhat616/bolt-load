@@ -7,6 +7,7 @@
 mod compio;
 #[cfg(feature = "mmap")]
 mod mmap;
+mod metrics;
 mod null;
 mod pool;
 
@@ -25,11 +26,12 @@ pub use self::compio::CompioWriterBuilder;
 #[cfg(feature = "mmap")]
 pub use self::mmap::MmapWriterBuilder;
 use self::{null::NullWriter, pool::PoolWriter};
+pub use self::metrics::{FileWriterMetrics, MetricsSnapshot};
 // Re-export builders for benchmarking and advanced usage
 pub use self::{null::NullWriterBuilder, pool::PoolWriterBuilder};
 use crate::runtime::yield_now;
 
-const FILE_WRITER_QUEUE_SIZE: usize = 2048;
+pub const FILE_WRITER_QUEUE_SIZE: usize = 2048;
 
 #[derive(Debug, Snafu)]
 pub enum CommandError {
@@ -187,6 +189,7 @@ async fn open_file(path: PathBuf, size: u64) -> Result<File, FileWriterError> {
 pub struct FileWriter {
     pub kind: FileRangeWriterKind,
     inner: Arc<FileRangeWriterImpl>,
+    metrics: FileWriterMetrics,
 }
 
 impl FileWriter {
@@ -201,16 +204,28 @@ impl FileWriter {
         kind: FileRangeWriterKind,
     ) -> Result<Self, FileWriterBuilderError> {
         let path = path.to_path_buf();
+        let metrics = FileWriterMetrics::new();
 
         let inner = match kind {
             #[cfg(feature = "mmap")]
             FileRangeWriterKind::Mmap => {
                 let file = open_file(path.clone(), size).await?;
-                FileRangeWriterImpl::Mmap(MmapWriterBuilder::new().file(file).build().await?)
+                FileRangeWriterImpl::Mmap(
+                    MmapWriterBuilder::new()
+                        .file(file)
+                        .metrics(metrics.clone())
+                        .build()
+                        .await?,
+                )
             }
             FileRangeWriterKind::Pool => {
                 let file = open_file(path.clone(), size).await?;
-                FileRangeWriterImpl::Pool(PoolWriterBuilder::new().file(file).build()?)
+                FileRangeWriterImpl::Pool(
+                    PoolWriterBuilder::new()
+                        .file(file)
+                        .metrics(metrics.clone())
+                        .build()?,
+                )
             }
             FileRangeWriterKind::Null => {
                 // For null writer, we don't need a file - just create the writer
@@ -222,6 +237,7 @@ impl FileWriter {
                 FileRangeWriterImpl::Compio(
                     CompioWriterBuilder::new()
                         .path(path.clone())
+                        .metrics(metrics.clone())
                         .build()
                         .await?,
                 )
@@ -230,6 +246,7 @@ impl FileWriter {
         Ok(Self {
             kind,
             inner: Arc::new(inner),
+            metrics,
         })
     }
 }
@@ -241,6 +258,18 @@ impl FileRangeWriter for FileWriter {
 
     async fn finalize(self) -> Result<(), FileWriterError> {
         self.inner.finalize().await
+    }
+}
+
+impl FileWriter {
+    /// Get the current metrics for this file writer
+    pub fn get_metrics(&self) -> &FileWriterMetrics {
+        &self.metrics
+    }
+
+    /// Get a snapshot of current metrics
+    pub fn get_metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 }
 

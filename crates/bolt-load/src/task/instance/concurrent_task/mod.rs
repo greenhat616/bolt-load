@@ -502,12 +502,19 @@ impl ConcurrentTaskInner {
 
         current_speed: f64,
         per_runner_avg_speed: f64,
+        file_writer: &FileWriter,
     ) -> Result<()> {
+        // Sample write metrics
+        let write_queue_depth = file_writer.get_metrics().get_queue_depth();
+        let write_speed = file_writer.get_metrics().sample_write_speed();
+
         if let Some((strategy_name, actions)) = strategy_control.execute(
             *max_concurrency,
             current_speed,
             per_runner_avg_speed,
             runner_manager,
+            write_queue_depth,
+            write_speed,
         ) {
             for action in actions {
                 trace!("[TASK] applying strategy: {strategy_name}, action: {action:?}");
@@ -579,6 +586,7 @@ impl ConcurrentTaskInner {
 
                             current_speed,
                             per_runner_avg_speed,
+                            &file_writer,
                         ).await.inspect_err(|e| {
                             error!("failed to download strategy timer tick: {e:?}");
                             self.sync_progress(&runner_manager);

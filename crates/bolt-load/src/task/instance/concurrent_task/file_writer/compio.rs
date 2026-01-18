@@ -7,8 +7,9 @@ use compio::{BufResult, fs::OpenOptions, io::AsyncWriteAt, runtime::Runtime};
 use snafu::prelude::*;
 
 use super::{
-    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    metrics::FileWriterMetrics, Chunk, CommandError, FileRangeWriter, FileWriterBuilderError,
+    FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu,
+    WriteRangeSnafu,
 };
 
 enum Command {
@@ -19,12 +20,21 @@ enum Command {
 pub struct CompioWriter {
     path: PathBuf,
     tx: Sender<Command>,
+    metrics: FileWriterMetrics,
 }
 
 impl FileRangeWriter for CompioWriter {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
-        let chunk = Chunk { range, data };
+        let chunk = Chunk {
+            range: range.clone(),
+            data: data.clone(),
+        };
+        let data_len = data.len() as u64;
+
+        // Update queue depth before sending
+        self.metrics.set_queue_depth(self.tx.len());
+
         self.tx
             .send(Command::Write(chunk.clone(), tx))
             .await
@@ -38,6 +48,8 @@ impl FileRangeWriter for CompioWriter {
                     path: self.path.clone(),
                 }
             })?;
+
+        // Wait for write to complete
         rx.await
             .map_err(|_| CommandError::Recv)
             .with_context(|_| WriteRangeSnafu {
@@ -49,6 +61,10 @@ impl FileRangeWriter for CompioWriter {
                 chunk: Some(chunk),
                 path: self.path.clone(),
             })?;
+
+        // Update bytes written after successful write
+        self.metrics.add_bytes_written(data_len);
+
         Ok(())
     }
     async fn finalize(self) -> Result<(), FileWriterError> {
@@ -140,6 +156,7 @@ fn compio_file_writer_task(
 #[derive(Default)]
 pub struct CompioWriterBuilder {
     path: Option<PathBuf>,
+    metrics: Option<FileWriterMetrics>,
 }
 
 impl FileWriterCapability for CompioWriterBuilder {}
@@ -154,6 +171,11 @@ impl CompioWriterBuilder {
         self
     }
 
+    pub fn metrics(mut self, metrics: FileWriterMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     pub async fn build(self) -> Result<CompioWriter, FileWriterBuilderError> {
         let Some(path) = self.path else {
             return ValidationSnafu {
@@ -161,6 +183,7 @@ impl CompioWriterBuilder {
             }
             .fail();
         };
+        let metrics = self.metrics.unwrap_or_default();
         let (tx, rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
         let path_clone = path.clone();
@@ -174,6 +197,7 @@ impl CompioWriterBuilder {
         Ok(CompioWriter {
             path,
             tx: tx.clone(),
+            metrics,
         })
     }
 }

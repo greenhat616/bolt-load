@@ -5,10 +5,13 @@ use bolt_load_utils::telemetry::*;
 mod concurrency_control_strategy;
 mod dynamic_strategy;
 mod runner_outcome_sampler;
+mod write_backpressure_strategy;
 
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use runner_outcome_sampler::{FailureKind as RunnerFailureKind, RunnerOutcomeSampler};
+use write_backpressure_strategy::{WriteBackpressureContext, WriteBackpressureStrategy};
+pub use write_backpressure_strategy::WriteBackpressureConfig;
 
 pub const DEFAULT_STRATEGY_TICK_INTERVAL: Duration = Duration::from_millis(1500); // 1.5 seconds
 
@@ -39,6 +42,7 @@ pub trait Strategy {
 pub struct StrategyControl {
     dynamic_strategy: DynamicStrategy,
     concurrency_control_strategy: ConcurrencyControlStrategy,
+    write_backpressure_strategy: WriteBackpressureStrategy,
 }
 
 impl StrategyControl {
@@ -48,6 +52,7 @@ impl StrategyControl {
             concurrency_control_strategy: ConcurrencyControlStrategy::with_default_config(
                 initial_max_concurrency,
             ),
+            write_backpressure_strategy: WriteBackpressureStrategy::with_default_config(),
         }
     }
 
@@ -57,8 +62,26 @@ impl StrategyControl {
         current_speed: f64,
         per_runner_avg_speed: f64,
         runner_manager: &mut super::RunnerManager,
+        write_queue_depth: usize,
+        write_speed: f64,
     ) -> Option<(&'static str, Vec<StrategyAction>)> {
+        // Priority 1: Check write backpressure first (highest priority)
         let active_runners = runner_manager.get_active_runners_count();
+        let mut write_context = WriteBackpressureContext {
+            queue_depth: write_queue_depth,
+            write_speed,
+            download_speed: current_speed,
+            current_concurrency: active_runners,
+            max_concurrency,
+        };
+        trace!("[STRATEGY] Write backpressure strategy context: {write_context:?}");
+        let actions = self.write_backpressure_strategy.step(&mut write_context);
+
+        if !actions.is_empty() {
+            return Some((WriteBackpressureStrategy::name(), actions));
+        }
+
+        // Priority 2: Concurrency control based on failure rate
         let available_chunks = runner_manager.get_available_ranges();
         let mut context = ConcurrencyControlContext {
             max_concurrency,

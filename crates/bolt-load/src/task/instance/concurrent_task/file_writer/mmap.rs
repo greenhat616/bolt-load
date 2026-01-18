@@ -9,13 +9,15 @@ use memmap2::MmapMut;
 use snafu::prelude::*;
 
 use super::{
-    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    metrics::FileWriterMetrics, Chunk, CommandError, FileRangeWriter, FileWriterBuilderError,
+    FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu,
+    WriteRangeSnafu,
 };
 
 pub struct MmapWriter {
     pub file: File,
     tx: Sender<Command>,
+    metrics: FileWriterMetrics,
 }
 
 impl FileRangeWriter for MmapWriter {
@@ -42,7 +44,15 @@ impl FileRangeWriter for MmapWriter {
 
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
-        let chunk = Chunk { range, data };
+        let chunk = Chunk {
+            range: range.clone(),
+            data: data.clone(),
+        };
+        let data_len = data.len() as u64;
+
+        // Update queue depth before sending
+        self.metrics.set_queue_depth(self.tx.len());
+
         self.tx
             .send(Command::Write(chunk.clone(), tx))
             .await
@@ -56,6 +66,8 @@ impl FileRangeWriter for MmapWriter {
                     path: self.file.path().to_path_buf(),
                 }
             })?;
+
+        // Wait for write to complete
         rx.await
             .map_err(|_| CommandError::Recv)
             .with_context(|_| WriteRangeSnafu {
@@ -67,6 +79,10 @@ impl FileRangeWriter for MmapWriter {
                 chunk: Some(chunk),
                 path: self.file.path().to_path_buf(),
             })?;
+
+        // Update bytes written after successful write
+        self.metrics.add_bytes_written(data_len);
+
         Ok(())
     }
 }
@@ -79,6 +95,7 @@ enum Command {
 #[derive(Default)]
 pub struct MmapWriterBuilder {
     pub file: Option<File>,
+    pub metrics: Option<FileWriterMetrics>,
 }
 
 impl FileWriterCapability for MmapWriterBuilder {
@@ -171,6 +188,11 @@ impl MmapWriterBuilder {
         self
     }
 
+    pub fn metrics(mut self, metrics: FileWriterMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     pub async fn build(self) -> Result<MmapWriter, FileWriterBuilderError> {
         let Some(file) = self.file else {
             return Err(ValidationSnafu {
@@ -179,6 +201,7 @@ impl MmapWriterBuilder {
             .build());
         };
 
+        let metrics = self.metrics.unwrap_or_default();
         let (chunk_tx, chunk_rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
         let file_clone = file
@@ -199,7 +222,11 @@ impl MmapWriterBuilder {
             .with_context(|_| OpenOrCreateFileSnafu {
                 path: file.path().to_path_buf(),
             })?;
-        Ok(MmapWriter { file, tx: chunk_tx })
+        Ok(MmapWriter {
+            file,
+            tx: chunk_tx,
+            metrics,
+        })
     }
 }
 
