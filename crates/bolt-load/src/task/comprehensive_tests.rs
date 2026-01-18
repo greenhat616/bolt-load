@@ -945,3 +945,62 @@ async fn test_concurrent_task_with_range_stream() {
     );
     info!("✓ Concurrent task with range stream test passed");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_concurrent_task_with_max_limit() {
+    let file_size = 1024 * 1024 * 1024;
+    let per_stream_speed = 10 * 1024 * 1024; // 10MB/s per stream
+    let max_speed = per_stream_speed * 10; // 100MB/s total speed
+    let runtime = create_test_runtime();
+    let adapter = SimpleTestAdapterBuilder::new()
+        .support_range(true)
+        .max_concurrent_streams(2)
+        .max_per_stream_speed(per_stream_speed)
+        .max_speed(max_speed)
+        .content_size(file_size)
+        .build()
+        .unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let save_path = temp_dir.path().join("concurrent_range_test.bin");
+    let cancel_token = CancellationToken::new();
+
+    let mut task = TaskBuilder::default()
+        .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
+        .save_path(save_path.clone())
+        .cancel_token(cancel_token)
+        .threaded_runtime(runtime)
+        .build()
+        .await
+        .unwrap();
+
+    let start_time = Instant::now();
+    task.run().await.unwrap();
+    task.wait().await.expect("concurrent task should succeed");
+    let concurrent_duration = start_time.elapsed();
+
+    let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
+
+    let result = task.wait().await;
+
+    result.expect("should be ok");
+    assert!(save_path.exists(), "Downloaded file should exist");
+    let content = std::fs::read(&save_path).unwrap();
+    assert_eq!(
+        content.len(),
+        file_size,
+        "Downloaded file should have correct size"
+    );
+
+    info!(
+        "
+    - Concurrent result:
+        - Measured Speed: {} MB/s
+        - Duration: {:?}
+        - File size: {} bytes",
+        concurrent_speed / (1024.0 * 1024.0),
+        concurrent_duration,
+        file_size
+    );
+    info!("✓ Concurrent task with max limit test passed");
+}
