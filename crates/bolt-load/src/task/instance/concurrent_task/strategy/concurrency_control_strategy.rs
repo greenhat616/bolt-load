@@ -44,7 +44,7 @@ impl Default for ConcurrencyControlConfig {
             degradation_step: 1,
             recovery_step: 1,
             min_concurrency: 1,
-            unretryable_detection_window: Duration::from_millis(500),
+            unretryable_detection_window: Duration::from_secs(5),
         }
     }
 }
@@ -111,10 +111,7 @@ impl ConcurrencyControlStrategy {
         context: &ConcurrencyControlContext,
         now: Instant,
     ) -> Vec<StrategyAction> {
-        let new_concurrency = context
-            .max_concurrency
-            .saturating_sub(self.config.degradation_step)
-            .max(self.config.min_concurrency);
+        let new_concurrency = context.active_runners;
 
         self.state = StrategyState::Degraded {
             target_concurrency: new_concurrency,
@@ -282,6 +279,7 @@ impl Strategy for ConcurrencyControlStrategy {
         // When first launch the task,
         // Create background runners for all available chunks according to the current concurrency
         if self.first_execute {
+            self.first_execute = false;
             return context
                 .available_chunks
                 .iter()
@@ -294,6 +292,7 @@ impl Strategy for ConcurrencyControlStrategy {
             .sampler
             .has_recent_unretryable(self.config.unretryable_detection_window)
         {
+            tracing::trace!("[CONTROL STRATEGY] Has recent unretryable, degraded");
             return self.handle_immediate_degradation(context, now);
         }
 
