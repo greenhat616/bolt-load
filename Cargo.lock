@@ -152,6 +152,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-notify"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b31189a260b12d7159e91b74d0b94bb0be3705237082709611b53342b2fb65d7"
+dependencies = [
+ "event-listener",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-once-cell"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -497,6 +508,7 @@ dependencies = [
  "async-fs",
  "async-io",
  "async-lock",
+ "async-notify",
  "async-ringbuf",
  "async-stream",
  "async-trait",

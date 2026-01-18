@@ -10,6 +10,7 @@ mod mmap;
 mod metrics;
 mod null;
 mod pool;
+mod write_budget;
 
 use std::{
     ops::Range,
@@ -27,6 +28,7 @@ pub use self::compio::CompioWriterBuilder;
 pub use self::mmap::MmapWriterBuilder;
 use self::{null::NullWriter, pool::PoolWriter};
 pub use self::metrics::{FileWriterMetrics, MetricsSnapshot};
+pub use self::write_budget::WriteBudget;
 // Re-export builders for benchmarking and advanced usage
 pub use self::{null::NullWriterBuilder, pool::PoolWriterBuilder};
 use crate::runtime::yield_now;
@@ -190,6 +192,7 @@ pub struct FileWriter {
     pub kind: FileRangeWriterKind,
     inner: Arc<FileRangeWriterImpl>,
     metrics: FileWriterMetrics,
+    budget: Option<WriteBudget>,
 }
 
 impl FileWriter {
@@ -247,13 +250,41 @@ impl FileWriter {
             kind,
             inner: Arc::new(inner),
             metrics,
+            budget: None,
         })
+    }
+
+    /// Set the write budget for backpressure control
+    ///
+    /// This enables runner-level flow control to prevent memory exhaustion
+    /// when disk I/O is slower than network download.
+    pub fn with_budget(mut self, budget: WriteBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Get the write budget if set
+    pub fn budget(&self) -> Option<&WriteBudget> {
+        self.budget.as_ref()
     }
 }
 
 impl FileRangeWriter for FileWriter {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
-        self.inner.write_range(range, data).await
+        let data_len = data.len();
+
+        // Perform the actual write
+        let result = self.inner.write_range(range, data).await;
+
+        // If write succeeded and budget is set, refill the budget
+        // This allows waiting runners to acquire more budget and continue downloading
+        if result.is_ok() {
+            if let Some(budget) = &self.budget {
+                budget.refill(data_len);
+            }
+        }
+
+        result
     }
 
     async fn finalize(self) -> Result<(), FileWriterError> {
