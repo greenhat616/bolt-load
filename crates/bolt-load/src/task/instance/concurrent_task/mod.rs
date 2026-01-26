@@ -7,6 +7,7 @@ use std::{
 };
 
 use async_waitgroup::WaitGroup;
+use bytes::Bytes;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
 use futures::{FutureExt, task::SpawnExt};
@@ -18,7 +19,9 @@ use super::{Result, TaskInstance};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
-    runner::{RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskError, TaskRunner},
+    runner::{
+        RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskError, TaskRunner,
+    },
     runtime::{
         LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl, Timer, TimerBuilder,
     },
@@ -30,6 +33,7 @@ use crate::{
         },
     },
 };
+use file_writer::budget_sampler::{BudgetConfig, BudgetSampler};
 
 mod chunk_planner;
 /// File writer implementations for concurrent downloads.
@@ -47,6 +51,11 @@ pub use runner_manager::{
 use strategy::*;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
+
+/// Queue length between runner manager and file writer workers
+const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
+/// Max file writer workers
+const DEFAULT_WRITE_WORKERS: usize = 4;
 
 /// Default capacity for control channels
 const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
@@ -266,6 +275,7 @@ impl ConcurrentTaskInner {
         incomplete_range: Range<u64>,
         adapter: Arc<AnyAdapter>,
         runner_id: RunnerId,
+        budget_sampler: Option<Arc<BudgetSampler>>,
     ) {
         let half_size = (incomplete_range.end - incomplete_range.start) / 2;
 
@@ -284,6 +294,7 @@ impl ConcurrentTaskInner {
                     control_rx,
                     runner_id,
                     runners_cancel_token.clone(),
+                    budget_sampler.clone(),
                 )
             })
             .expect("failed to allocate runner with chunk");
@@ -293,6 +304,7 @@ impl ConcurrentTaskInner {
         feature = "tracing",
         tracing::instrument(skip_all, fields(runner_id, range))
     )]
+    #[allow(clippy::too_many_arguments)]
     fn create_background_range_runner(
         threaded_rt: &ThreadedRuntimeImpl,
         wg: &WaitGroup,
@@ -301,6 +313,7 @@ impl ConcurrentTaskInner {
         control_rx: ControlReceiver,
         runner_id: RunnerId,
         cancel_token: CancellationToken,
+        budget_sampler: Option<Arc<BudgetSampler>>,
     ) -> oneshot::Receiver<Result<RunnerMessageConsumer, RunnerConnectorError>> {
         let (tx, rx) = oneshot::channel();
         let (start, end) = (range.start, range.end);
@@ -316,7 +329,8 @@ impl ConcurrentTaskInner {
                 .total(end - start)
                 .runner_id(runner_id)
                 .control_signal(control_rx)
-                .cancel_token(cancel_token.clone());
+                .cancel_token(cancel_token.clone())
+                .budget_sampler(budget_sampler.clone());
             let connector = RunnerConnector::new(
                 async move { adapter.range_stream(start, end).await }.boxed(),
                 builder,
@@ -415,6 +429,7 @@ impl ConcurrentTaskInner {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn handle_strategy_action(
         runner_manager: &mut RunnerManager,
@@ -426,6 +441,7 @@ impl ConcurrentTaskInner {
         wg: &WaitGroup,
         runners_cancel_token: &CancellationToken,
         adapter: &Arc<AnyAdapter>,
+        budget_sampler: Option<Arc<BudgetSampler>>,
     ) -> Result<()> {
         match action {
             // Split current all task into two separate tasks
@@ -442,6 +458,7 @@ impl ConcurrentTaskInner {
                         incomplete_range,
                         adapter.clone(),
                         runner_id,
+                        budget_sampler.clone(),
                     );
                 }
             }
@@ -460,6 +477,7 @@ impl ConcurrentTaskInner {
                     incomplete_range,
                     adapter.clone(),
                     task_id,
+                    budget_sampler.clone(),
                 );
             }
             // Change the max concurrency
@@ -480,6 +498,7 @@ impl ConcurrentTaskInner {
                             control_rx,
                             runner_id,
                             runners_cancel_token.clone(),
+                            budget_sampler.clone(),
                         )
                     })
                     .expect("failed to allocate runner with chunk");
@@ -499,6 +518,7 @@ impl ConcurrentTaskInner {
         adapter: &Arc<AnyAdapter>,
         runners_cancel_token: &CancellationToken,
         wg: &WaitGroup,
+        budget_sampler: Option<Arc<BudgetSampler>>,
 
         current_speed: f64,
         per_runner_avg_speed: f64,
@@ -519,6 +539,7 @@ impl ConcurrentTaskInner {
                     wg,
                     runners_cancel_token,
                     adapter,
+                    budget_sampler.clone(),
                 )?;
             }
         }
@@ -559,12 +580,52 @@ impl ConcurrentTaskInner {
         let mut per_runner_avg_speed = 0.0;
 
         let (tmp_path, file_writer) = self.create_file_writer().await?;
+        let budget_sampler = BudgetSampler::new(BudgetConfig::default());
+        // Write queue: (range, bytes, bytes_len, start_nanos for EWMA)
+        let (write_tx, write_rx) =
+            async_channel::bounded::<(Range<u64>, Bytes, usize, Option<u64>)>(DEFAULT_WRITE_QUEUE_CAPACITY);
+        let write_workers = initial_max_concurrency.clamp(1, DEFAULT_WRITE_WORKERS);
+        let write_wg = WaitGroup::new();
+        for _ in 0..write_workers {
+            let write_rx = write_rx.clone();
+            let file_writer = file_writer.clone();
+            let budget_sampler = budget_sampler.clone();
+            let write_wg = write_wg.clone();
+            rt.spawn(async move {
+                let _wg = write_wg;
+                while let Ok((range, bytes, bytes_len, start_nanos)) = write_rx.recv().await {
+                    if let Err(e) = file_writer.write_range(range, bytes).await {
+                        error!("failed to write to file: {e:?}");
+                    }
+                    // Release budget and update EWMA with actual write duration
+                    if let Some(start) = start_nanos {
+                        budget_sampler.release(bytes_len as u64, start);
+                    }
+                }
+            })
+            .expect("should never spawn failed");
+        }
+        drop(write_rx);
+        let mut pending_writes: VecDeque<(Range<u64>, Bytes, usize, Option<u64>)> = VecDeque::new();
 
         let mut throughout_meter_timer = rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
         let mut strategy_timer = rt.create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
 
         let event_loop_result: Result<()> = async {
             loop {
+                while let Some((range, bytes, bytes_len, start_nanos)) = pending_writes.front().cloned() {
+                    match write_tx.try_send((range, bytes, bytes_len, start_nanos)) {
+                        Ok(()) => {
+                            pending_writes.pop_front();
+                        }
+                        Err(async_channel::TrySendError::Full(_)) => break,
+                        Err(async_channel::TrySendError::Closed(_)) => {
+                            return Err(TaskInstanceError::new_failed(TaskError::Other {
+                                message: "write queue closed".to_string(),
+                            }));
+                        }
+                    }
+                }
                 futures::select_biased! {
                     _ = strategy_timer.tick().fuse() => {
                         Self::strategy_control_timer_tick(
@@ -576,6 +637,8 @@ impl ConcurrentTaskInner {
                             &adapter,
                             &runners_cancel_token,
                             &wg,
+
+                            Some(budget_sampler.clone()),
 
                             current_speed,
                             per_runner_avg_speed,
@@ -598,16 +661,9 @@ impl ConcurrentTaskInner {
                     }
                     state = runner_manager.tick(
                         &mut meters,
-                        |range, bytes| {
-                            let file_writer = file_writer.clone();
-                            let wg = wg.clone();
-                            rt.spawn(async move {
-                                let _wg = wg;
-                                if let Err(e) = file_writer.write_range(range, bytes).await {
-                                    // TODO: notify the task to stop
-                                    error!("failed to write to file: {e:?}");
-                                }
-                            }).expect("should never spawn failed");
+                        |range, bytes, start_nanos| {
+                            let bytes_len = bytes.len();
+                            pending_writes.push_back((range, bytes, bytes_len, start_nanos));
                         }
                     ).fuse() => {
                         if state == TaskState::Finished {
@@ -619,6 +675,16 @@ impl ConcurrentTaskInner {
             Ok(())
         }
         .await;
+        while let Some((range, bytes, bytes_len, start_nanos)) = pending_writes.pop_front() {
+            if write_tx.send((range, bytes, bytes_len, start_nanos)).await.is_err() {
+                // Release budget on send failure (no actual write happened)
+                if let Some(start) = start_nanos {
+                    budget_sampler.release(bytes_len as u64, start);
+                }
+            }
+        }
+        write_tx.close();
+        write_wg.wait().await;
         self.sync_progress(&runner_manager);
 
         // Wait all message handlers to finish
@@ -813,6 +879,7 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
+            None,
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
@@ -835,7 +902,7 @@ mod tests {
 
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _)) => {
                     assert_eq!(id, runner_id);
                     total_downloaded += bytes.len();
                     downloaded_data.extend_from_slice(&bytes);
@@ -890,6 +957,7 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
+            None,
         );
         let result = receiver.await.expect("receiver closed");
         wg.wait().await;
@@ -925,6 +993,7 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token.clone(),
+            None,
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
@@ -980,6 +1049,7 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
+            None,
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
@@ -995,7 +1065,7 @@ mod tests {
         let mut total_downloaded = 0;
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                     total_downloaded += bytes.len();
                 }
                 RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
@@ -1036,6 +1106,7 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
+            None,
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
@@ -1051,7 +1122,7 @@ mod tests {
         let mut downloaded_data = Vec::new();
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                     downloaded_data.extend_from_slice(&bytes);
                 }
                 RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
@@ -1088,6 +1159,7 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
+            None,
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
@@ -1144,6 +1216,7 @@ mod tests {
                     control_rx,
                     runner_id,
                     cancel_token,
+                    None,
                 );
                 let result = receiver.await.expect("receiver closed");
                 let msg_rx = result.expect("connection failed");
@@ -1163,7 +1236,7 @@ mod tests {
 
                 while let Some(msg) = msg_rx.next().await {
                     match msg {
-                        RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                        RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                             downloaded_size += bytes.len();
                         }
                         RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
@@ -1227,6 +1300,7 @@ mod tests {
             control_rx,
             runner_id,
             cancel_token,
+            None,
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
@@ -1242,7 +1316,7 @@ mod tests {
         let mut downloaded_data = Vec::new();
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                     downloaded_data.extend_from_slice(&bytes);
                 }
                 RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {

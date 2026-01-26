@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
 use bolt_load_utils::telemetry::*;
@@ -10,6 +10,7 @@ use crate::{
     DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AdapterError, AnyBytesStream},
     task::{ControlEvent, RunnerId},
+    task::instance::concurrent_task::file_writer::budget_sampler::BudgetSampler,
     utils::ShutdownGuardExt,
 };
 
@@ -40,9 +41,10 @@ pub enum RunnerMessageKind {
     Started,
     /// Stopped with message
     Stopped(StoppedReason),
-    /// Downloaded a chunk
-    Downloaded(Bytes),
+    /// Downloaded a chunk with optional budget start_nanos for EWMA tracking
+    Downloaded(Bytes, Option<u64>),
 }
+
 
 impl RunnerMessageKind {
     #[inline]
@@ -56,8 +58,8 @@ impl RunnerMessageKind {
     }
 
     #[inline]
-    pub fn downloaded(chunk: Bytes) -> Self {
-        Self::Downloaded(chunk)
+    pub fn downloaded(chunk: Bytes, start_nanos: Option<u64>) -> Self {
+        Self::Downloaded(chunk, start_nanos)
     }
 
     #[inline]
@@ -212,6 +214,8 @@ pub struct TaskRunner {
     cancel_token: CancellationToken,
     /// the shutdown signal, used for ensure the task runner is stopped
     shutdown_rx: Option<oneshot::Receiver<()>>,
+    /// budget sampler for backpressure and speed measurement
+    budget_sampler: Option<Arc<BudgetSampler>>,
 }
 
 enum Event {
@@ -235,6 +239,7 @@ impl TaskRunner {
         runner_id: RunnerId,
         receiver: ControlSignalReceiver,
         cancel_token: CancellationToken,
+        budget_sampler: Option<Arc<BudgetSampler>>,
     ) -> (Self, RunnerMessageConsumer) {
         let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
         let (prod, cons) = rb.split();
@@ -247,6 +252,7 @@ impl TaskRunner {
                 control_signal: receiver,
                 cancel_token,
                 shutdown_rx: None,
+                budget_sampler,
             },
             cons,
         )
@@ -258,6 +264,7 @@ impl TaskRunner {
         runner_id: RunnerId,
         receiver: ControlSignalReceiver,
         cancel_token: CancellationToken,
+        budget_sampler: Option<Arc<BudgetSampler>>,
         on_channel_created: impl FnOnce(RunnerMessageConsumer),
     ) -> Option<Self> {
         let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
@@ -282,6 +289,7 @@ impl TaskRunner {
             control_signal: receiver,
             cancel_token,
             shutdown_rx: None,
+            budget_sampler,
         })
     }
 
@@ -344,12 +352,29 @@ impl TaskRunner {
 
     async fn flush_buff(&mut self, buff: &mut BytesMut) -> Result<(), TaskError> {
         if !buff.is_empty() {
-            self.downloaded += buff.len() as u64;
+            let chunk_len = buff.len();
+            // Acquire budget permit (returns start_nanos for later release)
+            let start_nanos = if let Some(sampler) = &self.budget_sampler {
+                Some(sampler.acquire_permit(chunk_len as u64).await)
+            } else {
+                None
+            };
+            self.downloaded += chunk_len as u64;
             let chunk = buff.split().freeze();
-            self.notify
-                .send(RunnerMessageKind::Downloaded(chunk))
+            if self
+                .notify
+                .send(RunnerMessageKind::Downloaded(chunk, start_nanos))
                 .await
-                .map_err(|_| TaskError::ChannelClosed)?;
+                .is_err()
+            {
+                // Release budget on failure (no actual write happened)
+                if let Some(sampler) = &self.budget_sampler {
+                    if let Some(start) = start_nanos {
+                        sampler.release(chunk_len as u64, start);
+                    }
+                }
+                return Err(TaskError::ChannelClosed);
+            }
             // Note: BytesMut::split() already leaves the buffer empty, but we clear for clarity
         }
         Ok(())
@@ -592,6 +617,7 @@ mod tests {
             1,
             control_rx,
             token,
+            None,
         );
 
         // Spawn the runner
@@ -611,7 +637,7 @@ mod tests {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                     downloaded_size += bytes.len();
                 }
                 RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
@@ -647,6 +673,7 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -700,6 +727,7 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -736,6 +764,7 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -787,6 +816,7 @@ mod tests {
             runner_id,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -804,7 +834,7 @@ mod tests {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(_)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(_, _)) => {
                     // Send resize message immediately after first download (only once)
                     if !resize_sent {
                         control_tx
@@ -857,6 +887,7 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         let expected_total = (BUFFER_SIZE as f64 * 4.5) as u64;
@@ -877,7 +908,7 @@ mod tests {
                     trace!("task started");
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                     download_count += 1;
                     total_downloaded += bytes.len();
                     // After downloading 2 chunks (64 KB), resize to 4.5 chunks
@@ -923,6 +954,7 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         // Pre-schedule the control signal to be sent after 80ms
@@ -951,7 +983,7 @@ mod tests {
                     trace!("task started");
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                     total_downloaded += bytes.len();
                     trace!("downloaded batch, total: {total_downloaded} bytes");
                 }
@@ -1010,6 +1042,7 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -1026,7 +1059,7 @@ mod tests {
                 RunnerMessage(_, RunnerMessageKind::Started) => {
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
                     total_downloaded += bytes.len();
                 }
                 RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
@@ -1063,6 +1096,7 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
+            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -1120,6 +1154,7 @@ mod tests {
             runner_id,
             control_rx,
             cancel_token,
+            None,
             on_channel_created,
         )
         .await;
@@ -1148,7 +1183,7 @@ mod tests {
                     assert_eq!(id, runner_id);
                     started = true;
                 }
-                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes)) => {
+                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _)) => {
                     assert_eq!(id, runner_id);
                     total_downloaded += bytes.len();
                 }
@@ -1195,6 +1230,7 @@ mod tests {
             runner_id,
             control_rx,
             cancel_token,
+            None,
             on_channel_created,
         )
         .await;
@@ -1252,6 +1288,7 @@ mod tests {
             runner_id1,
             control_rx1,
             cancel_token.clone(),
+            None,
         );
 
         let (mut runner2, msg_rx2) = TaskRunner::new(
@@ -1260,6 +1297,7 @@ mod tests {
             runner_id2,
             control_rx2,
             cancel_token.clone(),
+            None,
         );
 
         let (mut runner3, msg_rx3) = TaskRunner::new(
@@ -1268,6 +1306,7 @@ mod tests {
             runner_id3,
             control_rx3,
             cancel_token.clone(),
+            None,
         );
 
         // Spawn all runners
@@ -1315,7 +1354,7 @@ mod tests {
                                 assert_eq!(id, runner_id1);
                                 runner1_started = true;
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _))) => {
                                 assert_eq!(id, runner_id1);
                                 runner1_downloaded += bytes.len();
 
@@ -1346,7 +1385,7 @@ mod tests {
                                 assert_eq!(id, runner_id2);
                                 runner2_started = true;
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _))) => {
                                 assert_eq!(id, runner_id2);
                                 runner2_downloaded += bytes.len();
                             }
@@ -1367,7 +1406,7 @@ mod tests {
                                 assert_eq!(id, runner_id3);
                                 runner3_started = true;
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes))) => {
+                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _))) => {
                                 assert_eq!(id, runner_id3);
                                 runner3_downloaded += bytes.len();
                             }

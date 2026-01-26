@@ -72,6 +72,7 @@ async-broadcast = { version = "0.7" }
 async-fs = "2"                                        # for async file operation
 async-io = "2"                                        # for async timer
 blocking = "1"                                        # convert blocking io to async
+event-listener = "5"                                  # A sync primitive for async/blocking event notification
 
 serde = { version = "1", features = ["derive"], optional = true }
 

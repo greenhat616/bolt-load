@@ -515,6 +515,7 @@ dependencies = [
  "criterion",
  "derive_more",
  "enum_dispatch",
+ "event-listener",
  "fs-err",
  "futures",
  "futures-concurrency",

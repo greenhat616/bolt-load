@@ -3,12 +3,13 @@
 //! Use memmap to write random access file,
 //! and use seek write to write the file in large file.
 
+pub mod budget_sampler;
 #[cfg(feature = "compio")]
-mod compio;
+mod compio_writer;
 #[cfg(feature = "mmap")]
-mod mmap;
-mod null;
-mod pool;
+mod mmap_writer;
+mod null_writer;
+mod pool_writer;
 
 use std::{
     ops::Range,
@@ -21,12 +22,12 @@ use fs_err::{File, OpenOptions};
 use snafu::prelude::*;
 
 #[cfg(feature = "compio")]
-pub use self::compio::CompioWriterBuilder;
+pub use self::compio_writer::CompioWriterBuilder;
 #[cfg(feature = "mmap")]
-pub use self::mmap::MmapWriterBuilder;
-use self::{null::NullWriter, pool::PoolWriter};
+pub use self::mmap_writer::MmapWriterBuilder;
+use self::{null_writer::NullWriter, pool_writer::PoolWriter};
 // Re-export builders for benchmarking and advanced usage
-pub use self::{null::NullWriterBuilder, pool::PoolWriterBuilder};
+pub use self::{null_writer::NullWriterBuilder, pool_writer::PoolWriterBuilder};
 use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
@@ -91,11 +92,11 @@ trait FileWriterCapability {
 #[enum_dispatch::enum_dispatch]
 pub enum FileRangeWriterImpl {
     #[cfg(feature = "mmap")]
-    Mmap(self::mmap::MmapWriter),
+    Mmap(self::mmap_writer::MmapWriter),
     Pool(PoolWriter),
     Null(NullWriter),
     #[cfg(feature = "compio")]
-    Compio(self::compio::CompioWriter),
+    Compio(self::compio_writer::CompioWriter),
 }
 
 impl FileRangeWriter for Arc<FileRangeWriterImpl> {
@@ -218,7 +219,7 @@ impl FileWriter {
             }
             #[cfg(feature = "compio")]
             FileRangeWriterKind::Compio => {
-                use self::compio::CompioWriterBuilder;
+                use self::compio_writer::CompioWriterBuilder;
                 FileRangeWriterImpl::Compio(
                     CompioWriterBuilder::new()
                         .path(path.clone())

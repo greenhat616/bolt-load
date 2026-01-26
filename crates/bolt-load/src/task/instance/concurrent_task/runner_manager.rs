@@ -388,7 +388,7 @@ impl RunnerManager {
         &mut self,
         msg: RunnerMessage,
         meters: &mut HashMap<RunnerId, usize>,
-        on_downloaded: impl FnOnce(Range<u64>, Bytes),
+        on_downloaded: impl FnOnce(Range<u64>, Bytes, Option<u64>),
     ) -> bool {
         let RunnerMessage(runner_id, msg) = msg;
 
@@ -440,7 +440,7 @@ impl RunnerManager {
                     }
                 }
             }
-            RunnerMessageKind::Downloaded(mut bytes) => {
+            RunnerMessageKind::Downloaded(mut bytes, start_nanos) => {
                 let bytes_len = bytes.len();
                 *meters.entry(runner_id).or_insert(0) += bytes_len;
 
@@ -452,7 +452,7 @@ impl RunnerManager {
                 let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
                 bytes.truncate(picked_size as usize);
 
-                on_downloaded(fixed_downloaded_range, bytes);
+                on_downloaded(fixed_downloaded_range, bytes, start_nanos);
             }
             RunnerMessageKind::Started => {
                 trace!("runner {runner_id} started");
@@ -492,7 +492,7 @@ impl RunnerManager {
     pub async fn tick(
         &mut self,
         meters: &mut HashMap<RunnerId, usize>,
-        on_downloaded: impl FnOnce(Range<u64>, Bytes),
+        on_downloaded: impl FnOnce(Range<u64>, Bytes, Option<u64>),
     ) -> TaskState {
         let next_notification = self.runner_notification.next().fuse();
         let pending = self.pending_runners.next().fuse();
@@ -701,7 +701,7 @@ mod tests {
 
         // Tick to process the pending runner
         let mut meters = HashMap::new();
-        let state = manager.tick(&mut meters, |_, _| {}).await;
+        let state = manager.tick(&mut meters, |_, _, _| {}).await;
 
         assert_eq!(state, TaskState::Downloading);
 
@@ -737,7 +737,7 @@ mod tests {
 
         // Tick to process the pending runner
         let mut meters = HashMap::new();
-        let state = manager.tick(&mut meters, |_, _| {}).await;
+        let state = manager.tick(&mut meters, |_, _, _| {}).await;
 
         assert_eq!(state, TaskState::Downloading);
 

@@ -208,7 +208,7 @@ impl SingletonTaskInner {
                 }
                 StoppedReason::Failed(kind) => return Err(TaskInstanceError::new_failed(kind)),
             },
-            RunnerMessageKind::Downloaded(chunk) => {
+            RunnerMessageKind::Downloaded(chunk, _start_nanos) => {
                 trace!("[SINGLETON TASK] downloaded chunk: {:?}", chunk.len());
                 *meter += chunk.len();
                 self.downloaded += chunk.len() as u64;
@@ -289,6 +289,7 @@ impl SingletonTaskInner {
             STATIC_RUNNER_ID,
             control_rx,
             cancel_token.clone(),
+            None,
         );
         let _cancel_guard = cancel_token.clone().drop_guard();
         self.instance = Some((guard, shutdown_rx));
