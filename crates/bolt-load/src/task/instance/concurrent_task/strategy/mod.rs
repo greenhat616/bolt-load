@@ -70,6 +70,7 @@ impl StrategyControl {
         let actions = self.concurrency_control_strategy.step(&mut context);
 
         if !actions.is_empty() {
+            trace!("[STRATEGY] Concurrency control strategy not none, proceeding");
             return Some((ConcurrencyControlStrategy::name(), actions));
         }
 
@@ -78,6 +79,7 @@ impl StrategyControl {
 
         if let Some((runner_id, suggested_range)) =
             runner_manager.find_chunk_to_split(planned_chunk_size)
+            && active_runners < max_concurrency
             && suggested_range.end - suggested_range.start >= planned_chunk_size
         {
             let runner_id =

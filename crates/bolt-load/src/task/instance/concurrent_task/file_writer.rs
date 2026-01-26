@@ -10,6 +10,8 @@ mod compio_writer;
 mod mmap_writer;
 mod null_writer;
 mod pool_writer;
+#[cfg(test)]
+mod slow;
 
 use std::{
     ops::Range,
@@ -97,6 +99,8 @@ pub enum FileRangeWriterImpl {
     Null(NullWriter),
     #[cfg(feature = "compio")]
     Compio(self::compio_writer::CompioWriter),
+    #[cfg(test)]
+    Slow(self::slow::SlowWriter),
 }
 
 impl FileRangeWriter for Arc<FileRangeWriterImpl> {
@@ -108,6 +112,8 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
             FileRangeWriterImpl::Null(writer) => writer.write_range(range, data).await,
             #[cfg(feature = "compio")]
             FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
         }
     }
 
@@ -135,6 +141,8 @@ pub enum FileRangeWriterKind {
     Null,
     #[cfg(feature = "compio")]
     Compio,
+    #[cfg(test)]
+    Slow(slow::SlowDiskConfig),
 }
 
 impl FileRangeWriterKind {
@@ -225,6 +233,21 @@ impl FileWriter {
                         .path(path.clone())
                         .build()
                         .await?,
+                )
+            }
+            #[cfg(test)]
+            FileRangeWriterKind::Slow(cfg) => {
+                let file = open_file(path.clone(), size).await?;
+                FileRangeWriterImpl::Slow(
+                    slow::SlowWriterBuilder::new()
+                        .file(file)
+                        .path(path.clone())
+                        .config(cfg)
+                        .build()
+                        .await
+                        .map_err(|e| FileWriterBuilderError::Validation {
+                            message: e.to_string(),
+                        })?,
                 )
             }
         };
@@ -531,5 +554,34 @@ mod tests {
         };
         let open_display = format!("{}", open_err);
         assert!(open_display.contains("failed to open or create file"));
+    }
+
+    #[tokio::test]
+    async fn test_slow_writer_works() {
+        use std::time::Duration;
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test_slow.bin");
+
+        let cfg = slow::SlowDiskConfig {
+            latency: Duration::from_millis(5),
+            max_jitter: Duration::from_millis(1),
+        };
+
+        let writer = FileWriter::new_with_kind(&file_path, 1024, FileRangeWriterKind::Slow(cfg))
+            .await
+            .unwrap();
+
+        let data = Bytes::from_static(b"slow!");
+        writer
+            .write_range(10..10 + data.len() as u64, data.clone())
+            .await
+            .unwrap();
+        writer.finalize().await.unwrap();
+
+        let mut file = std::fs::File::open(&file_path).unwrap();
+        file.seek(SeekFrom::Start(10)).unwrap();
+        let mut buf = vec![0u8; data.len()];
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &data[..]);
     }
 }
