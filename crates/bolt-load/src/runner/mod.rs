@@ -9,8 +9,9 @@ use smol_cancellation_token::CancellationToken;
 use crate::{
     DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AdapterError, AnyBytesStream},
-    task::{ControlEvent, RunnerId},
-    task::instance::concurrent_task::file_writer::budget_sampler::BudgetSampler,
+    task::{
+        ControlEvent, RunnerId, instance::concurrent_task::file_writer::write_budget::BudgetSampler,
+    },
     utils::ShutdownGuardExt,
 };
 
@@ -44,7 +45,6 @@ pub enum RunnerMessageKind {
     /// Downloaded a chunk with optional budget start_nanos for EWMA tracking
     Downloaded(Bytes, Option<u64>),
 }
-
 
 impl RunnerMessageKind {
     #[inline]

@@ -3,7 +3,6 @@
 //! Use memmap to write random access file,
 //! and use seek write to write the file in large file.
 
-pub mod budget_sampler;
 #[cfg(feature = "compio")]
 mod compio_writer;
 #[cfg(feature = "mmap")]
@@ -12,6 +11,7 @@ mod null_writer;
 mod pool_writer;
 #[cfg(test)]
 mod slow;
+pub mod write_budget;
 
 use std::{
     ops::Range,

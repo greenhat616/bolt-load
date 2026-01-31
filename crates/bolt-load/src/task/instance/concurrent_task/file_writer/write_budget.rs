@@ -7,8 +7,8 @@
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -39,10 +39,10 @@ pub struct BudgetConfig {
 impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
-            initial_capacity: 64 * 1024 * 1024,  // 64MB
-            min_capacity: 64 * 1024,              // 64KB
-            max_capacity: 256 * 1024 * 1024,      // 256MB
-            ewma_alpha_fp: 13107,                 // ≈0.2
+            initial_capacity: 64 * 1024 * 1024, // 64MB
+            min_capacity: 64 * 1024,            // 64KB
+            max_capacity: 256 * 1024 * 1024,    // 256MB
+            ewma_alpha_fp: 13107,               // ≈0.2
             sample_interval: Duration::from_millis(500),
         }
     }
@@ -156,9 +156,11 @@ impl BudgetSampler {
 
         // 3. Return budget (capped at max_capacity)
         let max = self.config.max_capacity;
-        let _ = self.budget.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-            Some(cur.saturating_add(bytes).min(max))
-        });
+        let _ = self
+            .budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_add(bytes).min(max))
+            });
 
         // 4. Wake one waiter (FIFO)
         self.notifier.notify_additional(1);
@@ -167,9 +169,7 @@ impl BudgetSampler {
     /// Update EWMA speed calculation
     fn update_ewma(&self, elapsed_nanos: u64) {
         // Get and reset bytes written since last sample
-        let bytes = self
-            .bytes_written_since_sample
-            .swap(0, Ordering::AcqRel);
+        let bytes = self.bytes_written_since_sample.swap(0, Ordering::AcqRel);
 
         // Calculate instantaneous speed (bytes/sec)
         let elapsed_secs = (elapsed_nanos as f64) / 1_000_000_000.0;
@@ -184,10 +184,9 @@ impl BudgetSampler {
 
         // Update EWMA using fixed-point arithmetic
         let alpha = self.config.ewma_alpha_fp;
-        let _ = self.ewma_speed_fp.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |cur_fp| {
+        let _ = self
+            .ewma_speed_fp
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur_fp| {
                 if cur_fp == 0 {
                     // Cold start: use instantaneous value
                     Some(inst_speed_fp)
@@ -196,17 +195,16 @@ impl BudgetSampler {
                     // In fixed-point: new_fp = cur_fp + (alpha * (inst_fp - cur_fp)) >> FP_SHIFT
                     let diff = if inst_speed_fp >= cur_fp {
                         let d = inst_speed_fp - cur_fp;
-                        let adj = ((d as u128) * (alpha as u128) >> FP_SHIFT) as u64;
+                        let adj = (((d as u128) * (alpha as u128)) >> FP_SHIFT) as u64;
                         cur_fp.saturating_add(adj)
                     } else {
                         let d = cur_fp - inst_speed_fp;
-                        let adj = ((d as u128) * (alpha as u128) >> FP_SHIFT) as u64;
+                        let adj = (((d as u128) * (alpha as u128)) >> FP_SHIFT) as u64;
                         cur_fp.saturating_sub(adj)
                     };
                     Some(diff)
                 }
-            },
-        );
+            });
     }
 
     /// Get current time in nanoseconds since start
@@ -410,10 +408,7 @@ mod tests {
         let sampler = BudgetSampler::with_defaults();
         let guard = sampler.acquire(1024).await;
         assert_eq!(guard.amount(), 1024);
-        assert_eq!(
-            sampler.available_budget(),
-            64 * 1024 * 1024 - 1024
-        );
+        assert_eq!(sampler.available_budget(), 64 * 1024 * 1024 - 1024);
     }
 
     #[tokio::test]
@@ -449,9 +444,7 @@ mod tests {
 
         // Try to acquire more than available - should block
         let sampler_clone = Arc::clone(&sampler);
-        let handle = tokio::spawn(async move {
-            sampler_clone.acquire(50).await
-        });
+        let handle = tokio::spawn(async move { sampler_clone.acquire(50).await });
 
         // Give some time for the task to start
         tokio::time::sleep(Duration::from_millis(10)).await;

@@ -7,9 +7,10 @@ use std::{
 };
 
 use async_waitgroup::WaitGroup;
-use bytes::Bytes;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
+use bytes::Bytes;
+use file_writer::write_budget::{BudgetConfig, BudgetSampler};
 use futures::{FutureExt, task::SpawnExt};
 use runner_manager::TaskState;
 use smol_cancellation_token::CancellationToken;
@@ -19,9 +20,7 @@ use super::{Result, TaskInstance};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
-    runner::{
-        RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskError, TaskRunner,
-    },
+    runner::{RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskError, TaskRunner},
     runtime::{
         LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl, Timer, TimerBuilder,
     },
@@ -33,7 +32,6 @@ use crate::{
         },
     },
 };
-use file_writer::budget_sampler::{BudgetConfig, BudgetSampler};
 
 mod chunk_planner;
 /// File writer implementations for concurrent downloads.
@@ -294,7 +292,7 @@ impl ConcurrentTaskInner {
                     control_rx,
                     runner_id,
                     runners_cancel_token.clone(),
-                    budget_sampler.clone(),
+                    write_budget.clone(),
                 )
             })
             .expect("failed to allocate runner with chunk");
@@ -330,7 +328,7 @@ impl ConcurrentTaskInner {
                 .runner_id(runner_id)
                 .control_signal(control_rx)
                 .cancel_token(cancel_token.clone())
-                .budget_sampler(budget_sampler.clone());
+                .budget_sampler(write_budget.clone());
             let connector = RunnerConnector::new(
                 async move { adapter.range_stream(start, end).await }.boxed(),
                 builder,
@@ -458,7 +456,7 @@ impl ConcurrentTaskInner {
                         incomplete_range,
                         adapter.clone(),
                         runner_id,
-                        budget_sampler.clone(),
+                        write_budget.clone(),
                     );
                 }
             }
@@ -477,7 +475,7 @@ impl ConcurrentTaskInner {
                     incomplete_range,
                     adapter.clone(),
                     task_id,
-                    budget_sampler.clone(),
+                    write_budget.clone(),
                 );
             }
             // Change the max concurrency
@@ -498,7 +496,7 @@ impl ConcurrentTaskInner {
                             control_rx,
                             runner_id,
                             runners_cancel_token.clone(),
-                            budget_sampler.clone(),
+                            write_budget.clone(),
                         )
                     })
                     .expect("failed to allocate runner with chunk");
@@ -539,7 +537,7 @@ impl ConcurrentTaskInner {
                     wg,
                     runners_cancel_token,
                     adapter,
-                    budget_sampler.clone(),
+                    write_budget.clone(),
                 )?;
             }
         }
@@ -582,14 +580,15 @@ impl ConcurrentTaskInner {
         let (tmp_path, file_writer) = self.create_file_writer().await?;
         let budget_sampler = BudgetSampler::new(BudgetConfig::default());
         // Write queue: (range, bytes, bytes_len, start_nanos for EWMA)
-        let (write_tx, write_rx) =
-            async_channel::bounded::<(Range<u64>, Bytes, usize, Option<u64>)>(DEFAULT_WRITE_QUEUE_CAPACITY);
+        let (write_tx, write_rx) = async_channel::bounded::<(Range<u64>, Bytes, usize, Option<u64>)>(
+            DEFAULT_WRITE_QUEUE_CAPACITY,
+        );
         let write_workers = initial_max_concurrency.clamp(1, DEFAULT_WRITE_WORKERS);
         let write_wg = WaitGroup::new();
         for _ in 0..write_workers {
             let write_rx = write_rx.clone();
             let file_writer = file_writer.clone();
-            let budget_sampler = budget_sampler.clone();
+            let budget_sampler = write_budget.clone();
             let write_wg = write_wg.clone();
             rt.spawn(async move {
                 let _wg = write_wg;
@@ -599,7 +598,7 @@ impl ConcurrentTaskInner {
                     }
                     // Release budget and update EWMA with actual write duration
                     if let Some(start) = start_nanos {
-                        budget_sampler.release(bytes_len as u64, start);
+                        write_budget.release(bytes_len as u64, start);
                     }
                 }
             })
@@ -613,7 +612,9 @@ impl ConcurrentTaskInner {
 
         let event_loop_result: Result<()> = async {
             loop {
-                while let Some((range, bytes, bytes_len, start_nanos)) = pending_writes.front().cloned() {
+                while let Some((range, bytes, bytes_len, start_nanos)) =
+                    pending_writes.front().cloned()
+                {
                     match write_tx.try_send((range, bytes, bytes_len, start_nanos)) {
                         Ok(()) => {
                             pending_writes.pop_front();
@@ -676,10 +677,14 @@ impl ConcurrentTaskInner {
         }
         .await;
         while let Some((range, bytes, bytes_len, start_nanos)) = pending_writes.pop_front() {
-            if write_tx.send((range, bytes, bytes_len, start_nanos)).await.is_err() {
+            if write_tx
+                .send((range, bytes, bytes_len, start_nanos))
+                .await
+                .is_err()
+            {
                 // Release budget on send failure (no actual write happened)
                 if let Some(start) = start_nanos {
-                    budget_sampler.release(bytes_len as u64, start);
+                    write_budget.release(bytes_len as u64, start);
                 }
             }
         }

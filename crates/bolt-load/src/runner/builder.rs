@@ -4,11 +4,12 @@ use async_ringbuf::{AsyncHeapRb, traits::Split};
 use bolt_load_core::adapter::AnyBytesStream;
 use smol_cancellation_token::CancellationToken;
 
-use super::{ControlSignalReceiver, RunnerMessage, RunnerMessageConsumer, RunnerMessageSender, TaskRunner};
+use super::{
+    ControlSignalReceiver, RunnerMessage, RunnerMessageConsumer, RunnerMessageSender, TaskRunner,
+};
 use crate::{
     DEFAULT_EVENT_CHANNEL_CAPACITY,
-    task::RunnerId,
-    task::instance::concurrent_task::file_writer::budget_sampler::BudgetSampler,
+    task::{RunnerId, instance::concurrent_task::file_writer::write_budget::BudgetSampler},
 };
 
 #[derive(Debug, snafu::Snafu)]
