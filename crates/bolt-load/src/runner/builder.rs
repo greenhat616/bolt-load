@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use async_ringbuf::{AsyncHeapRb, traits::Split};
 use bolt_load_core::adapter::AnyBytesStream;
 use smol_cancellation_token::CancellationToken;
@@ -7,10 +5,7 @@ use smol_cancellation_token::CancellationToken;
 use super::{
     ControlSignalReceiver, RunnerMessage, RunnerMessageConsumer, RunnerMessageSender, TaskRunner,
 };
-use crate::{
-    DEFAULT_EVENT_CHANNEL_CAPACITY,
-    task::{RunnerId, instance::concurrent_task::file_writer::write_budget::BudgetSampler},
-};
+use crate::{DEFAULT_EVENT_CHANNEL_CAPACITY, task::RunnerId};
 
 #[derive(Debug, snafu::Snafu)]
 pub enum TaskRunnerBuilderError {
@@ -37,8 +32,6 @@ pub struct TaskRunnerBuilder {
     pub control_signal: Option<ControlSignalReceiver>,
     /// the cancel token of the task
     pub cancel_token: Option<CancellationToken>,
-    /// the budget sampler for backpressure and speed measurement (optional)
-    pub budget_sampler: Option<Arc<BudgetSampler>>,
 }
 
 impl TaskRunnerBuilder {
@@ -72,12 +65,6 @@ impl TaskRunnerBuilder {
         self
     }
 
-    /// set the budget sampler for backpressure and speed measurement
-    pub fn budget_sampler(mut self, budget_sampler: Option<Arc<BudgetSampler>>) -> Self {
-        self.budget_sampler = budget_sampler;
-        self
-    }
-
     /// Build the task runner and return the runner and the message consumer
     pub fn build(self) -> Result<(TaskRunner, RunnerMessageConsumer), TaskRunnerBuilderError> {
         let runner_id = self
@@ -98,7 +85,6 @@ impl TaskRunnerBuilder {
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
             shutdown_rx: None,
-            budget_sampler: self.budget_sampler,
         };
         Ok((runner, cons))
     }

@@ -1,17 +1,15 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::cmp::Ordering;
 
-use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
+use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, traits::*};
 use bolt_load_utils::telemetry::*;
 use bytes::{Bytes, BytesMut};
+use future::FlushBuffFuture;
 use futures::{FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
 
 use crate::{
-    DEFAULT_EVENT_CHANNEL_CAPACITY,
     adapter::{AdapterError, AnyBytesStream},
-    task::{
-        ControlEvent, RunnerId, instance::concurrent_task::file_writer::write_budget::BudgetSampler,
-    },
+    task::{ControlEvent, RunnerId},
     utils::ShutdownGuardExt,
 };
 
@@ -21,9 +19,12 @@ pub type ControlSignalReceiver = async_channel::Receiver<ControlEvent>;
 
 mod builder;
 mod connector;
+mod error;
+mod future;
 mod guard;
 pub use builder::*;
 pub use connector::*;
+pub use error::*;
 pub use guard::*;
 
 // TODO: make it configurable or detect the local disk performance?
@@ -32,21 +33,29 @@ const BUFFER_SIZE: usize = 32 * 1024; // 32KB
 /// The timeout for the slow stream
 const SLOW_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// messages for runner -> manager
-#[derive(Debug)]
-pub struct RunnerMessage(pub RunnerId, pub RunnerMessageKind);
+pub const LIFECYCLE_CHANNEL_CAPACITY: usize = 2;
+pub const DATA_FRAME_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug)]
-pub enum RunnerMessageKind {
+pub struct DataFrame {
+    pub data: Bytes,
+    pub start_nanos: Option<u64>,
+}
+
+pub type DataFrameSender = AsyncHeapProd<DataFrame>;
+pub type DataFrameReceiver = AsyncHeapCons<DataFrame>;
+pub type LifecycleSender = AsyncHeapProd<LifecycleEvent>;
+pub type LifecycleReceiver = AsyncHeapCons<LifecycleEvent>;
+
+#[derive(Debug)]
+pub enum LifecycleEvent {
     /// The task is started
     Started,
     /// Stopped with message
     Stopped(StoppedReason),
-    /// Downloaded a chunk with optional budget start_nanos for EWMA tracking
-    Downloaded(Bytes, Option<u64>),
 }
 
-impl RunnerMessageKind {
+impl LifecycleEvent {
     #[inline]
     pub fn failed(e: TaskError) -> Self {
         Self::Stopped(StoppedReason::Failed(e))
@@ -55,11 +64,6 @@ impl RunnerMessageKind {
     #[inline]
     pub fn finished() -> Self {
         Self::Stopped(StoppedReason::Finished)
-    }
-
-    #[inline]
-    pub fn downloaded(chunk: Bytes, start_nanos: Option<u64>) -> Self {
-        Self::Downloaded(chunk, start_nanos)
     }
 
     #[inline]
@@ -90,97 +94,6 @@ pub enum StoppedReason {
     Failed(TaskError),
 }
 
-/// The kind of the task failed
-#[derive(Debug, snafu::Snafu)]
-pub enum TaskError {
-    /// The task is cancelled
-    #[snafu(display("task is cancelled"))]
-    Cancelled,
-    /// The task is timeout, only happen when a stream is not sent in a period
-    #[snafu(display("task is timeout"))]
-    Timeout,
-    /// The task is empty
-    #[snafu(display("task is empty"))]
-    Empty,
-    /// The channel is closed
-    #[snafu(display("channel is closed"))]
-    ChannelClosed,
-    /// The task is exceeded the total size
-    ///
-    /// Possible reason:
-    /// - The total sized while the downloaded chunk is larger than the total size
-    #[snafu(display("task is exceeded the total size"))]
-    ExceededTotalSize,
-    /// The task is smaller than the total size
-    ///
-    /// Possible reason:
-    /// - The total sized while the downloaded chunk is smaller than the total size
-    #[snafu(display("task is smaller than the total size"))]
-    SmallerThanTotalSize,
-    #[snafu(display("stream error: {source}"))]
-    StreamError { source: AdapterError },
-    /// The other error
-    #[snafu(display("other error: {message}"))]
-    Other { message: String },
-}
-
-impl TaskError {
-    #[inline]
-    pub const fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::StreamError {
-                source: AdapterError::Retryable { .. }
-            } | Self::Timeout
-        )
-    }
-
-    #[inline]
-    pub const fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled)
-    }
-
-    #[inline]
-    pub const fn is_stream_error(&self) -> bool {
-        matches!(self, Self::StreamError { .. })
-    }
-
-    #[inline]
-    pub const fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty)
-    }
-}
-
-/// a wrapper of the task message sender using ring buffer
-pub(crate) struct RunnerMessageSender {
-    runner_id: RunnerId,
-    producer: AsyncHeapProd<RunnerMessage>,
-}
-
-impl RunnerMessageSender {
-    pub fn new(runner_id: RunnerId, producer: AsyncHeapProd<RunnerMessage>) -> Self {
-        Self {
-            runner_id,
-            producer,
-        }
-    }
-
-    fn runner_id(&self) -> RunnerId {
-        self.runner_id
-    }
-
-    pub async fn send(&mut self, message: RunnerMessageKind) -> Result<(), RunnerMessage> {
-        self.producer
-            .push(RunnerMessage(self.runner_id, message))
-            .await
-    }
-
-    pub fn try_send(&mut self, message: RunnerMessageKind) -> Result<(), RunnerMessage> {
-        self.producer
-            .try_push(RunnerMessage(self.runner_id, message))
-    }
-}
-
 #[derive(Debug)]
 enum TaskRunError {
     Cancelled,
@@ -195,7 +108,10 @@ impl From<TaskError> for TaskRunError {
 
 /// runner for each chunk, or single file, responsible for downloading each chunk
 #[derive(derive_more::Debug)]
+#[non_exhaustive]
 pub struct TaskRunner {
+    /// The id of the runner
+    id: RunnerId,
     /// The total size of the this chunk or file
     /// possible None if the total size is unknown
     total: Option<u64>,
@@ -207,18 +123,20 @@ pub struct TaskRunner {
     /// the receiver of the manager messages (point-to-point channel)
     #[debug(skip)]
     control_signal: ControlSignalReceiver,
-    /// the sender of the task messages
+    /// the sender of the lifecycle events
     #[debug(skip)]
-    notify: RunnerMessageSender,
+    lifecycle_tx: LifecycleSender,
+    /// the sender of the data frames
+    #[debug(skip)]
+    data_tx: Option<DataFrameSender>,
     /// the cancel token
     cancel_token: CancellationToken,
     /// the shutdown signal, used for ensure the task runner is stopped
     shutdown_rx: Option<oneshot::Receiver<()>>,
-    /// budget sampler for backpressure and speed measurement
-    budget_sampler: Option<Arc<BudgetSampler>>,
 }
 
-enum Event {
+/// The step of the event loop
+enum EventLoopStep {
     /// The task is cancelled
     Cancelled,
     /// The stream is too slow, and transfer 0 bytes in the last SLOW_STREAM_TIMEOUT
@@ -227,72 +145,43 @@ enum Event {
     Control(Result<ControlEvent, async_channel::RecvError>),
     /// The download event is received
     Download(Option<Result<Bytes, AdapterError>>),
+    /// The pending flush operation completed
+    PendingComplete(Result<DataFrameSender, future::ChannelClosed>),
 }
 
-/// Type alias for the ring buffer consumer of runner messages
-pub type RunnerMessageConsumer = AsyncHeapCons<RunnerMessage>;
+/// The operation of the stream event
+enum StreamEventOperation {
+    /// Flush the buffer to the data channel
+    FlushBuff {
+        pending: FlushBuffFuture,
+        /// Whether the stream is finished
+        is_finished: bool,
+    },
+    /// The stream is errored, and we need to flush the remaining bytes in the buffer
+    StreamError {
+        error: AdapterError,
+        /// flush remaining bytes in the buffer, and break the loop
+        pending: Option<FlushBuffFuture>,
+    },
+}
+
+/// What to do after a pending flush future completes
+enum PendingPostAction {
+    /// Resume normal event loop (buffer was full, stream continues)
+    Resume,
+    /// Stream is finished, break with Ok(())
+    FinishSuccess,
+    /// Stream had an error, propagate it after flush
+    PropagateError(AdapterError),
+}
+
+/// Bundles a pending flush future with its post-completion action
+struct PendingFlushState {
+    future: FlushBuffFuture,
+    post_action: PendingPostAction,
+}
 
 impl TaskRunner {
-    pub fn new(
-        total: Option<u64>,
-        stream: AnyBytesStream,
-        runner_id: RunnerId,
-        receiver: ControlSignalReceiver,
-        cancel_token: CancellationToken,
-        budget_sampler: Option<Arc<BudgetSampler>>,
-    ) -> (Self, RunnerMessageConsumer) {
-        let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
-        let (prod, cons) = rb.split();
-        (
-            TaskRunner {
-                total,
-                downloaded: 0,
-                stream,
-                notify: RunnerMessageSender::new(runner_id, prod),
-                control_signal: receiver,
-                cancel_token,
-                shutdown_rx: None,
-                budget_sampler,
-            },
-            cons,
-        )
-    }
-
-    pub async fn new_with_async_and_callback(
-        total: Option<u64>,
-        stream: impl Future<Output = Result<AnyBytesStream, AdapterError>>,
-        runner_id: RunnerId,
-        receiver: ControlSignalReceiver,
-        cancel_token: CancellationToken,
-        budget_sampler: Option<Arc<BudgetSampler>>,
-        on_channel_created: impl FnOnce(RunnerMessageConsumer),
-    ) -> Option<Self> {
-        let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
-        let (mut prod, cons) = rb.split();
-        on_channel_created(cons);
-        let stream = match stream.await {
-            Ok(stream) => stream,
-            Err(e) => {
-                prod.try_push(RunnerMessage(
-                    runner_id,
-                    RunnerMessageKind::failed(TaskError::StreamError { source: e }),
-                ))
-                .expect("Manager ring buffer should never full or closed");
-                return None;
-            }
-        };
-        Some(TaskRunner {
-            total,
-            downloaded: 0,
-            stream,
-            notify: RunnerMessageSender::new(runner_id, prod),
-            control_signal: receiver,
-            cancel_token,
-            shutdown_rx: None,
-            budget_sampler,
-        })
-    }
-
     /// Get the builder of the task runner
     pub fn builder() -> TaskRunnerBuilder {
         TaskRunnerBuilder::default()
@@ -302,21 +191,24 @@ impl TaskRunner {
     /// This function will block until the task is finished or cancelled
     /// It should be called in a new thread or async spawn context
     #[cfg(feature = "tracing")]
-    #[tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.notify.runner_id()))]
+    #[tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.id))]
     pub async fn run(&mut self) {
         match self.run_inner().await {
             Ok(_) => {
-                let _ = self.notify.send(RunnerMessageKind::finished()).await;
+                let _ = self.lifecycle_tx.push(LifecycleEvent::finished()).await;
             }
             Err(err) => match err {
                 TaskRunError::Cancelled => {
                     let _ = self
-                        .notify
-                        .send(RunnerMessageKind::failed(TaskError::Cancelled))
+                        .lifecycle_tx
+                        .push(LifecycleEvent::failed(TaskError::Cancelled))
                         .await;
                 }
                 TaskRunError::Failed(task_err) => {
-                    let _ = self.notify.send(RunnerMessageKind::failed(task_err)).await;
+                    let _ = self
+                        .lifecycle_tx
+                        .push(LifecycleEvent::failed(task_err))
+                        .await;
                 }
             },
         }
@@ -328,7 +220,7 @@ impl TaskRunner {
     #[cfg_attr(feature = "tracing", tracing::instrument(
         skip(self),
         name = "TaskRunner::handle_control_signal",
-        fields(runner_id = self.notify.runner_id())
+        fields(runner_id = self.id)
     ))]
     fn handle_control_signal(&mut self, signal: &ControlEvent) -> Result<(), TaskError> {
         match signal {
@@ -350,34 +242,25 @@ impl TaskRunner {
         Ok(())
     }
 
-    async fn flush_buff(&mut self, buff: &mut BytesMut) -> Result<(), TaskError> {
+    /// Flush the buffer to the data channel
+    /// If the buffer is empty, return None
+    /// If the buffer is not empty, return the FlushBuffFuture
+    fn flush_buff(&mut self, buff: &mut BytesMut) -> Option<FlushBuffFuture> {
         if !buff.is_empty() {
-            let chunk_len = buff.len();
-            // Acquire budget permit (returns start_nanos for later release)
-            let start_nanos = if let Some(sampler) = &self.budget_sampler {
-                Some(sampler.acquire_permit(chunk_len as u64).await)
-            } else {
-                None
-            };
-            self.downloaded += chunk_len as u64;
+            self.downloaded += buff.len() as u64;
             let chunk = buff.split().freeze();
-            if self
-                .notify
-                .send(RunnerMessageKind::Downloaded(chunk, start_nanos))
-                .await
-                .is_err()
-            {
-                // Release budget on failure (no actual write happened)
-                if let Some(sampler) = &self.budget_sampler {
-                    if let Some(start) = start_nanos {
-                        sampler.release(chunk_len as u64, start);
-                    }
-                }
-                return Err(TaskError::ChannelClosed);
-            }
+            let data_tx = self.data_tx.take().expect("data_tx is not set");
+            let now = std::time::Instant::now();
+            return Some(FlushBuffFuture::new(
+                data_tx,
+                DataFrame {
+                    data: chunk,
+                    start_nanos: Some(now.elapsed().as_nanos() as u64),
+                },
+            ));
             // Note: BytesMut::split() already leaves the buffer empty, but we clear for clarity
         }
-        Ok(())
+        None
     }
 
     /// Handle the stream event
@@ -390,23 +273,26 @@ impl TaskRunner {
     #[cfg_attr(feature = "tracing", tracing::instrument(
         skip_all,
         name = "TaskRunner::handle_stream_event",
-        fields(runner_id = self.notify.runner_id())
+        fields(runner_id = self.id)
     ))]
-    async fn handle_stream_event(
+    fn handle_stream_event(
         &mut self,
         event: Option<Result<Bytes, AdapterError>>,
         buff: &mut BytesMut,
-        is_finished: &mut bool,
-    ) -> Result<(), TaskError> {
+    ) -> Option<StreamEventOperation> {
         match event {
             // TODO: check boundary after
             Some(Ok(item)) => {
                 if let Some(total) = self.total {
                     let current_downloaded = self.downloaded + buff.len() as u64;
                     if current_downloaded >= total {
-                        self.flush_buff(buff).await?;
-                        *is_finished = true;
-                        return Ok(());
+                        let flush_buff_future =
+                            self.flush_buff(buff).expect("buff should not be empty");
+
+                        return Some(StreamEventOperation::FlushBuff {
+                            pending: flush_buff_future,
+                            is_finished: true,
+                        });
                     }
                 }
 
@@ -419,13 +305,17 @@ impl TaskRunner {
                 };
 
                 if bytes_to_write == 0 {
-                    self.flush_buff(buff).await?;
-                    *is_finished = true;
-                    return Ok(());
+                    return Some(StreamEventOperation::FlushBuff {
+                        pending: self.flush_buff(buff).expect("buff should not be empty"),
+                        is_finished: true,
+                    });
                 }
 
                 if buff.len() + bytes_to_write > BUFFER_SIZE {
-                    self.flush_buff(buff).await?;
+                    return Some(StreamEventOperation::FlushBuff {
+                        pending: self.flush_buff(buff).expect("buff should not be empty"),
+                        is_finished: false,
+                    });
                 }
 
                 buff.extend_from_slice(&item[..bytes_to_write]);
@@ -433,38 +323,39 @@ impl TaskRunner {
                 if let Some(total) = self.total {
                     let current_downloaded = self.downloaded + buff.len() as u64;
                     if current_downloaded >= total {
-                        self.flush_buff(buff).await?;
-                        *is_finished = true;
+                        return Some(StreamEventOperation::FlushBuff {
+                            pending: self.flush_buff(buff).expect("buff should not be empty"),
+                            is_finished: true,
+                        });
                     }
                 }
+                None
             }
             // TODO: add a retry logic?
-            // First, we have to clarify whether this error is recoverable
             // If it is, we can retry it
             // If it is not, we should just return the error, and terminate the task
-            Some(Err(err)) => {
-                self.flush_buff(buff).await?;
-                return Err(TaskError::StreamError { source: err }.into());
-            }
+            Some(Err(err)) => Some(StreamEventOperation::StreamError {
+                error: err,
+                pending: self.flush_buff(buff),
+            }),
             // In this case, the download is closed, which means the stream is finished
-            None => {
-                self.flush_buff(buff).await?;
-                *is_finished = true;
-            }
+            None => Some(StreamEventOperation::FlushBuff {
+                pending: self.flush_buff(buff).expect("buff should not be empty"),
+                is_finished: true,
+            }),
         }
-        Ok(())
     }
 
     /// The inner logic of the task runner
     /// Just wrap a Result<(), TaskFailedKind> to return the error kind
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(skip(self), name = "TaskRunner::run_inner", fields(runner_id = self.notify.runner_id()))
+        tracing::instrument(skip(self), name = "TaskRunner::run_inner", fields(runner_id = self.id))
     )]
     async fn run_inner(&mut self) -> Result<(), TaskRunError> {
         trace!("runner: started");
-        self.notify
-            .send(RunnerMessageKind::Started)
+        self.lifecycle_tx
+            .push(LifecycleEvent::Started)
             .await
             .map_err(|_| TaskRunError::Failed(TaskError::ChannelClosed))?;
 
@@ -472,41 +363,50 @@ impl TaskRunner {
         let _guard = shutdown_tx.shutdown_guard();
         self.shutdown_rx = Some(shutdown_rx);
         let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
-        let mut is_finished = false;
-        let mut timer = async_io::Timer::after(SLOW_STREAM_TIMEOUT);
-        let _now = std::time::Instant::now();
+        let mut slow_transfer_timer = async_io::Timer::after(SLOW_STREAM_TIMEOUT);
+        let mut pending_state: Option<PendingFlushState> = None;
         let result = loop {
-            let step: Event = async {
+            let step: EventLoopStep = async {
                 let control_signal = self.control_signal.recv().fuse();
-                let download = self.stream.next().fuse();
                 let cancelled = self.cancel_token.cancelled().fuse();
-                let slow_transfer = timer.next().fuse();
-                futures::pin_mut!(control_signal, download, cancelled, slow_transfer);
-                futures::select_biased! {
-                    _ = cancelled => {
-                        Event::Cancelled
+                futures::pin_mut!(control_signal, cancelled);
+
+                if let Some(state) = pending_state.as_mut() {
+                    // PENDING MODE: only cancel + control + pending flush
+                    let pending_flush = (&mut state.future).fuse();
+                    futures::pin_mut!(pending_flush);
+                    futures::select_biased! {
+                        _ = cancelled => EventLoopStep::Cancelled,
+                        signal = control_signal => EventLoopStep::Control(signal),
+                        result = pending_flush => EventLoopStep::PendingComplete(result),
                     }
-                    signal = control_signal => {
-                        Event::Control(signal)
+                } else {
+                    // NORMAL MODE: full event loop
+                    let download = self.stream.next().fuse();
+                    let slow_transfer = slow_transfer_timer.next().fuse();
+                    futures::pin_mut!(download, slow_transfer);
+                    futures::select_biased! {
+                        _ = cancelled => EventLoopStep::Cancelled,
+                        signal = control_signal => EventLoopStep::Control(signal),
+                        _ = slow_transfer => {
+                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
+                            EventLoopStep::SlowTransfer
+                        }
+                        result = download => {
+                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
+                            EventLoopStep::Download(result)
+                        },
                     }
-                    _ = slow_transfer => {
-                        timer.set_after(SLOW_STREAM_TIMEOUT);
-                        Event::SlowTransfer
-                    }
-                    result = download => {
-                        timer.set_after(SLOW_STREAM_TIMEOUT);
-                        Event::Download(result)
-                    },
                 }
             }
             .await;
 
             match step {
-                Event::Cancelled => {
+                EventLoopStep::Cancelled => {
                     trace!("runner: cancelled");
                     break Err(TaskRunError::Cancelled);
                 }
-                Event::Control(signal) => match signal {
+                EventLoopStep::Control(signal) => match signal {
                     Ok(variant) => {
                         trace!("runner: control signal: {variant:?}");
                         if let Err(err) = self.handle_control_signal(&variant) {
@@ -523,25 +423,65 @@ impl TaskRunner {
                         break Err(TaskError::ChannelClosed.into());
                     }
                 },
-                Event::SlowTransfer => {
+                EventLoopStep::SlowTransfer => {
                     warn!(
                         "runner: very slow stream, transfer 0 bytes in the last {} seconds",
                         SLOW_STREAM_TIMEOUT.as_secs()
                     );
                 }
-                Event::Download(item) => {
-                    match self
-                        .handle_stream_event(item, &mut buff, &mut is_finished)
-                        .await
-                    {
-                        Ok(()) => {
-                            if is_finished {
-                                trace!("runner: finished");
-                                break Ok(());
+                EventLoopStep::Download(item) => {
+                    match self.handle_stream_event(item, &mut buff) {
+                        Some(StreamEventOperation::FlushBuff {
+                            pending,
+                            is_finished,
+                        }) => {
+                            pending_state = Some(PendingFlushState {
+                                future: pending,
+                                post_action: if is_finished {
+                                    PendingPostAction::FinishSuccess
+                                } else {
+                                    PendingPostAction::Resume
+                                },
+                            });
+                        }
+                        Some(StreamEventOperation::StreamError { error, pending }) => {
+                            match pending {
+                                Some(flush) => {
+                                    pending_state = Some(PendingFlushState {
+                                        future: flush,
+                                        post_action: PendingPostAction::PropagateError(error),
+                                    });
+                                }
+                                None => {
+                                    break Err(
+                                        TaskError::StreamError { source: error }.into(),
+                                    );
+                                }
                             }
                         }
-                        Err(err) => {
-                            break Err(err.into());
+                        None => {}
+                    }
+                }
+                EventLoopStep::PendingComplete(flush_result) => {
+                    let state = pending_state
+                        .take()
+                        .expect("pending_state must be set for PendingComplete");
+
+                    let data_tx = match flush_result {
+                        Ok(sender) => sender,
+                        Err(_) => break Err(TaskError::ChannelClosed.into()),
+                    };
+                    self.data_tx = Some(data_tx);
+
+                    match state.post_action {
+                        PendingPostAction::Resume => {
+                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
+                        }
+                        PendingPostAction::FinishSuccess => break Ok(()),
+                        PendingPostAction::PropagateError(error) => {
+                            break Err(
+                                TaskError::StreamError { source: error }.into(),
+                            );
                         }
                     }
                 }
@@ -617,7 +557,6 @@ mod tests {
             1,
             control_rx,
             token,
-            None,
         );
 
         // Spawn the runner
@@ -634,13 +573,13 @@ mod tests {
         while let Some(msg) = msg_rx.next().await {
             debug!("msg: {msg:?}");
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Started) => {
+                RunnerMessage(_, LifecycleEvent::Started) => {
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
+                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
                     downloaded_size += bytes.len();
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                     finished = true;
                     break;
                 }
@@ -673,7 +612,6 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -684,7 +622,7 @@ mod tests {
         let mut started = false;
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
+            if let RunnerMessage(_, LifecycleEvent::Started) = msg {
                 started = true;
                 break;
             }
@@ -727,7 +665,6 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -737,7 +674,7 @@ mod tests {
         let mut got_error = false;
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg {
+            if let RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) = msg {
                 if e.is_stream_error() {
                     got_error = true;
                     break;
@@ -764,7 +701,6 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -775,7 +711,7 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
             error!("msg: {msg:?}");
-            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg {
+            if let RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) = msg {
                 if e.is_empty() {
                     got_empty_error = true;
                     break;
@@ -816,7 +752,6 @@ mod tests {
             runner_id,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -831,10 +766,10 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Started) => {
+                RunnerMessage(_, LifecycleEvent::Started) => {
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(_, _)) => {
+                RunnerMessage(_, LifecycleEvent::Downloaded(_)) => {
                     // Send resize message immediately after first download (only once)
                     if !resize_sent {
                         control_tx
@@ -844,11 +779,11 @@ mod tests {
                         resize_sent = true;
                     }
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                     finished = true;
                     break;
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) => {
+                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) => {
                     error!("runner: stopped with error: {e:?}");
                     break;
                 }
@@ -887,7 +822,6 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         let expected_total = (BUFFER_SIZE as f64 * 4.5) as u64;
@@ -904,11 +838,11 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Started) => {
+                RunnerMessage(_, LifecycleEvent::Started) => {
                     trace!("task started");
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
+                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
                     download_count += 1;
                     total_downloaded += bytes.len();
                     // After downloading 2 chunks (64 KB), resize to 4.5 chunks
@@ -920,7 +854,7 @@ mod tests {
                             .unwrap();
                     }
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                     trace!("task finished");
                     break;
                 }
@@ -954,7 +888,6 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         // Pre-schedule the control signal to be sent after 80ms
@@ -979,19 +912,19 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Started) => {
+                RunnerMessage(_, LifecycleEvent::Started) => {
                     trace!("task started");
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
+                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
                     total_downloaded += bytes.len();
                     trace!("downloaded batch, total: {total_downloaded} bytes");
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                     trace!("task finished normally");
                     break;
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(err))) => {
+                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(err))) => {
                     trace!("task failed with error: {err:?}");
                     break;
                 }
@@ -1042,7 +975,6 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -1056,13 +988,13 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(_, RunnerMessageKind::Started) => {
+                RunnerMessage(_, LifecycleEvent::Started) => {
                     started = true;
                 }
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes, _)) => {
+                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
                     total_downloaded += bytes.len();
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                     finished = true;
                     break;
                 }
@@ -1096,7 +1028,6 @@ mod tests {
             1,
             control_rx,
             cancel_token.clone(),
-            None,
         );
 
         let runner_handle = tokio::spawn(async move {
@@ -1106,7 +1037,7 @@ mod tests {
         // Wait for start then drop the control channel
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, RunnerMessageKind::Started) = msg {
+            if let RunnerMessage(_, LifecycleEvent::Started) = msg {
                 drop(control_tx);
                 break;
             }
@@ -1114,7 +1045,7 @@ mod tests {
 
         let mut got_channel_closed = false;
         while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg {
+            if let RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) = msg {
                 if matches!(e, TaskError::ChannelClosed) {
                     got_channel_closed = true;
                     break;
@@ -1154,7 +1085,6 @@ mod tests {
             runner_id,
             control_rx,
             cancel_token,
-            None,
             on_channel_created,
         )
         .await;
@@ -1179,15 +1109,15 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         while let Some(msg) = msg_rx.next().await {
             match msg {
-                RunnerMessage(id, RunnerMessageKind::Started) => {
+                RunnerMessage(id, LifecycleEvent::Started) => {
                     assert_eq!(id, runner_id);
                     started = true;
                 }
-                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _)) => {
+                RunnerMessage(id, LifecycleEvent::Downloaded(bytes)) => {
                     assert_eq!(id, runner_id);
                     total_downloaded += bytes.len();
                 }
-                RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
+                RunnerMessage(id, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                     assert_eq!(id, runner_id);
                     finished = true;
                     break;
@@ -1230,7 +1160,6 @@ mod tests {
             runner_id,
             control_rx,
             cancel_token,
-            None,
             on_channel_created,
         )
         .await;
@@ -1245,7 +1174,7 @@ mod tests {
         let mut msg_rx = pin!(msg_rx);
         let msg = msg_rx.next().await.unwrap();
         match msg {
-            RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Failed(e)))
+            RunnerMessage(id, LifecycleEvent::Stopped(StoppedReason::Failed(e)))
                 if e.is_stream_error() =>
             {
                 assert_eq!(id, runner_id);
@@ -1288,7 +1217,6 @@ mod tests {
             runner_id1,
             control_rx1,
             cancel_token.clone(),
-            None,
         );
 
         let (mut runner2, msg_rx2) = TaskRunner::new(
@@ -1297,7 +1225,6 @@ mod tests {
             runner_id2,
             control_rx2,
             cancel_token.clone(),
-            None,
         );
 
         let (mut runner3, msg_rx3) = TaskRunner::new(
@@ -1306,7 +1233,6 @@ mod tests {
             runner_id3,
             control_rx3,
             cancel_token.clone(),
-            None,
         );
 
         // Spawn all runners
@@ -1350,11 +1276,11 @@ mod tests {
                 tokio::select! {
                     msg = msg_rx1.next(), if !runner1_finished => {
                         match msg {
-                            Some(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Started)) => {
                                 assert_eq!(id, runner_id1);
                                 runner1_started = true;
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _))) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Downloaded(bytes))) => {
                                 assert_eq!(id, runner_id1);
                                 runner1_downloaded += bytes.len();
 
@@ -1368,7 +1294,7 @@ mod tests {
                                     limit_sent = true;
                                 }
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Stopped(reason))) => {
                                 assert_eq!(id, runner_id1);
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner1_finished = true;
@@ -1381,15 +1307,15 @@ mod tests {
                     }
                     msg = msg_rx2.next(), if !runner2_finished => {
                         match msg {
-                            Some(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Started)) => {
                                 assert_eq!(id, runner_id2);
                                 runner2_started = true;
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _))) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Downloaded(bytes))) => {
                                 assert_eq!(id, runner_id2);
                                 runner2_downloaded += bytes.len();
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Stopped(reason))) => {
                                 assert_eq!(id, runner_id2);
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner2_finished = true;
@@ -1402,15 +1328,15 @@ mod tests {
                     }
                     msg = msg_rx3.next(), if !runner3_finished => {
                         match msg {
-                            Some(RunnerMessage(id, RunnerMessageKind::Started)) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Started)) => {
                                 assert_eq!(id, runner_id3);
                                 runner3_started = true;
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Downloaded(bytes, _))) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Downloaded(bytes))) => {
                                 assert_eq!(id, runner_id3);
                                 runner3_downloaded += bytes.len();
                             }
-                            Some(RunnerMessage(id, RunnerMessageKind::Stopped(reason))) => {
+                            Some(RunnerMessage(id, LifecycleEvent::Stopped(reason))) => {
                                 assert_eq!(id, runner_id3);
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner3_finished = true;
