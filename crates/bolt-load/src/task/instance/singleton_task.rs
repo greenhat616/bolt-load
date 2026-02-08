@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     adapter::AnyAdapter,
-    runner::{RunnerMessage, RunnerMessageKind, StoppedReason, TaskRunner, TaskRunnerGuard},
+    runner::{LifecycleEvent, StoppedReason, TaskRunner, TaskRunnerGuard},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
         Progress, RunnerId,
@@ -193,31 +193,36 @@ impl SingletonTaskInner {
         Ok(())
     }
 
-    async fn handle_runner_message(
+    async fn handle_lifecycle_event(
         &mut self,
-        RunnerMessage(_, kind): RunnerMessage,
-        file: &mut File,
-        meter: &mut usize,
+        event: LifecycleEvent,
         is_finished: &mut bool,
     ) -> Result<()> {
-        match kind {
-            RunnerMessageKind::Stopped(reason) => match reason {
+        match event {
+            LifecycleEvent::Stopped(reason) => match reason {
                 StoppedReason::Finished => {
                     *is_finished = true;
                     return Ok(());
                 }
                 StoppedReason::Failed(kind) => return Err(TaskInstanceError::new_failed(kind)),
             },
-            RunnerMessageKind::Downloaded(chunk, _start_nanos) => {
-                trace!("[SINGLETON TASK] downloaded chunk: {:?}", chunk.len());
-                *meter += chunk.len();
-                self.downloaded += chunk.len() as u64;
-                file.write_all(&chunk)
-                    .await
-                    .map_err(TaskInstanceError::new_write_chunk_failed)?;
-            }
             _ => {}
         }
+        Ok(())
+    }
+
+    async fn handle_data_frame(
+        &mut self,
+        data: bytes::Bytes,
+        file: &mut File,
+        meter: &mut usize,
+    ) -> Result<()> {
+        trace!("[SINGLETON TASK] downloaded chunk: {:?}", data.len());
+        *meter += data.len();
+        self.downloaded += data.len() as u64;
+        file.write_all(&data)
+            .await
+            .map_err(TaskInstanceError::new_write_chunk_failed)?;
         Ok(())
     }
 
@@ -283,14 +288,21 @@ impl SingletonTaskInner {
         let guard = TaskRunnerGuard::new(STATIC_RUNNER_ID, cancel_token.clone(), control_tx);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _shutdown_guard = shutdown_tx.shutdown_guard();
-        let (mut runner, runner_rx) = TaskRunner::new(
-            self.total,
-            stream,
-            STATIC_RUNNER_ID,
-            control_rx,
-            cancel_token.clone(),
-            None,
-        );
+
+        // Use builder pattern to create runner with split channels
+        let mut builder = TaskRunner::builder()
+            .stream(stream)
+            .runner_id(STATIC_RUNNER_ID)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone());
+
+        if let Some(total) = self.total {
+            builder = builder.total(total);
+        }
+
+        let (mut runner, lifecycle_rx, data_rx) =
+            builder.build().expect("failed to build task runner");
+
         let _cancel_guard = cancel_token.clone().drop_guard();
         self.instance = Some((guard, shutdown_rx));
 
@@ -303,17 +315,18 @@ impl SingletonTaskInner {
             let mut is_finished = false;
             let fut = runner.run().fuse();
             futures::pin_mut!(fut);
-            futures::pin_mut!(runner_rx);
+            futures::pin_mut!(lifecycle_rx);
+            futures::pin_mut!(data_rx);
             loop {
                 futures::select_biased! {
                     _ = timer.next().fuse() => {
                         self.handle_timer_tick(&wg, &mut speed, &mut sampler, &mut meter);
                     }
                     _ = fut => (),
-                    msg = runner_rx.next().fuse() => {
-                        match msg {
-                            Some(msg) => {
-                                match self.handle_runner_message(msg, &mut file, &mut meter, &mut is_finished).await {
+                    event = lifecycle_rx.next().fuse() => {
+                        match event {
+                            Some(event) => {
+                                match self.handle_lifecycle_event(event, &mut is_finished).await {
                                     Ok(()) => {
                                         if is_finished {
                                             break;
@@ -325,7 +338,22 @@ impl SingletonTaskInner {
                                 }
                             }
                             None => {
-                                warn!("runner message stream ended unexpectedly");
+                                warn!("lifecycle stream ended unexpectedly");
+                            }
+                        }
+                    }
+                    frame = data_rx.next().fuse() => {
+                        match frame {
+                            Some(frame) => {
+                                match self.handle_data_frame(frame.data, &mut file, &mut meter).await {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            None => {
+                                warn!("data stream ended unexpectedly");
                             }
                         }
                     }
