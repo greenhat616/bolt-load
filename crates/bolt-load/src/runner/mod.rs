@@ -532,7 +532,6 @@ mod tests {
     use std::{pin::pin, sync::Arc, time::Duration};
 
     use async_stream::stream;
-    use oneshot;
     use pretty_assertions::assert_eq;
     use tokio::time::sleep;
 
@@ -551,13 +550,14 @@ mod tests {
             }
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            Some(30), // Total size: 3 chunks * 10 bytes
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            token,
-        );
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(30) // Total size: 3 chunks * 10 bytes
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(token)
+            .build()
+            .unwrap();
 
         // Spawn the runner
         let runner_handle = tokio::spawn(async move {
@@ -569,21 +569,31 @@ mod tests {
         let mut started = false;
         let mut finished = false;
 
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            debug!("msg: {msg:?}");
-            match msg {
-                RunnerMessage(_, LifecycleEvent::Started) => {
-                    started = true;
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                msg = lifecycle_rx.next() => {
+                    match msg {
+                        Some(LifecycleEvent::Started) => {
+                            started = true;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            finished = true;
+                            break;
+                        }
+                        Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
+                        None => break,
+                    }
                 }
-                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
-                    downloaded_size += bytes.len();
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            downloaded_size += frame.data.len();
+                        }
+                        None => break,
+                    }
                 }
-                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
-                    finished = true;
-                    break;
-                }
-                _ => panic!("Unexpected message"),
             }
         }
 
@@ -606,13 +616,13 @@ mod tests {
             }
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            None,
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
@@ -620,9 +630,9 @@ mod tests {
 
         // Wait for the Started message
         let mut started = false;
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, LifecycleEvent::Started) = msg {
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        while let Some(msg) = lifecycle_rx.next().await {
+            if let LifecycleEvent::Started = msg {
                 started = true;
                 break;
             }
@@ -633,7 +643,7 @@ mod tests {
 
         // Wait for cancelled message
         let mut cancelled = false;
-        while let Some(RunnerMessage(_, msg)) = msg_rx.next().await {
+        while let Some(msg) = lifecycle_rx.next().await {
             if msg.is_cancelled() {
                 cancelled = true;
                 break;
@@ -659,22 +669,23 @@ mod tests {
             });
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            Some(20),
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .total(20)
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
         });
 
         let mut got_error = false;
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) = msg {
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        while let Some(msg) = lifecycle_rx.next().await {
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
                 if e.is_stream_error() {
                     got_error = true;
                     break;
@@ -695,23 +706,23 @@ mod tests {
             yield Ok(Bytes::from(vec![]));
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            None,
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
         });
 
         let mut got_empty_error = false;
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        while let Some(msg) = lifecycle_rx.next().await {
             error!("msg: {msg:?}");
-            if let RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) = msg {
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
                 if e.is_empty() {
                     got_empty_error = true;
                     break;
@@ -746,13 +757,14 @@ mod tests {
 
         let expected_total = (BUFFER_SIZE as f64 * 5.5) as u64;
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            Some(3 * BUFFER_SIZE as u64), // Initially larger than first chunk to avoid early termination
-            Box::pin(test_stream),
-            runner_id,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(3 * BUFFER_SIZE as u64) // Initially larger than first chunk to avoid early termination
+            .stream(Box::pin(test_stream))
+            .runner_id(runner_id)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
@@ -763,29 +775,40 @@ mod tests {
         let mut finished = false;
         let mut resize_sent = false;
 
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(_, LifecycleEvent::Started) => {
-                    started = true;
-                }
-                RunnerMessage(_, LifecycleEvent::Downloaded(_)) => {
-                    // Send resize message immediately after first download (only once)
-                    if !resize_sent {
-                        control_tx
-                            .send(ControlEvent::LimitTotal(expected_total))
-                            .await
-                            .unwrap();
-                        resize_sent = true;
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                msg = lifecycle_rx.next() => {
+                    match msg {
+                        Some(LifecycleEvent::Started) => {
+                            started = true;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            finished = true;
+                            break;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Failed(e))) => {
+                            error!("runner: stopped with error: {e:?}");
+                            break;
+                        }
+                        None => break,
                     }
                 }
-                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
-                    finished = true;
-                    break;
-                }
-                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) => {
-                    error!("runner: stopped with error: {e:?}");
-                    break;
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(_) => {
+                            // Send resize message immediately after first download (only once)
+                            if !resize_sent {
+                                control_tx
+                                    .send(ControlEvent::LimitTotal(expected_total))
+                                    .await
+                                    .unwrap();
+                                resize_sent = true;
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -816,13 +839,14 @@ mod tests {
             yield Ok(Bytes::from(vec![6; BUFFER_SIZE]));
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            Some(6 * BUFFER_SIZE as u64), // Initially larger size
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(6 * BUFFER_SIZE as u64) // Initially larger size
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         let expected_total = (BUFFER_SIZE as f64 * 4.5) as u64;
 
@@ -835,30 +859,41 @@ mod tests {
         let mut download_count = 0;
         let mut total_downloaded = 0;
 
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(_, LifecycleEvent::Started) => {
-                    trace!("task started");
-                    started = true;
-                }
-                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
-                    download_count += 1;
-                    total_downloaded += bytes.len();
-                    // After downloading 2 chunks (64 KB), resize to 4.5 chunks
-                    if download_count == 2 {
-                        trace!("runner: resize total to {expected_total}");
-                        control_tx
-                            .send(ControlEvent::LimitTotal(expected_total))
-                            .await
-                            .unwrap();
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                msg = lifecycle_rx.next() => {
+                    match msg {
+                        Some(LifecycleEvent::Started) => {
+                            trace!("task started");
+                            started = true;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            trace!("task finished");
+                            break;
+                        }
+                        Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
+                        None => break,
                     }
                 }
-                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
-                    trace!("task finished");
-                    break;
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            download_count += 1;
+                            total_downloaded += frame.data.len();
+                            // After downloading 2 chunks (64 KB), resize to 4.5 chunks
+                            if download_count == 2 {
+                                trace!("runner: resize total to {expected_total}");
+                                control_tx
+                                    .send(ControlEvent::LimitTotal(expected_total))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        None => break,
+                    }
                 }
-                _ => panic!("Unexpected message: {msg:?}"),
             }
         }
 
@@ -882,13 +917,14 @@ mod tests {
             }
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            Some(1000), // Initially allow 1000 bytes (20 chunks)
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(1000) // Initially allow 1000 bytes (20 chunks)
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         // Pre-schedule the control signal to be sent after 80ms
         // This should happen while the runner is actively downloading
@@ -909,24 +945,35 @@ mod tests {
         let mut started = false;
         let mut total_downloaded = 0;
 
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(_, LifecycleEvent::Started) => {
-                    trace!("task started");
-                    started = true;
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                msg = lifecycle_rx.next() => {
+                    match msg {
+                        Some(LifecycleEvent::Started) => {
+                            trace!("task started");
+                            started = true;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            trace!("task finished normally");
+                            break;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Failed(err))) => {
+                            trace!("task failed with error: {err:?}");
+                            break;
+                        }
+                        None => break,
+                    }
                 }
-                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
-                    total_downloaded += bytes.len();
-                    trace!("downloaded batch, total: {total_downloaded} bytes");
-                }
-                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
-                    trace!("task finished normally");
-                    break;
-                }
-                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(err))) => {
-                    trace!("task failed with error: {err:?}");
-                    break;
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            total_downloaded += frame.data.len();
+                            trace!("downloaded batch, total: {total_downloaded} bytes");
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -969,13 +1016,14 @@ mod tests {
             yield Ok(Bytes::from(vec![2; 10]));
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            Some(10), // Expect only 10 bytes but will receive 20
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(10) // Expect only 10 bytes but will receive 20
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
@@ -985,20 +1033,31 @@ mod tests {
         let mut finished = false;
         let mut total_downloaded = 0;
 
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(_, LifecycleEvent::Started) => {
-                    started = true;
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                msg = lifecycle_rx.next() => {
+                    match msg {
+                        Some(LifecycleEvent::Started) => {
+                            started = true;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            finished = true;
+                            break;
+                        }
+                        Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
+                        None => break,
+                    }
                 }
-                RunnerMessage(_, LifecycleEvent::Downloaded(bytes)) => {
-                    total_downloaded += bytes.len();
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            total_downloaded += frame.data.len();
+                        }
+                        None => break,
+                    }
                 }
-                RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
-                    finished = true;
-                    break;
-                }
-                _ => panic!("Unexpected message: {msg:?}"),
             }
         }
 
@@ -1022,30 +1081,30 @@ mod tests {
             }
         };
 
-        let (mut runner, msg_rx) = TaskRunner::new(
-            None,
-            Box::pin(test_stream),
-            1,
-            control_rx,
-            cancel_token.clone(),
-        );
+        let (mut runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
         });
 
         // Wait for start then drop the control channel
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, LifecycleEvent::Started) = msg {
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        while let Some(msg) = lifecycle_rx.next().await {
+            if let LifecycleEvent::Started = msg {
                 drop(control_tx);
                 break;
             }
         }
 
         let mut got_channel_closed = false;
-        while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(_, LifecycleEvent::Stopped(StoppedReason::Failed(e))) = msg {
+        while let Some(msg) = lifecycle_rx.next().await {
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
                 if matches!(e, TaskError::ChannelClosed) {
                     got_channel_closed = true;
                     break;
@@ -1063,38 +1122,20 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
 
-        // Create a successful stream future
-        let stream_future = async {
-            let test_stream = stream! {
-                yield Ok(Bytes::from(vec![1; 10]));
-                yield Ok(Bytes::from(vec![2; 10]));
-            };
-            Ok::<AnyBytesStream, AdapterError>(Box::pin(test_stream))
+        // Create the stream directly (builder pattern replaces the async callback API)
+        let test_stream = stream! {
+            yield Ok(Bytes::from(vec![1; 10]));
+            yield Ok(Bytes::from(vec![2; 10]));
         };
 
-        // Capture the consumer from the callback
-        let (callback_tx, callback_rx) = oneshot::channel();
-        let on_channel_created = move |rx: RunnerMessageConsumer| {
-            let _ = callback_tx.send(rx);
-        };
-
-        // Test the function
-        let result = TaskRunner::new_with_async_and_callback(
-            Some(20),
-            stream_future,
-            runner_id,
-            control_rx,
-            cancel_token,
-            on_channel_created,
-        )
-        .await;
-
-        // Should return Some(TaskRunner)
-        assert!(result.is_some());
-        let mut runner = result.unwrap();
-
-        // The callback should have been called with a consumer
-        let msg_rx = callback_rx.await.unwrap();
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(20)
+            .stream(Box::pin(test_stream))
+            .runner_id(runner_id)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token)
+            .build()
+            .unwrap();
 
         // Spawn the runner to test it works
         let runner_handle = tokio::spawn(async move {
@@ -1106,23 +1147,31 @@ mod tests {
         let mut finished = false;
         let mut total_downloaded = 0;
 
-        let mut msg_rx = pin!(msg_rx);
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(id, LifecycleEvent::Started) => {
-                    assert_eq!(id, runner_id);
-                    started = true;
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                msg = lifecycle_rx.next() => {
+                    match msg {
+                        Some(LifecycleEvent::Started) => {
+                            started = true;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            finished = true;
+                            break;
+                        }
+                        Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
+                        None => break,
+                    }
                 }
-                RunnerMessage(id, LifecycleEvent::Downloaded(bytes)) => {
-                    assert_eq!(id, runner_id);
-                    total_downloaded += bytes.len();
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            total_downloaded += frame.data.len();
+                        }
+                        None => break,
+                    }
                 }
-                RunnerMessage(id, LifecycleEvent::Stopped(StoppedReason::Finished)) => {
-                    assert_eq!(id, runner_id);
-                    finished = true;
-                    break;
-                }
-                _ => panic!("Unexpected message: {msg:?}"),
             }
         }
 
@@ -1138,52 +1187,42 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
 
-        // Create a failing stream future
-        let stream_future = async {
-            Err::<AnyBytesStream, AdapterError>(AdapterError::Unretryable {
+        // Create a stream that immediately errors (simulates stream creation failure)
+        let test_stream = stream! {
+            yield Err::<Bytes, AdapterError>(AdapterError::Unretryable {
                 source: UnretryableError::Io {
                     source: Arc::new(std::io::Error::other("Mock network error")),
                 },
-            })
+            });
         };
 
-        // Capture the consumer from the callback
-        let (callback_tx, callback_rx) = oneshot::channel();
-        let on_channel_created = move |rx: RunnerMessageConsumer| {
-            let _ = callback_tx.send(rx);
-        };
+        let (mut runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .total(20)
+            .stream(Box::pin(test_stream))
+            .runner_id(runner_id)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token)
+            .build()
+            .unwrap();
 
-        // Test the function
-        let result = TaskRunner::new_with_async_and_callback(
-            Some(20),
-            stream_future,
-            runner_id,
-            control_rx,
-            cancel_token,
-            on_channel_created,
-        )
-        .await;
-
-        // Should return None due to stream failure
-        assert!(result.is_none());
-
-        // The callback should still have been called with a consumer
-        let msg_rx = callback_rx.await.unwrap();
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
 
         // Should receive a stopped message with stream error
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        match msg {
-            RunnerMessage(id, LifecycleEvent::Stopped(StoppedReason::Failed(e)))
-                if e.is_stream_error() =>
-            {
-                assert_eq!(id, runner_id);
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut got_stream_error = false;
+        while let Some(msg) = lifecycle_rx.next().await {
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
+                if e.is_stream_error() {
+                    got_stream_error = true;
+                    break;
+                }
             }
-            _ => panic!("Expected stopped message with stream error, got: {msg:?}"),
         }
 
-        // Ring buffer consumer returns None when producer is dropped and buffer is empty
-        assert!(msg_rx.next().await.is_none());
+        runner_handle.await.unwrap();
+        assert!(got_stream_error);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1211,29 +1250,32 @@ mod tests {
         let runner_id2 = 2;
         let runner_id3 = 3;
 
-        let (mut runner1, msg_rx1) = TaskRunner::new(
-            Some(6 * BUFFER_SIZE as u64), // Total 6 chunks
-            Box::pin(create_stream()),
-            runner_id1,
-            control_rx1,
-            cancel_token.clone(),
-        );
+        let (mut runner1, lifecycle_rx1, data_rx1) = TaskRunner::builder()
+            .total(6 * BUFFER_SIZE as u64) // Total 6 chunks
+            .stream(Box::pin(create_stream()))
+            .runner_id(runner_id1)
+            .control_signal(control_rx1)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
-        let (mut runner2, msg_rx2) = TaskRunner::new(
-            Some(6 * BUFFER_SIZE as u64), // Total 6 chunks
-            Box::pin(create_stream()),
-            runner_id2,
-            control_rx2,
-            cancel_token.clone(),
-        );
+        let (mut runner2, lifecycle_rx2, data_rx2) = TaskRunner::builder()
+            .total(6 * BUFFER_SIZE as u64) // Total 6 chunks
+            .stream(Box::pin(create_stream()))
+            .runner_id(runner_id2)
+            .control_signal(control_rx2)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
-        let (mut runner3, msg_rx3) = TaskRunner::new(
-            Some(6 * BUFFER_SIZE as u64), // Total 6 chunks
-            Box::pin(create_stream()),
-            runner_id3,
-            control_rx3,
-            cancel_token.clone(),
-        );
+        let (mut runner3, lifecycle_rx3, data_rx3) = TaskRunner::builder()
+            .total(6 * BUFFER_SIZE as u64) // Total 6 chunks
+            .stream(Box::pin(create_stream()))
+            .runner_id(runner_id3)
+            .control_signal(control_rx3)
+            .cancel_token(cancel_token.clone())
+            .build()
+            .unwrap();
 
         // Spawn all runners
         let runner1_handle = tokio::spawn(async move {
@@ -1264,9 +1306,12 @@ mod tests {
         let mut limit_sent = false;
 
         // Pin the consumers for use with tokio::select!
-        let mut msg_rx1 = pin!(msg_rx1);
-        let mut msg_rx2 = pin!(msg_rx2);
-        let mut msg_rx3 = pin!(msg_rx3);
+        let mut lifecycle_rx1 = pin!(lifecycle_rx1);
+        let mut lifecycle_rx2 = pin!(lifecycle_rx2);
+        let mut lifecycle_rx3 = pin!(lifecycle_rx3);
+        let mut data_rx1 = pin!(data_rx1);
+        let mut data_rx2 = pin!(data_rx2);
+        let mut data_rx3 = pin!(data_rx3);
 
         // Use timeout to prevent infinite waiting
         let timeout_duration = Duration::from_secs(10);
@@ -1274,77 +1319,74 @@ mod tests {
             // Use select to handle messages from all runners
             loop {
                 tokio::select! {
-                    msg = msg_rx1.next(), if !runner1_finished => {
+                    msg = lifecycle_rx1.next(), if !runner1_finished => {
                         match msg {
-                            Some(RunnerMessage(id, LifecycleEvent::Started)) => {
-                                assert_eq!(id, runner_id1);
+                            Some(LifecycleEvent::Started) => {
                                 runner1_started = true;
                             }
-                            Some(RunnerMessage(id, LifecycleEvent::Downloaded(bytes))) => {
-                                assert_eq!(id, runner_id1);
-                                runner1_downloaded += bytes.len();
-
-                                // Send limit message ONLY to runner2's channel after some downloads
-                                if !limit_sent && runner1_downloaded >= 20 && runner2_downloaded >= 20 {
-                                    // Limit runner2 to 3 chunks - message goes directly to runner2
-                                    control_tx2
-                                        .send(ControlEvent::LimitTotal(3 * BUFFER_SIZE as u64))
-                                        .await
-                                        .unwrap();
-                                    limit_sent = true;
-                                }
-                            }
-                            Some(RunnerMessage(id, LifecycleEvent::Stopped(reason))) => {
-                                assert_eq!(id, runner_id1);
+                            Some(LifecycleEvent::Stopped(reason)) => {
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner1_finished = true;
                             }
                             None => {
-                                // Stream ended, treat as finished
                                 runner1_finished = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    frame = data_rx1.next(), if !runner1_finished => {
+                        if let Some(frame) = frame {
+                            runner1_downloaded += frame.data.len();
+
+                            // Send limit message ONLY to runner2's channel after some downloads
+                            if !limit_sent && runner1_downloaded >= 20 && runner2_downloaded >= 20 {
+                                // Limit runner2 to 3 chunks - message goes directly to runner2
+                                control_tx2
+                                    .send(ControlEvent::LimitTotal(3 * BUFFER_SIZE as u64))
+                                    .await
+                                    .unwrap();
+                                limit_sent = true;
                             }
                         }
                     }
-                    msg = msg_rx2.next(), if !runner2_finished => {
+                    msg = lifecycle_rx2.next(), if !runner2_finished => {
                         match msg {
-                            Some(RunnerMessage(id, LifecycleEvent::Started)) => {
-                                assert_eq!(id, runner_id2);
+                            Some(LifecycleEvent::Started) => {
                                 runner2_started = true;
                             }
-                            Some(RunnerMessage(id, LifecycleEvent::Downloaded(bytes))) => {
-                                assert_eq!(id, runner_id2);
-                                runner2_downloaded += bytes.len();
-                            }
-                            Some(RunnerMessage(id, LifecycleEvent::Stopped(reason))) => {
-                                assert_eq!(id, runner_id2);
+                            Some(LifecycleEvent::Stopped(reason)) => {
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner2_finished = true;
                             }
                             None => {
-                                // Stream ended, treat as finished
                                 runner2_finished = true;
                             }
+                            _ => {}
                         }
                     }
-                    msg = msg_rx3.next(), if !runner3_finished => {
+                    frame = data_rx2.next(), if !runner2_finished => {
+                        if let Some(frame) = frame {
+                            runner2_downloaded += frame.data.len();
+                        }
+                    }
+                    msg = lifecycle_rx3.next(), if !runner3_finished => {
                         match msg {
-                            Some(RunnerMessage(id, LifecycleEvent::Started)) => {
-                                assert_eq!(id, runner_id3);
+                            Some(LifecycleEvent::Started) => {
                                 runner3_started = true;
                             }
-                            Some(RunnerMessage(id, LifecycleEvent::Downloaded(bytes))) => {
-                                assert_eq!(id, runner_id3);
-                                runner3_downloaded += bytes.len();
-                            }
-                            Some(RunnerMessage(id, LifecycleEvent::Stopped(reason))) => {
-                                assert_eq!(id, runner_id3);
+                            Some(LifecycleEvent::Stopped(reason)) => {
                                 assert!(matches!(reason, StoppedReason::Finished));
                                 runner3_finished = true;
                             }
                             None => {
-                                // Stream ended, treat as finished
                                 runner3_finished = true;
                             }
+                            _ => {}
+                        }
+                    }
+                    frame = data_rx3.next(), if !runner3_finished => {
+                        if let Some(frame) = frame {
+                            runner3_downloaded += frame.data.len();
                         }
                     }
                 }
