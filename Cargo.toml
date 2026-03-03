@@ -12,7 +12,7 @@ resolver = "3"
 futures = "0.3"
 bytes = "1"
 thiserror = "2"
-snafu = "0.8"
+snafu = "0.9"
 
 async-trait = "0.1"
 async-lock = "3"
