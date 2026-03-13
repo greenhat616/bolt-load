@@ -62,7 +62,7 @@ fs-err = "3"                                          # for detailed io error me
 bitvec = "1"                                          # for task id generation
 memmap2 = { version = "0.9", optional = true }        # for better random range write for files if machine is available
 backon = "1"                                          # for retry strategy
-oneshot = { version = "0.1", features = ["async"] }   # for cross runtime oneshot
+oneshot = { version = "0.2", features = ["async"] }   # for cross runtime oneshot
 async-waitgroup = "0.1.3"                             # for cross runtime wait group
 async-lock = { workspace = true }                     # for cross runtime async lock
 ranges = "0.4"                                        # for range set operation
