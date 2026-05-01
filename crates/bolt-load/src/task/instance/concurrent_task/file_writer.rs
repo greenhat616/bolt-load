@@ -8,10 +8,10 @@ mod compio_writer;
 #[cfg(feature = "mmap")]
 mod mmap_writer;
 mod null_writer;
+mod pending_writer;
 mod pool_writer;
 #[cfg(test)]
 mod slow;
-pub mod write_budget;
 
 use std::{
     ops::Range,
@@ -68,21 +68,26 @@ pub enum FileWriterError {
     Finalize { source: CommandError, path: PathBuf },
 }
 
-#[enum_dispatch::enum_dispatch(FileRangeWriterImpl)]
-#[allow(async_fn_in_trait)] // Only for benchmarking and advanced usage
-pub trait FileRangeWriter {
+pub trait FileRangeWriter
+where
+    Self: Send + Sync,
+{
     /// Write data to file
     ///
     /// # Errors
     ///
     /// This function will return an error if the file is not writable or the disk is full.
-    async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError>;
+    fn write_range(
+        &self,
+        range: Range<u64>,
+        data: Bytes,
+    ) -> impl Future<Output = Result<(), FileWriterError>> + Send;
     /// Sync all data to disk
     ///
     /// # Errors
     ///
     /// This function will return an error if the file is not writable or the disk is full.
-    async fn finalize(self) -> Result<(), FileWriterError>;
+    fn finalize(self) -> impl Future<Output = Result<(), FileWriterError>> + Send;
 }
 
 trait FileWriterCapability {
@@ -91,7 +96,6 @@ trait FileWriterCapability {
     }
 }
 
-#[enum_dispatch::enum_dispatch]
 pub enum FileRangeWriterImpl {
     #[cfg(feature = "mmap")]
     Mmap(self::mmap_writer::MmapWriter),
@@ -101,6 +105,36 @@ pub enum FileRangeWriterImpl {
     Compio(self::compio_writer::CompioWriter),
     #[cfg(test)]
     Slow(self::slow::SlowWriter),
+}
+
+impl FileRangeWriter for FileRangeWriterImpl {
+    #[inline]
+    async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
+        match self {
+            #[cfg(feature = "mmap")]
+            FileRangeWriterImpl::Mmap(writer) => writer.write_range(range, data).await,
+            FileRangeWriterImpl::Pool(writer) => writer.write_range(range, data).await,
+            FileRangeWriterImpl::Null(writer) => writer.write_range(range, data).await,
+            #[cfg(feature = "compio")]
+            FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
+        }
+    }
+
+    #[inline]
+    async fn finalize(self) -> Result<(), FileWriterError> {
+        match self {
+            #[cfg(feature = "mmap")]
+            FileRangeWriterImpl::Mmap(writer) => writer.finalize().await,
+            FileRangeWriterImpl::Pool(writer) => writer.finalize().await,
+            FileRangeWriterImpl::Null(writer) => writer.finalize().await,
+            #[cfg(feature = "compio")]
+            FileRangeWriterImpl::Compio(writer) => writer.finalize().await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Slow(writer) => writer.finalize().await,
+        }
+    }
 }
 
 impl FileRangeWriter for Arc<FileRangeWriterImpl> {
