@@ -612,6 +612,7 @@ impl ConcurrentTaskInner {
                         );
                     }
                     state = runner_manager.tick(
+                        true,
                         &mut meters,
                         |range, bytes| {
                             let file_writer = file_writer.clone();

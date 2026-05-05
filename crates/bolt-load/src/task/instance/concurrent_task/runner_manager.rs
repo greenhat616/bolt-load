@@ -524,11 +524,16 @@ impl RunnerManager {
 
     pub async fn tick(
         &mut self,
+        can_accept_data: bool,
         meters: &mut HashMap<RunnerId, usize>,
         on_downloaded: impl FnOnce(Range<u64>, Bytes),
     ) -> TaskState {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
-        let next_data = self.data_aggregator.next().fuse();
+        let next_data = if can_accept_data {
+            futures::future::Either::Left(self.data_aggregator.next().fuse())
+        } else {
+            futures::future::Either::Right(futures::future::pending())
+        };
         let pending = self.pending_runners.next().fuse();
         futures::pin_mut!(next_lifecycle, next_data, pending);
         // Use select_biased! to ensure data is processed before lifecycle
@@ -746,7 +751,7 @@ mod tests {
 
         // Tick to process the pending runner
         let mut meters = HashMap::new();
-        let state = manager.tick(&mut meters, |_, _| {}).await;
+        let state = manager.tick(true, &mut meters, |_, _| {}).await;
 
         assert_eq!(state, TaskState::Downloading);
 
@@ -791,7 +796,7 @@ mod tests {
 
         // Tick to process the pending runner
         let mut meters = HashMap::new();
-        let state = manager.tick(&mut meters, |_, _| {}).await;
+        let state = manager.tick(true, &mut meters, |_, _| {}).await;
 
         assert_eq!(state, TaskState::Downloading);
 
@@ -833,7 +838,7 @@ mod tests {
             .unwrap();
 
         let mut meters = HashMap::new();
-        let _ = manager.tick(&mut meters, |_, _| {}).await;
+        let _ = manager.tick(true, &mut meters, |_, _| {}).await;
 
         // Runner should be released
         assert!(manager.get_runner_state(runner_id).is_none());
@@ -876,7 +881,7 @@ mod tests {
         let mut received_range = None;
 
         let _ = manager
-            .tick(&mut meters, |range, bytes| {
+            .tick(true, &mut meters, |range, bytes| {
                 received_data = true;
                 received_range = Some(range);
                 assert_eq!(bytes.len(), 100);
