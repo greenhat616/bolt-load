@@ -29,7 +29,11 @@ pub use self::compio_writer::CompioWriterBuilder;
 pub use self::mmap_writer::MmapWriterBuilder;
 use self::{null_writer::NullWriter, pool_writer::PoolWriter};
 // Re-export builders for benchmarking and advanced usage
-pub use self::{null_writer::NullWriterBuilder, pool_writer::PoolWriterBuilder};
+pub use self::{
+    null_writer::NullWriterBuilder,
+    pending_writer::{PendingWrite, PendingWriter, WriteCompletion, WriteStatus, WriterFullError},
+    pool_writer::PoolWriterBuilder,
+};
 use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;

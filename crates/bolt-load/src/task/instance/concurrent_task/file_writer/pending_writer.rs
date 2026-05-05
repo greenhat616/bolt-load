@@ -8,6 +8,7 @@
 
 use std::{
     ops::Range,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -16,9 +17,9 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
-use futures::task::{Spawn, SpawnExt};
+use futures::task::SpawnExt;
 
-use super::{FileRangeWriter, FileWriterError};
+use super::{Chunk, CommandError, FileRangeWriter, FileWriterError};
 use crate::runtime::ThreadedRuntimeImpl;
 
 /// A single write request: range + data.
@@ -77,9 +78,11 @@ where
     F: FileRangeWriter + 'static,
 {
     pub fn new(writer: Arc<F>, threaded_rt: ThreadedRuntimeImpl, capacity: usize) -> Self {
-        // Use a bounded channel equal to capacity – completions are always
-        // consumed by tick(), so this will never block in practice.
-        let (tx, rx) = async_channel::bounded(capacity.max(1));
+        let capacity = capacity.max(1);
+
+        // +1 ensures the spawn-failure error path can always deliver a
+        // completion even when all normal slots are unconsumed.
+        let (tx, rx) = async_channel::bounded(capacity + 1);
         Self {
             writer,
             threaded_rt,
@@ -200,8 +203,13 @@ where
         let in_flight = Arc::clone(&self.in_flight);
         let tx = self.completion_tx.clone();
         let task_range = range.clone();
+        let completion_range = range.clone();
+        let completion_chunk = Chunk {
+            range,
+            data: data.clone(),
+        };
 
-        self.threaded_rt.spawn(async move {
+        if let Err(spawn_error) = self.threaded_rt.spawn(async move {
             let result = writer.write_range(task_range.clone(), data).await;
             // Decrement before sending so that `is_full` reflects reality
             // by the time the caller processes the completion.
@@ -213,7 +221,22 @@ where
                     result,
                 })
                 .await;
-        });
+        }) {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            let _ = self.completion_tx.try_send(WriteCompletion {
+                range: completion_range,
+                result: Err(FileWriterError::WriteRange {
+                    source: CommandError::Io {
+                        source: std::io::Error::other(format!(
+                            "failed to spawn write task: {spawn_error}"
+                        )),
+                    },
+                    chunk: Some(completion_chunk),
+                    // PendingWriter does not own path context; keep this empty.
+                    path: PathBuf::new(),
+                }),
+            });
+        }
     }
 
     /// If a slot has opened and we have a buffered write, dispatch it.
@@ -232,5 +255,270 @@ where
             completions.push(c);
         }
         completions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use async_channel::Receiver;
+    use bytes::Bytes;
+    use futures::{
+        future::FutureObj,
+        task::{Spawn, SpawnError},
+    };
+
+    use super::*;
+    use crate::runtime::{
+        DowncastLocalRuntime, ObjectSafeTimer, ThreadedRuntime, TimerBuilder, TimerImpl,
+    };
+
+    #[derive(Debug, Default)]
+    struct RecordingWriter {
+        writes: Mutex<Vec<(Range<u64>, Bytes)>>,
+    }
+
+    impl RecordingWriter {
+        fn writes(&self) -> Vec<(Range<u64>, Bytes)> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl FileRangeWriter for RecordingWriter {
+        async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
+            self.writes.lock().unwrap().push((range, data));
+            Ok(())
+        }
+
+        async fn finalize(self) -> Result<(), FileWriterError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ControlledWriter {
+        writes: Mutex<Vec<(Range<u64>, Bytes)>>,
+        release_rx: Receiver<()>,
+    }
+
+    impl ControlledWriter {
+        fn new(release_rx: Receiver<()>) -> Self {
+            Self {
+                writes: Mutex::new(Vec::new()),
+                release_rx,
+            }
+        }
+
+        fn writes(&self) -> Vec<(Range<u64>, Bytes)> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl FileRangeWriter for ControlledWriter {
+        async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
+            let _ = self.release_rx.recv().await;
+            self.writes.lock().unwrap().push((range, data));
+            Ok(())
+        }
+
+        async fn finalize(self) -> Result<(), FileWriterError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FailingRuntime;
+
+    impl Spawn for FailingRuntime {
+        fn spawn_obj(&self, _future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+            Err(SpawnError::shutdown())
+        }
+    }
+
+    impl DowncastLocalRuntime for FailingRuntime {}
+
+    impl TimerBuilder for FailingRuntime {
+        fn create_delayed_timer(&self, _duration: Duration) -> TimerImpl {
+            TimerImpl::Custom(Box::new(NoopTimer))
+        }
+    }
+
+    impl ThreadedRuntime for FailingRuntime {}
+
+    struct NoopTimer;
+
+    #[async_trait::async_trait]
+    impl ObjectSafeTimer for NoopTimer {
+        async fn tick(&mut self) {}
+    }
+
+    async fn next_tick<F>(writer: &mut PendingWriter<F>) -> Vec<WriteCompletion>
+    where
+        F: FileRangeWriter + 'static,
+    {
+        tokio::time::timeout(Duration::from_secs(1), writer.tick())
+            .await
+            .expect("timed out waiting for write completion")
+            .expect("completion channel closed")
+    }
+
+    #[tokio::test]
+    async fn basic_write_tick_completion() {
+        let writer = Arc::new(RecordingWriter::default());
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+
+        assert_eq!(
+            pending
+                .write_range(0..4, Bytes::from_static(b"test"))
+                .unwrap(),
+            WriteStatus::Dispatched
+        );
+
+        let completions = next_tick(&mut pending).await;
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].range, 0..4);
+        assert!(completions[0].result.is_ok());
+        assert!(pending.is_idle());
+
+        let writes = writer.writes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 0..4);
+        assert_eq!(&writes[0].1[..], b"test");
+    }
+
+    #[tokio::test]
+    async fn pending_buffer_fallback_flushes_after_capacity_opens() {
+        let (release_tx, release_rx) = async_channel::unbounded();
+        let writer = Arc::new(ControlledWriter::new(release_rx));
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+
+        assert_eq!(
+            pending.write_range(0..1, Bytes::from_static(b"a")).unwrap(),
+            WriteStatus::Dispatched
+        );
+        assert_eq!(
+            pending.write_range(1..2, Bytes::from_static(b"b")).unwrap(),
+            WriteStatus::Pending
+        );
+        assert!(pending.is_full());
+        assert!(pending.has_pending_write());
+
+        release_tx.send(()).await.unwrap();
+        let first = next_tick(&mut pending).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].range, 0..1);
+        assert!(first[0].result.is_ok());
+        assert!(!pending.has_pending_write());
+        assert!(pending.is_full());
+
+        release_tx.send(()).await.unwrap();
+        let second = next_tick(&mut pending).await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].range, 1..2);
+        assert!(second[0].result.is_ok());
+        assert!(pending.is_idle());
+
+        let writes = writer.writes();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].0, 0..1);
+        assert_eq!(writes[1].0, 1..2);
+    }
+
+    #[tokio::test]
+    async fn writer_full_error_boundary_rejects_third_write() {
+        let (release_tx, release_rx) = async_channel::unbounded();
+        let writer = Arc::new(ControlledWriter::new(release_rx));
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+
+        assert_eq!(
+            pending.write_range(0..1, Bytes::from_static(b"a")).unwrap(),
+            WriteStatus::Dispatched
+        );
+        assert_eq!(
+            pending.write_range(1..2, Bytes::from_static(b"b")).unwrap(),
+            WriteStatus::Pending
+        );
+
+        let err = pending
+            .write_range(2..3, Bytes::from_static(b"c"))
+            .unwrap_err();
+        assert_eq!(err.0.range, 2..3);
+        assert_eq!(&err.0.bytes[..], b"c");
+
+        release_tx.send(()).await.unwrap();
+        let _ = next_tick(&mut pending).await;
+        release_tx.send(()).await.unwrap();
+        let _ = next_tick(&mut pending).await;
+        assert!(pending.is_idle());
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_is_clamped_to_one() {
+        let (release_tx, release_rx) = async_channel::unbounded();
+        let writer = Arc::new(ControlledWriter::new(release_rx));
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 0);
+
+        assert!(!pending.is_full());
+        assert_eq!(
+            pending.write_range(0..1, Bytes::from_static(b"a")).unwrap(),
+            WriteStatus::Dispatched
+        );
+        assert_eq!(pending.in_flight_count(), 1);
+        assert!(pending.is_full());
+        assert_eq!(
+            pending.write_range(1..2, Bytes::from_static(b"b")).unwrap(),
+            WriteStatus::Pending
+        );
+
+        release_tx.send(()).await.unwrap();
+        let _ = next_tick(&mut pending).await;
+        release_tx.send(()).await.unwrap();
+        let _ = next_tick(&mut pending).await;
+        assert!(pending.is_idle());
+    }
+
+    #[tokio::test]
+    async fn spawn_error_decrements_in_flight_and_reports_completion() {
+        let writer = Arc::new(RecordingWriter::default());
+        let rt = ThreadedRuntimeImpl::new_other_rt(FailingRuntime);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), rt, 1);
+
+        assert_eq!(
+            pending
+                .write_range(0..4, Bytes::from_static(b"boom"))
+                .unwrap(),
+            WriteStatus::Dispatched
+        );
+        assert_eq!(pending.in_flight_count(), 0);
+
+        let completions = next_tick(&mut pending).await;
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].range, 0..4);
+
+        match &completions[0].result {
+            Err(FileWriterError::WriteRange {
+                source,
+                chunk,
+                path,
+            }) => {
+                assert!(matches!(source, CommandError::Io { .. }));
+                let chunk = chunk.as_ref().unwrap();
+                assert_eq!(chunk.range, 0..4);
+                assert_eq!(&chunk.data[..], b"boom");
+                assert!(path.as_os_str().is_empty());
+            }
+            other => panic!("expected WriteRange spawn failure, got {other:?}"),
+        }
+
+        assert!(writer.writes().is_empty());
+        assert!(pending.is_idle());
     }
 }
