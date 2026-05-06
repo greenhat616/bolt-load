@@ -6,14 +6,7 @@
 //! a slot opens. Callers should check [`is_full`] / [`has_pending_write`] to
 //! decide whether to submit more writes.
 
-use std::{
-    ops::Range,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use async_channel::{Receiver, Sender};
 use bytes::Bytes;
@@ -60,8 +53,7 @@ pub struct PendingWriter<F> {
     threaded_rt: ThreadedRuntimeImpl,
     capacity: usize,
 
-    /// Tracks in-flight writes
-    in_flight: Arc<AtomicUsize>,
+    in_flight: usize,
 
     /// Channel for receiving write completions.
     #[debug(skip)]
@@ -90,7 +82,7 @@ where
             writer,
             threaded_rt,
             capacity,
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            in_flight: 0,
             completion_tx: tx,
             completion_rx: rx,
             pending_write: None,
@@ -98,13 +90,9 @@ where
         }
     }
 
-    /// Number of writes currently being executed in the background.
-    ///
-    // Relaxed is sufficient: this counter only gates capacity decisions.
-    // Write result visibility is synchronized by the bounded completion channel.
     #[inline]
     pub fn in_flight_count(&self) -> usize {
-        self.in_flight.load(Ordering::Relaxed)
+        self.in_flight
     }
 
     /// `true` when the number of in-flight writes has reached `capacity`.
@@ -183,6 +171,7 @@ where
         while let Ok(c) = self.completion_rx.try_recv() {
             completions.push(c);
         }
+        self.ack_completions(completions.len());
         self.saw_error |= Self::completions_have_error(&completions);
         if !self.saw_error {
             self.try_flush_pending();
@@ -211,6 +200,7 @@ where
 
             match self.completion_rx.recv().await {
                 Ok(c) => {
+                    self.ack_completions(1);
                     self.saw_error |= c.result.is_err();
                     completions.push(c);
                 }
@@ -228,12 +218,17 @@ where
         completions.iter().any(|c| c.result.is_err())
     }
 
-    /// Spawn a write task on the threaded runtime.
-    fn dispatch_write(&self, range: Range<u64>, data: Bytes) {
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    fn ack_completions(&mut self, count: usize) {
+        self.in_flight = self
+            .in_flight
+            .checked_sub(count)
+            .expect("in_flight underflow: more completions drained than dispatched");
+    }
+
+    fn dispatch_write(&mut self, range: Range<u64>, data: Bytes) {
+        self.in_flight += 1;
 
         let writer = Arc::clone(&self.writer);
-        let in_flight = Arc::clone(&self.in_flight);
         let tx = self.completion_tx.clone();
         let task_range = range.clone();
         let completion_range = range.clone();
@@ -244,10 +239,6 @@ where
 
         if let Err(spawn_error) = self.threaded_rt.spawn(async move {
             let result = writer.write_range(task_range.clone(), data).await;
-            // Decrement before sending so that `is_full` reflects reality
-            // by the time the caller processes the completion.
-            in_flight.fetch_sub(1, Ordering::Relaxed);
-            // If the receiver is dropped we just discard the result.
             let _ = tx
                 .send(WriteCompletion {
                     range: task_range,
@@ -255,20 +246,20 @@ where
                 })
                 .await;
         }) {
-            self.in_flight.fetch_sub(1, Ordering::Relaxed);
-            let _ = self.completion_tx.try_send(WriteCompletion {
-                range: completion_range,
-                result: Err(FileWriterError::WriteRange {
-                    source: CommandError::Io {
-                        source: std::io::Error::other(format!(
-                            "failed to spawn write task: {spawn_error}"
-                        )),
-                    },
-                    chunk: Some(completion_chunk),
-                    // PendingWriter does not own path context; keep this empty.
-                    path: PathBuf::new(),
-                }),
-            });
+            self.completion_tx
+                .try_send(WriteCompletion {
+                    range: completion_range,
+                    result: Err(FileWriterError::WriteRange {
+                        source: CommandError::Io {
+                            source: std::io::Error::other(format!(
+                                "failed to spawn write task: {spawn_error}"
+                            )),
+                        },
+                        chunk: Some(completion_chunk),
+                        path: PathBuf::new(),
+                    }),
+                })
+                .expect("completion channel should have capacity for spawn-failure completion");
         }
     }
 
@@ -281,12 +272,12 @@ where
         }
     }
 
-    /// Drain all immediately-available completions from the channel.
     fn drain_completions(&mut self) -> Vec<WriteCompletion> {
         let mut completions = Vec::new();
         while let Ok(c) = self.completion_rx.try_recv() {
             completions.push(c);
         }
+        self.ack_completions(completions.len());
         completions
     }
 }
@@ -530,7 +521,7 @@ mod tests {
                 .unwrap(),
             WriteStatus::Dispatched
         );
-        assert_eq!(pending.in_flight_count(), 0);
+        assert_eq!(pending.in_flight_count(), 1);
 
         let completions = next_tick(&mut pending).await;
         assert_eq!(completions.len(), 1);
