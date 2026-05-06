@@ -391,6 +391,8 @@ impl ConcurrentTaskInner {
 
         meters: &mut HashMap<RunnerId, usize>,
         sampler: &mut SpeedSampler,
+        write_bytes_meter: &mut usize,
+        write_sampler: &mut SpeedSampler,
         current_speed: &mut f64,
         per_runner_avg_speed: &mut f64,
 
@@ -399,9 +401,13 @@ impl ConcurrentTaskInner {
         let count = meters.len();
         let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
         let (_, ema_speed) = sampler.sample(&mut total_bytes);
-        // debug!("ema speed {ema_speed} count {count}");
+        let (_, write_ema_speed) = write_sampler.sample(write_bytes_meter);
         *current_speed = ema_speed;
-        *per_runner_avg_speed = ema_speed / count as f64;
+        *per_runner_avg_speed = if count == 0 {
+            0.0
+        } else {
+            ema_speed / count as f64
+        };
 
         let event_tx = event_tx.clone();
         let total = runner_manager.total();
@@ -421,6 +427,7 @@ impl ConcurrentTaskInner {
                         downloaded_chunks,
                     },
                     ema_speed,
+                    write_ema_speed,
                 )))
                 .await
             {
@@ -570,6 +577,8 @@ impl ConcurrentTaskInner {
         let mut strategy_control = StrategyControl::new(initial_max_concurrency);
         let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
         let mut sampler = SpeedSampler::new();
+        let mut write_bytes_meter: usize = 0;
+        let mut write_sampler = SpeedSampler::new();
         let mut current_speed = 0.0;
         let mut per_runner_avg_speed = 0.0;
 
@@ -583,15 +592,21 @@ impl ConcurrentTaskInner {
         let mut throughout_meter_timer = rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
         let mut strategy_timer = rt.create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
 
-        fn check_completions(completions: Vec<WriteCompletion>) -> Result<()> {
+        fn check_completions(completions: Vec<WriteCompletion>) -> Result<usize> {
+            let mut written = 0usize;
             for c in &completions {
-                if let Err(e) = &c.result {
-                    return Err(TaskInstanceError::new_failed(TaskError::Other {
-                        message: format!("write failed at {:?}: {e}", c.range),
-                    }));
+                match &c.result {
+                    Ok(()) => {
+                        written += (c.range.end - c.range.start) as usize;
+                    }
+                    Err(e) => {
+                        return Err(TaskInstanceError::new_failed(TaskError::Other {
+                            message: format!("write failed at {:?}: {e}", c.range),
+                        }));
+                    }
                 }
             }
-            Ok(())
+            Ok(written)
         }
 
         enum LoopEvent {
@@ -603,7 +618,7 @@ impl ConcurrentTaskInner {
 
         let event_loop_result: Result<()> = async {
             loop {
-                check_completions(pending_writer.try_tick())
+                write_bytes_meter += check_completions(pending_writer.try_tick())
                     .inspect_err(|_| runners_cancel_token.cancel())?;
 
                 let can_write = pending_writer.can_write();
@@ -643,7 +658,7 @@ impl ConcurrentTaskInner {
 
                 match event {
                     LoopEvent::WriterCompleted(Some(completions)) => {
-                        check_completions(completions)
+                        write_bytes_meter += check_completions(completions)
                             .inspect_err(|_| runners_cancel_token.cancel())?;
                     }
                     LoopEvent::WriterCompleted(None) => {
@@ -678,6 +693,8 @@ impl ConcurrentTaskInner {
                             &runner_manager,
                             &mut meters,
                             &mut sampler,
+                            &mut write_bytes_meter,
+                            &mut write_sampler,
                             &mut current_speed,
                             &mut per_runner_avg_speed,
                             &event_tx,
@@ -716,10 +733,12 @@ impl ConcurrentTaskInner {
 
         event_loop_result?;
 
-        check_completions(pending_writer.flush().await).map_err(|e| {
-            runners_cancel_token.cancel();
-            e
-        })?;
+        check_completions(pending_writer.flush().await)
+            .map_err(|e| {
+                runners_cancel_token.cancel();
+                e
+            })
+            .map(drop)?;
         drop(pending_writer);
 
         file_writer.finalize().await.map_err(|e| {
@@ -764,6 +783,7 @@ impl ConcurrentTaskInner {
                     .event_tx
                     .send(TaskEvent::Downloading(ProgressWithSpeed::new(
                         self.progress.clone(),
+                        0.0,
                         0.0,
                     )))
                     .await;
