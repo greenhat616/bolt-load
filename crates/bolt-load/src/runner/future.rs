@@ -23,7 +23,6 @@ pin_project_lite::pin_project! {
         Pushing {
             data_tx: DataFrameSender,
             frame: Option<DataFrame>,
-            waker_registered: bool,
         },
         Done,
     }
@@ -53,17 +52,12 @@ impl Future for FlushBuffFuture {
                     this.set(FlushBuffFuture::Pushing {
                         data_tx,
                         frame: Some(frame),
-                        waker_registered: false,
                     });
 
                     continue;
                 }
 
-                FlushProj::Pushing {
-                    data_tx,
-                    frame,
-                    waker_registered,
-                } => {
+                FlushProj::Pushing { data_tx, frame } => {
                     let Some(item) = frame.take() else {
                         let old = this.as_mut().project_replace(FlushBuffFuture::Done);
                         let data_tx = match old {
@@ -77,6 +71,9 @@ impl Future for FlushBuffFuture {
                         return Poll::Ready(Err(ChannelClosed));
                     }
 
+                    // Register waker BEFORE try_push to prevent lost wakes
+                    data_tx.register_waker(cx.waker());
+
                     match data_tx.try_push(item) {
                         Ok(()) => {
                             *frame = None;
@@ -84,11 +81,6 @@ impl Future for FlushBuffFuture {
                         }
                         Err(item_back) => {
                             *frame = Some(item_back);
-                            if *waker_registered {
-                                return Poll::Pending;
-                            }
-                            data_tx.register_waker(cx.waker());
-                            *waker_registered = true;
                             return Poll::Pending;
                         }
                     }

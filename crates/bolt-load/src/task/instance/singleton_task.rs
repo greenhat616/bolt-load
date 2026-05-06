@@ -313,23 +313,51 @@ impl SingletonTaskInner {
 
         let result = async {
             let mut is_finished = false;
+            let mut runner_stopped = false;
+            let mut data_done = false;
             let fut = runner.run().fuse();
             futures::pin_mut!(fut);
             futures::pin_mut!(lifecycle_rx);
             futures::pin_mut!(data_rx);
             loop {
+                let data_next = if data_done {
+                    futures::future::Either::Left(futures::future::pending())
+                } else {
+                    futures::future::Either::Right(data_rx.next())
+                }
+                .fuse();
+                futures::pin_mut!(data_next);
+
                 futures::select_biased! {
                     _ = timer.next().fuse() => {
                         self.handle_timer_tick(&wg, &mut speed, &mut sampler, &mut meter);
                     }
                     _ = fut => (),
+                    // Data FIRST — higher priority than lifecycle to avoid losing frames
+                    frame = data_next => {
+                        match frame {
+                            Some(frame) => {
+                                self.handle_data_frame(frame.data, &mut file, &mut meter).await?;
+                            }
+                            None => {
+                                data_done = true;
+                                if runner_stopped {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     event = lifecycle_rx.next().fuse() => {
                         match event {
                             Some(event) => {
                                 match self.handle_lifecycle_event(event, &mut is_finished).await {
                                     Ok(()) => {
                                         if is_finished {
-                                            break;
+                                            runner_stopped = true;
+                                            // Don't break — drain data_rx first
+                                            if data_done {
+                                                break;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -339,21 +367,6 @@ impl SingletonTaskInner {
                             }
                             None => {
                                 warn!("lifecycle stream ended unexpectedly");
-                            }
-                        }
-                    }
-                    frame = data_rx.next().fuse() => {
-                        match frame {
-                            Some(frame) => {
-                                match self.handle_data_frame(frame.data, &mut file, &mut meter).await {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        return Err(e);
-                                    }
-                                }
-                            }
-                            None => {
-                                warn!("data stream ended unexpectedly");
                             }
                         }
                     }

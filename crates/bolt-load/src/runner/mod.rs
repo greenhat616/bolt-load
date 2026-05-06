@@ -148,26 +148,39 @@ enum EventLoopStep {
     PendingComplete(Result<DataFrameSender, future::ChannelClosed>),
 }
 
+/// Bundles a flush future with the byte count being flushed
+struct FlushRequest {
+    future: FlushBuffFuture,
+    flushed_bytes: u64,
+}
+
 /// The operation of the stream event
 enum StreamEventOperation {
     /// Flush the buffer to the data channel
     FlushBuff {
-        pending: FlushBuffFuture,
-        /// Whether the stream is finished
-        is_finished: bool,
+        pending: FlushRequest,
+        post_action: PendingPostAction,
     },
     /// The stream is errored, and we need to flush the remaining bytes in the buffer
     StreamError {
         error: AdapterError,
         /// flush remaining bytes in the buffer, and break the loop
-        pending: Option<FlushBuffFuture>,
+        pending: Option<FlushRequest>,
     },
+    /// Stream ended with an empty buffer — nothing to flush
+    FinishWithoutFlush,
 }
 
 /// What to do after a pending flush future completes
 enum PendingPostAction {
     /// Resume normal event loop (buffer was full, stream continues)
     Resume,
+    /// Continue processing the remainder of a chunk that didn't fit in the buffer
+    ContinueItem {
+        item: Bytes,
+        offset: usize,
+        bytes_to_write: usize,
+    },
     /// Stream is finished, break with Ok(())
     FinishSuccess,
     /// Stream had an error, propagate it after flush
@@ -177,6 +190,7 @@ enum PendingPostAction {
 /// Bundles a pending flush future with its post-completion action
 struct PendingFlushState {
     future: FlushBuffFuture,
+    flushed_bytes: u64,
     post_action: PendingPostAction,
 }
 
@@ -192,7 +206,12 @@ impl TaskRunner {
     #[cfg(feature = "tracing")]
     #[tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.id))]
     pub async fn run(&mut self) {
-        match self.run_inner().await {
+        let result = self.run_inner().await;
+        if Self::should_wait_data_drain(&result) {
+            self.wait_data_drained().await;
+        }
+
+        match result {
             Ok(_) => {
                 let _ = self.lifecycle_tx.push(LifecycleEvent::finished()).await;
             }
@@ -210,6 +229,20 @@ impl TaskRunner {
                         .await;
                 }
             },
+        }
+        self.data_tx.take();
+    }
+
+    fn should_wait_data_drain(result: &Result<(), TaskRunError>) -> bool {
+        matches!(
+            result,
+            Ok(()) | Err(TaskRunError::Failed(TaskError::ExceededTotalSize))
+        )
+    }
+
+    async fn wait_data_drained(&mut self) {
+        if let Some(data_tx) = self.data_tx.as_mut() {
+            data_tx.wait_vacant(DATA_FRAME_CHANNEL_CAPACITY).await;
         }
     }
 
@@ -241,16 +274,15 @@ impl TaskRunner {
         Ok(())
     }
 
-    /// Flush the buffer to the data channel
-    /// If the buffer is empty, return None
-    /// If the buffer is not empty, return the FlushBuffFuture
-    fn flush_buff(&mut self, buff: &mut BytesMut) -> Option<FlushBuffFuture> {
+    fn flush_buff(&mut self, buff: &mut BytesMut) -> Option<FlushRequest> {
         if !buff.is_empty() {
-            self.downloaded += buff.len() as u64;
+            let flushed_bytes = buff.len() as u64;
             let chunk = buff.split().freeze();
             let data_tx = self.data_tx.take().expect("data_tx is not set");
-            return Some(FlushBuffFuture::new(data_tx, DataFrame { data: chunk }));
-            // Note: BytesMut::split() already leaves the buffer empty, but we clear for clarity
+            return Some(FlushRequest {
+                future: FlushBuffFuture::new(data_tx, DataFrame { data: chunk }),
+                flushed_bytes,
+            });
         }
         None
     }
@@ -273,17 +305,16 @@ impl TaskRunner {
         buff: &mut BytesMut,
     ) -> Option<StreamEventOperation> {
         match event {
-            // TODO: check boundary after
             Some(Ok(item)) => {
                 if let Some(total) = self.total {
                     let current_downloaded = self.downloaded + buff.len() as u64;
                     if current_downloaded >= total {
-                        let flush_buff_future =
-                            self.flush_buff(buff).expect("buff should not be empty");
-
-                        return Some(StreamEventOperation::FlushBuff {
-                            pending: flush_buff_future,
-                            is_finished: true,
+                        return Some(match self.flush_buff(buff) {
+                            Some(flush) => StreamEventOperation::FlushBuff {
+                                pending: flush,
+                                post_action: PendingPostAction::FinishSuccess,
+                            },
+                            None => StreamEventOperation::FinishWithoutFlush,
                         });
                     }
                 }
@@ -297,16 +328,35 @@ impl TaskRunner {
                 };
 
                 if bytes_to_write == 0 {
-                    return Some(StreamEventOperation::FlushBuff {
-                        pending: self.flush_buff(buff).expect("buff should not be empty"),
-                        is_finished: true,
+                    return Some(match self.flush_buff(buff) {
+                        Some(flush) => StreamEventOperation::FlushBuff {
+                            pending: flush,
+                            post_action: PendingPostAction::FinishSuccess,
+                        },
+                        None => StreamEventOperation::FinishWithoutFlush,
                     });
                 }
 
                 if buff.len() + bytes_to_write > BUFFER_SIZE {
+                    let take = BUFFER_SIZE.saturating_sub(buff.len()).min(bytes_to_write);
+                    if take > 0 {
+                        buff.extend_from_slice(&item[..take]);
+                    }
+                    let flush = self
+                        .flush_buff(buff)
+                        .expect("buff should not be empty after fill");
+                    let remaining = bytes_to_write - take;
                     return Some(StreamEventOperation::FlushBuff {
-                        pending: self.flush_buff(buff).expect("buff should not be empty"),
-                        is_finished: false,
+                        pending: flush,
+                        post_action: if remaining > 0 {
+                            PendingPostAction::ContinueItem {
+                                item,
+                                offset: take,
+                                bytes_to_write: remaining,
+                            }
+                        } else {
+                            PendingPostAction::Resume
+                        },
                     });
                 }
 
@@ -315,25 +365,27 @@ impl TaskRunner {
                 if let Some(total) = self.total {
                     let current_downloaded = self.downloaded + buff.len() as u64;
                     if current_downloaded >= total {
-                        return Some(StreamEventOperation::FlushBuff {
-                            pending: self.flush_buff(buff).expect("buff should not be empty"),
-                            is_finished: true,
+                        return Some(match self.flush_buff(buff) {
+                            Some(flush) => StreamEventOperation::FlushBuff {
+                                pending: flush,
+                                post_action: PendingPostAction::FinishSuccess,
+                            },
+                            None => StreamEventOperation::FinishWithoutFlush,
                         });
                     }
                 }
                 None
             }
-            // TODO: add a retry logic?
-            // If it is, we can retry it
-            // If it is not, we should just return the error, and terminate the task
             Some(Err(err)) => Some(StreamEventOperation::StreamError {
                 error: err,
                 pending: self.flush_buff(buff),
             }),
-            // In this case, the download is closed, which means the stream is finished
-            None => Some(StreamEventOperation::FlushBuff {
-                pending: self.flush_buff(buff).expect("buff should not be empty"),
-                is_finished: true,
+            None => Some(match self.flush_buff(buff) {
+                Some(flush) => StreamEventOperation::FlushBuff {
+                    pending: flush,
+                    post_action: PendingPostAction::FinishSuccess,
+                },
+                None => StreamEventOperation::FinishWithoutFlush,
             }),
         }
     }
@@ -424,21 +476,19 @@ impl TaskRunner {
                 EventLoopStep::Download(item) => match self.handle_stream_event(item, &mut buff) {
                     Some(StreamEventOperation::FlushBuff {
                         pending,
-                        is_finished,
+                        post_action,
                     }) => {
                         pending_state = Some(PendingFlushState {
-                            future: pending,
-                            post_action: if is_finished {
-                                PendingPostAction::FinishSuccess
-                            } else {
-                                PendingPostAction::Resume
-                            },
+                            future: pending.future,
+                            flushed_bytes: pending.flushed_bytes,
+                            post_action,
                         });
                     }
                     Some(StreamEventOperation::StreamError { error, pending }) => match pending {
                         Some(flush) => {
                             pending_state = Some(PendingFlushState {
-                                future: flush,
+                                future: flush.future,
+                                flushed_bytes: flush.flushed_bytes,
                                 post_action: PendingPostAction::PropagateError(error),
                             });
                         }
@@ -446,6 +496,9 @@ impl TaskRunner {
                             break Err(TaskError::StreamError { source: error }.into());
                         }
                     },
+                    Some(StreamEventOperation::FinishWithoutFlush) => {
+                        break Ok(());
+                    }
                     None => {}
                 },
                 EventLoopStep::PendingComplete(flush_result) => {
@@ -458,9 +511,30 @@ impl TaskRunner {
                         Err(_) => break Err(TaskError::ChannelClosed.into()),
                     };
                     self.data_tx = Some(data_tx);
+                    self.downloaded += state.flushed_bytes;
 
                     match state.post_action {
                         PendingPostAction::Resume => {
+                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
+                        }
+                        PendingPostAction::ContinueItem {
+                            item,
+                            offset,
+                            bytes_to_write,
+                        } => {
+                            buff.extend_from_slice(&item[offset..offset + bytes_to_write]);
+                            if let Some(total) = self.total {
+                                if self.downloaded + buff.len() as u64 >= total {
+                                    let flush =
+                                        self.flush_buff(&mut buff).expect("just buffered data");
+                                    pending_state = Some(PendingFlushState {
+                                        future: flush.future,
+                                        flushed_bytes: flush.flushed_bytes,
+                                        post_action: PendingPostAction::FinishSuccess,
+                                    });
+                                    continue;
+                                }
+                            }
                             slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
                         }
                         PendingPostAction::FinishSuccess => break Ok(()),
@@ -555,6 +629,7 @@ mod tests {
 
         let mut lifecycle_rx = pin!(lifecycle_rx);
         let mut data_rx = pin!(data_rx);
+        let mut data_done = false;
         loop {
             tokio::select! {
                 msg = lifecycle_rx.next() => {
@@ -564,20 +639,23 @@ mod tests {
                         }
                         Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                             finished = true;
-                            break;
                         }
                         Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
                         None => break,
                     }
                 }
-                frame = data_rx.next() => {
+                frame = data_rx.next(), if !data_done => {
                     match frame {
                         Some(frame) => {
                             downloaded_size += frame.data.len();
                         }
-                        None => break,
+                        None => { data_done = true; }
                     }
                 }
+            }
+
+            if finished && data_done {
+                break;
             }
         }
 
@@ -761,6 +839,7 @@ mod tests {
 
         let mut lifecycle_rx = pin!(lifecycle_rx);
         let mut data_rx = pin!(data_rx);
+        let mut data_done = false;
         loop {
             tokio::select! {
                 msg = lifecycle_rx.next() => {
@@ -779,7 +858,7 @@ mod tests {
                         None => break,
                     }
                 }
-                frame = data_rx.next() => {
+                frame = data_rx.next(), if !data_done => {
                     match frame {
                         Some(_) => {
                             // Send resize message immediately after first download (only once)
@@ -791,7 +870,7 @@ mod tests {
                                 resize_sent = true;
                             }
                         }
-                        None => break,
+                        None => { data_done = true; }
                     }
                 }
             }
@@ -840,11 +919,13 @@ mod tests {
 
         // Wait for start and collect some download messages
         let mut started = false;
+        let mut finished = false;
         let mut download_count = 0;
         let mut total_downloaded = 0;
 
         let mut lifecycle_rx = pin!(lifecycle_rx);
         let mut data_rx = pin!(data_rx);
+        let mut data_done = false;
         loop {
             tokio::select! {
                 msg = lifecycle_rx.next() => {
@@ -855,13 +936,13 @@ mod tests {
                         }
                         Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                             trace!("task finished");
-                            break;
+                            finished = true;
                         }
                         Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
                         None => break,
                     }
                 }
-                frame = data_rx.next() => {
+                frame = data_rx.next(), if !data_done => {
                     match frame {
                         Some(frame) => {
                             download_count += 1;
@@ -875,9 +956,13 @@ mod tests {
                                     .unwrap();
                             }
                         }
-                        None => break,
+                        None => { data_done = true; }
                     }
                 }
+            }
+
+            if finished && data_done {
+                break;
             }
         }
 
@@ -927,10 +1012,12 @@ mod tests {
         });
 
         let mut started = false;
+        let mut stopped = false;
         let mut total_downloaded = 0;
 
         let mut lifecycle_rx = pin!(lifecycle_rx);
         let mut data_rx = pin!(data_rx);
+        let mut data_done = false;
         loop {
             tokio::select! {
                 msg = lifecycle_rx.next() => {
@@ -941,24 +1028,28 @@ mod tests {
                         }
                         Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                             trace!("task finished normally");
-                            break;
+                            stopped = true;
                         }
                         Some(LifecycleEvent::Stopped(StoppedReason::Failed(err))) => {
                             trace!("task failed with error: {err:?}");
-                            break;
+                            stopped = true;
                         }
                         None => break,
                     }
                 }
-                frame = data_rx.next() => {
+                frame = data_rx.next(), if !data_done => {
                     match frame {
                         Some(frame) => {
                             total_downloaded += frame.data.len();
                             trace!("downloaded batch, total: {total_downloaded} bytes");
                         }
-                        None => break,
+                        None => { data_done = true; }
                     }
                 }
+            }
+
+            if stopped && data_done {
+                break;
             }
         }
 
@@ -1019,6 +1110,7 @@ mod tests {
 
         let mut lifecycle_rx = pin!(lifecycle_rx);
         let mut data_rx = pin!(data_rx);
+        let mut data_done = false;
         loop {
             tokio::select! {
                 msg = lifecycle_rx.next() => {
@@ -1028,20 +1120,23 @@ mod tests {
                         }
                         Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                             finished = true;
-                            break;
                         }
                         Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
                         None => break,
                     }
                 }
-                frame = data_rx.next() => {
+                frame = data_rx.next(), if !data_done => {
                     match frame {
                         Some(frame) => {
                             total_downloaded += frame.data.len();
                         }
-                        None => break,
+                        None => { data_done = true; }
                     }
                 }
+            }
+
+            if finished && data_done {
+                break;
             }
         }
 
@@ -1133,6 +1228,7 @@ mod tests {
 
         let mut lifecycle_rx = pin!(lifecycle_rx);
         let mut data_rx = pin!(data_rx);
+        let mut data_done = false;
         loop {
             tokio::select! {
                 msg = lifecycle_rx.next() => {
@@ -1142,20 +1238,23 @@ mod tests {
                         }
                         Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                             finished = true;
-                            break;
                         }
                         Some(other) => panic!("Unexpected lifecycle event: {other:?}"),
                         None => break,
                     }
                 }
-                frame = data_rx.next() => {
+                frame = data_rx.next(), if !data_done => {
                     match frame {
                         Some(frame) => {
                             total_downloaded += frame.data.len();
                         }
-                        None => break,
+                        None => { data_done = true; }
                     }
                 }
+            }
+
+            if finished && data_done {
+                break;
             }
         }
 
@@ -1296,6 +1395,9 @@ mod tests {
         let mut data_rx1 = pin!(data_rx1);
         let mut data_rx2 = pin!(data_rx2);
         let mut data_rx3 = pin!(data_rx3);
+        let mut data1_done = false;
+        let mut data2_done = false;
+        let mut data3_done = false;
 
         // Use timeout to prevent infinite waiting
         let timeout_duration = Duration::from_secs(10);
@@ -1318,19 +1420,22 @@ mod tests {
                             _ => {}
                         }
                     }
-                    frame = data_rx1.next(), if !runner1_finished => {
-                        if let Some(frame) = frame {
-                            runner1_downloaded += frame.data.len();
+                    frame = data_rx1.next(), if !data1_done => {
+                        match frame {
+                            Some(frame) => {
+                                runner1_downloaded += frame.data.len();
 
-                            // Send limit message ONLY to runner2's channel after some downloads
-                            if !limit_sent && runner1_downloaded >= 20 && runner2_downloaded >= 20 {
-                                // Limit runner2 to 3 chunks - message goes directly to runner2
-                                control_tx2
-                                    .send(ControlEvent::LimitTotal(3 * BUFFER_SIZE as u64))
-                                    .await
-                                    .unwrap();
-                                limit_sent = true;
+                                // Send limit message ONLY to runner2's channel after some downloads
+                                if !limit_sent && runner1_downloaded >= 20 && runner2_downloaded >= 20 {
+                                    // Limit runner2 to 3 chunks - message goes directly to runner2
+                                    control_tx2
+                                        .send(ControlEvent::LimitTotal(3 * BUFFER_SIZE as u64))
+                                        .await
+                                        .unwrap();
+                                    limit_sent = true;
+                                }
                             }
+                            None => { data1_done = true; }
                         }
                     }
                     msg = lifecycle_rx2.next(), if !runner2_finished => {
@@ -1348,9 +1453,12 @@ mod tests {
                             _ => {}
                         }
                     }
-                    frame = data_rx2.next(), if !runner2_finished => {
-                        if let Some(frame) = frame {
-                            runner2_downloaded += frame.data.len();
+                    frame = data_rx2.next(), if !data2_done => {
+                        match frame {
+                            Some(frame) => {
+                                runner2_downloaded += frame.data.len();
+                            }
+                            None => { data2_done = true; }
                         }
                     }
                     msg = lifecycle_rx3.next(), if !runner3_finished => {
@@ -1368,15 +1476,24 @@ mod tests {
                             _ => {}
                         }
                     }
-                    frame = data_rx3.next(), if !runner3_finished => {
-                        if let Some(frame) = frame {
-                            runner3_downloaded += frame.data.len();
+                    frame = data_rx3.next(), if !data3_done => {
+                        match frame {
+                            Some(frame) => {
+                                runner3_downloaded += frame.data.len();
+                            }
+                            None => { data3_done = true; }
                         }
                     }
                 }
 
-                // Break when all runners are finished
-                if runner1_finished && runner2_finished && runner3_finished {
+                // Break when all runners have stopped and their data streams are drained.
+                if runner1_finished
+                    && runner2_finished
+                    && runner3_finished
+                    && data1_done
+                    && data2_done
+                    && data3_done
+                {
                     break;
                 }
             }

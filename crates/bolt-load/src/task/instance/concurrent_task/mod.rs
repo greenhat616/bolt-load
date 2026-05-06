@@ -731,15 +731,14 @@ impl ConcurrentTaskInner {
 
         wg.wait().await;
 
-        event_loop_result?;
-
-        check_completions(pending_writer.flush().await)
-            .map_err(|e| {
-                runners_cancel_token.cancel();
-                e
-            })
-            .map(drop)?;
+        // Always flush pending writes, even on error path
+        let flush_completions = pending_writer.flush().await;
+        let flush_result = check_completions(flush_completions);
         drop(pending_writer);
+
+        // Main error takes precedence
+        event_loop_result?;
+        flush_result.map(drop)?;
 
         file_writer.finalize().await.map_err(|e| {
             TaskInstanceError::new_failed(TaskError::Other {
@@ -1179,18 +1178,19 @@ mod tests {
         let mut downloaded_data = Vec::new();
         let mut data_rx = pin!(data_rx);
         let mut finished = false;
+        let mut data_done = false;
 
         loop {
             tokio::select! {
                 biased;
                 // Prefer data frames over lifecycle events to avoid losing data
-                frame = data_rx.next() => {
+                frame = data_rx.next(), if !data_done => {
                     match frame {
                         Some(frame) => {
                             downloaded_data.extend_from_slice(&frame.data);
                         }
                         None => {
-                            // Data channel closed, wait for lifecycle to finish
+                            data_done = true;
                             if finished {
                                 break;
                             }
@@ -1201,11 +1201,9 @@ mod tests {
                     match lifecycle {
                         Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                             finished = true;
-                            // Drain remaining data
-                            while let Some(frame) = data_rx.next().await {
-                                downloaded_data.extend_from_slice(&frame.data);
+                            if data_done {
+                                break;
                             }
-                            break;
                         }
                         None => break,
                         _ => {}
@@ -1314,18 +1312,20 @@ mod tests {
                 // Collect all data
                 let mut downloaded_size = 0;
                 let mut finished = false;
+                let mut data_done = false;
 
                 let mut data_rx = pin!(data_rx);
                 loop {
                     tokio::select! {
                         biased;
                         // Prefer data frames to avoid losing data
-                        frame = data_rx.next() => {
+                        frame = data_rx.next(), if !data_done => {
                             match frame {
                                 Some(frame) => {
                                     downloaded_size += frame.data.len();
                                 }
                                 None => {
+                                    data_done = true;
                                     if finished {
                                         break;
                                     }
@@ -1336,11 +1336,9 @@ mod tests {
                             match lifecycle {
                                 Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
                                     finished = true;
-                                    // Drain remaining data
-                                    while let Some(frame) = data_rx.next().await {
-                                        downloaded_size += frame.data.len();
+                                    if data_done {
+                                        break;
                                     }
-                                    break;
                                 }
                                 Some(LifecycleEvent::Stopped(StoppedReason::Failed(kind))) => {
                                     panic!("Runner {runner_id} failed with error: {kind:?}");
