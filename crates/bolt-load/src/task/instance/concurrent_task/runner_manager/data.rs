@@ -156,11 +156,7 @@ mod tests {
 
         // Send data
         let data = Bytes::from("test data");
-        tx.push(DataFrame {
-            data: data.clone(),
-        })
-        .await
-        .unwrap();
+        tx.push(DataFrame { data: data.clone() }).await.unwrap();
 
         // Poll for the data
         use futures::StreamExt;

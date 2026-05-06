@@ -249,10 +249,7 @@ impl TaskRunner {
             self.downloaded += buff.len() as u64;
             let chunk = buff.split().freeze();
             let data_tx = self.data_tx.take().expect("data_tx is not set");
-            return Some(FlushBuffFuture::new(
-                data_tx,
-                DataFrame { data: chunk },
-            ));
+            return Some(FlushBuffFuture::new(data_tx, DataFrame { data: chunk }));
             // Note: BytesMut::split() already leaves the buffer empty, but we clear for clarity
         }
         None
@@ -424,39 +421,33 @@ impl TaskRunner {
                         SLOW_STREAM_TIMEOUT.as_secs()
                     );
                 }
-                EventLoopStep::Download(item) => {
-                    match self.handle_stream_event(item, &mut buff) {
-                        Some(StreamEventOperation::FlushBuff {
-                            pending,
-                            is_finished,
-                        }) => {
+                EventLoopStep::Download(item) => match self.handle_stream_event(item, &mut buff) {
+                    Some(StreamEventOperation::FlushBuff {
+                        pending,
+                        is_finished,
+                    }) => {
+                        pending_state = Some(PendingFlushState {
+                            future: pending,
+                            post_action: if is_finished {
+                                PendingPostAction::FinishSuccess
+                            } else {
+                                PendingPostAction::Resume
+                            },
+                        });
+                    }
+                    Some(StreamEventOperation::StreamError { error, pending }) => match pending {
+                        Some(flush) => {
                             pending_state = Some(PendingFlushState {
-                                future: pending,
-                                post_action: if is_finished {
-                                    PendingPostAction::FinishSuccess
-                                } else {
-                                    PendingPostAction::Resume
-                                },
+                                future: flush,
+                                post_action: PendingPostAction::PropagateError(error),
                             });
                         }
-                        Some(StreamEventOperation::StreamError { error, pending }) => {
-                            match pending {
-                                Some(flush) => {
-                                    pending_state = Some(PendingFlushState {
-                                        future: flush,
-                                        post_action: PendingPostAction::PropagateError(error),
-                                    });
-                                }
-                                None => {
-                                    break Err(
-                                        TaskError::StreamError { source: error }.into(),
-                                    );
-                                }
-                            }
+                        None => {
+                            break Err(TaskError::StreamError { source: error }.into());
                         }
-                        None => {}
-                    }
-                }
+                    },
+                    None => {}
+                },
                 EventLoopStep::PendingComplete(flush_result) => {
                     let state = pending_state
                         .take()
@@ -474,9 +465,7 @@ impl TaskRunner {
                         }
                         PendingPostAction::FinishSuccess => break Ok(()),
                         PendingPostAction::PropagateError(error) => {
-                            break Err(
-                                TaskError::StreamError { source: error }.into(),
-                            );
+                            break Err(TaskError::StreamError { source: error }.into());
                         }
                     }
                 }
@@ -1391,7 +1380,8 @@ mod tests {
                     break;
                 }
             }
-        }).await;
+        })
+        .await;
 
         // Check if test timed out
         if result.is_err() {

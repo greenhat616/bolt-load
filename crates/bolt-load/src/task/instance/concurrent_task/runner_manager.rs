@@ -560,10 +560,7 @@ impl RunnerManager {
         }
     }
 
-    pub async fn tick(
-        &mut self,
-        meters: &mut HashMap<RunnerId, usize>,
-    ) -> RunnerTick {
+    pub async fn tick(&mut self, meters: &mut HashMap<RunnerId, usize>) -> RunnerTick {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
         let next_data = self.data_aggregator.next().fuse();
         let pending = self.pending_runners.next().fuse();

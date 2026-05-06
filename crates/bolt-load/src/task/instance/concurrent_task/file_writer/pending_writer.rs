@@ -620,7 +620,11 @@ mod tests {
     }
 
     impl FileRangeWriter for DelayWriter {
-        async fn write_range(&self, _range: Range<u64>, _data: Bytes) -> Result<(), FileWriterError> {
+        async fn write_range(
+            &self,
+            _range: Range<u64>,
+            _data: Bytes,
+        ) -> Result<(), FileWriterError> {
             tokio::time::sleep(self.delay).await;
             Ok(())
         }
@@ -757,7 +761,9 @@ mod tests {
         assert!(!pending.can_write());
 
         // Reject when truly full.
-        let err = pending.write_range(3..4, Bytes::from_static(b"d")).unwrap_err();
+        let err = pending
+            .write_range(3..4, Bytes::from_static(b"d"))
+            .unwrap_err();
         assert_eq!(err.0.range, 3..4);
 
         // Drain everything.
@@ -775,8 +781,11 @@ mod tests {
             delay: Duration::from_millis(10),
         });
         let capacity = 8;
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), capacity);
+        let mut pending = PendingWriter::new(
+            Arc::clone(&writer),
+            ThreadedRuntimeImpl::new_tokio_rt(),
+            capacity,
+        );
 
         for i in 0u64..16 {
             while !pending.can_write() {
