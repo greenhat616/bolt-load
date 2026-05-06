@@ -176,11 +176,7 @@ enum PendingPostAction {
     /// Resume normal event loop (buffer was full, stream continues)
     Resume,
     /// Continue processing the remainder of a chunk that didn't fit in the buffer
-    ContinueItem {
-        item: Bytes,
-        offset: usize,
-        bytes_to_write: usize,
-    },
+    ContinueItem { item: Bytes, offset: usize },
     /// Stream is finished, break with Ok(())
     FinishSuccess,
     /// Stream had an error, propagate it after flush
@@ -241,8 +237,21 @@ impl TaskRunner {
     }
 
     async fn wait_data_drained(&mut self) {
-        if let Some(data_tx) = self.data_tx.as_mut() {
-            data_tx.wait_vacant(DATA_FRAME_CHANNEL_CAPACITY).await;
+        let Some(data_tx) = self.data_tx.as_mut() else {
+            return;
+        };
+
+        if self.cancel_token.is_cancelled() || data_tx.is_closed() {
+            return;
+        }
+
+        let drained = data_tx.wait_vacant(DATA_FRAME_CHANNEL_CAPACITY).fuse();
+        let cancelled = self.cancel_token.cancelled().fuse();
+        futures::pin_mut!(drained, cancelled);
+
+        futures::select_biased! {
+            _ = cancelled => {}
+            _ = drained => {}
         }
     }
 
@@ -352,7 +361,6 @@ impl TaskRunner {
                             PendingPostAction::ContinueItem {
                                 item,
                                 offset: take,
-                                bytes_to_write: remaining,
                             }
                         } else {
                             PendingPostAction::Resume
@@ -517,12 +525,29 @@ impl TaskRunner {
                         PendingPostAction::Resume => {
                             slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
                         }
-                        PendingPostAction::ContinueItem {
-                            item,
-                            offset,
-                            bytes_to_write,
-                        } => {
-                            buff.extend_from_slice(&item[offset..offset + bytes_to_write]);
+                        PendingPostAction::ContinueItem { item, offset } => {
+                            let remaining_in_item = item.len() - offset;
+                            let allowed = self
+                                .total
+                                .map(|t| {
+                                    t.saturating_sub(self.downloaded + buff.len() as u64) as usize
+                                })
+                                .unwrap_or(usize::MAX);
+                            let take = remaining_in_item.min(allowed).min(BUFFER_SIZE);
+
+                            if take == 0 || allowed == 0 {
+                                if let Some(flush) = self.flush_buff(&mut buff) {
+                                    pending_state = Some(PendingFlushState {
+                                        future: flush.future,
+                                        flushed_bytes: flush.flushed_bytes,
+                                        post_action: PendingPostAction::FinishSuccess,
+                                    });
+                                    continue;
+                                }
+                                break Ok(());
+                            }
+
+                            buff.extend_from_slice(&item[offset..offset + take]);
                             if let Some(total) = self.total {
                                 if self.downloaded + buff.len() as u64 >= total {
                                     let flush =

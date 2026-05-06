@@ -315,6 +315,7 @@ impl SingletonTaskInner {
             let mut is_finished = false;
             let mut runner_stopped = false;
             let mut data_done = false;
+            let mut lifecycle_done = false;
             let fut = runner.run().fuse();
             futures::pin_mut!(fut);
             futures::pin_mut!(lifecycle_rx);
@@ -326,14 +327,19 @@ impl SingletonTaskInner {
                     futures::future::Either::Right(data_rx.next())
                 }
                 .fuse();
-                futures::pin_mut!(data_next);
+                let lifecycle_next = if lifecycle_done {
+                    futures::future::Either::Left(futures::future::pending())
+                } else {
+                    futures::future::Either::Right(lifecycle_rx.next())
+                }
+                .fuse();
+                futures::pin_mut!(data_next, lifecycle_next);
 
                 futures::select_biased! {
                     _ = timer.next().fuse() => {
                         self.handle_timer_tick(&wg, &mut speed, &mut sampler, &mut meter);
                     }
                     _ = fut => (),
-                    // Data FIRST — higher priority than lifecycle to avoid losing frames
                     frame = data_next => {
                         match frame {
                             Some(frame) => {
@@ -347,14 +353,13 @@ impl SingletonTaskInner {
                             }
                         }
                     }
-                    event = lifecycle_rx.next().fuse() => {
+                    event = lifecycle_next => {
                         match event {
                             Some(event) => {
                                 match self.handle_lifecycle_event(event, &mut is_finished).await {
                                     Ok(()) => {
                                         if is_finished {
                                             runner_stopped = true;
-                                            // Don't break — drain data_rx first
                                             if data_done {
                                                 break;
                                             }
@@ -367,6 +372,15 @@ impl SingletonTaskInner {
                             }
                             None => {
                                 warn!("lifecycle stream ended unexpectedly");
+                                lifecycle_done = true;
+                                if !runner_stopped {
+                                    return Err(TaskInstanceError::new_failed(
+                                        crate::runner::TaskError::ChannelClosed,
+                                    ));
+                                }
+                                if data_done {
+                                    break;
+                                }
                             }
                         }
                     }

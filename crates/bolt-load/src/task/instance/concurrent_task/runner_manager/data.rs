@@ -8,7 +8,7 @@ use futures::{Stream, task::AtomicWaker};
 use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
-use super::stream::{RunnerTaggedStream, RunnerTaggedStreamItem};
+use super::stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem};
 use crate::{
     runner::{DataFrame, DataFrameReceiver},
     task::RunnerId,
@@ -104,8 +104,14 @@ impl DataAggregator {
     }
 }
 
+#[derive(Debug)]
+pub enum DataStreamEvent {
+    Data(RunnerTaggedStreamItem<DataFrame>),
+    Closed(RunnerId),
+}
+
 impl Stream for DataAggregator {
-    type Item = RunnerTaggedStreamItem<DataFrame>;
+    type Item = DataStreamEvent;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -119,7 +125,15 @@ impl Stream for DataAggregator {
         }
 
         match this.group.poll_next(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(Some(event)) => match event {
+                RunnerStreamEvent::Item(item) => {
+                    Poll::Ready(Some(DataStreamEvent::Data(item)))
+                }
+                RunnerStreamEvent::Closed(runner_id) => {
+                    this.map.remove(&runner_id);
+                    Poll::Ready(Some(DataStreamEvent::Closed(runner_id)))
+                }
+            },
             Poll::Ready(None) => {
                 if *this.is_closed {
                     Poll::Ready(None)
@@ -160,9 +174,14 @@ mod tests {
 
         // Poll for the data
         use futures::StreamExt;
-        let item = aggregator.next().await.unwrap();
-        assert_eq!(item.runner_id, runner_id);
-        assert_eq!(item.item.data, data);
+        let event = aggregator.next().await.unwrap();
+        match event {
+            DataStreamEvent::Data(item) => {
+                assert_eq!(item.runner_id, runner_id);
+                assert_eq!(item.item.data, data);
+            }
+            other => panic!("expected Data event, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -189,11 +208,13 @@ mod tests {
         .unwrap();
 
         use futures::StreamExt;
-        let item1 = aggregator.next().await.unwrap();
-        let item2 = aggregator.next().await.unwrap();
-
-        // Both items should be received (order may vary)
-        let runner_ids: Vec<_> = [&item1, &item2].iter().map(|i| i.runner_id).collect();
+        let mut runner_ids = Vec::new();
+        for _ in 0..2 {
+            match aggregator.next().await.unwrap() {
+                DataStreamEvent::Data(item) => runner_ids.push(item.runner_id),
+                other => panic!("expected Data event, got {other:?}"),
+            }
+        }
         assert!(runner_ids.contains(&1));
         assert!(runner_ids.contains(&2));
     }
@@ -243,8 +264,10 @@ mod tests {
         .unwrap();
 
         use futures::StreamExt;
-        let item = aggregator.next().await.unwrap();
-        assert_eq!(item.runner_id, 1);
+        match aggregator.next().await.unwrap() {
+            DataStreamEvent::Data(item) => assert_eq!(item.runner_id, 1),
+            other => panic!("expected Data event, got {other:?}"),
+        }
 
         // Unregister runner 1 (simulating Stopped event)
         aggregator.unregister(1);
@@ -271,10 +294,15 @@ mod tests {
         use futures::StreamExt;
 
         // Should receive the data
-        let item = aggregator.next().await.unwrap();
-        assert_eq!(item.runner_id, 1);
+        match aggregator.next().await.unwrap() {
+            DataStreamEvent::Data(item) => assert_eq!(item.runner_id, 1),
+            other => panic!("expected Data event, got {other:?}"),
+        }
 
-        // After sender closes, stream returns None for that runner
-        // The aggregator should handle this gracefully
+        // After sender closes, stream emits Closed
+        match aggregator.next().await.unwrap() {
+            DataStreamEvent::Closed(id) => assert_eq!(id, 1),
+            other => panic!("expected Closed event, got {other:?}"),
+        }
     }
 }

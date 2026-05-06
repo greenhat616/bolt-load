@@ -13,15 +13,21 @@ pin_project! {
         runner_id: RunnerId,
         #[pin]
         stream: S,
+        closed_emitted: bool,
     }
 }
 
 impl<S: Stream> RunnerTaggedStream<S> {
     pub fn new(runner_id: RunnerId, stream: S) -> Self {
-        Self { runner_id, stream }
+        Self {
+            runner_id,
+            stream,
+            closed_emitted: false,
+        }
     }
 }
 
+#[derive(Debug)]
 pub struct RunnerTaggedStreamItem<T> {
     pub runner_id: RunnerId,
     pub item: T,
@@ -33,16 +39,31 @@ impl<T> RunnerTaggedStreamItem<T> {
     }
 }
 
+pub enum RunnerStreamEvent<T> {
+    Item(RunnerTaggedStreamItem<T>),
+    Closed(RunnerId),
+}
+
 impl<S: Stream> Stream for RunnerTaggedStream<S> {
-    type Item = RunnerTaggedStreamItem<S::Item>;
+    type Item = RunnerStreamEvent<S::Item>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         match this.stream.poll_next(cx) {
-            Poll::Ready(item) => Poll::Ready(item.map(|item| RunnerTaggedStreamItem {
-                runner_id: *this.runner_id,
-                item,
-            })),
+            Poll::Ready(Some(item)) => {
+                Poll::Ready(Some(RunnerStreamEvent::Item(RunnerTaggedStreamItem {
+                    runner_id: *this.runner_id,
+                    item,
+                })))
+            }
+            Poll::Ready(None) => {
+                if !*this.closed_emitted {
+                    *this.closed_emitted = true;
+                    Poll::Ready(Some(RunnerStreamEvent::Closed(*this.runner_id)))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
             Poll::Pending => Poll::Pending,
         }
     }

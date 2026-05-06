@@ -8,7 +8,7 @@ use futures::{Stream, task::AtomicWaker};
 use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
-use super::stream::{RunnerTaggedStream, RunnerTaggedStreamItem};
+use super::stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem};
 use crate::{
     runner::{LifecycleEvent, LifecycleReceiver},
     task::RunnerId,
@@ -93,8 +93,13 @@ impl LifecycleAggregator {
     }
 }
 
+pub enum LifecycleStreamEvent {
+    Event(RunnerTaggedStreamItem<LifecycleEvent>),
+    Closed(RunnerId),
+}
+
 impl Stream for LifecycleAggregator {
-    type Item = RunnerTaggedStreamItem<LifecycleEvent>;
+    type Item = LifecycleStreamEvent;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
@@ -105,7 +110,15 @@ impl Stream for LifecycleAggregator {
         }
 
         match this.group.poll_next(cx) {
-            Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
+            Poll::Ready(Some(event)) => match event {
+                RunnerStreamEvent::Item(item) => {
+                    Poll::Ready(Some(LifecycleStreamEvent::Event(item)))
+                }
+                RunnerStreamEvent::Closed(runner_id) => {
+                    this.map.remove(&runner_id);
+                    Poll::Ready(Some(LifecycleStreamEvent::Closed(runner_id)))
+                }
+            },
             Poll::Ready(None) => {
                 if *this.is_closed {
                     Poll::Ready(None)
@@ -146,7 +159,13 @@ mod tests {
         use futures::StreamExt;
         let event = aggregator.next().await;
         assert!(
-            matches!(event, Some(RunnerTaggedStreamItem { runner_id: id, item: LifecycleEvent::Started }) if id == runner_id)
+            matches!(
+                event,
+                Some(LifecycleStreamEvent::Event(RunnerTaggedStreamItem {
+                    runner_id: id,
+                    item: LifecycleEvent::Started
+                })) if id == runner_id
+            )
         );
     }
 
@@ -173,10 +192,10 @@ mod tests {
         let runner_ids: Vec<_> = [&event1, &event2]
             .into_iter()
             .filter_map(|e| match e {
-                RunnerTaggedStreamItem {
+                LifecycleStreamEvent::Event(RunnerTaggedStreamItem {
                     runner_id: id,
                     item: LifecycleEvent::Started,
-                } => Some(*id),
+                }) => Some(*id),
                 _ => None,
             })
             .collect();

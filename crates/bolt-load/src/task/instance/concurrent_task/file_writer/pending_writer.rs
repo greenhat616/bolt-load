@@ -166,6 +166,10 @@ where
     /// Returns `None` only if all senders have been dropped (should not
     /// happen while `self` is alive).
     pub async fn tick(&mut self) -> Option<Vec<WriteCompletion>> {
+        if self.in_flight_count() == 0 {
+            return Some(Vec::new());
+        }
+
         let first = self.completion_rx.recv().await.ok()?;
         let mut completions = vec![first];
         while let Ok(c) = self.completion_rx.try_recv() {

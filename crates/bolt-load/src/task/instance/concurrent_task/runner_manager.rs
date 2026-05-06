@@ -68,8 +68,8 @@ mod lifecycle;
 pub mod pending;
 mod stream;
 
-pub use data::DataAggregator;
-pub use lifecycle::LifecycleAggregator;
+pub use data::{DataAggregator, DataStreamEvent};
+pub use lifecycle::{LifecycleAggregator, LifecycleStreamEvent};
 pub use pending::PendingRunnerReceiver;
 
 /// Default capacity for control channels
@@ -537,6 +537,21 @@ impl RunnerManager {
         }
     }
 
+    /// Handle a runner whose stream closed without sending `Stopped`.
+    fn handle_runner_lost(
+        &mut self,
+        runner_id: RunnerId,
+        meters: &mut HashMap<RunnerId, usize>,
+    ) {
+        meters.remove(&runner_id);
+        self.chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        self.runner_outcome_sampler
+            .record_stream_closed(RunnerFailureKind::Retryable);
+        self.release_runner(runner_id);
+    }
+
     /// Handle data frames from runners, returning the chunk ready for writing.
     fn handle_data_frame(
         &mut self,
@@ -565,18 +580,20 @@ impl RunnerManager {
         let next_data = self.data_aggregator.next().fuse();
         let pending = self.pending_runners.next().fuse();
         futures::pin_mut!(next_lifecycle, next_data, pending);
-        // Priority: data > lifecycle > pending
+        // Priority: lifecycle > pending > data (lifecycle is control-plane, must not be starved)
         futures::select_biased! {
-            data = next_data => {
-                if let Some(item) = data {
-                    let chunk = self.handle_data_frame(item.runner_id, item.item.data, meters);
-                    return RunnerTick::with_chunk(chunk);
-                }
-            }
             event = next_lifecycle => {
                 if let Some(event) = event {
-                    if self.handle_lifecycle(event, meters) {
-                        return RunnerTick::finished();
+                    match event {
+                        LifecycleStreamEvent::Event(tagged) => {
+                            if self.handle_lifecycle(tagged, meters) {
+                                return RunnerTick::finished();
+                            }
+                        }
+                        LifecycleStreamEvent::Closed(runner_id) => {
+                            warn!("runner {runner_id} lifecycle stream closed unexpectedly");
+                            self.handle_runner_lost(runner_id, meters);
+                        }
                     }
                 }
             }
@@ -588,6 +605,19 @@ impl RunnerManager {
                     None => {
                         if self.chunk_planner.is_complete() {
                             return RunnerTick::finished();
+                        }
+                    }
+                }
+            }
+            data = next_data => {
+                if let Some(event) = data {
+                    match event {
+                        DataStreamEvent::Data(item) => {
+                            let chunk = self.handle_data_frame(item.runner_id, item.item.data, meters);
+                            return RunnerTick::with_chunk(chunk);
+                        }
+                        DataStreamEvent::Closed(runner_id) => {
+                            trace!("runner {runner_id} data stream closed");
                         }
                     }
                 }

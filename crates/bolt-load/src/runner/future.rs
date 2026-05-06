@@ -68,6 +68,7 @@ impl Future for FlushBuffFuture {
                     };
 
                     if data_tx.is_closed() {
+                        this.as_mut().project_replace(FlushBuffFuture::Done);
                         return Poll::Ready(Err(ChannelClosed));
                     }
 
