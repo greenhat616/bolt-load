@@ -15,6 +15,43 @@ use futures::{FutureExt, StreamExt};
 use pending::{PendingRunnerContext, PendingRunnerError, PendingRunnerGroup, PendingRunnerOutput};
 use stream::RunnerTaggedStreamItem;
 
+/// A chunk of data downloaded by a runner, ready to be written to disk.
+#[derive(Debug)]
+pub(super) struct DownloadedChunk {
+    pub range: Range<u64>,
+    pub bytes: Bytes,
+}
+
+/// Result of a single `RunnerManager::tick()` call.
+#[derive(Debug)]
+pub(super) struct RunnerTick {
+    pub state: TaskState,
+    pub downloaded: Option<DownloadedChunk>,
+}
+
+impl RunnerTick {
+    fn downloading() -> Self {
+        Self {
+            state: TaskState::Downloading,
+            downloaded: None,
+        }
+    }
+
+    fn finished() -> Self {
+        Self {
+            state: TaskState::Finished,
+            downloaded: None,
+        }
+    }
+
+    fn with_chunk(chunk: DownloadedChunk) -> Self {
+        Self {
+            state: TaskState::Downloading,
+            downloaded: Some(chunk),
+        }
+    }
+}
+
 use super::{
     ChunkPlanner, PlannerGuard, chunk_planner::ChunkState, strategy::RunnerOutcomeSampler,
 };
@@ -500,18 +537,16 @@ impl RunnerManager {
         }
     }
 
-    /// Handle data frames from runners
+    /// Handle data frames from runners, returning the chunk ready for writing.
     fn handle_data_frame(
         &mut self,
         runner_id: RunnerId,
         mut data_frame: Bytes,
         meters: &mut HashMap<RunnerId, usize>,
-        on_downloaded: impl FnOnce(Range<u64>, Bytes),
-    ) {
+    ) -> DownloadedChunk {
         let bytes_len = data_frame.len();
         *meters.entry(runner_id).or_insert(0) += bytes_len;
 
-        // update the chunk planner progress
         let fixed_downloaded_range = self
             .chunk_planner
             .update_progress(runner_id, bytes_len as u64)
@@ -519,42 +554,35 @@ impl RunnerManager {
         let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
         data_frame.truncate(picked_size as usize);
 
-        on_downloaded(fixed_downloaded_range, data_frame);
+        DownloadedChunk {
+            range: fixed_downloaded_range,
+            bytes: data_frame,
+        }
     }
 
     pub async fn tick(
         &mut self,
-        can_accept_data: bool,
         meters: &mut HashMap<RunnerId, usize>,
-        on_downloaded: impl FnOnce(Range<u64>, Bytes),
-    ) -> TaskState {
+    ) -> RunnerTick {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
-        let next_data = if can_accept_data {
-            futures::future::Either::Left(self.data_aggregator.next().fuse())
-        } else {
-            futures::future::Either::Right(futures::future::pending())
-        };
+        let next_data = self.data_aggregator.next().fuse();
         let pending = self.pending_runners.next().fuse();
         futures::pin_mut!(next_lifecycle, next_data, pending);
-        // Use select_biased! to ensure data is processed before lifecycle
         // Priority: data > lifecycle > pending
-        // This prevents data loss when Stopped event arrives with pending data frames
         futures::select_biased! {
-            // Highest priority: process data frames first
             data = next_data => {
                 if let Some(item) = data {
-                    self.handle_data_frame(item.runner_id, item.item.data, meters, on_downloaded);
+                    let chunk = self.handle_data_frame(item.runner_id, item.item.data, meters);
+                    return RunnerTick::with_chunk(chunk);
                 }
             }
-            // Second priority: lifecycle events
             event = next_lifecycle => {
                 if let Some(event) = event {
                     if self.handle_lifecycle(event, meters) {
-                        return TaskState::Finished;
+                        return RunnerTick::finished();
                     }
                 }
             }
-            // Lowest priority: pending runners
             pending = pending => {
                 match pending {
                     Some(pending) => {
@@ -562,13 +590,13 @@ impl RunnerManager {
                     }
                     None => {
                         if self.chunk_planner.is_complete() {
-                            return TaskState::Finished;
+                            return RunnerTick::finished();
                         }
                     }
                 }
             }
         }
-        TaskState::Downloading
+        RunnerTick::downloading()
     }
 }
 
@@ -751,9 +779,10 @@ mod tests {
 
         // Tick to process the pending runner
         let mut meters = HashMap::new();
-        let state = manager.tick(true, &mut meters, |_, _| {}).await;
+        let tick = manager.tick(&mut meters).await;
 
-        assert_eq!(state, TaskState::Downloading);
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(tick.downloaded.is_none());
 
         // Verify state is now running
         let chunk_state = manager.get_runner_state(0).unwrap();
@@ -796,9 +825,10 @@ mod tests {
 
         // Tick to process the pending runner
         let mut meters = HashMap::new();
-        let state = manager.tick(true, &mut meters, |_, _| {}).await;
+        let tick = manager.tick(&mut meters).await;
 
-        assert_eq!(state, TaskState::Downloading);
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(tick.downloaded.is_none());
 
         // Verify runner state is removed (failed)
         assert!(manager.get_runner_state(0).is_none());
@@ -838,7 +868,10 @@ mod tests {
             .unwrap();
 
         let mut meters = HashMap::new();
-        let _ = manager.tick(true, &mut meters, |_, _| {}).await;
+        let tick = manager.tick(&mut meters).await;
+
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(tick.downloaded.is_none());
 
         // Runner should be released
         assert!(manager.get_runner_state(runner_id).is_none());
@@ -877,18 +910,11 @@ mod tests {
 
         // Tick to process data
         let mut meters = HashMap::new();
-        let mut received_data = false;
-        let mut received_range = None;
+        let tick = manager.tick(&mut meters).await;
 
-        let _ = manager
-            .tick(true, &mut meters, |range, bytes| {
-                received_data = true;
-                received_range = Some(range);
-                assert_eq!(bytes.len(), 100);
-            })
-            .await;
-
-        assert!(received_data);
-        assert_eq!(received_range, Some(0..100));
+        assert_eq!(tick.state, TaskState::Downloading);
+        let chunk = tick.downloaded.expect("should have downloaded chunk");
+        assert_eq!(chunk.range, 0..100);
+        assert_eq!(chunk.bytes.len(), 100);
     }
 }
