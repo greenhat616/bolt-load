@@ -903,7 +903,6 @@ mod tests {
         data_prod
             .push(DataFrame {
                 data: Bytes::from(vec![1; 100]),
-                start_nanos: Some(12345),
             })
             .await
             .unwrap();

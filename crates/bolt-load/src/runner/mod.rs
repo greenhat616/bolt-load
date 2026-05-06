@@ -39,7 +39,6 @@ pub const DATA_FRAME_CHANNEL_CAPACITY: usize = 32;
 #[derive(Debug)]
 pub struct DataFrame {
     pub data: Bytes,
-    pub start_nanos: Option<u64>,
 }
 
 pub type DataFrameSender = AsyncHeapProd<DataFrame>;
@@ -250,13 +249,9 @@ impl TaskRunner {
             self.downloaded += buff.len() as u64;
             let chunk = buff.split().freeze();
             let data_tx = self.data_tx.take().expect("data_tx is not set");
-            let now = std::time::Instant::now();
             return Some(FlushBuffFuture::new(
                 data_tx,
-                DataFrame {
-                    data: chunk,
-                    start_nanos: Some(now.elapsed().as_nanos() as u64),
-                },
+                DataFrame { data: chunk },
             ));
             // Note: BytesMut::split() already leaves the buffer empty, but we clear for clarity
         }

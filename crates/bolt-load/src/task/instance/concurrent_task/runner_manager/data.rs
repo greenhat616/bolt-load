@@ -158,7 +158,6 @@ mod tests {
         let data = Bytes::from("test data");
         tx.push(DataFrame {
             data: data.clone(),
-            start_nanos: Some(12345),
         })
         .await
         .unwrap();
@@ -168,7 +167,6 @@ mod tests {
         let item = aggregator.next().await.unwrap();
         assert_eq!(item.runner_id, runner_id);
         assert_eq!(item.item.data, data);
-        assert_eq!(item.item.start_nanos, Some(12345));
     }
 
     #[tokio::test]
@@ -185,13 +183,11 @@ mod tests {
         // Send data from both runners
         tx1.push(DataFrame {
             data: Bytes::from("data1"),
-            start_nanos: None,
         })
         .await
         .unwrap();
         tx2.push(DataFrame {
             data: Bytes::from("data2"),
-            start_nanos: None,
         })
         .await
         .unwrap();
@@ -222,7 +218,6 @@ mod tests {
         let result = tx
             .push(DataFrame {
                 data: Bytes::from("test"),
-                start_nanos: None,
             })
             .await;
         assert!(result.is_err());
@@ -247,7 +242,6 @@ mod tests {
         // Send and receive data
         tx1.push(DataFrame {
             data: Bytes::from("runner1"),
-            start_nanos: None,
         })
         .await
         .unwrap();
@@ -273,7 +267,6 @@ mod tests {
         // Send some data then close
         tx.push(DataFrame {
             data: Bytes::from("data"),
-            start_nanos: None,
         })
         .await
         .unwrap();
