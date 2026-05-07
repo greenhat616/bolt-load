@@ -3,8 +3,8 @@ use bolt_load_core::adapter::AnyBytesStream;
 use smol_cancellation_token::CancellationToken;
 
 use super::{
-    ControlSignalReceiver, DATA_FRAME_CHANNEL_CAPACITY, DataFrame, DataFrameReceiver,
-    LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver, TaskRunner,
+    ControlSignalReceiver, DATA_DRAIN_TIMEOUT, DATA_FRAME_CHANNEL_CAPACITY, DataFrame,
+    DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver, TaskRunner,
 };
 use crate::task::RunnerId;
 
@@ -33,6 +33,8 @@ pub struct TaskRunnerBuilder {
     pub control_signal: Option<ControlSignalReceiver>,
     /// the cancel token of the task
     pub cancel_token: Option<CancellationToken>,
+    /// optional override for tests that need to exercise drain timeout paths quickly
+    pub data_drain_timeout: Option<std::time::Duration>,
 }
 
 impl TaskRunnerBuilder {
@@ -66,6 +68,12 @@ impl TaskRunnerBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub fn data_drain_timeout(mut self, data_drain_timeout: std::time::Duration) -> Self {
+        self.data_drain_timeout = Some(data_drain_timeout);
+        self
+    }
+
     /// Build the task runner and return the runner, lifecycle receiver, and data receiver
     pub fn build(
         self,
@@ -89,6 +97,7 @@ impl TaskRunnerBuilder {
                 .ok_or(TaskRunnerBuilderError::ControlSignalNotSet)?,
             lifecycle_tx: lifecycle_prod,
             data_tx: Some(data_prod),
+            data_drain_timeout: self.data_drain_timeout.unwrap_or(DATA_DRAIN_TIMEOUT),
             cancel_token: self
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,

@@ -8,10 +8,6 @@ pub enum StreamConnector {
 }
 
 impl StreamConnector {
-    pub const fn is_connector(&self) -> bool {
-        matches!(self, Self::StreamConnector(_))
-    }
-
     pub async fn connect(self) -> Result<AnyBytesStream, ConnectionError> {
         match self {
             Self::DirectStream(stream) => Ok(stream),

@@ -206,7 +206,7 @@ impl SingletonTaskInner {
                 }
                 StoppedReason::Failed(kind) => return Err(TaskInstanceError::new_failed(kind)),
             },
-            _ => {}
+            LifecycleEvent::Started => {}
         }
         Ok(())
     }

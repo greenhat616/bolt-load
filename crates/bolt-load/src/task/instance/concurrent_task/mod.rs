@@ -634,16 +634,11 @@ impl ConcurrentTaskInner {
                     let runner_fut = if can_write {
                         Either::Left(runner_manager.tick(&mut meters))
                     } else {
-                        Either::Right(futures::future::pending::<RunnerTick>())
+                        Either::Right(runner_manager.tick_lifecycle_only(&mut meters))
                     }
                     .fuse();
 
-                    let strategy_tick = if can_write {
-                        Either::Left(strategy_timer.tick())
-                    } else {
-                        Either::Right(futures::future::pending::<()>())
-                    }
-                    .fuse();
+                    let strategy_tick = strategy_timer.tick().fuse();
                     let throughput_tick = throughout_meter_timer.tick().fuse();
 
                     futures::pin_mut!(writer_fut, runner_fut, strategy_tick, throughput_tick);

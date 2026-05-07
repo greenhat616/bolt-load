@@ -32,6 +32,7 @@ const BUFFER_SIZE: usize = 32 * 1024; // 32KB
 
 /// The timeout for the slow stream
 const SLOW_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DATA_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub const LIFECYCLE_CHANNEL_CAPACITY: usize = 2;
 pub const DATA_FRAME_CHANNEL_CAPACITY: usize = 32;
@@ -107,7 +108,6 @@ impl From<TaskError> for TaskRunError {
 
 /// runner for each chunk, or single file, responsible for downloading each chunk
 #[derive(derive_more::Debug)]
-#[non_exhaustive]
 pub struct TaskRunner {
     /// The id of the runner
     id: RunnerId,
@@ -128,6 +128,8 @@ pub struct TaskRunner {
     /// the sender of the data frames
     #[debug(skip)]
     data_tx: Option<DataFrameSender>,
+    /// How long to wait for data frames to be consumed after the stream stops.
+    data_drain_timeout: std::time::Duration,
     /// the cancel token
     cancel_token: CancellationToken,
     /// the shutdown signal, used for ensure the task runner is stopped
@@ -183,6 +185,13 @@ enum PendingPostAction {
     PropagateError(AdapterError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataDrainOutcome {
+    Drained,
+    Cancelled,
+    TimedOut,
+}
+
 /// Bundles a pending flush future with its post-completion action
 struct PendingFlushState {
     future: FlushBuffFuture,
@@ -202,9 +211,18 @@ impl TaskRunner {
     #[cfg(feature = "tracing")]
     #[tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.id))]
     pub async fn run(&mut self) {
-        let result = self.run_inner().await;
+        let mut result = self.run_inner().await;
         if Self::should_wait_data_drain(&result) {
-            self.wait_data_drained().await;
+            match self.wait_data_drained().await {
+                DataDrainOutcome::Drained => {}
+                DataDrainOutcome::Cancelled => result = Err(TaskRunError::Cancelled),
+                DataDrainOutcome::TimedOut => {
+                    warn!(
+                        "data drain timed out; reporting as timeout so undrained bytes are retried"
+                    );
+                    result = Err(TaskRunError::Failed(TaskError::Timeout));
+                }
+            }
         }
 
         match result {
@@ -236,22 +254,28 @@ impl TaskRunner {
         )
     }
 
-    async fn wait_data_drained(&mut self) {
+    async fn wait_data_drained(&mut self) -> DataDrainOutcome {
         let Some(data_tx) = self.data_tx.as_mut() else {
-            return;
+            return DataDrainOutcome::Drained;
         };
 
-        if self.cancel_token.is_cancelled() || data_tx.is_closed() {
-            return;
+        if self.cancel_token.is_cancelled() {
+            return DataDrainOutcome::Cancelled;
+        }
+        if data_tx.is_closed() {
+            return DataDrainOutcome::Drained;
         }
 
+        let timeout = async_io::Timer::after(self.data_drain_timeout);
         let drained = data_tx.wait_vacant(DATA_FRAME_CHANNEL_CAPACITY).fuse();
         let cancelled = self.cancel_token.cancelled().fuse();
-        futures::pin_mut!(drained, cancelled);
+        let timeout = futures::FutureExt::fuse(timeout);
+        futures::pin_mut!(drained, cancelled, timeout);
 
         futures::select_biased! {
-            _ = cancelled => {}
-            _ = drained => {}
+            _ = cancelled => DataDrainOutcome::Cancelled,
+            _ = timeout => DataDrainOutcome::TimedOut,
+            _ = drained => DataDrainOutcome::Drained,
         }
     }
 
@@ -467,6 +491,8 @@ impl TaskRunner {
                             if pending_state.is_some() {
                                 if deferred_control_error.is_none() {
                                     deferred_control_error = Some(err);
+                                } else {
+                                    warn!("discarding control error during pending flush: {err:?}");
                                 }
                                 continue;
                             }
@@ -484,6 +510,8 @@ impl TaskRunner {
                         if pending_state.is_some() {
                             if deferred_control_error.is_none() {
                                 deferred_control_error = Some(err);
+                            } else {
+                                warn!("discarding control error during pending flush: {err:?}");
                             }
                             continue;
                         }

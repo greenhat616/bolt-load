@@ -246,14 +246,25 @@ impl RunnerManager {
     // ==================== Runner Notification Related Methods ====================
 
     /// Registers a lifecycle receiver for a runner
-    pub fn register_lifecycle(&mut self, runner_id: RunnerId, receiver: LifecycleReceiver) {
+    fn register_lifecycle(&mut self, runner_id: RunnerId, receiver: LifecycleReceiver) {
         self.lifecycle_aggregator.add(runner_id, receiver);
     }
 
     /// Registers a data receiver for a runner
     /// Called when the runner is successfully created
-    pub fn register_data(&mut self, runner_id: RunnerId, receiver: DataFrameReceiver) {
+    fn register_data(&mut self, runner_id: RunnerId, receiver: DataFrameReceiver) {
         self.data_aggregator.register(runner_id, receiver);
+    }
+
+    /// Registers both lifecycle and data receivers for a runner.
+    pub fn register_runner_channels(
+        &mut self,
+        runner_id: RunnerId,
+        lifecycle_rx: LifecycleReceiver,
+        data_rx: DataFrameReceiver,
+    ) {
+        self.lifecycle_aggregator.add(runner_id, lifecycle_rx);
+        self.data_aggregator.register(runner_id, data_rx);
     }
 
     /// Returns a reference to the data aggregator for consuming data
@@ -510,8 +521,7 @@ impl RunnerManager {
                 self.chunk_planner
                     .mark_running(pending.context.runner_id)
                     .expect("chunk planner should not fail");
-                self.register_lifecycle(pending.context.runner_id, lifecycle_rx);
-                self.register_data(pending.context.runner_id, data_rx);
+                self.register_runner_channels(pending.context.runner_id, lifecycle_rx, data_rx);
             }
             Err(error) => {
                 error!("failed to create runner: {error:?}");
@@ -614,6 +624,46 @@ impl RunnerManager {
                         }
                         DataStreamEvent::Closed(runner_id) => {
                             trace!("runner {runner_id} data stream closed");
+                            self.data_aggregator.unregister(runner_id);
+                        }
+                    }
+                }
+            }
+        }
+        RunnerTick::downloading()
+    }
+
+    pub async fn tick_lifecycle_only(
+        &mut self,
+        meters: &mut HashMap<RunnerId, usize>,
+    ) -> RunnerTick {
+        let next_lifecycle = self.lifecycle_aggregator.next().fuse();
+        let pending = self.pending_runners.next().fuse();
+        futures::pin_mut!(next_lifecycle, pending);
+        futures::select_biased! {
+            event = next_lifecycle => {
+                if let Some(event) = event {
+                    match event {
+                        LifecycleStreamEvent::Event(tagged) => {
+                            if self.handle_lifecycle(tagged, meters) {
+                                return RunnerTick::finished();
+                            }
+                        }
+                        LifecycleStreamEvent::Closed(runner_id) => {
+                            warn!("runner {runner_id} lifecycle stream closed unexpectedly");
+                            self.handle_runner_lost(runner_id, meters);
+                        }
+                    }
+                }
+            }
+            pending = pending => {
+                match pending {
+                    Some(pending) => {
+                        self.handle_pending(pending);
+                    }
+                    None => {
+                        if self.chunk_planner.is_complete() {
+                            return RunnerTick::finished();
                         }
                     }
                 }
@@ -625,6 +675,8 @@ impl RunnerManager {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{super::chunk_planner::ChunkStatus, *};
     use crate::runner::{ConnectionError, DATA_FRAME_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY};
 
@@ -877,12 +929,13 @@ mod tests {
 
         // Allocate runner and chunk
         let _reg = manager.allocate_runner_with_chunk(0..500).unwrap();
-        manager.register_lifecycle(runner_id, lifecycle_cons);
 
-        // Create and register data channel
+        // Create data channel
         let data_rb = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY);
         let (_data_prod, data_cons) = data_rb.split();
-        manager.register_data(runner_id, data_cons);
+
+        // Register both channels atomically
+        manager.register_runner_channels(runner_id, lifecycle_cons, data_cons);
 
         // Now emit Stopped
         lifecycle_prod
@@ -903,13 +956,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_data_channel_closed_before_lifecycle_stopped_is_handled() {
+        use async_ringbuf::{
+            AsyncHeapRb,
+            traits::{AsyncProducer, Split},
+        };
+
+        use crate::runner::{DataFrame, LifecycleEvent};
+
+        let mut manager = RunnerManager::new(500, 1);
+        let runner_id = 0;
+        let _reg = manager.allocate_runner_with_chunk(0..500).unwrap();
+
+        let data_rb = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY);
+        let (data_prod, data_cons) = data_rb.split();
+
+        let lifecycle_rb = AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY);
+        let (mut lifecycle_prod, lifecycle_cons) = lifecycle_rb.split();
+
+        manager.register_runner_channels(runner_id, lifecycle_cons, data_cons);
+
+        drop(data_prod);
+
+        let mut meters = HashMap::new();
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick(&mut meters))
+            .await
+            .expect("data channel close should be observed without blocking");
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(tick.downloaded.is_none());
+        assert!(!manager.data_aggregator.contains(runner_id));
+        assert!(manager.get_runner_state(runner_id).is_some());
+
+        lifecycle_prod
+            .push(LifecycleEvent::Stopped(StoppedReason::Finished))
+            .await
+            .unwrap();
+
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick(&mut meters))
+            .await
+            .expect("lifecycle stopped should still be handled after data closes");
+        assert_eq!(tick.state, TaskState::Finished);
+        assert!(tick.downloaded.is_none());
+        assert!(manager.get_runner_state(runner_id).is_none());
+        assert!(manager.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_only_tick_handles_stopped_during_writer_backpressure() {
+        use async_ringbuf::{
+            AsyncHeapRb,
+            traits::{AsyncProducer, Split},
+        };
+
+        use crate::runner::{DataFrame, LifecycleEvent};
+
+        let mut manager = RunnerManager::new(256, 1);
+        let runner_id = 0;
+        let _reg = manager.allocate_runner_with_chunk(0..256).unwrap();
+
+        let data_rb = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY);
+        let (mut data_prod, data_cons) = data_rb.split();
+
+        let lifecycle_rb = AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY);
+        let (mut lifecycle_prod, lifecycle_cons) = lifecycle_rb.split();
+
+        manager.register_runner_channels(runner_id, lifecycle_cons, data_cons);
+        data_prod
+            .push(DataFrame {
+                data: Bytes::from(vec![1; 64]),
+            })
+            .await
+            .unwrap();
+        lifecycle_prod
+            .push(LifecycleEvent::Stopped(StoppedReason::Failed(
+                TaskError::Cancelled,
+            )))
+            .await
+            .unwrap();
+
+        let mut meters = HashMap::new();
+        let tick = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.tick_lifecycle_only(&mut meters),
+        )
+        .await
+        .expect("lifecycle-only tick should not wait for writer capacity");
+
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(tick.downloaded.is_none());
+        assert!(manager.get_runner_state(runner_id).is_none());
+        assert!(!manager.data_aggregator.contains(runner_id));
+        assert_eq!(manager.get_available_ranges(), vec![0..256]);
+    }
+
+    #[tokio::test]
+    async fn test_drain_timeout_releases_chunk_for_retry() {
+        use async_stream::stream;
+        use smol_cancellation_token::CancellationToken;
+
+        use crate::runner::TaskRunner;
+
+        let mut manager = RunnerManager::new(64, 1);
+        let registration = manager.allocate_runner_with_chunk(0..64).unwrap();
+        let runner_id = registration.runner_id;
+        let cancel_token = CancellationToken::new();
+        let test_stream = stream! {
+            yield Ok(Bytes::from(vec![7; 64]));
+        };
+
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(64)
+            .stream(Box::pin(test_stream))
+            .runner_id(runner_id)
+            .control_signal(registration.control_rx)
+            .cancel_token(cancel_token)
+            .data_drain_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+
+        manager.register_runner_channels(runner_id, lifecycle_rx, data_rx);
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut meters = HashMap::new();
+        let tick = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let tick = manager.tick_lifecycle_only(&mut meters).await;
+                if manager.get_runner_state(runner_id).is_none() {
+                    break tick;
+                }
+            }
+        })
+        .await
+        .expect("drain timeout should surface as lifecycle failure");
+
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(tick.downloaded.is_none());
+        assert_eq!(manager.get_available_ranges(), vec![0..64]);
+        assert!(manager.is_empty());
+
+        let stats = manager.runner_outcome_sampler_mut().stats();
+        assert_eq!(stats.stream_closed_retryable, 1);
+        assert_eq!(stats.stream_closed_unretryable, 0);
+
+        runner_handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_new_arch_data_aggregator_receives_data() {
         use async_ringbuf::{
             AsyncHeapRb,
             traits::{AsyncProducer, Split},
         };
 
-        use crate::runner::DataFrame;
+        use crate::runner::{DataFrame, LifecycleEvent};
 
         let mut manager = RunnerManager::new(1000, 2);
         let runner_id = 0;
@@ -917,10 +1119,16 @@ mod tests {
         // Allocate runner
         let _ = manager.allocate_runner_with_chunk(0..500).unwrap();
 
-        // Create and register data channel
+        // Create lifecycle channel (needed for combined registration)
+        let lifecycle_rb = AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY);
+        let (_lifecycle_prod, lifecycle_cons) = lifecycle_rb.split();
+
+        // Create data channel
         let data_rb = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY);
         let (mut data_prod, data_cons) = data_rb.split();
-        manager.register_data(runner_id, data_cons);
+
+        // Register both channels atomically
+        manager.register_runner_channels(runner_id, lifecycle_cons, data_cons);
 
         // Send data
         data_prod
