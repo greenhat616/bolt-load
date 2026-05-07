@@ -56,6 +56,7 @@ impl LifecycleAggregator {
             .group
             .insert(RunnerTaggedStream::new(runner_id, receiver));
         self.map.insert(runner_id, key);
+        self.waker.wake();
     }
 
     /// Remove a lifecycle receiver for a runner.
@@ -106,6 +107,9 @@ impl Stream for LifecycleAggregator {
         this.waker.register(cx.waker());
 
         if this.map.is_empty() {
+            if *this.is_closed {
+                return Poll::Ready(None);
+            }
             return Poll::Pending;
         }
 
@@ -133,10 +137,29 @@ impl Stream for LifecycleAggregator {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
     use async_ringbuf::{AsyncHeapRb, traits::*};
+    use futures::task::{ArcWake, waker_ref};
 
     use super::*;
     use crate::runner::{LIFECYCLE_CHANNEL_CAPACITY, LifecycleReceiver, LifecycleSender};
+
+    #[derive(Default)]
+    struct CountWaker(AtomicUsize);
+
+    impl ArcWake for CountWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn create_lifecycle_channel() -> (LifecycleSender, LifecycleReceiver) {
         AsyncHeapRb::new(LIFECYCLE_CHANNEL_CAPACITY).split()
@@ -158,15 +181,13 @@ mod tests {
         // Poll for the event
         use futures::StreamExt;
         let event = aggregator.next().await;
-        assert!(
-            matches!(
-                event,
-                Some(LifecycleStreamEvent::Event(RunnerTaggedStreamItem {
-                    runner_id: id,
-                    item: LifecycleEvent::Started
-                })) if id == runner_id
-            )
-        );
+        assert!(matches!(
+            event,
+            Some(LifecycleStreamEvent::Event(RunnerTaggedStreamItem {
+                runner_id: id,
+                item: LifecycleEvent::Started
+            })) if id == runner_id
+        ));
     }
 
     #[tokio::test]
@@ -219,5 +240,38 @@ mod tests {
         // Sender should now be disconnected
         let result = tx.push(LifecycleEvent::Started).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lifecycle_aggregator_add_wakes_pending_poller() {
+        let mut aggregator = LifecycleAggregator::new();
+        let waker = Arc::new(CountWaker::default());
+        let waker_ref = waker_ref(&waker);
+        let mut cx = Context::from_waker(&waker_ref);
+
+        assert!(matches!(
+            Pin::new(&mut aggregator).poll_next(&mut cx),
+            Poll::Pending
+        ));
+
+        let (_tx, rx) = create_lifecycle_channel();
+        aggregator.add(1, rx);
+
+        assert_eq!(waker.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_lifecycle_aggregator_closed_empty_returns_none() {
+        let mut aggregator = LifecycleAggregator::new();
+        let waker = Arc::new(CountWaker::default());
+        let waker_ref = waker_ref(&waker);
+        let mut cx = Context::from_waker(&waker_ref);
+
+        aggregator.close();
+
+        assert!(matches!(
+            Pin::new(&mut aggregator).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 }

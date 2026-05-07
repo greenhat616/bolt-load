@@ -8,6 +8,14 @@
 
 </div>
 
+### Runner lifecycle API migration
+
+The runner lifecycle refactor splits runner output into separate lifecycle and
+data receivers. Legacy APIs and types such as `TaskRunner::new`,
+`RunnerConnector`, `RunnerMessage`, and `RunnerMessageConsumer` are no longer
+available; callers should use `TaskRunner::builder().build()` and consume the
+returned `(TaskRunner, LifecycleReceiver, DataFrameReceiver)`.
+
 ### Thread control algroithm
 
 Split the process into 2 parts, slow start & max thread control

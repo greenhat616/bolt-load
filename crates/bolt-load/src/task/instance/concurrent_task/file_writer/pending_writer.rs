@@ -31,6 +31,48 @@ pub struct WriteCompletion {
     pub result: Result<(), FileWriterError>,
 }
 
+struct WriteCompletionGuard {
+    tx: Sender<WriteCompletion>,
+    range: Range<u64>,
+    chunk: Option<Chunk>,
+    armed: bool,
+}
+
+impl WriteCompletionGuard {
+    fn new(tx: Sender<WriteCompletion>, range: Range<u64>, chunk: Chunk) -> Self {
+        Self {
+            tx,
+            range,
+            chunk: Some(chunk),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.chunk = None;
+    }
+}
+
+impl Drop for WriteCompletionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let _ = self.tx.try_send(WriteCompletion {
+            range: self.range.clone(),
+            result: Err(FileWriterError::WriteRange {
+                source: CommandError::Io {
+                    source: std::io::Error::other("write task panicked"),
+                },
+                chunk: self.chunk.take(),
+                path: PathBuf::new(),
+            }),
+        });
+    }
+}
+
 /// Indicates what happened when [`PendingWriter::write_range`] was called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteStatus {
@@ -236,12 +278,18 @@ where
         let tx = self.completion_tx.clone();
         let task_range = range.clone();
         let completion_range = range.clone();
+        let guard_range = range.clone();
+        let guard_chunk = Chunk {
+            range: range.clone(),
+            data: data.clone(),
+        };
         let completion_chunk = Chunk {
             range,
             data: data.clone(),
         };
 
         if let Err(spawn_error) = self.threaded_rt.spawn(async move {
+            let mut guard = WriteCompletionGuard::new(tx.clone(), guard_range, guard_chunk);
             let result = writer.write_range(task_range.clone(), data).await;
             let _ = tx
                 .send(WriteCompletion {
@@ -249,6 +297,7 @@ where
                     result,
                 })
                 .await;
+            guard.disarm();
         }) {
             self.completion_tx
                 .try_send(WriteCompletion {
@@ -376,6 +425,23 @@ mod tests {
     }
 
     impl ThreadedRuntime for FailingRuntime {}
+
+    #[derive(Debug)]
+    struct PanicWriter;
+
+    impl FileRangeWriter for PanicWriter {
+        async fn write_range(
+            &self,
+            _range: Range<u64>,
+            _data: Bytes,
+        ) -> Result<(), FileWriterError> {
+            panic!("injected write panic");
+        }
+
+        async fn finalize(self) -> Result<(), FileWriterError> {
+            Ok(())
+        }
+    }
 
     struct NoopTimer;
 
@@ -547,6 +613,27 @@ mod tests {
         }
 
         assert!(writer.writes().is_empty());
+        assert!(pending.is_idle());
+    }
+
+    #[tokio::test]
+    async fn panic_guard_decrements_in_flight_and_reports_completion() {
+        let writer = Arc::new(PanicWriter);
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+
+        assert_eq!(
+            pending
+                .write_range(0..4, Bytes::from_static(b"boom"))
+                .unwrap(),
+            WriteStatus::Dispatched
+        );
+        assert_eq!(pending.in_flight_count(), 1);
+
+        let completions = next_tick(&mut pending).await;
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].range, 0..4);
+        assert!(completions[0].result.is_err());
         assert!(pending.is_idle());
     }
 

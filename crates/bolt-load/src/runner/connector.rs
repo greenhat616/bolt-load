@@ -21,6 +21,7 @@ impl StreamConnector {
 }
 
 #[derive(Debug, snafu::Snafu)]
+#[snafu(display("failed to connect stream: {source}"))]
 pub struct ConnectionError {
     pub source: AdapterError,
 }

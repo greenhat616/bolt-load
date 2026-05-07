@@ -18,11 +18,11 @@ pin_project! {
     /// Aggregates data from multiple runners into a single stream.
     ///
     /// Unlike `LifecycleAggregator`, data receivers are registered dynamically
-    /// when the `Ready` lifecycle event is received. Each data item is tagged
+    /// when the runner starts. Each data item is tagged
     /// with its source runner ID for proper attribution.
     ///
     /// This supports:
-    /// - Dynamic registration of data receivers (called when Ready event arrives)
+    /// - Dynamic registration of data receivers (called when Started event arrives)
     /// - Proper cleanup when receivers close
     /// - Tracking runner ID for each data item
     pub struct DataAggregator {
@@ -55,7 +55,7 @@ impl DataAggregator {
     }
 
     /// Register a data receiver for a runner.
-    /// This is typically called when a `Ready` lifecycle event is received.
+    /// This is typically called when a `Started` lifecycle event is received.
     pub fn register(&mut self, runner_id: RunnerId, receiver: DataFrameReceiver) {
         let tagged_stream = RunnerTaggedStream::new(runner_id, receiver);
         let key = self.group.insert(tagged_stream);
@@ -126,9 +126,7 @@ impl Stream for DataAggregator {
 
         match this.group.poll_next(cx) {
             Poll::Ready(Some(event)) => match event {
-                RunnerStreamEvent::Item(item) => {
-                    Poll::Ready(Some(DataStreamEvent::Data(item)))
-                }
+                RunnerStreamEvent::Item(item) => Poll::Ready(Some(DataStreamEvent::Data(item))),
                 RunnerStreamEvent::Closed(runner_id) => {
                     this.map.remove(&runner_id);
                     Poll::Ready(Some(DataStreamEvent::Closed(runner_id)))
@@ -247,7 +245,7 @@ mod tests {
         // Start with no runners
         assert!(aggregator.is_empty());
 
-        // Dynamically register runners (simulating Ready events)
+        // Dynamically register runners (simulating Started events)
         let (mut tx1, rx1) = create_data_channel();
         aggregator.register(1, rx1);
 

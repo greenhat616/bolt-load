@@ -66,7 +66,7 @@ impl TaskRunnerBuilder {
         self
     }
 
-    /// Build the task runner and return the runner and the message consumer
+    /// Build the task runner and return the runner, lifecycle receiver, and data receiver
     pub fn build(
         self,
     ) -> Result<(TaskRunner, LifecycleReceiver, DataFrameReceiver), TaskRunnerBuilderError> {

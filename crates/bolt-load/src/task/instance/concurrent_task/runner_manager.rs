@@ -538,11 +538,7 @@ impl RunnerManager {
     }
 
     /// Handle a runner whose stream closed without sending `Stopped`.
-    fn handle_runner_lost(
-        &mut self,
-        runner_id: RunnerId,
-        meters: &mut HashMap<RunnerId, usize>,
-    ) {
+    fn handle_runner_lost(&mut self, runner_id: RunnerId, meters: &mut HashMap<RunnerId, usize>) {
         meters.remove(&runner_id);
         self.chunk_planner
             .mark_failed(runner_id)

@@ -283,17 +283,17 @@ impl TaskRunner {
         Ok(())
     }
 
-    fn flush_buff(&mut self, buff: &mut BytesMut) -> Option<FlushRequest> {
+    fn flush_buff(&mut self, buff: &mut BytesMut) -> Result<Option<FlushRequest>, TaskRunError> {
         if !buff.is_empty() {
+            let data_tx = self.data_tx.take().ok_or(TaskError::ChannelClosed)?;
             let flushed_bytes = buff.len() as u64;
             let chunk = buff.split().freeze();
-            let data_tx = self.data_tx.take().expect("data_tx is not set");
-            return Some(FlushRequest {
+            return Ok(Some(FlushRequest {
                 future: FlushBuffFuture::new(data_tx, DataFrame { data: chunk }),
                 flushed_bytes,
-            });
+            }));
         }
-        None
+        Ok(None)
     }
 
     /// Handle the stream event
@@ -312,19 +312,19 @@ impl TaskRunner {
         &mut self,
         event: Option<Result<Bytes, AdapterError>>,
         buff: &mut BytesMut,
-    ) -> Option<StreamEventOperation> {
-        match event {
+    ) -> Result<Option<StreamEventOperation>, TaskRunError> {
+        Ok(match event {
             Some(Ok(item)) => {
                 if let Some(total) = self.total {
                     let current_downloaded = self.downloaded + buff.len() as u64;
                     if current_downloaded >= total {
-                        return Some(match self.flush_buff(buff) {
+                        return Ok(Some(match self.flush_buff(buff)? {
                             Some(flush) => StreamEventOperation::FlushBuff {
                                 pending: flush,
                                 post_action: PendingPostAction::FinishSuccess,
                             },
                             None => StreamEventOperation::FinishWithoutFlush,
-                        });
+                        }));
                     }
                 }
 
@@ -337,13 +337,13 @@ impl TaskRunner {
                 };
 
                 if bytes_to_write == 0 {
-                    return Some(match self.flush_buff(buff) {
+                    return Ok(Some(match self.flush_buff(buff)? {
                         Some(flush) => StreamEventOperation::FlushBuff {
                             pending: flush,
                             post_action: PendingPostAction::FinishSuccess,
                         },
                         None => StreamEventOperation::FinishWithoutFlush,
-                    });
+                    }));
                 }
 
                 if buff.len() + bytes_to_write > BUFFER_SIZE {
@@ -351,21 +351,21 @@ impl TaskRunner {
                     if take > 0 {
                         buff.extend_from_slice(&item[..take]);
                     }
-                    let flush = self
-                        .flush_buff(buff)
-                        .expect("buff should not be empty after fill");
+                    let Some(flush) = self.flush_buff(buff)? else {
+                        return Err(TaskError::Other {
+                            message: "buffer unexpectedly empty after fill".to_string(),
+                        }
+                        .into());
+                    };
                     let remaining = bytes_to_write - take;
-                    return Some(StreamEventOperation::FlushBuff {
+                    return Ok(Some(StreamEventOperation::FlushBuff {
                         pending: flush,
                         post_action: if remaining > 0 {
-                            PendingPostAction::ContinueItem {
-                                item,
-                                offset: take,
-                            }
+                            PendingPostAction::ContinueItem { item, offset: take }
                         } else {
                             PendingPostAction::Resume
                         },
-                    });
+                    }));
                 }
 
                 buff.extend_from_slice(&item[..bytes_to_write]);
@@ -373,29 +373,29 @@ impl TaskRunner {
                 if let Some(total) = self.total {
                     let current_downloaded = self.downloaded + buff.len() as u64;
                     if current_downloaded >= total {
-                        return Some(match self.flush_buff(buff) {
+                        return Ok(Some(match self.flush_buff(buff)? {
                             Some(flush) => StreamEventOperation::FlushBuff {
                                 pending: flush,
                                 post_action: PendingPostAction::FinishSuccess,
                             },
                             None => StreamEventOperation::FinishWithoutFlush,
-                        });
+                        }));
                     }
                 }
                 None
             }
             Some(Err(err)) => Some(StreamEventOperation::StreamError {
                 error: err,
-                pending: self.flush_buff(buff),
+                pending: self.flush_buff(buff)?,
             }),
-            None => Some(match self.flush_buff(buff) {
+            None => Some(match self.flush_buff(buff)? {
                 Some(flush) => StreamEventOperation::FlushBuff {
                     pending: flush,
                     post_action: PendingPostAction::FinishSuccess,
                 },
                 None => StreamEventOperation::FinishWithoutFlush,
             }),
-        }
+        })
     }
 
     /// The inner logic of the task runner
@@ -417,6 +417,7 @@ impl TaskRunner {
         let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
         let mut slow_transfer_timer = async_io::Timer::after(SLOW_STREAM_TIMEOUT);
         let mut pending_state: Option<PendingFlushState> = None;
+        let mut deferred_control_error: Option<TaskRunError> = None;
         let result = loop {
             let step: EventLoopStep = async {
                 let control_signal = self.control_signal.recv().fuse();
@@ -462,7 +463,14 @@ impl TaskRunner {
                     Ok(variant) => {
                         trace!("runner: control signal: {variant:?}");
                         if let Err(err) = self.handle_control_signal(&variant) {
-                            break Err(err.into());
+                            let err = err.into();
+                            if pending_state.is_some() {
+                                if deferred_control_error.is_none() {
+                                    deferred_control_error = Some(err);
+                                }
+                                continue;
+                            }
+                            break Err(err);
                         }
                         trace!(
                             "current downloaded: {}",
@@ -472,7 +480,14 @@ impl TaskRunner {
                     Err(_) => {
                         // Control channel closed - manager has released this runner
                         trace!("runner: control signal channel closed");
-                        break Err(TaskError::ChannelClosed.into());
+                        let err = TaskError::ChannelClosed.into();
+                        if pending_state.is_some() {
+                            if deferred_control_error.is_none() {
+                                deferred_control_error = Some(err);
+                            }
+                            continue;
+                        }
+                        break Err(err);
                     }
                 },
                 EventLoopStep::SlowTransfer => {
@@ -482,17 +497,18 @@ impl TaskRunner {
                     );
                 }
                 EventLoopStep::Download(item) => match self.handle_stream_event(item, &mut buff) {
-                    Some(StreamEventOperation::FlushBuff {
+                    Ok(Some(StreamEventOperation::FlushBuff {
                         pending,
                         post_action,
-                    }) => {
+                    })) => {
                         pending_state = Some(PendingFlushState {
                             future: pending.future,
                             flushed_bytes: pending.flushed_bytes,
                             post_action,
                         });
                     }
-                    Some(StreamEventOperation::StreamError { error, pending }) => match pending {
+                    Ok(Some(StreamEventOperation::StreamError { error, pending })) => match pending
+                    {
                         Some(flush) => {
                             pending_state = Some(PendingFlushState {
                                 future: flush.future,
@@ -504,15 +520,19 @@ impl TaskRunner {
                             break Err(TaskError::StreamError { source: error }.into());
                         }
                     },
-                    Some(StreamEventOperation::FinishWithoutFlush) => {
+                    Ok(Some(StreamEventOperation::FinishWithoutFlush)) => {
                         break Ok(());
                     }
-                    None => {}
+                    Ok(None) => {}
+                    Err(err) => break Err(err),
                 },
                 EventLoopStep::PendingComplete(flush_result) => {
-                    let state = pending_state
-                        .take()
-                        .expect("pending_state must be set for PendingComplete");
+                    let Some(state) = pending_state.take() else {
+                        break Err(TaskError::Other {
+                            message: "pending flush completed without pending state".to_string(),
+                        }
+                        .into());
+                    };
 
                     let data_tx = match flush_result {
                         Ok(sender) => sender,
@@ -521,22 +541,31 @@ impl TaskRunner {
                     self.data_tx = Some(data_tx);
                     self.downloaded += state.flushed_bytes;
 
+                    if let PendingPostAction::PropagateError(error) = state.post_action {
+                        break Err(TaskError::StreamError { source: error }.into());
+                    }
+
+                    if let Some(err) = deferred_control_error.take() {
+                        break Err(err);
+                    }
+
                     match state.post_action {
                         PendingPostAction::Resume => {
                             slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
                         }
                         PendingPostAction::ContinueItem { item, offset } => {
-                            let remaining_in_item = item.len() - offset;
+                            let remaining_in_item = item.len().saturating_sub(offset);
                             let allowed = self
                                 .total
                                 .map(|t| {
                                     t.saturating_sub(self.downloaded + buff.len() as u64) as usize
                                 })
                                 .unwrap_or(usize::MAX);
-                            let take = remaining_in_item.min(allowed).min(BUFFER_SIZE);
+                            let writable = remaining_in_item.min(allowed);
+                            let take = writable.min(BUFFER_SIZE.saturating_sub(buff.len()));
 
                             if take == 0 || allowed == 0 {
-                                if let Some(flush) = self.flush_buff(&mut buff) {
+                                if let Some(flush) = self.flush_buff(&mut buff)? {
                                     pending_state = Some(PendingFlushState {
                                         future: flush.future,
                                         flushed_bytes: flush.flushed_bytes,
@@ -548,10 +577,17 @@ impl TaskRunner {
                             }
 
                             buff.extend_from_slice(&item[offset..offset + take]);
+                            let next_offset = offset + take;
                             if let Some(total) = self.total {
                                 if self.downloaded + buff.len() as u64 >= total {
-                                    let flush =
-                                        self.flush_buff(&mut buff).expect("just buffered data");
+                                    let Some(flush) = self.flush_buff(&mut buff)? else {
+                                        break Err(TaskError::Other {
+                                            message: "buffer unexpectedly empty after continuing \
+                                                      item"
+                                                .to_string(),
+                                        }
+                                        .into());
+                                    };
                                     pending_state = Some(PendingFlushState {
                                         future: flush.future,
                                         flushed_bytes: flush.flushed_bytes,
@@ -559,6 +595,25 @@ impl TaskRunner {
                                     });
                                     continue;
                                 }
+                            }
+
+                            if next_offset < item.len() && take < writable {
+                                let Some(flush) = self.flush_buff(&mut buff)? else {
+                                    break Err(TaskError::Other {
+                                        message: "buffer unexpectedly empty after continuing item"
+                                            .to_string(),
+                                    }
+                                    .into());
+                                };
+                                pending_state = Some(PendingFlushState {
+                                    future: flush.future,
+                                    flushed_bytes: flush.flushed_bytes,
+                                    post_action: PendingPostAction::ContinueItem {
+                                        item,
+                                        offset: next_offset,
+                                    },
+                                });
+                                continue;
                             }
                             slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
                         }
@@ -616,10 +671,81 @@ mod tests {
 
     use async_stream::stream;
     use pretty_assertions::assert_eq;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     use super::*;
     use crate::adapter::{AdapterError, UnretryableError};
+
+    fn patterned_frame(len: usize) -> Bytes {
+        Bytes::from((0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>())
+    }
+
+    async fn run_runner_and_collect(
+        stream: AnyBytesStream,
+        total: Option<u64>,
+    ) -> (Vec<u8>, bool, Option<TaskError>) {
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let token = CancellationToken::new();
+        let mut builder = TaskRunner::builder()
+            .stream(stream)
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(token);
+        if let Some(total) = total {
+            builder = builder.total(total);
+        }
+
+        let (mut runner, lifecycle_rx, data_rx) = builder.build().unwrap();
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+        let mut data_done = false;
+        let mut stopped = false;
+        let mut finished = false;
+        let mut failed = None;
+        let mut received = Vec::new();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    msg = lifecycle_rx.next(), if !stopped => {
+                        match msg {
+                            Some(LifecycleEvent::Started) => {}
+                            Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                                stopped = true;
+                                finished = true;
+                            }
+                            Some(LifecycleEvent::Stopped(StoppedReason::Failed(err))) => {
+                                stopped = true;
+                                failed = Some(err);
+                            }
+                            None => {
+                                stopped = true;
+                            }
+                        }
+                    }
+                    frame = data_rx.next(), if !data_done => {
+                        match frame {
+                            Some(frame) => received.extend_from_slice(&frame.data),
+                            None => data_done = true,
+                        }
+                    }
+                }
+
+                if stopped && data_done {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out collecting runner output");
+
+        runner_handle.await.unwrap();
+        (received, finished, failed)
+    }
 
     #[tokio::test]
     async fn test_normal_download() {
@@ -688,6 +814,140 @@ mod tests {
         assert!(started);
         assert!(finished);
         assert_eq!(downloaded_size, 30);
+    }
+
+    #[tokio::test]
+    async fn test_single_large_frame_known_total_preserves_all_bytes() {
+        let frame = patterned_frame(BUFFER_SIZE * 3 + 123);
+        let expected = frame.to_vec();
+        let stream = stream! {
+            yield Ok(frame);
+        };
+
+        let (received, finished, failed) =
+            run_runner_and_collect(Box::pin(stream), Some(expected.len() as u64)).await;
+
+        assert!(finished);
+        assert!(failed.is_none());
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn test_single_large_frame_unknown_total_preserves_all_bytes() {
+        let frame = patterned_frame(BUFFER_SIZE * 3 + 123);
+        let expected = frame.to_vec();
+        let stream = stream! {
+            yield Ok(frame);
+        };
+
+        let (received, finished, failed) = run_runner_and_collect(Box::pin(stream), None).await;
+
+        assert!(finished);
+        assert!(failed.is_none());
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn test_single_frame_exactly_two_buffers_preserves_all_bytes() {
+        let frame = patterned_frame(BUFFER_SIZE * 2);
+        let expected = frame.to_vec();
+        let stream = stream! {
+            yield Ok(frame);
+        };
+
+        let (received, finished, failed) =
+            run_runner_and_collect(Box::pin(stream), Some(expected.len() as u64)).await;
+
+        assert!(finished);
+        assert!(failed.is_none());
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn test_pending_flush_survives_control_error() {
+        let (control_tx, control_rx) = async_channel::bounded(4);
+        let cancel_token = CancellationToken::new();
+        let frame_count = DATA_FRAME_CHANNEL_CAPACITY + 4;
+        let total = (frame_count * BUFFER_SIZE) as u64;
+        let test_stream = stream! {
+            for i in 0..frame_count {
+                yield Ok(Bytes::from(vec![i as u8; BUFFER_SIZE]));
+            }
+            std::future::pending::<()>().await;
+        };
+
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(total)
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token)
+            .build()
+            .unwrap();
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let mut data_rx = pin!(data_rx);
+
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = lifecycle_rx.next().await {
+                if matches!(event, LifecycleEvent::Started) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for runner start");
+
+        sleep(Duration::from_millis(100)).await;
+        control_tx
+            .send(ControlEvent::LimitTotal(total + BUFFER_SIZE as u64))
+            .await
+            .unwrap();
+
+        let mut received = 0;
+        let mut data_done = false;
+        let mut failed_exceeded_total = false;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    frame = data_rx.next(), if !data_done => {
+                        match frame {
+                            Some(frame) => received += frame.data.len(),
+                            None => data_done = true,
+                        }
+                    }
+                    event = lifecycle_rx.next(), if !failed_exceeded_total => {
+                        match event {
+                            Some(LifecycleEvent::Stopped(StoppedReason::Failed(TaskError::ExceededTotalSize))) => {
+                                failed_exceeded_total = true;
+                            }
+                            Some(LifecycleEvent::Stopped(other)) => {
+                                panic!("expected ExceededTotalSize, got {other:?}");
+                            }
+                            Some(LifecycleEvent::Started) => {}
+                            None => break,
+                        }
+                    }
+                }
+
+                if data_done && failed_exceeded_total {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out collecting deferred control error output");
+
+        runner_handle.await.unwrap();
+        assert!(failed_exceeded_total);
+        assert!(
+            received > DATA_FRAME_CHANNEL_CAPACITY * BUFFER_SIZE,
+            "pending frame was dropped: received {received} bytes"
+        );
     }
 
     #[tokio::test]
