@@ -250,7 +250,10 @@ impl TaskRunner {
     fn should_wait_data_drain(result: &Result<(), TaskRunError>) -> bool {
         matches!(
             result,
-            Ok(()) | Err(TaskRunError::Failed(TaskError::ExceededTotalSize))
+            Ok(())
+                | Err(TaskRunError::Failed(
+                    TaskError::ExceededTotalSize | TaskError::StreamError { .. },
+                ))
         )
     }
 
@@ -274,8 +277,8 @@ impl TaskRunner {
 
         futures::select_biased! {
             _ = cancelled => DataDrainOutcome::Cancelled,
-            _ = timeout => DataDrainOutcome::TimedOut,
             _ = drained => DataDrainOutcome::Drained,
+            _ = timeout => DataDrainOutcome::TimedOut,
         }
     }
 
@@ -350,6 +353,10 @@ impl TaskRunner {
                             None => StreamEventOperation::FinishWithoutFlush,
                         }));
                     }
+                }
+
+                if item.is_empty() {
+                    return Ok(None);
                 }
 
                 let bytes_to_write = if let Some(total) = self.total {
@@ -442,26 +449,36 @@ impl TaskRunner {
         let mut slow_transfer_timer = async_io::Timer::after(SLOW_STREAM_TIMEOUT);
         let mut pending_state: Option<PendingFlushState> = None;
         let mut deferred_control_error: Option<TaskRunError> = None;
+        let mut control_channel_closed = false;
         let result = loop {
             let step: EventLoopStep = async {
-                let control_signal = self.control_signal.recv().fuse();
                 let cancelled = self.cancel_token.cancelled().fuse();
-                futures::pin_mut!(control_signal, cancelled);
+                futures::pin_mut!(cancelled);
 
                 if let Some(state) = pending_state.as_mut() {
                     // PENDING MODE: only cancel + control + pending flush
                     let pending_flush = (&mut state.future).fuse();
                     futures::pin_mut!(pending_flush);
-                    futures::select_biased! {
-                        _ = cancelled => EventLoopStep::Cancelled,
-                        signal = control_signal => EventLoopStep::Control(signal),
-                        result = pending_flush => EventLoopStep::PendingComplete(result),
+                    if control_channel_closed {
+                        futures::select_biased! {
+                            _ = cancelled => EventLoopStep::Cancelled,
+                            result = pending_flush => EventLoopStep::PendingComplete(result),
+                        }
+                    } else {
+                        let control_signal = self.control_signal.recv().fuse();
+                        futures::pin_mut!(control_signal);
+                        futures::select_biased! {
+                            _ = cancelled => EventLoopStep::Cancelled,
+                            signal = control_signal => EventLoopStep::Control(signal),
+                            result = pending_flush => EventLoopStep::PendingComplete(result),
+                        }
                     }
                 } else {
                     // NORMAL MODE: full event loop
+                    let control_signal = self.control_signal.recv().fuse();
                     let download = self.stream.next().fuse();
                     let slow_transfer = slow_transfer_timer.next().fuse();
-                    futures::pin_mut!(download, slow_transfer);
+                    futures::pin_mut!(control_signal, download, slow_transfer);
                     futures::select_biased! {
                         _ = cancelled => EventLoopStep::Cancelled,
                         signal = control_signal => EventLoopStep::Control(signal),
@@ -508,6 +525,7 @@ impl TaskRunner {
                         trace!("runner: control signal channel closed");
                         let err = TaskError::ChannelClosed.into();
                         if pending_state.is_some() {
+                            control_channel_closed = true;
                             if deferred_control_error.is_none() {
                                 deferred_control_error = Some(err);
                             } else {
@@ -708,6 +726,14 @@ mod tests {
         Bytes::from((0..len).map(|idx| (idx % 251) as u8).collect::<Vec<_>>())
     }
 
+    fn stream_io_error(message: &'static str) -> AdapterError {
+        AdapterError::Unretryable {
+            source: UnretryableError::Io {
+                source: Arc::new(std::io::Error::other(message)),
+            },
+        }
+    }
+
     async fn run_runner_and_collect(
         stream: AnyBytesStream,
         total: Option<u64>,
@@ -773,6 +799,24 @@ mod tests {
 
         runner_handle.await.unwrap();
         (received, finished, failed)
+    }
+
+    #[tokio::test]
+    async fn test_drain_zero_timeout_empty_channel_returns_drained() {
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let token = CancellationToken::new();
+        let test_stream = futures::stream::pending::<Result<Bytes, AdapterError>>();
+
+        let (mut runner, _lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(token)
+            .data_drain_timeout(Duration::ZERO)
+            .build()
+            .unwrap();
+
+        assert_eq!(runner.wait_data_drained().await, DataDrainOutcome::Drained);
     }
 
     #[tokio::test]
@@ -979,6 +1023,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_control_drop_during_pending_flush_no_livelock() {
+        let (control_tx, control_rx) = async_channel::bounded(1);
+        let cancel_token = CancellationToken::new();
+        let frame = patterned_frame((DATA_FRAME_CHANNEL_CAPACITY + 2) * BUFFER_SIZE);
+        let test_stream = stream! {
+            yield Ok(frame);
+            std::future::pending::<()>().await;
+        };
+
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .stream(Box::pin(test_stream))
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(cancel_token)
+            .build()
+            .unwrap();
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let data_rx = data_rx;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match lifecycle_rx.next().await {
+                    Some(LifecycleEvent::Started) => break,
+                    Some(other) => panic!("unexpected lifecycle event before start: {other:?}"),
+                    None => panic!("lifecycle channel closed before start"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for runner start");
+
+        timeout(Duration::from_secs(2), async {
+            while data_rx.occupied_len() < DATA_FRAME_CHANNEL_CAPACITY {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for pending flush backpressure");
+
+        sleep(Duration::from_millis(20)).await;
+        drop(control_tx);
+
+        let mut data_rx = pin!(data_rx);
+        let mut received = 0;
+        let mut data_done = false;
+        let mut got_channel_closed = false;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    frame = data_rx.next(), if !data_done => {
+                        match frame {
+                            Some(frame) => received += frame.data.len(),
+                            None => data_done = true,
+                        }
+                    }
+                    event = lifecycle_rx.next(), if !got_channel_closed => {
+                        match event {
+                            Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+                                TaskError::ChannelClosed,
+                            ))) => {
+                                got_channel_closed = true;
+                            }
+                            Some(LifecycleEvent::Started) => {}
+                            Some(other) => panic!("expected ChannelClosed, got {other:?}"),
+                            None => panic!("lifecycle channel closed before ChannelClosed"),
+                        }
+                    }
+                }
+
+                if data_done && got_channel_closed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out collecting control-drop output");
+
+        runner_handle.await.unwrap();
+        assert!(got_channel_closed);
+        assert!(
+            received > DATA_FRAME_CHANNEL_CAPACITY * BUFFER_SIZE,
+            "pending frame was not flushed: received {received} bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cancel_download() {
         let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
@@ -1032,24 +1167,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_network_error() {
-        let (_control_tx, control_rx) = async_channel::bounded(1);
-        let cancel_token = CancellationToken::new();
         // Create a stream that yields an error
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![1; 10]));
-            yield Err(AdapterError::Unretryable{
-                source: UnretryableError::Io {
-                    source: Arc::new(std::io::Error::other("Network error")),
-                },
-            });
+            yield Err(stream_io_error("Network error"));
         };
 
-        let (mut runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
-            .total(20)
+        let (received, finished, failed) =
+            run_runner_and_collect(Box::pin(test_stream), Some(20)).await;
+
+        assert!(!finished);
+        assert_eq!(received, vec![1; 10]);
+        assert!(matches!(failed, Some(err) if err.is_stream_error()));
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_after_data_flush_waits_drain() {
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let cancel_token = CancellationToken::new();
+        let test_stream = stream! {
+            yield Ok(Bytes::from_static(b"abc"));
+            yield Err(stream_io_error("Network error"));
+        };
+
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
             .stream(Box::pin(test_stream))
             .runner_id(1)
             .control_signal(control_rx)
-            .cancel_token(cancel_token.clone())
+            .cancel_token(cancel_token)
             .build()
             .unwrap();
 
@@ -1057,19 +1202,83 @@ mod tests {
             runner.run().await;
         });
 
-        let mut got_error = false;
         let mut lifecycle_rx = pin!(lifecycle_rx);
-        while let Some(msg) = lifecycle_rx.next().await {
-            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
-                if e.is_stream_error() {
-                    got_error = true;
-                    break;
+        let data_rx = data_rx;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match lifecycle_rx.next().await {
+                    Some(LifecycleEvent::Started) => break,
+                    Some(other) => panic!("unexpected lifecycle event before start: {other:?}"),
+                    None => panic!("lifecycle channel closed before start"),
                 }
             }
-        }
+        })
+        .await
+        .expect("timed out waiting for runner start");
+
+        timeout(Duration::from_secs(2), async {
+            while data_rx.occupied_len() == 0 {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for flushed data");
+
+        let stopped_before_drain = timeout(Duration::from_millis(100), async {
+            loop {
+                match lifecycle_rx.next().await {
+                    Some(LifecycleEvent::Started) => {}
+                    Some(LifecycleEvent::Stopped(_)) | None => break,
+                }
+            }
+        })
+        .await;
+        assert!(
+            stopped_before_drain.is_err(),
+            "runner reported stopped before flushed data was drained"
+        );
+
+        let mut data_rx = pin!(data_rx);
+        let frame = data_rx.next().await.expect("expected flushed data frame");
+        assert_eq!(frame.data, Bytes::from_static(b"abc"));
+
+        let mut got_stream_error = false;
+        timeout(Duration::from_secs(2), async {
+            while let Some(msg) = lifecycle_rx.next().await {
+                match msg {
+                    LifecycleEvent::Stopped(StoppedReason::Failed(err)) => {
+                        assert!(err.is_stream_error());
+                        got_stream_error = true;
+                        break;
+                    }
+                    LifecycleEvent::Started => {}
+                    other => panic!("unexpected lifecycle event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for stream error");
 
         runner_handle.await.unwrap();
-        assert!(got_error);
+        assert!(got_stream_error);
+    }
+
+    #[tokio::test]
+    async fn test_empty_frames_mid_stream_are_skipped() {
+        let test_stream = stream! {
+            yield Ok(Bytes::new());
+            yield Ok(Bytes::from_static(b"abc"));
+            yield Ok(Bytes::new());
+            yield Ok(Bytes::from_static(b"def"));
+        };
+
+        let (received, finished, failed) =
+            run_runner_and_collect(Box::pin(test_stream), None).await;
+
+        assert!(finished);
+        assert!(failed.is_none());
+        assert_eq!(received, b"abcdef");
     }
 
     #[tokio::test]
