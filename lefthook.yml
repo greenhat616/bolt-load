@@ -1,0 +1,33 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: Backend fmt
+      run: cargo fmt --all -- --check
+      glob:
+        - "**/*.rs"
+        - "rustfmt.toml"
+    - name: Backend Checker
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      glob:
+        - "**/*.rs"
+        - "Cargo.toml"
+        - "Cargo.lock"
+    - name: Deno fmt
+      run: deno fmt --check
+      glob:
+        - "**/*.ts"
+        - "**/*.tsx"
+        - "**/*.js"
+        - "**/*.jsx"
+    - name: Deno lint
+      run: deno lint
+      glob:
+        - "**/*.ts"
+        - "**/*.tsx"
+        - "**/*.js"
+        - "**/*.jsx"
+
+commit-msg:
+  jobs:
+    - name: Commitlint
+      run: deno run -A npm:@commitlint/cli --config commitlint.config.ts --edit {1}
