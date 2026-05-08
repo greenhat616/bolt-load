@@ -674,6 +674,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_to_running_via_tick() {
         use async_ringbuf::{AsyncHeapRb, traits::Split};
+        use futures::StreamExt as _;
 
         use crate::{DEFAULT_EVENT_CHANNEL_CAPACITY, runner::RunnerMessage};
 
@@ -697,7 +698,7 @@ mod tests {
         let (_prod, cons) = rb.split();
 
         // Send the consumer through the channel
-        tx.send(Ok(cons)).unwrap();
+        tx.send(Ok(cons.boxed())).unwrap();
 
         // Tick to process the pending runner
         let mut meters = HashMap::new();
