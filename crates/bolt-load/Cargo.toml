@@ -90,7 +90,7 @@ tokio = { version = "1", features = [
     "tracing",
 ], optional = true }
 smol = { version = "2", optional = true }
-compio = { version = "0.17", optional = true, default-features = false, features = [
+compio = { version = "0.18", optional = true, default-features = false, features = [
     "io-uring",
     "runtime",
 ] }
