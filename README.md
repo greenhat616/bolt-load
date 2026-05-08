@@ -42,3 +42,27 @@ then \quad &thread_t = thread_{t-1} + 1 \\
 else \quad & thread_t = thread_{t-1}
 \end{align}
 ```
+
+## Development
+
+Install [Lefthook](https://lefthook.dev/) and [Deno](https://deno.com/) before
+working on this repository.
+
+```bash
+lefthook install
+```
+
+The configured Git hooks run the following checks:
+
+- `cargo fmt --all -- --check` for Rust formatting.
+- `cargo clippy --all-targets --all-features -- -D warnings` for Rust linting.
+- `deno fmt --check` for TypeScript and JavaScript formatting.
+- `deno lint` for TypeScript and JavaScript linting.
+- `deno run -A npm:@commitlint/cli --config commitlint.config.ts --edit {1}`
+  for commit message validation.
+
+Commit messages must follow the Conventional Commits style, for example:
+
+```text
+feat: add resumable download support
+```
