@@ -1,1 +1,5 @@
 /target
+.serena/*
+!.serena/project.yml
+.claude/*
+!.claude/settings.json

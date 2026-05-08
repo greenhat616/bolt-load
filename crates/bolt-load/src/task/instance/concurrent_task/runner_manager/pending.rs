@@ -12,12 +12,29 @@ use futures::{
 use futures_concurrency::future::FutureGroup;
 
 use crate::{
-    runner::{RunnerConnectorError, RunnerMessageConsumer},
+    runner::{ConnectionError, DataFrameReceiver, LifecycleReceiver},
     task::RunnerId,
 };
 
-pub type PendingRunnerReceiver =
-    oneshot::Receiver<Result<RunnerMessageConsumer, RunnerConnectorError>>;
+pub struct RunnerBuilderOutput {
+    pub data_rx: DataFrameReceiver,
+    pub lifecycle_rx: LifecycleReceiver,
+}
+
+impl std::fmt::Debug for RunnerBuilderOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnerBuilderOutput")
+            .finish_non_exhaustive()
+    }
+}
+
+pub type PendingRunnerReceiver = oneshot::Receiver<Result<RunnerBuilderOutput, PendingRunnerError>>;
+
+pub fn failed_receiver(error: PendingRunnerError) -> PendingRunnerReceiver {
+    let (tx, rx) = oneshot::channel();
+    let _ = tx.send(Err(error));
+    rx
+}
 
 #[derive(Debug, Clone)]
 pub struct PendingRunnerContext {
@@ -44,13 +61,15 @@ pin_project_lite::pin_project! {
 pub enum PendingRunnerError {
     #[snafu(display("the consumer receiver is closed"))]
     ReceiverClosed,
-    #[snafu(display("the connector failed: {source}"))]
-    Connector { source: RunnerConnectorError },
+    #[snafu(display("the connection failed: {source}"))]
+    Connection { source: ConnectionError },
+    #[snafu(display("failed to spawn runner task: {message}"))]
+    Spawn { message: String },
 }
 
 pub struct PendingRunnerOutput {
     pub context: PendingRunnerContext,
-    pub result: Result<RunnerMessageConsumer, PendingRunnerError>,
+    pub result: Result<RunnerBuilderOutput, PendingRunnerError>,
 }
 
 impl Future for PendingRunner {
@@ -59,13 +78,13 @@ impl Future for PendingRunner {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         match this.consumer_rx.poll_unpin(cx) {
-            Poll::Ready(Ok(Ok(consumer))) => Poll::Ready(PendingRunnerOutput {
+            Poll::Ready(Ok(Ok(output))) => Poll::Ready(PendingRunnerOutput {
                 context: this.context.clone(),
-                result: Ok(consumer),
+                result: Ok(output),
             }),
             Poll::Ready(Ok(Err(error))) => Poll::Ready(PendingRunnerOutput {
                 context: this.context.clone(),
-                result: Err(PendingRunnerError::Connector { source: error }),
+                result: Err(error),
             }),
             Poll::Ready(Err(_)) => Poll::Ready(PendingRunnerOutput {
                 context: this.context.clone(),

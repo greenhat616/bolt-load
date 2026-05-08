@@ -4,11 +4,12 @@
 //! and use seek write to write the file in large file.
 
 #[cfg(feature = "compio")]
-mod compio;
+mod compio_writer;
 #[cfg(feature = "mmap")]
-mod mmap;
-mod null;
-mod pool;
+mod mmap_writer;
+mod null_writer;
+mod pending_writer;
+mod pool_writer;
 #[cfg(test)]
 mod slow;
 
@@ -23,12 +24,16 @@ use fs_err::{File, OpenOptions};
 use snafu::prelude::*;
 
 #[cfg(feature = "compio")]
-pub use self::compio::CompioWriterBuilder;
+pub use self::compio_writer::CompioWriterBuilder;
 #[cfg(feature = "mmap")]
-pub use self::mmap::MmapWriterBuilder;
-use self::{null::NullWriter, pool::PoolWriter};
+pub use self::mmap_writer::MmapWriterBuilder;
+use self::{null_writer::NullWriter, pool_writer::PoolWriter};
 // Re-export builders for benchmarking and advanced usage
-pub use self::{null::NullWriterBuilder, pool::PoolWriterBuilder};
+pub use self::{
+    null_writer::NullWriterBuilder,
+    pending_writer::{PendingWrite, PendingWriter, WriteCompletion, WriteStatus, WriterFullError},
+    pool_writer::PoolWriterBuilder,
+};
 use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
@@ -67,21 +72,26 @@ pub enum FileWriterError {
     Finalize { source: CommandError, path: PathBuf },
 }
 
-#[enum_dispatch::enum_dispatch(FileRangeWriterImpl)]
-#[allow(async_fn_in_trait)] // Only for benchmarking and advanced usage
-pub trait FileRangeWriter {
+pub trait FileRangeWriter
+where
+    Self: Send + Sync,
+{
     /// Write data to file
     ///
     /// # Errors
     ///
     /// This function will return an error if the file is not writable or the disk is full.
-    async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError>;
+    fn write_range(
+        &self,
+        range: Range<u64>,
+        data: Bytes,
+    ) -> impl Future<Output = Result<(), FileWriterError>> + Send;
     /// Sync all data to disk
     ///
     /// # Errors
     ///
     /// This function will return an error if the file is not writable or the disk is full.
-    async fn finalize(self) -> Result<(), FileWriterError>;
+    fn finalize(self) -> impl Future<Output = Result<(), FileWriterError>> + Send;
 }
 
 trait FileWriterCapability {
@@ -90,16 +100,45 @@ trait FileWriterCapability {
     }
 }
 
-#[enum_dispatch::enum_dispatch]
 pub enum FileRangeWriterImpl {
     #[cfg(feature = "mmap")]
-    Mmap(self::mmap::MmapWriter),
+    Mmap(self::mmap_writer::MmapWriter),
     Pool(PoolWriter),
     Null(NullWriter),
     #[cfg(feature = "compio")]
-    Compio(self::compio::CompioWriter),
+    Compio(self::compio_writer::CompioWriter),
     #[cfg(test)]
     Slow(self::slow::SlowWriter),
+}
+
+impl FileRangeWriter for FileRangeWriterImpl {
+    #[inline]
+    async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
+        match self {
+            #[cfg(feature = "mmap")]
+            FileRangeWriterImpl::Mmap(writer) => writer.write_range(range, data).await,
+            FileRangeWriterImpl::Pool(writer) => writer.write_range(range, data).await,
+            FileRangeWriterImpl::Null(writer) => writer.write_range(range, data).await,
+            #[cfg(feature = "compio")]
+            FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
+        }
+    }
+
+    #[inline]
+    async fn finalize(self) -> Result<(), FileWriterError> {
+        match self {
+            #[cfg(feature = "mmap")]
+            FileRangeWriterImpl::Mmap(writer) => writer.finalize().await,
+            FileRangeWriterImpl::Pool(writer) => writer.finalize().await,
+            FileRangeWriterImpl::Null(writer) => writer.finalize().await,
+            #[cfg(feature = "compio")]
+            FileRangeWriterImpl::Compio(writer) => writer.finalize().await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Slow(writer) => writer.finalize().await,
+        }
+    }
 }
 
 impl FileRangeWriter for Arc<FileRangeWriterImpl> {
@@ -226,7 +265,7 @@ impl FileWriter {
             }
             #[cfg(feature = "compio")]
             FileRangeWriterKind::Compio => {
-                use self::compio::CompioWriterBuilder;
+                use self::compio_writer::CompioWriterBuilder;
                 FileRangeWriterImpl::Compio(
                     CompioWriterBuilder::new()
                         .path(path.clone())
@@ -269,11 +308,23 @@ impl FileRangeWriter for FileWriter {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        io::{Read, Seek, SeekFrom},
+        sync::Arc,
+        time::Duration,
+    };
 
+    use async_waitgroup::WaitGroup;
+    use bolt_load_tests::adapter::simple::{SimpleTestAdapterBuilder, calculate_blake3};
+    use smol_cancellation_token::CancellationToken;
     use tempfile::TempDir;
 
-    use super::*;
+    use super::{
+        super::{ConcurrentTaskInner, RunnerManager, runner_manager::TaskState},
+        *,
+    };
+    use crate::{adapter::BoltLoadAdapter, runtime::ThreadedRuntimeImpl};
 
     #[test]
     #[cfg(feature = "compio")]
@@ -582,5 +633,170 @@ mod tests {
         let mut buf = vec![0u8; data.len()];
         file.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, &data[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[n0_tracing_test::traced_test]
+    async fn test_slow_writer_backpressure_multi_runner_byte_integrity() {
+        const TOTAL_SIZE: usize = 256 * 1024;
+        const CHUNK_SIZE: usize = 1024;
+        const RUNNER_COUNT: usize = 4;
+
+        fn record_completions(
+            completions: Vec<WriteCompletion>,
+            written_bytes: &mut usize,
+            write_count: &mut usize,
+        ) {
+            for completion in completions {
+                let range = completion.range;
+                completion
+                    .result
+                    .unwrap_or_else(|e| panic!("write failed at {range:?}: {e}"));
+                *written_bytes += (range.end - range.start) as usize;
+                *write_count += 1;
+            }
+        }
+
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(TOTAL_SIZE)
+            .chunk_size(CHUNK_SIZE)
+            .support_range(true)
+            .build()
+            .expect("adapter should build");
+        let expected_hash = adapter.expected_hash().to_string();
+        let adapter = Arc::new(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>);
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("slow_backpressure_multi_runner.bin");
+        let slow_cfg = slow::SlowDiskConfig {
+            latency: Duration::from_millis(10),
+            max_jitter: Duration::from_millis(2),
+        };
+        let file_writer = FileWriter::new_with_kind(
+            &file_path,
+            TOTAL_SIZE as u64,
+            FileRangeWriterKind::Slow(slow_cfg),
+        )
+        .await
+        .expect("slow file writer should build");
+
+        let mut pending_writer = PendingWriter::new(Arc::new(file_writer.clone()), rt.clone(), 1);
+        let mut runner_manager = RunnerManager::new(TOTAL_SIZE as u64, RUNNER_COUNT);
+        let runners_cancel_token = CancellationToken::new();
+        let wg = WaitGroup::new();
+        let partition_size = TOTAL_SIZE as u64 / RUNNER_COUNT as u64;
+
+        for idx in 0..RUNNER_COUNT {
+            let start = idx as u64 * partition_size;
+            let end = if idx + 1 == RUNNER_COUNT {
+                TOTAL_SIZE as u64
+            } else {
+                start + partition_size
+            };
+            let range = start..end;
+            let runner_range = range.clone();
+            let adapter = adapter.clone();
+            let token = runners_cancel_token.clone();
+
+            runner_manager
+                .allocate_pending_runner_with_chunk(range, |runner_id, control_rx| {
+                    ConcurrentTaskInner::create_background_range_runner(
+                        &rt,
+                        &wg,
+                        runner_range,
+                        adapter,
+                        control_rx,
+                        runner_id,
+                        token,
+                    )
+                })
+                .expect("runner slot should be available");
+        }
+
+        let mut meters = HashMap::with_capacity(RUNNER_COUNT);
+        let mut written_bytes = 0usize;
+        let mut write_count = 0usize;
+        let mut downloaded_chunks = 0usize;
+        let mut touched_partitions = BTreeSet::new();
+        let mut observed_backpressure = false;
+
+        let download_result = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                record_completions(
+                    pending_writer.try_tick(),
+                    &mut written_bytes,
+                    &mut write_count,
+                );
+
+                if !pending_writer.can_write() {
+                    observed_backpressure = true;
+                    let completions = pending_writer
+                        .tick()
+                        .await
+                        .expect("writer completion channel should stay open");
+                    record_completions(completions, &mut written_bytes, &mut write_count);
+                    continue;
+                }
+
+                let tick = runner_manager.tick(&mut meters).await;
+                if let Some(chunk) = tick.downloaded {
+                    downloaded_chunks += 1;
+                    touched_partitions.insert(
+                        (chunk.range.start / partition_size).min((RUNNER_COUNT - 1) as u64),
+                    );
+
+                    let status = pending_writer
+                        .write_range(chunk.range, chunk.bytes)
+                        .expect("backpressure gate should only write when capacity is available");
+                    if status == WriteStatus::Pending || !pending_writer.can_write() {
+                        observed_backpressure = true;
+                    }
+                }
+
+                if tick.state == TaskState::Finished {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        if download_result.is_err() {
+            runners_cancel_token.cancel();
+        }
+        download_result.expect("multi-runner download should not time out");
+
+        wg.wait().await;
+        let completions = pending_writer.flush().await;
+        record_completions(completions, &mut written_bytes, &mut write_count);
+        drop(pending_writer);
+
+        file_writer
+            .finalize()
+            .await
+            .expect("slow writer should finalize");
+
+        assert!(
+            observed_backpressure,
+            "slow writer should force the runner loop to wait for write capacity"
+        );
+        assert_eq!(
+            touched_partitions.len(),
+            RUNNER_COUNT,
+            "all runner ranges should contribute bytes"
+        );
+        assert!(
+            downloaded_chunks >= RUNNER_COUNT,
+            "expected chunks from multiple runner ranges, got {downloaded_chunks}"
+        );
+        assert!(
+            write_count >= RUNNER_COUNT,
+            "expected multiple writes, got {write_count}"
+        );
+        assert_eq!(written_bytes, TOTAL_SIZE);
+
+        let content = std::fs::read(&file_path).unwrap();
+        assert_eq!(content.len(), TOTAL_SIZE);
+        assert_eq!(calculate_blake3(&content), expected_hash);
     }
 }

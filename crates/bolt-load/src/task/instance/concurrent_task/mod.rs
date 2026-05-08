@@ -9,7 +9,7 @@ use std::{
 use async_waitgroup::WaitGroup;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
-use futures::{FutureExt, task::SpawnExt};
+use futures::{FutureExt, future::Either, task::SpawnExt};
 use runner_manager::TaskState;
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
@@ -18,7 +18,7 @@ use super::{Result, TaskInstance};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     adapter::{AnyAdapter, UnretryableError},
-    runner::{RunnerConnector, RunnerConnectorError, RunnerMessageConsumer, TaskError, TaskRunner},
+    runner::{StreamConnector, TaskError, TaskRunner},
     runtime::{
         LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl, Timer, TimerBuilder,
     },
@@ -41,9 +41,7 @@ mod strategy;
 
 use chunk_planner::*;
 use file_writer::*;
-pub use runner_manager::{
-    ControlReceiver, ControlSender, RunnerManager, RunnerNotification, RunnerRegistration,
-};
+pub use runner_manager::{ControlReceiver, ControlSender, RunnerManager, RunnerRegistration};
 use strategy::*;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
@@ -301,7 +299,9 @@ impl ConcurrentTaskInner {
         control_rx: ControlReceiver,
         runner_id: RunnerId,
         cancel_token: CancellationToken,
-    ) -> oneshot::Receiver<Result<RunnerMessageConsumer, RunnerConnectorError>> {
+    ) -> runner_manager::PendingRunnerReceiver {
+        use runner_manager::pending::{PendingRunnerError, RunnerBuilderOutput};
+
         let (tx, rx) = oneshot::channel();
         let (start, end) = (range.start, range.end);
         let wg = wg.clone();
@@ -312,42 +312,70 @@ impl ConcurrentTaskInner {
                 "[TASK] create background range runner connector: id: {runner_id}, range: \
                  {range:?}"
             );
-            let builder = TaskRunner::builder()
-                .total(end - start)
-                .runner_id(runner_id)
-                .control_signal(control_rx)
-                .cancel_token(cancel_token.clone());
-            let connector = RunnerConnector::new(
-                async move { adapter.range_stream(start, end).await }.boxed(),
-                builder,
-            );
-            match connector.connect().await {
-                Ok((mut runner, consumer)) => {
-                    if let Err(e) = tx.send(Ok(consumer)) {
-                        error!("failed to send consumer to channel: {e:?}");
-                        return;
-                    }
-                    let wg = wg.clone();
-                    let runner_task = async move {
-                        let _wg = wg;
-                        runner.run().await;
-                    };
 
-                    #[cfg(feature = "tracing")]
-                    let runner_task = tracing::Instrument::instrument(
-                        runner_task,
-                        tracing::trace_span!(
-                            parent: tracing::Span::current(),
-                            "background_task::runner",
-                        ),
-                    );
-                    rt.spawn(runner_task).expect("should never spawn failed");
+            // 1. Connect stream using StreamConnector
+            let connector =
+                StreamConnector::from(async move { adapter.range_stream(start, end).await });
+
+            match connector.connect().await {
+                Ok(stream) => {
+                    // 2. Build TaskRunner with new architecture
+                    let result = TaskRunner::builder()
+                        .total(end - start)
+                        .stream(stream)
+                        .runner_id(runner_id)
+                        .control_signal(control_rx)
+                        .cancel_token(cancel_token.clone())
+                        .build();
+
+                    match result {
+                        Ok((mut runner, lifecycle_rx, data_rx)) => {
+                            // 3. Spawn runner
+                            let wg = wg.clone();
+                            let runner_task = async move {
+                                let _wg = wg;
+                                runner.run().await;
+                            };
+
+                            #[cfg(feature = "tracing")]
+                            let runner_task = tracing::Instrument::instrument(
+                                runner_task,
+                                tracing::trace_span!(
+                                    parent: tracing::Span::current(),
+                                    "background_task::runner",
+                                ),
+                            );
+                            match rt.spawn(runner_task) {
+                                Ok(()) => {
+                                    let output = RunnerBuilderOutput {
+                                        data_rx,
+                                        lifecycle_rx,
+                                    };
+                                    if let Err(e) = tx.send(Ok(output)) {
+                                        error!(
+                                            "failed to send channels to pending receiver: {e:?}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("failed to spawn background range runner: {e}");
+                                    let _ = tx.send(Err(PendingRunnerError::Spawn {
+                                        message: e.to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Build error - should not happen with proper setup
+                            error!("failed to build task runner: {e:?}");
+                            let _ = tx.send(Err(PendingRunnerError::ReceiverClosed));
+                        }
+                    }
                 }
                 Err(e) => {
+                    // Connection error
                     error!("failed to create background range runner connector: {e:?}");
-                    if let Err(e) = tx.send(Err(e)) {
-                        error!("failed to send error to channel: {e:?}");
-                    }
+                    let _ = tx.send(Err(PendingRunnerError::Connection { source: e }));
                 }
             }
         };
@@ -361,9 +389,12 @@ impl ConcurrentTaskInner {
                 range = ?start..end,
             ),
         );
-        threaded_rt
-            .spawn(connector_task)
-            .expect("should never spawn failed");
+        if let Err(e) = threaded_rt.spawn(connector_task) {
+            error!("failed to spawn background range runner connector: {e}");
+            return runner_manager::pending::failed_receiver(PendingRunnerError::Spawn {
+                message: e.to_string(),
+            });
+        }
         rx
     }
 
@@ -376,6 +407,8 @@ impl ConcurrentTaskInner {
 
         meters: &mut HashMap<RunnerId, usize>,
         sampler: &mut SpeedSampler,
+        write_bytes_meter: &mut usize,
+        write_sampler: &mut SpeedSampler,
         current_speed: &mut f64,
         per_runner_avg_speed: &mut f64,
 
@@ -384,9 +417,13 @@ impl ConcurrentTaskInner {
         let count = meters.len();
         let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
         let (_, ema_speed) = sampler.sample(&mut total_bytes);
-        // debug!("ema speed {ema_speed} count {count}");
+        let (_, write_ema_speed) = write_sampler.sample(write_bytes_meter);
         *current_speed = ema_speed;
-        *per_runner_avg_speed = ema_speed / count as f64;
+        *per_runner_avg_speed = if count == 0 {
+            0.0
+        } else {
+            ema_speed / count as f64
+        };
 
         let event_tx = event_tx.clone();
         let total = runner_manager.total();
@@ -406,6 +443,7 @@ impl ConcurrentTaskInner {
                         downloaded_chunks,
                     },
                     ema_speed,
+                    write_ema_speed,
                 )))
                 .await
             {
@@ -533,6 +571,9 @@ impl ConcurrentTaskInner {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+        use file_writer::{PendingWriter, WriteCompletion, WriterFullError};
+        use runner_manager::RunnerTick;
+
         let total = self
             .progress
             .total
@@ -544,73 +585,147 @@ impl ConcurrentTaskInner {
         let runners_cancel_token = cancel_token.child_token();
         let _runner_cancel_guard = runners_cancel_token.clone().drop_guard();
 
-        // The initial max concurrency is the number of available threads
         let initial_max_concurrency = std::thread::available_parallelism()
             .map(|t| t.get())
             .unwrap_or(DEFAULT_MAX_CONCURRENCY);
-        // The max concurrency should follows 1 <= max_concurrency <= initial_max_concurrency
         let mut max_concurrency = initial_max_concurrency;
         let mut runner_manager = RunnerManager::new(total, initial_max_concurrency);
         let mut strategy_control = StrategyControl::new(initial_max_concurrency);
-        // TODO: make meters removal more efficient
         let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
         let mut sampler = SpeedSampler::new();
+        let mut write_bytes_meter: usize = 0;
+        let mut write_sampler = SpeedSampler::new();
         let mut current_speed = 0.0;
         let mut per_runner_avg_speed = 0.0;
 
         let (tmp_path, file_writer) = self.create_file_writer().await?;
+        let mut pending_writer = PendingWriter::new(
+            Arc::new(file_writer.clone()),
+            rt.clone(),
+            initial_max_concurrency,
+        );
 
         let mut throughout_meter_timer = rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
         let mut strategy_timer = rt.create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
 
+        fn check_completions(completions: Vec<WriteCompletion>) -> Result<usize> {
+            let mut written = 0usize;
+            for c in &completions {
+                match &c.result {
+                    Ok(()) => {
+                        written += (c.range.end - c.range.start) as usize;
+                    }
+                    Err(e) => {
+                        return Err(TaskInstanceError::new_failed(TaskError::Other {
+                            message: format!("write failed at {:?}: {e}", c.range),
+                        }));
+                    }
+                }
+            }
+            Ok(written)
+        }
+
+        enum LoopEvent {
+            WriterCompleted(Option<Vec<WriteCompletion>>),
+            StrategyTimer,
+            ThroughputTimer,
+            Runner(RunnerTick),
+        }
+
         let event_loop_result: Result<()> = async {
             loop {
-                futures::select_biased! {
-                    _ = strategy_timer.tick().fuse() => {
+                write_bytes_meter += check_completions(pending_writer.try_tick())
+                    .inspect_err(|_| runners_cancel_token.cancel())?;
+
+                let can_write = pending_writer.can_write();
+
+                let event = {
+                    let writer_fut = if pending_writer.is_idle() {
+                        Either::Left(futures::future::pending::<Option<Vec<WriteCompletion>>>())
+                    } else {
+                        Either::Right(pending_writer.tick())
+                    }
+                    .fuse();
+
+                    let runner_fut = if can_write {
+                        Either::Left(runner_manager.tick(&mut meters))
+                    } else {
+                        Either::Right(runner_manager.tick_lifecycle_only(&mut meters))
+                    }
+                    .fuse();
+
+                    let strategy_tick = strategy_timer.tick().fuse();
+                    let throughput_tick = throughout_meter_timer.tick().fuse();
+
+                    futures::pin_mut!(writer_fut, runner_fut, strategy_tick, throughput_tick);
+
+                    futures::select_biased! {
+                        completions = writer_fut => LoopEvent::WriterCompleted(completions),
+                        _ = strategy_tick => LoopEvent::StrategyTimer,
+                        _ = throughput_tick => LoopEvent::ThroughputTimer,
+                        tick = runner_fut => LoopEvent::Runner(tick),
+                    }
+                };
+
+                match event {
+                    LoopEvent::WriterCompleted(Some(completions)) => {
+                        write_bytes_meter += check_completions(completions)
+                            .inspect_err(|_| runners_cancel_token.cancel())?;
+                    }
+                    LoopEvent::WriterCompleted(None) => {
+                        runners_cancel_token.cancel();
+                        return Err(TaskInstanceError::new_failed(TaskError::Other {
+                            message: "writer completion channel closed unexpectedly".into(),
+                        }));
+                    }
+                    LoopEvent::StrategyTimer => {
                         Self::strategy_control_timer_tick(
                             &mut runner_manager,
                             &mut strategy_control,
                             &mut max_concurrency,
-
                             &rt,
                             &adapter,
                             &runners_cancel_token,
                             &wg,
-
                             current_speed,
                             per_runner_avg_speed,
-                        ).await.inspect_err(|e| {
+                        )
+                        .await
+                        .inspect_err(|e| {
                             error!("failed to download strategy timer tick: {e:?}");
+                            runners_cancel_token.cancel();
                             self.sync_progress(&runner_manager);
                         })?;
                     }
-                    _ = throughout_meter_timer.tick().fuse() => {
+                    LoopEvent::ThroughputTimer => {
                         Self::throughout_meter_tick(
                             &rt,
                             &wg,
                             &runner_manager,
                             &mut meters,
                             &mut sampler,
+                            &mut write_bytes_meter,
+                            &mut write_sampler,
                             &mut current_speed,
                             &mut per_runner_avg_speed,
                             &event_tx,
                         );
                     }
-                    state = runner_manager.tick(
-                        &mut meters,
-                        |range, bytes| {
-                            let file_writer = file_writer.clone();
-                            let wg = wg.clone();
-                            rt.spawn(async move {
-                                let _wg = wg;
-                                if let Err(e) = file_writer.write_range(range, bytes).await {
-                                    // TODO: notify the task to stop
-                                    error!("failed to write to file: {e:?}");
-                                }
-                            }).expect("should never spawn failed");
+                    LoopEvent::Runner(tick) => {
+                        if let Some(chunk) = tick.downloaded {
+                            pending_writer
+                                .write_range(chunk.range, chunk.bytes)
+                                .map_err(|e: WriterFullError| {
+                                    TaskInstanceError::new_failed(TaskError::Other {
+                                        message: format!(
+                                            "writer full (invariant violation): {:?}",
+                                            e.0.range
+                                        ),
+                                    })
+                                })
+                                .inspect_err(|_| runners_cancel_token.cancel())?;
                         }
-                    ).fuse() => {
-                        if state == TaskState::Finished {
+                        if tick.state == TaskState::Finished {
                             break;
                         }
                     }
@@ -619,14 +734,23 @@ impl ConcurrentTaskInner {
             Ok(())
         }
         .await;
+
+        if event_loop_result.is_err() {
+            runners_cancel_token.cancel();
+        }
         self.sync_progress(&runner_manager);
 
-        // Wait all message handlers to finish
         wg.wait().await;
 
-        event_loop_result?;
+        // Always flush pending writes, even on error path
+        let flush_completions = pending_writer.flush().await;
+        let flush_result = check_completions(flush_completions);
+        drop(pending_writer);
 
-        // TODO: add a finalizing state?
+        // Main error takes precedence
+        event_loop_result?;
+        flush_result.map(drop)?;
+
         file_writer.finalize().await.map_err(|e| {
             TaskInstanceError::new_failed(TaskError::Other {
                 message: e.to_string(),
@@ -669,6 +793,7 @@ impl ConcurrentTaskInner {
                     .event_tx
                     .send(TaskEvent::Downloading(ProgressWithSpeed::new(
                         self.progress.clone(),
+                        0.0,
                         0.0,
                     )))
                     .await;
@@ -776,21 +901,80 @@ impl ConcurrentTaskInner {
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::pin, sync::Arc};
+    use std::{
+        pin::pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use bolt_load_tests::adapter::simple::{SimpleTestAdapter, calculate_blake3};
     use bolt_load_utils::telemetry::*;
-    use futures::StreamExt;
+    use futures::{
+        StreamExt,
+        future::FutureObj,
+        task::{Spawn, SpawnError},
+    };
     use pretty_assertions::assert_eq;
+    use runner_manager::pending::PendingRunnerError;
     use smol_cancellation_token::CancellationToken;
 
     use super::*;
     use crate::{
         adapter::BoltLoadAdapter,
-        runner::{RunnerMessage, RunnerMessageKind, StoppedReason},
-        runtime::ThreadedRuntimeImpl,
+        runner::{LifecycleEvent, StoppedReason},
+        runtime::{
+            DowncastLocalRuntime, ObjectSafeTimer, ThreadedRuntime, ThreadedRuntimeImpl,
+            TimerBuilder, TimerImpl,
+        },
         task::ControlEvent,
     };
+
+    #[derive(Clone, Debug)]
+    struct FailOnSpawnRuntime {
+        fail_on: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FailOnSpawnRuntime {
+        fn new(fail_on: usize) -> Self {
+            Self {
+                fail_on,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl Spawn for FailOnSpawnRuntime {
+        fn spawn_obj(&self, future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == self.fail_on {
+                return Err(SpawnError::shutdown());
+            }
+
+            tokio::spawn(future);
+            Ok(())
+        }
+    }
+
+    impl DowncastLocalRuntime for FailOnSpawnRuntime {}
+
+    impl TimerBuilder for FailOnSpawnRuntime {
+        fn create_delayed_timer(&self, _duration: Duration) -> TimerImpl {
+            TimerImpl::Custom(Box::new(NoopTimer))
+        }
+    }
+
+    impl ThreadedRuntime for FailOnSpawnRuntime {}
+
+    struct NoopTimer;
+
+    #[async_trait::async_trait]
+    impl ObjectSafeTimer for NoopTimer {
+        async fn tick(&mut self) {}
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
@@ -816,37 +1000,46 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let msg_rx = result.unwrap();
-        wg.wait().await;
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Verify that Started message is received
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        match msg {
-            RunnerMessage(id, RunnerMessageKind::Started) => {
-                assert_eq!(id, runner_id);
-            }
-            _ => panic!("Expected Started message, got: {:?}", msg),
-        }
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let msg = lifecycle_rx.next().await.unwrap();
+        assert!(matches!(msg, LifecycleEvent::Started));
 
-        // Verify that downloaded data is received
+        // Verify that downloaded data is received via data channel
         let mut total_downloaded = 0;
         let mut downloaded_data = Vec::new();
 
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(id, RunnerMessageKind::Downloaded(bytes)) => {
-                    assert_eq!(id, runner_id);
-                    total_downloaded += bytes.len();
-                    downloaded_data.extend_from_slice(&bytes);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            total_downloaded += frame.data.len();
+                            downloaded_data.extend_from_slice(&frame.data);
+                        }
+                        None => break,
+                    }
                 }
-                RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
-                    assert_eq!(id, runner_id);
-                    break;
+                lifecycle = lifecycle_rx.next() => {
+                    match lifecycle {
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            break;
+                        }
+                        Some(LifecycleEvent::Stopped(StoppedReason::Failed(e))) => {
+                            panic!("Runner failed: {e:?}");
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
+
+        wg.wait().await;
 
         // Verify the amount of downloaded data
         assert_eq!(total_downloaded, (range.end - range.start) as usize);
@@ -871,8 +1064,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_adapter_failure() {
-        use crate::runner::RunnerConnectorError;
-
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1024).with_failure(true))
             as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
@@ -897,10 +1088,76 @@ mod tests {
         // Connection should fail because range_stream fails
         assert!(result.is_err());
         match result {
-            Ok(_) => panic!("Expected Connection error, got cons rx"),
-            Err(RunnerConnectorError::Connection { .. }) => {}
+            Ok(_) => panic!("Expected Connection error, got channels"),
+            Err(PendingRunnerError::Connection { .. }) => {}
             Err(e) => panic!("Expected Connection error, got: {:?}", e),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[n0_tracing_test::traced_test]
+    async fn test_create_background_range_runner_reports_connector_spawn_error() {
+        let rt = ThreadedRuntimeImpl::new_other_rt(FailOnSpawnRuntime::new(0));
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(1024).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
+        let range = 0u64..500u64;
+        let runner_id = 8;
+        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let cancel_token = CancellationToken::new();
+        let wg = WaitGroup::new();
+
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            &wg,
+            range,
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token,
+        );
+        let result = receiver.await.expect("receiver closed");
+
+        match result {
+            Err(PendingRunnerError::Spawn { message }) => assert!(!message.is_empty()),
+            other => panic!("expected Spawn error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[n0_tracing_test::traced_test]
+    async fn test_create_background_range_runner_reports_runner_spawn_error() {
+        let rt = ThreadedRuntimeImpl::new_other_rt(FailOnSpawnRuntime::new(1));
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(1024).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
+        let range = 0u64..500u64;
+        let runner_id = 9;
+        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let cancel_token = CancellationToken::new();
+        let wg = WaitGroup::new();
+
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            &wg,
+            range,
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("timed out waiting for spawn error")
+            .expect("receiver closed");
+
+        match result {
+            Err(PendingRunnerError::Spawn { message }) => assert!(!message.is_empty()),
+            other => panic!("expected Spawn error, got: {other:?}"),
+        }
+        wg.wait().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -928,26 +1185,28 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let msg_rx = result.unwrap();
-        wg.wait().await;
+        let output = result.unwrap();
+        let _data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start message
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let msg = lifecycle_rx.next().await.unwrap();
+        assert!(matches!(msg, LifecycleEvent::Started));
 
         // Cancel the task
         cancel_token.cancel();
 
         // Wait for cancellation message
-        while let Some(msg) = msg_rx.next().await {
-            if let RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Failed(e))) = msg
+        while let Some(msg) = lifecycle_rx.next().await {
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg
                 && e.is_cancelled()
             {
-                assert_eq!(id, runner_id);
                 break;
             }
         }
+
+        wg.wait().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -983,27 +1242,37 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let msg_rx = result.unwrap();
-        wg.wait().await;
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start message
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let msg = lifecycle_rx.next().await.unwrap();
+        assert!(matches!(msg, LifecycleEvent::Started));
 
         // Collect downloaded data
         let mut total_downloaded = 0;
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
-                    total_downloaded += bytes.len();
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            total_downloaded += frame.data.len();
+                        }
+                        None => break,
+                    }
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
-                    break;
+                lifecycle = lifecycle_rx.next() => {
+                    if let Some(LifecycleEvent::Stopped(StoppedReason::Finished)) = lifecycle {
+                        break;
+                    }
                 }
-                _ => {}
             }
         }
+
+        wg.wait().await;
 
         // Verify that downloaded amount is the adjusted size
         if total_downloaded != new_total as usize {
@@ -1039,28 +1308,54 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let msg_rx = result.unwrap();
-        wg.wait().await;
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let msg = lifecycle_rx.next().await.unwrap();
+        assert!(matches!(msg, LifecycleEvent::Started));
 
-        // Collect all data
+        // Collect all data - drain data_rx first, then check lifecycle
         let mut downloaded_data = Vec::new();
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
-                    downloaded_data.extend_from_slice(&bytes);
+        let mut data_rx = pin!(data_rx);
+        let mut finished = false;
+        let mut data_done = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                // Prefer data frames over lifecycle events to avoid losing data
+                frame = data_rx.next(), if !data_done => {
+                    match frame {
+                        Some(frame) => {
+                            downloaded_data.extend_from_slice(&frame.data);
+                        }
+                        None => {
+                            data_done = true;
+                            if finished {
+                                break;
+                            }
+                        }
+                    }
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
-                    break;
+                lifecycle = lifecycle_rx.next() => {
+                    match lifecycle {
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            finished = true;
+                            if data_done {
+                                break;
+                            }
+                        }
+                        None => break,
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
 
+        wg.wait().await;
         assert_eq!(downloaded_data.len(), (range.end - range.start) as usize);
     }
 
@@ -1091,21 +1386,24 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let msg_rx = result.unwrap();
+        let output = result.unwrap();
+        let _data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
+
         wg.wait().await;
 
         // Wait for start
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let msg = lifecycle_rx.next().await.unwrap();
+        assert!(matches!(msg, LifecycleEvent::Started));
 
         // Should finish immediately without downloading any data
-        let msg = msg_rx.next().await.unwrap();
+        // Zero-length range may result in Empty error
+        let msg = lifecycle_rx.next().await;
         match msg {
-            RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
-                assert_eq!(id, runner_id);
-            }
-            _ => panic!("Expected immediate finish for zero-length range, got: {msg:?}"),
+            Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {}
+            Some(LifecycleEvent::Stopped(StoppedReason::Failed(e))) if e.is_empty() => {}
+            other => panic!("Expected immediate finish for zero-length range, got: {other:?}"),
         }
     }
 
@@ -1146,40 +1444,60 @@ mod tests {
                     cancel_token,
                 );
                 let result = receiver.await.expect("receiver closed");
-                let msg_rx = result.expect("connection failed");
-                wg.wait().await;
+                let output = result.expect("connection failed");
+                let data_rx = output.data_rx;
+                let lifecycle_rx = output.lifecycle_rx;
 
                 // Keep the control channel sender alive
                 let _control_tx = control_tx;
 
                 // Wait for start
-                let mut msg_rx = pin!(msg_rx);
-                let msg = msg_rx.next().await.unwrap();
-                assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+                let mut lifecycle_rx = pin!(lifecycle_rx);
+                let msg = lifecycle_rx.next().await.unwrap();
+                assert!(matches!(msg, LifecycleEvent::Started));
 
                 // Collect all data
                 let mut downloaded_size = 0;
                 let mut finished = false;
+                let mut data_done = false;
 
-                while let Some(msg) = msg_rx.next().await {
-                    match msg {
-                        RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
-                            downloaded_size += bytes.len();
+                let mut data_rx = pin!(data_rx);
+                loop {
+                    tokio::select! {
+                        biased;
+                        // Prefer data frames to avoid losing data
+                        frame = data_rx.next(), if !data_done => {
+                            match frame {
+                                Some(frame) => {
+                                    downloaded_size += frame.data.len();
+                                }
+                                None => {
+                                    data_done = true;
+                                    if finished {
+                                        break;
+                                    }
+                                }
+                            }
                         }
-                        RunnerMessage(id, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
-                            assert_eq!(id, runner_id);
-                            finished = true;
-                            break;
+                        lifecycle = lifecycle_rx.next() => {
+                            match lifecycle {
+                                Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                                    finished = true;
+                                    if data_done {
+                                        break;
+                                    }
+                                }
+                                Some(LifecycleEvent::Stopped(StoppedReason::Failed(kind))) => {
+                                    panic!("Runner {runner_id} failed with error: {kind:?}");
+                                }
+                                None => break,
+                                _ => {}
+                            }
                         }
-                        RunnerMessage(
-                            id,
-                            RunnerMessageKind::Stopped(StoppedReason::Failed(kind)),
-                        ) => {
-                            panic!("Runner {id} failed with error: {kind:?}");
-                        }
-                        _ => {}
                     }
                 }
+
+                wg.wait().await;
 
                 // Ensure the runner completed correctly
                 if !finished {
@@ -1230,27 +1548,40 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let msg_rx = result.unwrap();
-        wg.wait().await;
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start message
-        let mut msg_rx = pin!(msg_rx);
-        let msg = msg_rx.next().await.unwrap();
-        assert!(matches!(msg, RunnerMessage(_, RunnerMessageKind::Started)));
+        let mut lifecycle_rx = pin!(lifecycle_rx);
+        let msg = lifecycle_rx.next().await.unwrap();
+        assert!(matches!(msg, LifecycleEvent::Started));
 
         // Collect all downloaded data
         let mut downloaded_data = Vec::new();
-        while let Some(msg) = msg_rx.next().await {
-            match msg {
-                RunnerMessage(_, RunnerMessageKind::Downloaded(bytes)) => {
-                    downloaded_data.extend_from_slice(&bytes);
+        let mut data_rx = pin!(data_rx);
+        loop {
+            tokio::select! {
+                frame = data_rx.next() => {
+                    match frame {
+                        Some(frame) => {
+                            downloaded_data.extend_from_slice(&frame.data);
+                        }
+                        None => break,
+                    }
                 }
-                RunnerMessage(_, RunnerMessageKind::Stopped(StoppedReason::Finished)) => {
-                    break;
+                lifecycle = lifecycle_rx.next() => {
+                    match lifecycle {
+                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
+
+        wg.wait().await;
 
         // Use the same adapter to directly get data from the same range for comparison
         let reference_adapter = SimpleTestAdapter::new(5000).with_range_support(true);

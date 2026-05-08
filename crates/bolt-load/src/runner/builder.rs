@@ -3,9 +3,10 @@ use bolt_load_core::adapter::AnyBytesStream;
 use smol_cancellation_token::CancellationToken;
 
 use super::{
-    ControlSignalReceiver, RunnerMessage, RunnerMessageConsumer, RunnerMessageSender, TaskRunner,
+    ControlSignalReceiver, DATA_DRAIN_TIMEOUT, DATA_FRAME_CHANNEL_CAPACITY, DataFrame,
+    DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver, TaskRunner,
 };
-use crate::{DEFAULT_EVENT_CHANNEL_CAPACITY, task::RunnerId};
+use crate::task::RunnerId;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum TaskRunnerBuilderError {
@@ -32,6 +33,8 @@ pub struct TaskRunnerBuilder {
     pub control_signal: Option<ControlSignalReceiver>,
     /// the cancel token of the task
     pub cancel_token: Option<CancellationToken>,
+    /// optional override for tests that need to exercise drain timeout paths quickly
+    pub data_drain_timeout: Option<std::time::Duration>,
 }
 
 impl TaskRunnerBuilder {
@@ -65,14 +68,26 @@ impl TaskRunnerBuilder {
         self
     }
 
-    /// Build the task runner and return the runner and the message consumer
-    pub fn build(self) -> Result<(TaskRunner, RunnerMessageConsumer), TaskRunnerBuilderError> {
+    #[cfg(test)]
+    pub fn data_drain_timeout(mut self, data_drain_timeout: std::time::Duration) -> Self {
+        self.data_drain_timeout = Some(data_drain_timeout);
+        self
+    }
+
+    /// Build the task runner and return the runner, lifecycle receiver, and data receiver
+    pub fn build(
+        self,
+    ) -> Result<(TaskRunner, LifecycleReceiver, DataFrameReceiver), TaskRunnerBuilderError> {
         let runner_id = self
             .runner_id
             .ok_or(TaskRunnerBuilderError::RunnerIdNotSet)?;
-        let rb = AsyncHeapRb::<RunnerMessage>::new(DEFAULT_EVENT_CHANNEL_CAPACITY);
-        let (prod, cons) = rb.split();
+        let lifecycle_rb = AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY);
+        let data_rb = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY);
+
+        let (lifecycle_prod, lifecycle_cons) = lifecycle_rb.split();
+        let (data_prod, data_cons) = data_rb.split();
         let runner = TaskRunner {
+            id: runner_id,
             total: self.total,
             downloaded: 0,
             stream: self.stream.ok_or(TaskRunnerBuilderError::StreamNotSet)?,
@@ -80,12 +95,14 @@ impl TaskRunnerBuilder {
             control_signal: self
                 .control_signal
                 .ok_or(TaskRunnerBuilderError::ControlSignalNotSet)?,
-            notify: RunnerMessageSender::new(runner_id, prod),
+            lifecycle_tx: lifecycle_prod,
+            data_tx: Some(data_prod),
+            data_drain_timeout: self.data_drain_timeout.unwrap_or(DATA_DRAIN_TIMEOUT),
             cancel_token: self
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
             shutdown_rx: None,
         };
-        Ok((runner, cons))
+        Ok((runner, lifecycle_cons, data_cons))
     }
 }

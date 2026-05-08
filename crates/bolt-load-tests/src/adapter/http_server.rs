@@ -131,13 +131,17 @@ mod tests {
         }
     }
 
+    fn local_client() -> Result<Client> {
+        Ok(Client::builder().no_proxy().build()?)
+    }
+
     #[tokio::test]
     #[n0_tracing_test::traced_test]
     async fn server_starts_and_serves_full_content() -> Result<()> {
         let (port, handle) = create_http_server().await?;
         let _guard = ServerGuard(handle);
 
-        let client = Client::new();
+        let client = local_client()?;
         let resp = client
             .get(format!("http://127.0.0.1:{port}/no_range"))
             .send()
@@ -163,7 +167,7 @@ mod tests {
         let (port, handle) = create_http_server().await?;
         let _guard = ServerGuard(handle);
 
-        let client = Client::new();
+        let client = local_client()?;
         let resp = client
             .get(format!("http://127.0.0.1:{port}/range"))
             .header(RANGE, "bytes=0-99")
@@ -194,7 +198,7 @@ mod tests {
         let (port, handle) = create_http_server().await?;
         let _guard = ServerGuard(handle);
 
-        let client = Client::new();
+        let client = local_client()?;
         let resp = client
             .get(format!("http://127.0.0.1:{port}/no_range"))
             .header(RANGE, "bytes=0-99")

@@ -324,6 +324,10 @@ mod test {
 
     use super::*;
 
+    fn local_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
     #[tokio::test]
     async fn test_get_content_size() {
         let content_size: u64 = 1024 * 1024;
@@ -331,7 +335,7 @@ mod test {
             .await
             .unwrap();
         let url = Url::parse(&format!("http://localhost:{port}/no_range")).unwrap();
-        let client = reqwest::Client::new();
+        let client = local_client();
         let adapter = client
             .clone()
             .into_reqwest_adapter((reqwest::Method::GET, url));
@@ -352,7 +356,7 @@ mod test {
     async fn test_suggest_filename() {
         let (port, _) = http_server::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{port}/no_range")).unwrap();
-        let client = reqwest::Client::new();
+        let client = local_client();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
         assert_eq!(
             adapter.retrieve_meta().await.unwrap().filename,
@@ -364,7 +368,7 @@ mod test {
     async fn test_is_range_stream_available() {
         let (port, _) = http_server::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{port}/range")).unwrap();
-        let client = reqwest::Client::new();
+        let client = local_client();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
         assert!(
             adapter.is_range_stream_available().await,
@@ -372,7 +376,7 @@ mod test {
         );
 
         let url = Url::parse(&format!("http://localhost:{port}/no_range")).unwrap();
-        let client = reqwest::Client::new();
+        let client = local_client();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
         assert!(
             !adapter.is_range_stream_available().await,
@@ -387,7 +391,7 @@ mod test {
             .await
             .unwrap();
         let url = Url::parse(&format!("http://localhost:{port}/no_range")).unwrap();
-        let client = reqwest::Client::new();
+        let client = local_client();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
         let mut stream = adapter.full_stream().await.unwrap();
         let mut bytes = bytes::BytesMut::new();
@@ -401,7 +405,7 @@ mod test {
     async fn test_range_stream() {
         let (port, _) = http_server::create_http_server().await.unwrap();
         let url = Url::parse(&format!("http://localhost:{port}/range")).unwrap();
-        let client = reqwest::Client::new();
+        let client = local_client();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
         let mut stream = adapter.range_stream(0, 100).await.unwrap();
         let mut bytes = bytes::BytesMut::new();
