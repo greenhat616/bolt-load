@@ -226,12 +226,12 @@ impl RunnerOutcomeSampler {
     /// Used to trigger immediate degradation
     pub fn has_recent_unretryable(&mut self, within: Duration) -> bool {
         let now = Instant::now();
-        if let Some(last) = self.last_unretryable_at {
-            if now.duration_since(last) <= within {
-                // 清除标记，避免重复触发
-                self.last_unretryable_at = None;
-                return true;
-            }
+        if let Some(last) = self.last_unretryable_at
+            && now.duration_since(last) <= within
+        {
+            // 清除标记，避免重复触发
+            self.last_unretryable_at = None;
+            return true;
         }
         false
     }

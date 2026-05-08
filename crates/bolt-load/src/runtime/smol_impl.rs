@@ -130,6 +130,12 @@ impl TimerBuilder for SmolLocalRuntime {
     }
 }
 
+impl Default for SmolLocalRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SmolLocalRuntime {
     pub fn new() -> Self {
         Self {

@@ -94,6 +94,7 @@ where
     fn finalize(self) -> impl Future<Output = Result<(), FileWriterError>> + Send;
 }
 
+#[allow(dead_code)]
 trait FileWriterCapability {
     fn is_supported(_file_size: u64) -> bool {
         true

@@ -1,3 +1,4 @@
+#![doc = include_str!("../../docs/runner.md")]
 use std::cmp::Ordering;
 
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, traits::*};
@@ -624,23 +625,22 @@ impl TaskRunner {
 
                             buff.extend_from_slice(&item[offset..offset + take]);
                             let next_offset = offset + take;
-                            if let Some(total) = self.total {
-                                if self.downloaded + buff.len() as u64 >= total {
-                                    let Some(flush) = self.flush_buff(&mut buff)? else {
-                                        break Err(TaskError::Other {
-                                            message: "buffer unexpectedly empty after continuing \
-                                                      item"
-                                                .to_string(),
-                                        }
-                                        .into());
-                                    };
-                                    pending_state = Some(PendingFlushState {
-                                        future: flush.future,
-                                        flushed_bytes: flush.flushed_bytes,
-                                        post_action: PendingPostAction::FinishSuccess,
-                                    });
-                                    continue;
-                                }
+                            if let Some(total) = self.total
+                                && self.downloaded + buff.len() as u64 >= total
+                            {
+                                let Some(flush) = self.flush_buff(&mut buff)? else {
+                                    break Err(TaskError::Other {
+                                        message: "buffer unexpectedly empty after continuing item"
+                                            .to_string(),
+                                    }
+                                    .into());
+                                };
+                                pending_state = Some(PendingFlushState {
+                                    future: flush.future,
+                                    flushed_bytes: flush.flushed_bytes,
+                                    post_action: PendingPostAction::FinishSuccess,
+                                });
+                                continue;
                             }
 
                             if next_offset < item.len() && take < writable {
@@ -1048,12 +1048,10 @@ mod tests {
         let data_rx = data_rx;
 
         timeout(Duration::from_secs(2), async {
-            loop {
-                match lifecycle_rx.next().await {
-                    Some(LifecycleEvent::Started) => break,
-                    Some(other) => panic!("unexpected lifecycle event before start: {other:?}"),
-                    None => panic!("lifecycle channel closed before start"),
-                }
+            match lifecycle_rx.next().await {
+                Some(LifecycleEvent::Started) => {}
+                Some(other) => panic!("unexpected lifecycle event before start: {other:?}"),
+                None => panic!("lifecycle channel closed before start"),
             }
         })
         .await
@@ -1206,12 +1204,10 @@ mod tests {
         let data_rx = data_rx;
 
         timeout(Duration::from_secs(2), async {
-            loop {
-                match lifecycle_rx.next().await {
-                    Some(LifecycleEvent::Started) => break,
-                    Some(other) => panic!("unexpected lifecycle event before start: {other:?}"),
-                    None => panic!("lifecycle channel closed before start"),
-                }
+            match lifecycle_rx.next().await {
+                Some(LifecycleEvent::Started) => {}
+                Some(other) => panic!("unexpected lifecycle event before start: {other:?}"),
+                None => panic!("lifecycle channel closed before start"),
             }
         })
         .await
@@ -1226,12 +1222,7 @@ mod tests {
         .expect("timed out waiting for flushed data");
 
         let stopped_before_drain = timeout(Duration::from_millis(100), async {
-            loop {
-                match lifecycle_rx.next().await {
-                    Some(LifecycleEvent::Started) => {}
-                    Some(LifecycleEvent::Stopped(_)) | None => break,
-                }
-            }
+            while let Some(LifecycleEvent::Started) = lifecycle_rx.next().await {}
         })
         .await;
         assert!(
@@ -1306,11 +1297,11 @@ mod tests {
         let mut lifecycle_rx = pin!(lifecycle_rx);
         while let Some(msg) = lifecycle_rx.next().await {
             error!("msg: {msg:?}");
-            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
-                if e.is_empty() {
-                    got_empty_error = true;
-                    break;
-                }
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg
+                && e.is_empty()
+            {
+                got_empty_error = true;
+                break;
             }
         }
 
@@ -1705,11 +1696,11 @@ mod tests {
 
         let mut got_channel_closed = false;
         while let Some(msg) = lifecycle_rx.next().await {
-            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
-                if matches!(e, TaskError::ChannelClosed) {
-                    got_channel_closed = true;
-                    break;
-                }
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg
+                && matches!(e, TaskError::ChannelClosed)
+            {
+                got_channel_closed = true;
+                break;
             }
         }
 
@@ -1818,11 +1809,11 @@ mod tests {
         let mut lifecycle_rx = pin!(lifecycle_rx);
         let mut got_stream_error = false;
         while let Some(msg) = lifecycle_rx.next().await {
-            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg {
-                if e.is_stream_error() {
-                    got_stream_error = true;
-                    break;
-                }
+            if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg
+                && e.is_stream_error()
+            {
+                got_stream_error = true;
+                break;
             }
         }
 
@@ -1939,7 +1930,6 @@ mod tests {
                             None => {
                                 runner1_finished = true;
                             }
-                            _ => {}
                         }
                     }
                     frame = data_rx1.next(), if !data1_done => {
@@ -1972,7 +1962,6 @@ mod tests {
                             None => {
                                 runner2_finished = true;
                             }
-                            _ => {}
                         }
                     }
                     frame = data_rx2.next(), if !data2_done => {
@@ -1995,7 +1984,6 @@ mod tests {
                             None => {
                                 runner3_finished = true;
                             }
-                            _ => {}
                         }
                     }
                     frame = data_rx3.next(), if !data3_done => {

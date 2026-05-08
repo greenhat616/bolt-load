@@ -150,7 +150,7 @@ impl FileRangeWriter for SlowWriter {
         .await
     }
 
-    async fn finalize(mut self) -> Result<(), FileWriterError> {
+    async fn finalize(self) -> Result<(), FileWriterError> {
         self.inject_delay(0).await;
 
         let path = self.path.clone();

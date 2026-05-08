@@ -347,10 +347,8 @@ async fn test_task_basic_lifecycle() {
             match std::fs::read_dir(parent) {
                 Ok(entries) => {
                     info!("Directory contents:");
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            info!("  - {:?}", entry.path());
-                        }
+                    for entry in entries.flatten() {
+                        info!("  - {:?}", entry.path());
                     }
                 }
                 Err(e) => info!("Failed to read directory: {:?}", e),

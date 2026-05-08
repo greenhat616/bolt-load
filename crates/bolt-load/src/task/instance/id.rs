@@ -98,6 +98,7 @@ impl Generator {
     /// * `true` - If the ID is allocated
     /// * `false` - If the ID is free or invalid
     #[inline]
+    #[allow(dead_code)]
     pub fn is_allocated(&self, id: usize) -> bool {
         id < self.bitvec.len() && self.bitvec[id]
     }
@@ -110,6 +111,7 @@ impl Generator {
 
     /// Get the total capacity
     #[inline]
+    #[allow(dead_code)]
     pub fn capacity(&self) -> usize {
         self.bitvec.len()
     }
@@ -127,6 +129,7 @@ impl Generator {
     }
 
     /// Reset the generator, releasing all allocated IDs
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.bitvec.fill(false);
         self.next_free_hint = 0;

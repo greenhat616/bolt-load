@@ -16,6 +16,7 @@ pub enum DownloadSource {
 // TODO: we should implement a life cycle for the client, and provide a client handle to task manager
 /// BotLoaderGlobalConfiguration
 #[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
 pub struct BoltLoadConfiguration {
     prefer_download_mode: DownloadMode,
 }
@@ -23,6 +24,7 @@ pub struct BoltLoadConfiguration {
 type TaskId = u64;
 // The main client
 #[non_exhaustive]
+#[allow(dead_code)]
 pub struct BoltLoad {
     // TODO: use a enum to represent the manager or channel
     // TODO: rethink how to share the state of the task manager, when we impl the persistent
@@ -31,6 +33,7 @@ pub struct BoltLoad {
 }
 
 /// a handle to access client context from sub modules
+#[allow(dead_code)]
 pub(crate) struct BoltLoadHandle {}
 
 impl BoltLoad {}

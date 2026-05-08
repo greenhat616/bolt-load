@@ -39,6 +39,7 @@ pub fn failed_receiver(error: PendingRunnerError) -> PendingRunnerReceiver {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PendingRunnerContext {
     pub runner_id: RunnerId,
     pub range: Range<u64>,

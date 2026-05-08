@@ -79,16 +79,13 @@ impl TaskBuilder {
         let adapter = self.adapter.as_ref().unwrap();
         let meta = try_get_or_init_meta(&self.meta, adapter).await?;
 
-        if self.save_path.is_none() {
-            if let Some(ref filename) = meta.filename {
-                if let Some(ref save_dir) = self.save_dir {
-                    self.save_path = Some(save_dir.join(filename));
-                } else {
-                    warn!(
-                        "save dir is not set, the retrieved filename will not be automatically \
-                         set."
-                    );
-                }
+        if self.save_path.is_none()
+            && let Some(ref filename) = meta.filename
+        {
+            if let Some(ref save_dir) = self.save_dir {
+                self.save_path = Some(save_dir.join(filename));
+            } else {
+                warn!("save dir is not set, the retrieved filename will not be automatically set.");
             }
         }
 

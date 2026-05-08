@@ -178,10 +178,10 @@ impl ChunkPlanner {
         }
 
         // Check max chunk count
-        if let Some(max) = self.max_chunk_count {
-            if self.get_chunks_count() >= max.get() {
-                return false;
-            }
+        if let Some(max) = self.max_chunk_count
+            && self.get_chunks_count() >= max.get()
+        {
+            return false;
         }
 
         let generic_range = GenericRange::from(range.clone());

@@ -253,6 +253,7 @@ impl ConcurrencyControlStrategy {
     }
 
     /// Get the current state
+    #[allow(dead_code)]
     pub fn current_state(&self) -> &str {
         match self.state {
             StrategyState::Normal => "normal",

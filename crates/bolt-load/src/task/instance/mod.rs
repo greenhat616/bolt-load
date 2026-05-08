@@ -21,13 +21,16 @@ mod tests;
 #[cfg(test)]
 mod integration_test;
 
+#[allow(ambiguous_glob_reexports)]
 pub use concurrent_task::*;
 use id::Generator;
+#[allow(ambiguous_glob_reexports)]
 pub use singleton_task::*;
 
 /// The default capacity of the control channel
 ///
 /// It is used to control the task runner
+#[allow(dead_code)]
 const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone)]

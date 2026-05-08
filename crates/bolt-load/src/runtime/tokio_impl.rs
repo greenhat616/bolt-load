@@ -26,6 +26,12 @@ tokio::task_local! {
     static IN_TOKIO_LOCAL_CONTEXT: bool;
 }
 
+impl Default for LocalTokioRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalTokioRuntime {
     /// Create a local runtime from a current thread.
     pub fn new() -> Self {

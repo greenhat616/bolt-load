@@ -1,3 +1,4 @@
+#![doc = include_str!("../../docs/runtime.md")]
 #![allow(dead_code)]
 use std::{rc::Rc, sync::Arc};
 

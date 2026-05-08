@@ -118,6 +118,7 @@ impl BoltLoadAdapter for MockAdapter {
 }
 
 // Test helper functions
+#[allow(unreachable_code)]
 fn create_test_runtime() -> ThreadedRuntimeImpl {
     #[cfg(feature = "tokio")]
     {
@@ -222,9 +223,10 @@ async fn test_concurrent_task_basic_download() {
 
     // Concurrent task might succeed or fail depending on implementation
     // Just verify that if it succeeds, the file content is correct
-    if task_result.is_ok() && events_result.is_ok() {
-        eprintln!("events: {events_result:?}");
-        let events = events_result.unwrap();
+    if task_result.is_ok()
+        && let Ok(events) = events_result
+    {
+        eprintln!("events: {events:?}");
         assert!(!events.is_empty());
         assert!(matches!(events[0], TaskEvent::Initializing));
 

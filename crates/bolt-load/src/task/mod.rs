@@ -1,3 +1,4 @@
+#![doc = include_str!("../../docs/task.md")]
 use std::{
     fmt::Debug,
     ops::Range,
@@ -114,8 +115,10 @@ pub enum TaskCommand {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct TaskStateControl(Option<(TaskState, async_channel::Sender<TaskState>)>);
 
+#[allow(dead_code)]
 impl TaskStateControl {
     pub fn new(state: TaskState, sender: Sender<TaskState>) -> Self {
         Self(Some((state, sender)))
@@ -136,6 +139,7 @@ impl TaskStateControl {
 
 #[non_exhaustive]
 #[derive(derive_more::Debug)]
+#[allow(dead_code)]
 pub struct Task {
     /// the async runtime passed from the client
     #[debug(ignore)]

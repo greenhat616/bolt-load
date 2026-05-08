@@ -5,9 +5,7 @@ use bolt_load::{
     runtime::ThreadedRuntimeImpl,
     task::{DownloadMode, TaskBuilder},
 };
-use bolt_load_tests::adapter::simple::{
-    SimpleTestAdapter, SimpleTestAdapterBuilder, calculate_blake3,
-};
+use bolt_load_tests::adapter::simple::{SimpleTestAdapterBuilder, calculate_blake3};
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
@@ -22,9 +20,7 @@ use opentelemetry_semantic_conventions::{
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 use tracing::{level_filters::LevelFilter, *};
-use tracing_subscriber::{
-    EnvFilter, Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 // Create a Resource that captures information about the entity for which telemetry is recorded.
 fn resource() -> Resource {
@@ -118,8 +114,8 @@ pub async fn init_telemetry() -> OtelGuard {
 }
 
 pub async fn init_tracing(opentelemetry_ptr: &mut *mut OtelGuard) {
-    let current_crate = env!("CARGO_CRATE_NAME");
-    let has_arg_spans = std::env::args().any(|arg| arg == "--spans");
+    let _current_crate = env!("CARGO_CRATE_NAME");
+    let _has_arg_spans = std::env::args().any(|arg| arg == "--spans");
     let has_arg_opentelemetry = std::env::args().any(|arg| arg == "--opentelemetry");
 
     // let fmt_layer = tracing_subscriber::fmt::layer().with_level(true);

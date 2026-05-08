@@ -47,8 +47,10 @@ use strategy::*;
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
 
 /// Default capacity for control channels
+#[allow(dead_code)]
 const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
 
+#[allow(dead_code)]
 pub struct ConcurrentTask {
     threaded_rt: ThreadedRuntimeImpl,
     local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
@@ -170,6 +172,7 @@ pub enum Event {
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[allow(dead_code)]
 enum RunnerStatus {
     Running,
     Finished,
@@ -1571,11 +1574,8 @@ mod tests {
                     }
                 }
                 lifecycle = lifecycle_rx.next() => {
-                    match lifecycle {
-                        Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {
-                            break;
-                        }
-                        _ => {}
+                    if let Some(LifecycleEvent::Stopped(StoppedReason::Finished)) = lifecycle {
+                        break;
                     }
                 }
             }

@@ -318,10 +318,10 @@ where
 
     /// If a slot has opened and we have a buffered write, dispatch it.
     fn try_flush_pending(&mut self) {
-        if !self.is_full() {
-            if let Some(pw) = self.pending_write.take() {
-                self.dispatch_write(pw.range, pw.bytes);
-            }
+        if !self.is_full()
+            && let Some(pw) = self.pending_write.take()
+        {
+            self.dispatch_write(pw.range, pw.bytes);
         }
     }
 

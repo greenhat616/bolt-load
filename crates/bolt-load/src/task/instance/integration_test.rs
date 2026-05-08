@@ -202,7 +202,7 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_task_cancellation() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
-        let content_hash = simple_adapter.expected_hash().to_string();
+        let _content_hash = simple_adapter.expected_hash().to_string();
         let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
 
         let temp_dir = TempDir::new().unwrap();

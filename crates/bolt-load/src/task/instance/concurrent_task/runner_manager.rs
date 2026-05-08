@@ -129,6 +129,7 @@ pub enum TaskState {
     /// The task is downloading
     Downloading,
     /// No runner is allocated or running
+    #[allow(dead_code)]
     Paused,
     /// The task is finished
     Finished,
@@ -246,12 +247,14 @@ impl RunnerManager {
     // ==================== Runner Notification Related Methods ====================
 
     /// Registers a lifecycle receiver for a runner
+    #[allow(dead_code)]
     fn register_lifecycle(&mut self, runner_id: RunnerId, receiver: LifecycleReceiver) {
         self.lifecycle_aggregator.add(runner_id, receiver);
     }
 
     /// Registers a data receiver for a runner
     /// Called when the runner is successfully created
+    #[allow(dead_code)]
     fn register_data(&mut self, runner_id: RunnerId, receiver: DataFrameReceiver) {
         self.data_aggregator.register(runner_id, receiver);
     }
@@ -600,6 +603,7 @@ impl RunnerManager {
         }
     }
 
+    #[allow(private_interfaces)]
     pub async fn tick(&mut self, meters: &mut HashMap<RunnerId, usize>) -> RunnerTick {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
         let next_data = self.data_aggregator.next().fuse();
@@ -654,6 +658,7 @@ impl RunnerManager {
         RunnerTick::downloading()
     }
 
+    #[allow(private_interfaces)]
     pub async fn tick_lifecycle_only(
         &mut self,
         meters: &mut HashMap<RunnerId, usize>,

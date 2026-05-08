@@ -73,7 +73,7 @@ impl SpeedSampler {
 
 #[cfg(test)]
 mod test {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use bolt_load_tests::adapter::simple::SimpleTestAdapterBuilder;
     use bolt_load_utils::telemetry::*;

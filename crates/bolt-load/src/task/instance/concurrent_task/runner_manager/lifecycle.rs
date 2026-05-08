@@ -67,28 +67,33 @@ impl LifecycleAggregator {
     }
 
     /// Check if the aggregator is closed.
+    #[allow(dead_code)]
     pub fn is_closed(&self) -> bool {
         self.is_closed
     }
 
     /// Close the aggregator, signaling no more events will be received.
+    #[allow(dead_code)]
     pub fn close(&mut self) {
         self.is_closed = true;
         self.waker.wake();
     }
 
     /// Reopen the aggregator for receiving events.
+    #[allow(dead_code)]
     pub fn reopen(&mut self) {
         self.is_closed = false;
         self.waker.wake();
     }
 
     /// Get the number of runners being tracked.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
     /// Check if there are no runners being tracked.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

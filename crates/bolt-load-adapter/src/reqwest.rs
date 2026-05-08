@@ -165,7 +165,7 @@ impl ReqwestAdapter {
             _ => {
                 let content_length: Option<u64> = response
                     .content_length()
-                    .and_then(|len| if len > 0 { Some(len) } else { None })
+                    .filter(|&len| len > 0)
                     // fallback to just parse the CONTENT_LENGTH header
                     .or_else(|| {
                         response
