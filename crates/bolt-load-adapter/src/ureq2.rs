@@ -46,13 +46,14 @@ impl IntoUreqAdapter for ureq2::Agent {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-#[repr(transparent)]
-pub struct UreqError(#[from] ureq2::Error);
+#[derive(Debug, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct UreqError {
+    source: ureq2::Error,
+}
 
 impl From<UreqError> for AdapterError {
-    fn from(UreqError(e): UreqError) -> Self {
+    fn from(UreqError { source: e }: UreqError) -> Self {
         match e {
             ureq2::Error::Transport(_) => RetryableError::Io {
                 source: Arc::new(std::io::Error::new(

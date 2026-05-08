@@ -82,13 +82,13 @@ pub type ControlSender = Sender<ControlEvent>;
 pub type ControlReceiver = Receiver<ControlEvent>;
 
 /// Errors that may occur when sending messages
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, snafu::Snafu)]
 pub enum SendError {
-    #[error("Runner {0} not found")]
-    RunnerNotFound(RunnerId),
-    #[error("Control channel is full")]
+    #[snafu(display("Runner {runner_id} not found"))]
+    RunnerNotFound { runner_id: RunnerId },
+    #[snafu(display("Control channel is full"))]
     ChannelFull,
-    #[error("Control channel is closed")]
+    #[snafu(display("Control channel is closed"))]
     ChannelClosed,
 }
 
@@ -102,7 +102,7 @@ impl ManagerControlMapExt for HashMap<RunnerId, ControlSender> {
             tx.try_send(message)?;
             Ok(())
         } else {
-            Err(SendError::RunnerNotFound(runner_id))
+            Err(SendError::RunnerNotFound { runner_id })
         }
     }
 }
@@ -762,7 +762,10 @@ mod tests {
 
         // Send message to non-existent runner
         let result = manager.send_message(999, ControlEvent::LimitTotal(500));
-        assert!(matches!(result, Err(SendError::RunnerNotFound(999))));
+        assert!(matches!(
+            result,
+            Err(SendError::RunnerNotFound { runner_id: 999 })
+        ));
     }
 
     #[test]

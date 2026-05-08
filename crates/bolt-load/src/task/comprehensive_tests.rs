@@ -95,7 +95,7 @@ async fn test_task_builder_validation_errors() {
 
     assert!(matches!(
         result,
-        Err(TaskManagerBuildError::FieldValidationFailed(_))
+        Err(TaskManagerBuildError::FieldValidationFailed { .. })
     ));
 
     // Test missing save path
@@ -108,7 +108,7 @@ async fn test_task_builder_validation_errors() {
 
     assert!(matches!(
         result,
-        Err(TaskManagerBuildError::FieldValidationFailed(_))
+        Err(TaskManagerBuildError::FieldValidationFailed { .. })
     ));
 
     // Test missing cancel token
@@ -121,7 +121,7 @@ async fn test_task_builder_validation_errors() {
 
     assert!(matches!(
         result,
-        Err(TaskManagerBuildError::FieldValidationFailed(_))
+        Err(TaskManagerBuildError::FieldValidationFailed { .. })
     ));
 
     // Test invalid save path (parent directory does not exist)
@@ -135,7 +135,7 @@ async fn test_task_builder_validation_errors() {
 
     assert!(matches!(
         result,
-        Err(TaskManagerBuildError::FieldValidationFailed(_))
+        Err(TaskManagerBuildError::FieldValidationFailed { .. })
     ));
 
     // Test invalid save path (parent directory is not a directory)
@@ -150,7 +150,7 @@ async fn test_task_builder_validation_errors() {
         .await;
     assert!(matches!(
         result,
-        Err(TaskManagerBuildError::FieldValidationFailed(_))
+        Err(TaskManagerBuildError::FieldValidationFailed { .. })
     ));
 
     // Test invalid save path (write a directory)
@@ -164,7 +164,7 @@ async fn test_task_builder_validation_errors() {
 
     assert!(matches!(
         result,
-        Err(TaskManagerBuildError::FieldValidationFailed(_))
+        Err(TaskManagerBuildError::FieldValidationFailed { .. })
     ));
 
     info!("✓ TaskBuilder validation errors test passed");

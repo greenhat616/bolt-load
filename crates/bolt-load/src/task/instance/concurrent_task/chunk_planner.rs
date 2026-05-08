@@ -42,14 +42,14 @@ impl ChunkStatus {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, snafu::Snafu)]
 pub enum Error {
-    #[error("Runner {0} not found")]
-    RunnerNotFound(RunnerId),
-    #[error("Chunk for runner {0} not found")]
-    ChunkNotFound(RunnerId),
-    #[error("Invalid split position: {0}")]
-    InvalidSplitPosition(u64),
+    #[snafu(display("Runner {runner_id} not found"))]
+    RunnerNotFound { runner_id: RunnerId },
+    #[snafu(display("Chunk for runner {runner_id} not found"))]
+    ChunkNotFound { runner_id: RunnerId },
+    #[snafu(display("Invalid split position: {position}"))]
+    InvalidSplitPosition { position: u64 },
 }
 
 impl ChunkState {
@@ -238,7 +238,7 @@ impl ChunkPlanner {
         let range = self
             .runner_to_chunk
             .get(&runner_id)
-            .ok_or(Error::RunnerNotFound(runner_id))?;
+            .ok_or(Error::RunnerNotFound { runner_id })?;
 
         if let Some(chunk) = self.chunks.get_mut(range) {
             debug_assert!(
@@ -248,7 +248,7 @@ impl ChunkPlanner {
             chunk.status = ChunkStatus::Running;
             Ok(())
         } else {
-            Err(Error::ChunkNotFound(runner_id))
+            Err(Error::ChunkNotFound { runner_id })
         }
     }
 
@@ -257,13 +257,13 @@ impl ChunkPlanner {
         let range = self
             .runner_to_chunk
             .remove(&runner_id)
-            .ok_or(Error::RunnerNotFound(runner_id))?;
+            .ok_or(Error::RunnerNotFound { runner_id })?;
 
         if let Some(chunk) = self.chunks.get_mut(&range) {
             chunk.status = ChunkStatus::Finished;
             Ok(())
         } else {
-            Err(Error::ChunkNotFound(runner_id))
+            Err(Error::ChunkNotFound { runner_id })
         }
     }
 
@@ -272,7 +272,7 @@ impl ChunkPlanner {
         let range = self
             .runner_to_chunk
             .remove(&runner_id)
-            .ok_or(Error::RunnerNotFound(runner_id))?;
+            .ok_or(Error::RunnerNotFound { runner_id })?;
 
         if let Some(mut chunk) = self.chunks.remove(&range) {
             // Return the unfinished portion
@@ -294,7 +294,7 @@ impl ChunkPlanner {
                 Ok(unfinished)
             }
         } else {
-            Err(Error::ChunkNotFound(runner_id))
+            Err(Error::ChunkNotFound { runner_id })
         }
     }
 
@@ -308,18 +308,20 @@ impl ChunkPlanner {
         let range = self
             .runner_to_chunk
             .remove(&runner_id)
-            .ok_or(Error::RunnerNotFound(runner_id))?;
+            .ok_or(Error::RunnerNotFound { runner_id })?;
 
         let chunk = self
             .chunks
             .remove(&range)
-            .ok_or(Error::ChunkNotFound(runner_id))?;
+            .ok_or(Error::ChunkNotFound { runner_id })?;
 
         // Validate split position
         if split_pos <= chunk.downloaded.end || split_pos >= chunk.allocated.end {
             self.chunks.insert(range, chunk);
             self.runner_to_chunk.insert(runner_id, range);
-            return Err(Error::InvalidSplitPosition(split_pos));
+            return Err(Error::InvalidSplitPosition {
+                position: split_pos,
+            });
         }
 
         // Create two new chunks
@@ -482,11 +484,11 @@ impl ChunkPlanner {
         let chunk = self
             .runner_to_chunk
             .remove(&runner_id)
-            .ok_or(Error::RunnerNotFound(runner_id))?;
+            .ok_or(Error::RunnerNotFound { runner_id })?;
         let mut state = self
             .chunks
             .remove(&chunk)
-            .ok_or(Error::ChunkNotFound(runner_id))?;
+            .ok_or(Error::ChunkNotFound { runner_id })?;
         let downloaded_size = state.downloaded.end - state.downloaded.start;
         state.allocated.end = state.downloaded.end + new_size;
         let new_chunk = GenericRange::from(state.allocated.clone());
@@ -852,14 +854,14 @@ mod tests {
         // Try to mark non-existent runner as finished
         assert!(matches!(
             planner.mark_finished(99),
-            Err(Error::RunnerNotFound(99))
+            Err(Error::RunnerNotFound { runner_id: 99 })
         ));
 
         // Allocate a chunk then try to mark another runner
         assert!(planner.allocate_chunk(0..100, Some(1)));
         assert!(matches!(
             planner.mark_finished(2),
-            Err(Error::RunnerNotFound(2))
+            Err(Error::RunnerNotFound { runner_id: 2 })
         ));
     }
 
@@ -870,7 +872,7 @@ mod tests {
         // Try to mark non-existent runner as failed
         assert!(matches!(
             planner.mark_failed(99),
-            Err(Error::RunnerNotFound(99))
+            Err(Error::RunnerNotFound { runner_id: 99 })
         ));
     }
 
@@ -881,7 +883,7 @@ mod tests {
         // Try to split non-existent chunk
         assert!(matches!(
             planner.split_chunk(99, 500, 2),
-            Err(Error::RunnerNotFound(99))
+            Err(Error::RunnerNotFound { runner_id: 99 })
         ));
 
         // Allocate chunk and partially download
@@ -891,19 +893,19 @@ mod tests {
         // Invalid split positions
         assert!(matches!(
             planner.split_chunk(1, 200, 2),
-            Err(Error::InvalidSplitPosition(200))
+            Err(Error::InvalidSplitPosition { position: 200 })
         )); // Within downloaded range
         assert!(matches!(
             planner.split_chunk(1, 150, 2),
-            Err(Error::InvalidSplitPosition(150))
+            Err(Error::InvalidSplitPosition { position: 150 })
         )); // Within downloaded range
         assert!(matches!(
             planner.split_chunk(1, 500, 2),
-            Err(Error::InvalidSplitPosition(500))
+            Err(Error::InvalidSplitPosition { position: 500 })
         )); // On chunk boundary
         assert!(matches!(
             planner.split_chunk(1, 600, 2),
-            Err(Error::InvalidSplitPosition(600))
+            Err(Error::InvalidSplitPosition { position: 600 })
         )); // Beyond chunk range
     }
 
@@ -914,7 +916,7 @@ mod tests {
         // Try to resize non-existent runner
         assert!(matches!(
             planner.resize_runner_state(99, 100),
-            Err(Error::RunnerNotFound(99))
+            Err(Error::RunnerNotFound { runner_id: 99 })
         ));
 
         // Allocate chunk and test resizing

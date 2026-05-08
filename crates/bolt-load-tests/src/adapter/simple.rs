@@ -97,8 +97,8 @@ impl Default for SimpleTestAdapterBuilder {
 }
 
 /// Build error type for SimpleTestAdapterBuilder
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("content size is not set")]
+#[derive(Debug, Clone, snafu::Snafu)]
+#[snafu(display("content size is not set"))]
 pub struct SimpleTestAdapterBuildError;
 
 impl SimpleTestAdapterBuilder {

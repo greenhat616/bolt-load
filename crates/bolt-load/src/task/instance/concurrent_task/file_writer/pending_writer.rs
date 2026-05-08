@@ -84,9 +84,11 @@ pub enum WriteStatus {
 }
 
 /// Error returned when a write cannot be accepted at all.
-#[derive(Debug, thiserror::Error)]
-#[error("writer is full and a pending write already exists")]
-pub struct WriterFullError(pub PendingWrite);
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("writer is full and a pending write already exists"))]
+pub struct WriterFullError {
+    pub pending_write: PendingWrite,
+}
 
 #[derive(derive_more::Debug)]
 pub struct PendingWriter<F> {
@@ -183,7 +185,9 @@ where
             self.pending_write = Some(PendingWrite { range, bytes: data });
             Ok(WriteStatus::Pending)
         } else {
-            Err(WriterFullError(PendingWrite { range, bytes: data }))
+            Err(WriterFullError {
+                pending_write: PendingWrite { range, bytes: data },
+            })
         }
     }
 
@@ -543,8 +547,8 @@ mod tests {
         let err = pending
             .write_range(2..3, Bytes::from_static(b"c"))
             .unwrap_err();
-        assert_eq!(err.0.range, 2..3);
-        assert_eq!(&err.0.bytes[..], b"c");
+        assert_eq!(err.pending_write.range, 2..3);
+        assert_eq!(&err.pending_write.bytes[..], b"c");
 
         release_tx.send(()).await.unwrap();
         let _ = next_tick(&mut pending).await;
@@ -855,7 +859,7 @@ mod tests {
         let err = pending
             .write_range(3..4, Bytes::from_static(b"d"))
             .unwrap_err();
-        assert_eq!(err.0.range, 3..4);
+        assert_eq!(err.pending_write.range, 3..4);
 
         // Drain everything.
         let completions = tokio::time::timeout(Duration::from_secs(5), pending.flush())

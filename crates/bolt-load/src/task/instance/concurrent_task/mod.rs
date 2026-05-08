@@ -203,17 +203,17 @@ impl ConcurrentTaskInner {
         let meta = adapter
             .retrieve_meta()
             .await
-            .map_err(TaskInstanceError::RetrieveMetaFailed)?;
+            .map_err(TaskInstanceError::new_retrieve_meta_failed)?;
         let total = if meta.content_size == 0 {
-            return Err(TaskInstanceError::RetrieveMetaFailed(
-                AdapterError::Unretryable {
+            return Err(TaskInstanceError::RetrieveMetaFailed {
+                source: AdapterError::Unretryable {
                     source: UnretryableError::Whatever {
                         message: "content size is 0; concurrent task does not support 0-size file"
                             .to_string(),
                         source: None,
                     },
                 },
-            ));
+            });
         } else {
             meta.content_size
         };
@@ -722,7 +722,7 @@ impl ConcurrentTaskInner {
                                     TaskInstanceError::new_failed(TaskError::Other {
                                         message: format!(
                                             "writer full (invariant violation): {:?}",
-                                            e.0.range
+                                            e.pending_write.range
                                         ),
                                     })
                                 })

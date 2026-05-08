@@ -130,39 +130,45 @@ pub enum TaskInstanceImpl {
     Concurrent(ConcurrentTask),
 }
 
-#[derive(Debug, thiserror::Error, Clone)]
+#[derive(Debug, snafu::Snafu, Clone)]
 pub enum TaskInstanceError {
-    #[error("retrieve meta failed: {0}")]
-    RetrieveMetaFailed(AdapterError),
-    #[error("failed to allocate file size: {0}")]
-    AllocateFileSpaceFailed(Arc<std::io::Error>),
-    #[error("failed to fetch stream failed: {0}")]
-    StreamFailed(AdapterError),
-    #[error("task failed: {0:?}")]
-    Failed(Arc<TaskError>),
-    #[error("failed to write chunk: {0}")]
-    WriteChunkFailed(Arc<std::io::Error>),
+    #[snafu(display("retrieve meta failed: {source}"))]
+    RetrieveMetaFailed { source: AdapterError },
+    #[snafu(display("failed to allocate file size: {source}"))]
+    AllocateFileSpaceFailed { source: Arc<std::io::Error> },
+    #[snafu(display("failed to fetch stream failed: {source}"))]
+    StreamFailed { source: AdapterError },
+    #[snafu(display("task failed: {source:?}"))]
+    Failed { source: Arc<TaskError> },
+    #[snafu(display("failed to write chunk: {source}"))]
+    WriteChunkFailed { source: Arc<std::io::Error> },
 }
 
 impl TaskInstanceError {
     pub fn new_retrieve_meta_failed(e: AdapterError) -> Self {
-        Self::RetrieveMetaFailed(e)
+        Self::RetrieveMetaFailed { source: e }
     }
 
     pub fn new_stream_failed(e: AdapterError) -> Self {
-        Self::StreamFailed(e)
+        Self::StreamFailed { source: e }
     }
 
     pub fn new_failed(e: TaskError) -> Self {
-        Self::Failed(Arc::new(e))
+        Self::Failed {
+            source: Arc::new(e),
+        }
     }
 
     pub fn new_write_chunk_failed(e: std::io::Error) -> Self {
-        Self::WriteChunkFailed(Arc::new(e))
+        Self::WriteChunkFailed {
+            source: Arc::new(e),
+        }
     }
 
     pub fn new_allocate_file_size_failed(e: std::io::Error) -> Self {
-        Self::AllocateFileSpaceFailed(Arc::new(e))
+        Self::AllocateFileSpaceFailed {
+            source: Arc::new(e),
+        }
     }
 }
 

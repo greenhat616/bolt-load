@@ -276,8 +276,8 @@ pub fn yield_now() -> YieldNow {
     YieldNow(false)
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("timeout deadline exceeded")]
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("timeout deadline exceeded"))]
 pub struct TimeoutError;
 
 pub async fn timeout<T>(

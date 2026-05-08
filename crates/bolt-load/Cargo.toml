@@ -44,7 +44,6 @@ bolt-load-core = { path = "../bolt-load-core", version = "0.1" }
 bolt-load-adapter = { path = "../bolt-load-adapter", version = "0.1" }
 bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
 
-thiserror = "2"
 snafu = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }

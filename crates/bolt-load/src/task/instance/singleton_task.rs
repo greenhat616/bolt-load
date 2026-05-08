@@ -182,7 +182,7 @@ impl SingletonTaskInner {
             .unwrap()
             .retrieve_meta()
             .await
-            .map_err(TaskInstanceError::RetrieveMetaFailed)?;
+            .map_err(TaskInstanceError::new_retrieve_meta_failed)?;
         let total = if meta.content_size == 0 {
             None
         } else {
@@ -267,7 +267,7 @@ impl SingletonTaskInner {
             .unwrap()
             .full_stream()
             .await
-            .map_err(TaskInstanceError::StreamFailed)?;
+            .map_err(TaskInstanceError::new_stream_failed)?;
         trace!("[SINGLETON TASK] stream obtained successfully");
 
         let mut file = OpenOptions::new()

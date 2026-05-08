@@ -71,13 +71,14 @@ impl IntoReqwestAdapter for reqwest::Client {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-#[repr(transparent)]
-pub struct ReqwestError(#[from] reqwest::Error);
+#[derive(Debug, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct ReqwestError {
+    source: reqwest::Error,
+}
 
 impl From<ReqwestError> for AdapterError {
-    fn from(ReqwestError(e): ReqwestError) -> Self {
+    fn from(ReqwestError { source: e }: ReqwestError) -> Self {
         if let Some(status_code) = e.status()
             && status_code.is_client_error()
         {

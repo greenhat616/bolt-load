@@ -19,7 +19,6 @@ bolt-load-core = { path = "../bolt-load-core", version = "0.1" }
 bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
 
 futures = { workspace = true }
-thiserror = { workspace = true }
 snafu = { workspace = true }
 
 async-trait = { workspace = true }

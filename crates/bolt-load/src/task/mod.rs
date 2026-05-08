@@ -92,17 +92,17 @@ pub enum TaskState {
     Failed,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, snafu::Snafu)]
 pub enum TaskFailedError {
     /// the task is cancelled
-    #[error("the task is cancelled")]
+    #[snafu(display("the task is cancelled"))]
     Cancelled,
     /// the task is stopped
-    #[error("the task is stopped: {0:?}")]
-    Stopped(TaskInstanceError),
+    #[snafu(display("the task is stopped: {source:?}"))]
+    Stopped { source: TaskInstanceError },
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, snafu::Snafu)]
 pub enum TaskCommandError {}
 
 type CommandResult<T> = Result<T, TaskCommandError>;

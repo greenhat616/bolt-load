@@ -45,16 +45,16 @@ impl Default for TaskBuilder {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, snafu::Snafu)]
 pub enum TaskManagerBuildError {
-    #[error("field validation failed: {0}")]
-    FieldValidationFailed(String),
-    #[error(transparent)]
+    #[snafu(display("field validation failed: {message}"))]
+    FieldValidationFailed { message: String },
+    #[snafu(transparent)]
     /// The error is unretryable, just returned by the adapter
     // TODO: mapping to UnretryableError
-    AdapterError(#[from] AdapterError),
-    #[error(transparent)]
-    IOError(#[from] std::io::Error),
+    AdapterError { source: AdapterError },
+    #[snafu(transparent)]
+    IOError { source: std::io::Error },
 }
 
 async fn try_get_or_init_meta<'a>(
@@ -72,9 +72,9 @@ impl TaskBuilder {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub async fn retrieve_meta(&mut self) -> Result<&BoltLoadAdapterMeta, TaskManagerBuildError> {
         if self.adapter.is_none() {
-            return Err(TaskManagerBuildError::FieldValidationFailed(
-                "adapter is not set".to_string(),
-            ));
+            return Err(TaskManagerBuildError::FieldValidationFailed {
+                message: "adapter is not set".to_string(),
+            });
         }
         let adapter = self.adapter.as_ref().unwrap();
         let meta = try_get_or_init_meta(&self.meta, adapter).await?;
@@ -153,27 +153,27 @@ impl TaskBuilder {
 
     fn validate(&self) -> Result<(), TaskManagerBuildError> {
         if self.threaded_runtime.is_none() {
-            return Err(TaskManagerBuildError::FieldValidationFailed(
-                "runtime is not set".to_string(),
-            ));
+            return Err(TaskManagerBuildError::FieldValidationFailed {
+                message: "runtime is not set".to_string(),
+            });
         }
         if self.adapter.is_none() {
-            return Err(TaskManagerBuildError::FieldValidationFailed(
-                "adapter is not set".to_string(),
-            ));
+            return Err(TaskManagerBuildError::FieldValidationFailed {
+                message: "adapter is not set".to_string(),
+            });
         }
         match self.save_path {
             Some(ref path) => {
                 if path.file_name().is_none() {
-                    return Err(TaskManagerBuildError::FieldValidationFailed(
-                        "save path must have a filename".to_string(),
-                    ));
+                    return Err(TaskManagerBuildError::FieldValidationFailed {
+                        message: "save path must have a filename".to_string(),
+                    });
                 }
             }
             None => {
-                return Err(TaskManagerBuildError::FieldValidationFailed(
-                    "save path is not set".to_string(),
-                ));
+                return Err(TaskManagerBuildError::FieldValidationFailed {
+                    message: "save path is not set".to_string(),
+                });
             }
         }
         Ok(())
@@ -189,9 +189,9 @@ impl TaskBuilder {
     ))]
     pub async fn build(mut self) -> Result<Task, TaskManagerBuildError> {
         if self.cancel_token.is_none() {
-            return Err(TaskManagerBuildError::FieldValidationFailed(
-                "cancel token is not set".to_string(),
-            ));
+            return Err(TaskManagerBuildError::FieldValidationFailed {
+                message: "cancel token is not set".to_string(),
+            });
         }
         let cancel_token = self.cancel_token.take().unwrap();
         // retrieve the meta
@@ -217,25 +217,27 @@ impl TaskBuilder {
         let save_path = self.save_path.unwrap();
 
         // Check if the parent directory exists
-        let parent_dir = save_path
-            .parent()
-            .ok_or(TaskManagerBuildError::FieldValidationFailed(
-                "save path parent directory does not exist".to_string(),
-            ))?;
+        let parent_dir =
+            save_path
+                .parent()
+                .ok_or(TaskManagerBuildError::FieldValidationFailed {
+                    message: "save path parent directory does not exist".to_string(),
+                })?;
 
         let meta = async_fs::metadata(parent_dir).await.ok();
         if meta.is_none_or(|m| !m.is_dir()) {
-            return Err(TaskManagerBuildError::FieldValidationFailed(
-                "save path parent directory does not exist or is not a directory".to_string(),
-            ));
+            return Err(TaskManagerBuildError::FieldValidationFailed {
+                message: "save path parent directory does not exist or is not a directory"
+                    .to_string(),
+            });
         }
 
         // Check if the file exists and is a directory
         let meta = async_fs::metadata(&save_path).await;
         if meta.is_ok_and(|m| m.is_dir()) {
-            return Err(TaskManagerBuildError::FieldValidationFailed(
-                "save path already exists as a directory".to_string(),
-            ));
+            return Err(TaskManagerBuildError::FieldValidationFailed {
+                message: "save path already exists as a directory".to_string(),
+            });
         }
 
         let mut temp_path = save_path.clone();
