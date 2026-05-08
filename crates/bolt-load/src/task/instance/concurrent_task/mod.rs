@@ -379,15 +379,22 @@ impl ConcurrentTaskInner {
         sampler: &mut SpeedSampler,
         current_speed: &mut f64,
         per_runner_avg_speed: &mut f64,
+        write_bytes_meter: &mut usize,
+        write_sampler: &mut SpeedSampler,
 
         event_tx: &async_channel::Sender<TaskEvent>,
     ) {
         let count = meters.len();
         let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
         let (_, ema_speed) = sampler.sample(&mut total_bytes);
+        let (_, write_ema_speed) = write_sampler.sample(write_bytes_meter);
         // debug!("ema speed {ema_speed} count {count}");
         *current_speed = ema_speed;
-        *per_runner_avg_speed = ema_speed / count as f64;
+        *per_runner_avg_speed = if count == 0 {
+            0.0
+        } else {
+            ema_speed / count as f64
+        };
 
         let event_tx = event_tx.clone();
         let total = runner_manager.total();
@@ -407,6 +414,7 @@ impl ConcurrentTaskInner {
                         downloaded_chunks,
                     },
                     ema_speed,
+                    write_ema_speed,
                 )))
                 .await
             {
@@ -561,6 +569,8 @@ impl ConcurrentTaskInner {
         let mut sampler = SpeedSampler::new();
         let mut current_speed = 0.0;
         let mut per_runner_avg_speed = 0.0;
+        let mut write_bytes_meter = 0usize;
+        let mut write_sampler = SpeedSampler::new();
 
         let (tmp_path, file_writer) = self.create_file_writer().await?;
         let mut pending_writer = PendingWriter::new(
@@ -572,15 +582,21 @@ impl ConcurrentTaskInner {
         let mut throughout_meter_timer = rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
         let mut strategy_timer = rt.create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
 
-        fn check_completions(completions: Vec<WriteCompletion>) -> Result<()> {
+        fn check_completions(completions: Vec<WriteCompletion>) -> Result<usize> {
+            let mut written = 0usize;
             for completion in completions {
-                if let Err(error) = completion.result {
-                    return Err(TaskInstanceError::new_failed(TaskError::Other {
-                        message: format!("write failed at {:?}: {error}", completion.range),
-                    }));
+                match completion.result {
+                    Ok(()) => {
+                        written += (completion.range.end - completion.range.start) as usize;
+                    }
+                    Err(error) => {
+                        return Err(TaskInstanceError::new_failed(TaskError::Other {
+                            message: format!("write failed at {:?}: {error}", completion.range),
+                        }));
+                    }
                 }
             }
-            Ok(())
+            Ok(written)
         }
 
         enum LoopEvent {
@@ -592,7 +608,7 @@ impl ConcurrentTaskInner {
 
         let event_loop_result: Result<()> = async {
             loop {
-                check_completions(pending_writer.try_tick())
+                write_bytes_meter += check_completions(pending_writer.try_tick())
                     .inspect_err(|_| runners_cancel_token.cancel())?;
 
                 let can_write = pending_writer.can_write();
@@ -627,7 +643,7 @@ impl ConcurrentTaskInner {
 
                 match event {
                     LoopEvent::WriterCompleted(Some(completions)) => {
-                        check_completions(completions)
+                        write_bytes_meter += check_completions(completions)
                             .inspect_err(|_| runners_cancel_token.cancel())?;
                     }
                     LoopEvent::WriterCompleted(None) => {
@@ -664,6 +680,8 @@ impl ConcurrentTaskInner {
                             &mut sampler,
                             &mut current_speed,
                             &mut per_runner_avg_speed,
+                            &mut write_bytes_meter,
+                            &mut write_sampler,
                             &event_tx,
                         );
                     }
@@ -702,7 +720,7 @@ impl ConcurrentTaskInner {
         drop(pending_writer);
 
         event_loop_result?;
-        flush_result?;
+        flush_result.map(drop)?;
 
         // TODO: add a finalizing state?
         file_writer.finalize().await.map_err(|e| {
@@ -747,6 +765,7 @@ impl ConcurrentTaskInner {
                     .event_tx
                     .send(TaskEvent::Downloading(ProgressWithSpeed::new(
                         self.progress.clone(),
+                        0.0,
                         0.0,
                     )))
                     .await;
@@ -910,6 +929,55 @@ mod tests {
         .expect("timed out collecting runner channels");
 
         (started, finished, failed, downloaded_data)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn throughput_tick_reports_download_and_write_speed() {
+        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let wg = WaitGroup::new();
+        let runner_manager = RunnerManager::new(1024, 2);
+        let mut meters = std::collections::HashMap::new();
+        meters.insert(0, 512usize);
+        let mut sampler = SpeedSampler::new();
+        let mut write_sampler = SpeedSampler::new();
+        let mut current_speed = 0.0;
+        let mut per_runner_avg_speed = 0.0;
+        let mut write_bytes_meter = 768usize;
+        let (event_tx, event_rx) = async_channel::bounded(1);
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        ConcurrentTaskInner::throughout_meter_tick(
+            &rt,
+            &wg,
+            &runner_manager,
+            &mut meters,
+            &mut sampler,
+            &mut current_speed,
+            &mut per_runner_avg_speed,
+            &mut write_bytes_meter,
+            &mut write_sampler,
+            &event_tx,
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("timed out waiting for progress event")
+            .expect("progress event channel closed");
+
+        match event {
+            TaskEvent::Downloading(progress) => {
+                assert!(progress.speed() > 0.0);
+                assert!(progress.write_speed() > 0.0);
+            }
+            other => panic!("expected downloading progress event, got {other:?}"),
+        }
+        assert_eq!(meters.get(&0), Some(&0));
+        assert_eq!(write_bytes_meter, 0);
+        assert!(current_speed > 0.0);
+        assert!(per_runner_avg_speed > 0.0);
+
+        wg.wait().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

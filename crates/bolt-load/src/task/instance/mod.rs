@@ -36,11 +36,17 @@ pub struct ProgressWithSpeed {
     #[cfg_attr(feature = "serde", serde(flatten))]
     progress: Progress,
     speed: f64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    write_speed: f64,
 }
 
 impl ProgressWithSpeed {
-    pub fn new(progress: Progress, speed: f64) -> Self {
-        Self { progress, speed }
+    pub fn new(progress: Progress, speed: f64, write_speed: f64) -> Self {
+        Self {
+            progress,
+            speed,
+            write_speed,
+        }
     }
 
     /// Get the progress
@@ -48,9 +54,14 @@ impl ProgressWithSpeed {
         &self.progress
     }
 
-    /// Get the speed in bytes per second
+    /// Get the download speed in bytes per second
     pub fn speed(&self) -> f64 {
         self.speed
+    }
+
+    /// Get the write speed in bytes per second
+    pub fn write_speed(&self) -> f64 {
+        self.write_speed
     }
 
     /// Get the total size

@@ -249,7 +249,7 @@ impl SingletonTaskInner {
             let _wg = wg;
             let _ = event_tx
                 .send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                    progress, speed,
+                    progress, speed, 0.0,
                 )))
                 .await;
         });
@@ -408,7 +408,7 @@ impl SingletonTaskInner {
                 let _ = self
                     .event_tx
                     .send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                        progress, 0.0,
+                        progress, 0.0, 0.0,
                     )))
                     .await;
             }
