@@ -2,7 +2,9 @@ use bolt_load_core::adapter::{AdapterError, AnyBytesStream};
 use futures::{FutureExt, future::BoxFuture};
 use snafu::ResultExt;
 
-use super::{RunnerMessageConsumer, TaskRunner, TaskRunnerBuilder, TaskRunnerBuilderError};
+use super::{
+    DataFrameReceiver, LifecycleReceiver, TaskRunner, TaskRunnerBuilder, TaskRunnerBuilderError,
+};
 
 pub enum StreamConnector {
     DirectStream(AnyBytesStream),
@@ -87,7 +89,7 @@ impl RunnerConnector {
 
     pub async fn connect(
         self,
-    ) -> Result<(TaskRunner, RunnerMessageConsumer), RunnerConnectorError> {
+    ) -> Result<(TaskRunner, LifecycleReceiver, DataFrameReceiver), RunnerConnectorError> {
         let RunnerConnector { connector, builder } = self;
         let stream = connector
             .connect()
@@ -96,7 +98,7 @@ impl RunnerConnector {
 
         builder
             .stream(stream)
-            .build_legacy()
+            .build()
             .map_err(|source| RunnerConnectorError::Build { source })
     }
 }

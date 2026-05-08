@@ -4,8 +4,7 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{
     ControlSignalReceiver, DATA_DRAIN_TIMEOUT, DATA_FRAME_CHANNEL_CAPACITY, DataFrame,
-    DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver,
-    RunnerMessageConsumer, TaskRunner, legacy_consumer,
+    DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver, TaskRunner,
 };
 use crate::task::RunnerId;
 
@@ -42,11 +41,6 @@ impl TaskRunnerBuilder {
     /// set the total size of the task
     pub fn total(mut self, total: u64) -> Self {
         self.total = Some(total);
-        self
-    }
-
-    pub fn with_optional_total(mut self, total: Option<u64>) -> Self {
-        self.total = total;
         self
     }
 
@@ -87,25 +81,6 @@ impl TaskRunnerBuilder {
         self.build_inner(None)
     }
 
-    pub fn build_legacy(
-        self,
-    ) -> Result<(TaskRunner, RunnerMessageConsumer), TaskRunnerBuilderError> {
-        let (mut runner, lifecycle_rx, data_rx) = self.build()?;
-        runner.legacy_mode = true;
-        let consumer = legacy_consumer(runner.id, lifecycle_rx, data_rx);
-        Ok((runner, consumer))
-    }
-
-    pub(crate) fn build_legacy_without_stream(
-        self,
-    ) -> Result<(TaskRunner, RunnerMessageConsumer), TaskRunnerBuilderError> {
-        let stream: AnyBytesStream = Box::pin(futures::stream::pending());
-        let (mut runner, lifecycle_rx, data_rx) = self.build_inner(Some(stream))?;
-        runner.legacy_mode = true;
-        let consumer = legacy_consumer(runner.id, lifecycle_rx, data_rx);
-        Ok((runner, consumer))
-    }
-
     fn build_inner(
         self,
         stream_override: Option<AnyBytesStream>,
@@ -132,7 +107,6 @@ impl TaskRunnerBuilder {
             lifecycle_tx: lifecycle_prod,
             data_tx: Some(data_prod),
             data_drain_timeout: self.data_drain_timeout.unwrap_or(DATA_DRAIN_TIMEOUT),
-            legacy_mode: false,
             cancel_token: self
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
