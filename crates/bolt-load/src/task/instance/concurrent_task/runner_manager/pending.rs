@@ -29,6 +29,8 @@ impl std::fmt::Debug for RunnerBuilderOutput {
 }
 
 pub type PendingRunnerReceiver = oneshot::Receiver<Result<RunnerBuilderOutput, PendingRunnerError>>;
+pub type PendingRunnerAsyncReceiver =
+    oneshot::AsyncReceiver<Result<RunnerBuilderOutput, PendingRunnerError>>;
 
 pub fn failed_receiver(error: PendingRunnerError) -> PendingRunnerReceiver {
     let (tx, rx) = oneshot::channel();
@@ -53,7 +55,7 @@ pin_project_lite::pin_project! {
     struct PendingRunner {
         context: PendingRunnerContext,
         #[pin]
-        consumer_rx: Fuse<PendingRunnerReceiver>,
+        consumer_rx: Fuse<PendingRunnerAsyncReceiver>,
     }
 }
 
@@ -120,7 +122,7 @@ impl PendingRunnerGroup {
     pub fn insert(&mut self, context: PendingRunnerContext, consumer_rx: PendingRunnerReceiver) {
         self.group.insert(PendingRunner {
             context,
-            consumer_rx: consumer_rx.fuse(),
+            consumer_rx: consumer_rx.into_future().fuse(),
         });
         self.waker.wake();
     }
