@@ -2,7 +2,7 @@
 name = "bolt-load"
 edition = "2024"
 version = "0.1.0"
-rust-version = "1.85.0" # the first version that supports 2024 edition
+rust-version = "1.88.0"
 
 [features]
 default = ["tokio", "serde", "tracing", "progressbar", "mmap"]
