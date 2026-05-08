@@ -9,22 +9,24 @@ pub enum StreamConnector {
     StreamConnector(BoxFuture<'static, Result<AnyBytesStream, AdapterError>>),
 }
 
-#[derive(Debug, snafu::Snafu)]
-pub enum RunnerConnectorError {
-    #[snafu(display("build failed: {source}"))]
-    Build { source: TaskRunnerBuilderError },
-    #[snafu(display("connection failed: {source}"))]
-    Connection { source: AdapterError },
+impl StreamConnector {
+    pub async fn connect(self) -> Result<AnyBytesStream, ConnectionError> {
+        match self {
+            Self::DirectStream(stream) => Ok(stream),
+            Self::StreamConnector(future) => future.await.context(ConnectionSnafu),
+        }
+    }
 }
 
-impl RunnerConnectorError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Connection {
-                source: AdapterError::Retryable { .. }
-            }
-        )
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("failed to connect stream: {source}"))]
+pub struct ConnectionError {
+    pub source: AdapterError,
+}
+
+impl ConnectionError {
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self.source, AdapterError::Retryable { .. })
     }
 }
 
@@ -34,6 +36,23 @@ where
 {
     fn from(value: F) -> Self {
         StreamConnector::StreamConnector(value.boxed())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RunnerConnectorError {
+    #[error("build failed: {source}")]
+    Build { source: TaskRunnerBuilderError },
+    #[error("connection failed: {source}")]
+    Connection { source: ConnectionError },
+}
+
+impl RunnerConnectorError {
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            Self::Connection { source } => source.is_retryable(),
+            Self::Build { .. } => false,
+        }
     }
 }
 
@@ -70,13 +89,14 @@ impl RunnerConnector {
         self,
     ) -> Result<(TaskRunner, RunnerMessageConsumer), RunnerConnectorError> {
         let RunnerConnector { connector, builder } = self;
-        let stream = match connector {
-            StreamConnector::DirectStream(stream) => stream,
-            StreamConnector::StreamConnector(connector) => {
-                connector.await.context(ConnectionSnafu)?
-            }
-        };
+        let stream = connector
+            .connect()
+            .await
+            .map_err(|source| RunnerConnectorError::Connection { source })?;
 
-        builder.stream(stream).build().context(BuildSnafu)
+        builder
+            .stream(stream)
+            .build_legacy()
+            .map_err(|source| RunnerConnectorError::Build { source })
     }
 }

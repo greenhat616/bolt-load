@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{Stream, StreamExt, stream::BoxStream, task::AtomicWaker};
+use futures::{Stream, stream::BoxStream, task::AtomicWaker};
 use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
@@ -45,7 +45,7 @@ impl RunnerNotification {
     }
 
     pub fn add(&mut self, runner_id: RunnerId, consumer: RunnerMessageConsumer) {
-        let key = self.group.insert(consumer.boxed());
+        let key = self.group.insert(consumer);
         self.map.insert(runner_id, key);
     }
 
