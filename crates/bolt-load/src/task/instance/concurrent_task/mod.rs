@@ -300,7 +300,7 @@ impl ConcurrentTaskInner {
         runner_id: RunnerId,
         cancel_token: CancellationToken,
     ) -> runner_manager::PendingRunnerReceiver {
-        use runner_manager::pending::PendingRunnerError;
+        use runner_manager::pending::{PendingRunnerError, RunnerBuilderOutput};
 
         let (tx, rx) = oneshot::channel();
         let (start, end) = (range.start, range.end);
@@ -330,12 +330,7 @@ impl ConcurrentTaskInner {
 
                     match result {
                         Ok((mut runner, lifecycle_rx, data_rx)) => {
-                            // 3. Send channels to pending receiver
-                            if let Err(e) = tx.send(Ok((data_rx, lifecycle_rx))) {
-                                error!("failed to send channels to pending receiver: {e:?}");
-                                return;
-                            }
-                            // 4. Spawn runner
+                            // 3. Spawn runner
                             let wg = wg.clone();
                             let runner_task = async move {
                                 let _wg = wg;
@@ -350,7 +345,25 @@ impl ConcurrentTaskInner {
                                     "background_task::runner",
                                 ),
                             );
-                            rt.spawn(runner_task).expect("should never spawn failed");
+                            match rt.spawn(runner_task) {
+                                Ok(()) => {
+                                    let output = RunnerBuilderOutput {
+                                        data_rx,
+                                        lifecycle_rx,
+                                    };
+                                    if let Err(e) = tx.send(Ok(output)) {
+                                        error!(
+                                            "failed to send channels to pending receiver: {e:?}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("failed to spawn background range runner: {e}");
+                                    let _ = tx.send(Err(PendingRunnerError::Spawn {
+                                        message: e.to_string(),
+                                    }));
+                                }
+                            }
                         }
                         Err(e) => {
                             // Build error - should not happen with proper setup
@@ -376,9 +389,12 @@ impl ConcurrentTaskInner {
                 range = ?start..end,
             ),
         );
-        threaded_rt
-            .spawn(connector_task)
-            .expect("should never spawn failed");
+        if let Err(e) = threaded_rt.spawn(connector_task) {
+            error!("failed to spawn background range runner connector: {e}");
+            return runner_manager::pending::failed_receiver(PendingRunnerError::Spawn {
+                message: e.to_string(),
+            });
+        }
         rx
     }
 
@@ -885,11 +901,22 @@ impl ConcurrentTaskInner {
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::pin, sync::Arc};
+    use std::{
+        pin::pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use bolt_load_tests::adapter::simple::{SimpleTestAdapter, calculate_blake3};
     use bolt_load_utils::telemetry::*;
-    use futures::StreamExt;
+    use futures::{
+        StreamExt,
+        future::FutureObj,
+        task::{Spawn, SpawnError},
+    };
     use pretty_assertions::assert_eq;
     use runner_manager::pending::PendingRunnerError;
     use smol_cancellation_token::CancellationToken;
@@ -898,9 +925,56 @@ mod tests {
     use crate::{
         adapter::BoltLoadAdapter,
         runner::{LifecycleEvent, StoppedReason},
-        runtime::ThreadedRuntimeImpl,
+        runtime::{
+            DowncastLocalRuntime, ObjectSafeTimer, ThreadedRuntime, ThreadedRuntimeImpl,
+            TimerBuilder, TimerImpl,
+        },
         task::ControlEvent,
     };
+
+    #[derive(Clone, Debug)]
+    struct FailOnSpawnRuntime {
+        fail_on: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FailOnSpawnRuntime {
+        fn new(fail_on: usize) -> Self {
+            Self {
+                fail_on,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl Spawn for FailOnSpawnRuntime {
+        fn spawn_obj(&self, future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == self.fail_on {
+                return Err(SpawnError::shutdown());
+            }
+
+            tokio::spawn(future);
+            Ok(())
+        }
+    }
+
+    impl DowncastLocalRuntime for FailOnSpawnRuntime {}
+
+    impl TimerBuilder for FailOnSpawnRuntime {
+        fn create_delayed_timer(&self, _duration: Duration) -> TimerImpl {
+            TimerImpl::Custom(Box::new(NoopTimer))
+        }
+    }
+
+    impl ThreadedRuntime for FailOnSpawnRuntime {}
+
+    struct NoopTimer;
+
+    #[async_trait::async_trait]
+    impl ObjectSafeTimer for NoopTimer {
+        async fn tick(&mut self) {}
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
@@ -926,7 +1000,9 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (data_rx, lifecycle_rx) = result.unwrap();
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Verify that Started message is received
         let mut lifecycle_rx = pin!(lifecycle_rx);
@@ -1020,6 +1096,72 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
+    async fn test_create_background_range_runner_reports_connector_spawn_error() {
+        let rt = ThreadedRuntimeImpl::new_other_rt(FailOnSpawnRuntime::new(0));
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(1024).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
+        let range = 0u64..500u64;
+        let runner_id = 8;
+        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let cancel_token = CancellationToken::new();
+        let wg = WaitGroup::new();
+
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            &wg,
+            range,
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token,
+        );
+        let result = receiver.await.expect("receiver closed");
+
+        match result {
+            Err(PendingRunnerError::Spawn { message }) => assert!(!message.is_empty()),
+            other => panic!("expected Spawn error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[n0_tracing_test::traced_test]
+    async fn test_create_background_range_runner_reports_runner_spawn_error() {
+        let rt = ThreadedRuntimeImpl::new_other_rt(FailOnSpawnRuntime::new(1));
+        let adapter = Arc::new(
+            Box::new(SimpleTestAdapter::new(1024).with_range_support(true))
+                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
+        );
+        let range = 0u64..500u64;
+        let runner_id = 9;
+        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let cancel_token = CancellationToken::new();
+        let wg = WaitGroup::new();
+
+        let receiver = ConcurrentTaskInner::create_background_range_runner(
+            &rt,
+            &wg,
+            range,
+            adapter,
+            control_rx,
+            runner_id,
+            cancel_token,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("timed out waiting for spawn error")
+            .expect("receiver closed");
+
+        match result {
+            Err(PendingRunnerError::Spawn { message }) => assert!(!message.is_empty()),
+            other => panic!("expected Spawn error, got: {other:?}"),
+        }
+        wg.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_cancellation() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let adapter = Arc::new(
@@ -1043,7 +1185,9 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (_data_rx, lifecycle_rx) = result.unwrap();
+        let output = result.unwrap();
+        let _data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start message
         let mut lifecycle_rx = pin!(lifecycle_rx);
@@ -1098,7 +1242,9 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (data_rx, lifecycle_rx) = result.unwrap();
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start message
         let mut lifecycle_rx = pin!(lifecycle_rx);
@@ -1162,7 +1308,9 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (data_rx, lifecycle_rx) = result.unwrap();
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start
         let mut lifecycle_rx = pin!(lifecycle_rx);
@@ -1238,7 +1386,9 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (_data_rx, lifecycle_rx) = result.unwrap();
+        let output = result.unwrap();
+        let _data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         wg.wait().await;
 
@@ -1294,7 +1444,9 @@ mod tests {
                     cancel_token,
                 );
                 let result = receiver.await.expect("receiver closed");
-                let (data_rx, lifecycle_rx) = result.expect("connection failed");
+                let output = result.expect("connection failed");
+                let data_rx = output.data_rx;
+                let lifecycle_rx = output.lifecycle_rx;
 
                 // Keep the control channel sender alive
                 let _control_tx = control_tx;
@@ -1396,7 +1548,9 @@ mod tests {
         );
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
-        let (data_rx, lifecycle_rx) = result.unwrap();
+        let output = result.unwrap();
+        let data_rx = output.data_rx;
+        let lifecycle_rx = output.lifecycle_rx;
 
         // Wait for start message
         let mut lifecycle_rx = pin!(lifecycle_rx);

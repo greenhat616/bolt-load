@@ -16,9 +16,25 @@ use crate::{
     task::RunnerId,
 };
 
-pub type RunnerBuilderOutput = (DataFrameReceiver, LifecycleReceiver);
+pub struct RunnerBuilderOutput {
+    pub data_rx: DataFrameReceiver,
+    pub lifecycle_rx: LifecycleReceiver,
+}
+
+impl std::fmt::Debug for RunnerBuilderOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnerBuilderOutput")
+            .finish_non_exhaustive()
+    }
+}
 
 pub type PendingRunnerReceiver = oneshot::Receiver<Result<RunnerBuilderOutput, PendingRunnerError>>;
+
+pub fn failed_receiver(error: PendingRunnerError) -> PendingRunnerReceiver {
+    let (tx, rx) = oneshot::channel();
+    let _ = tx.send(Err(error));
+    rx
+}
 
 #[derive(Debug, Clone)]
 pub struct PendingRunnerContext {
@@ -47,6 +63,8 @@ pub enum PendingRunnerError {
     ReceiverClosed,
     #[snafu(display("the connection failed: {source}"))]
     Connection { source: ConnectionError },
+    #[snafu(display("failed to spawn runner task: {message}"))]
+    Spawn { message: String },
 }
 
 pub struct PendingRunnerOutput {
