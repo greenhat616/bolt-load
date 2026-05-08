@@ -13,7 +13,10 @@ use bytes::Bytes;
 use fs_err::File;
 use snafu::prelude::*;
 
-use super::{CommandError, FileRangeWriter, FileWriterError, FinalizeSnafu, WriteRangeSnafu};
+use super::{
+    CommandError, FileRangeWriter, FileWriterError, FileWriterFuture, FinalizeSnafu,
+    WriteRangeSnafu,
+};
 use crate::runtime::yield_now;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -119,48 +122,52 @@ impl SlowWriter {
 }
 
 impl FileRangeWriter for SlowWriter {
-    async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
-        self.inject_delay(range.start).await;
+    fn write_range(&self, range: Range<u64>, data: Bytes) -> FileWriterFuture<'_> {
+        Box::pin(async move {
+            self.inject_delay(range.start).await;
 
-        // NOTE: We are doing blocking IO in a blocking section to keep async runtime healthy.
-        let mut file = self
-            .file
-            .try_clone()
-            .map_err(CommandError::from)
-            .with_context(|_| WriteRangeSnafu {
-                chunk: None,
-                path: self.path.clone(),
-            })?;
-
-        let path = self.path.clone();
-        blocking::unblock(move || {
-            file.seek(SeekFrom::Start(range.start))
+            // NOTE: We are doing blocking IO in a blocking section to keep async runtime healthy.
+            let mut file = self
+                .file
+                .try_clone()
                 .map_err(CommandError::from)
                 .with_context(|_| WriteRangeSnafu {
                     chunk: None,
-                    path: path.clone(),
+                    path: self.path.clone(),
                 })?;
 
-            file.write_all(&data)
-                .map_err(CommandError::from)
-                .with_context(|_| WriteRangeSnafu { chunk: None, path })?;
+            let path = self.path.clone();
+            blocking::unblock(move || {
+                file.seek(SeekFrom::Start(range.start))
+                    .map_err(CommandError::from)
+                    .with_context(|_| WriteRangeSnafu {
+                        chunk: None,
+                        path: path.clone(),
+                    })?;
 
-            Ok::<_, FileWriterError>(())
+                file.write_all(&data)
+                    .map_err(CommandError::from)
+                    .with_context(|_| WriteRangeSnafu { chunk: None, path })?;
+
+                Ok::<_, FileWriterError>(())
+            })
+            .await
         })
-        .await
     }
 
-    async fn finalize(mut self) -> Result<(), FileWriterError> {
-        self.inject_delay(0).await;
+    fn finalize(self) -> FileWriterFuture<'static> {
+        Box::pin(async move {
+            self.inject_delay(0).await;
 
-        let path = self.path.clone();
-        blocking::unblock(move || {
-            self.file
-                .sync_all()
-                .map_err(CommandError::from)
-                .with_context(|_| FinalizeSnafu { path })?;
-            Ok::<_, FileWriterError>(())
+            let path = self.path.clone();
+            blocking::unblock(move || {
+                self.file
+                    .sync_all()
+                    .map_err(CommandError::from)
+                    .with_context(|_| FinalizeSnafu { path })?;
+                Ok::<_, FileWriterError>(())
+            })
+            .await
         })
-        .await
     }
 }

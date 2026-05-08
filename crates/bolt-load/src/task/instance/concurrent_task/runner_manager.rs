@@ -636,12 +636,58 @@ impl RunnerManager {
         }
         RunnerTick::downloading()
     }
+
+    pub(super) async fn tick_lifecycle_only(
+        &mut self,
+        meters: &mut HashMap<RunnerId, usize>,
+    ) -> RunnerTick {
+        let next_lifecycle = self.lifecycle_aggregator.next().fuse();
+        let pending = self.pending_runners.next().fuse();
+        futures::pin_mut!(next_lifecycle, pending);
+
+        futures::select_biased! {
+            event = next_lifecycle => {
+                if let Some(event) = event {
+                    match event {
+                        LifecycleStreamEvent::Event(tagged) => {
+                            if self.handle_lifecycle(tagged, meters) {
+                                return RunnerTick::finished();
+                            }
+                        }
+                        LifecycleStreamEvent::Closed(runner_id) => {
+                            warn!("runner {runner_id} lifecycle stream closed unexpectedly");
+                            if self.handle_runner_lost(runner_id, meters) {
+                                return RunnerTick::finished();
+                            }
+                        }
+                    }
+                }
+            }
+            pending = pending => {
+                match pending {
+                    Some(pending) => {
+                        self.handle_pending(pending);
+                    }
+                    None => {
+                        if self.chunk_planner.is_complete() {
+                            return RunnerTick::finished();
+                        }
+                    }
+                }
+            }
+        }
+        RunnerTick::downloading()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::{super::chunk_planner::ChunkStatus, *};
-    use crate::runner::{DataFrame, LifecycleEvent, RunnerConnectorError};
+    use crate::runner::{
+        DataFrame, LifecycleEvent, RunnerConnectorError, StoppedReason, TaskError,
+    };
 
     #[test]
     fn test_runner_manager_creation() {
@@ -861,5 +907,50 @@ mod tests {
 
         // Verify runner state is removed (failed)
         assert!(manager.get_runner_state(0).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_only_tick_handles_stopped_during_writer_backpressure() {
+        use async_ringbuf::{
+            AsyncHeapRb,
+            traits::{AsyncProducer, Split},
+        };
+
+        let mut manager = RunnerManager::new(256, 1);
+        let runner_id = 0;
+        let _registration = manager.allocate_runner_with_chunk(0..256).unwrap();
+
+        let data_rb = AsyncHeapRb::<DataFrame>::new(crate::runner::DATA_FRAME_CHANNEL_CAPACITY);
+        let (mut data_prod, data_rx) = data_rb.split();
+        let lifecycle_rb =
+            AsyncHeapRb::<LifecycleEvent>::new(crate::runner::LIFECYCLE_CHANNEL_CAPACITY);
+        let (mut lifecycle_prod, lifecycle_rx) = lifecycle_rb.split();
+
+        manager.register_runner_channels(runner_id, lifecycle_rx, data_rx);
+        data_prod
+            .push(DataFrame {
+                data: Bytes::from(vec![1; 64]),
+            })
+            .await
+            .unwrap();
+        lifecycle_prod
+            .push(LifecycleEvent::Stopped(StoppedReason::Failed(
+                TaskError::Cancelled,
+            )))
+            .await
+            .unwrap();
+
+        let mut meters = HashMap::new();
+        let tick = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.tick_lifecycle_only(&mut meters),
+        )
+        .await
+        .expect("lifecycle-only tick should not wait for writer capacity");
+
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(tick.downloaded.is_none());
+        assert!(manager.get_runner_state(runner_id).is_none());
+        assert_eq!(manager.get_available_ranges(), vec![0..256]);
     }
 }

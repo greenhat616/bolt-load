@@ -9,7 +9,7 @@ use std::{
 use async_waitgroup::WaitGroup;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
-use futures::{FutureExt, task::SpawnExt};
+use futures::{FutureExt, future::Either, task::SpawnExt};
 use runner_manager::TaskState;
 use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
@@ -534,6 +534,9 @@ impl ConcurrentTaskInner {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+        use file_writer::{PendingWriter, WriteCompletion, WriterFullError};
+        use runner_manager::RunnerTick;
+
         let total = self
             .progress
             .total
@@ -560,32 +563,99 @@ impl ConcurrentTaskInner {
         let mut per_runner_avg_speed = 0.0;
 
         let (tmp_path, file_writer) = self.create_file_writer().await?;
+        let mut pending_writer = PendingWriter::new(
+            Arc::new(file_writer.clone()),
+            rt.clone(),
+            initial_max_concurrency,
+        );
 
         let mut throughout_meter_timer = rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
         let mut strategy_timer = rt.create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
 
+        fn check_completions(completions: Vec<WriteCompletion>) -> Result<()> {
+            for completion in completions {
+                if let Err(error) = completion.result {
+                    return Err(TaskInstanceError::new_failed(TaskError::Other {
+                        message: format!("write failed at {:?}: {error}", completion.range),
+                    }));
+                }
+            }
+            Ok(())
+        }
+
+        enum LoopEvent {
+            WriterCompleted(Option<Vec<WriteCompletion>>),
+            StrategyTimer,
+            ThroughputTimer,
+            Runner(RunnerTick),
+        }
+
         let event_loop_result: Result<()> = async {
             loop {
-                futures::select_biased! {
-                    _ = strategy_timer.tick().fuse() => {
+                check_completions(pending_writer.try_tick())
+                    .inspect_err(|_| runners_cancel_token.cancel())?;
+
+                let can_write = pending_writer.can_write();
+
+                let event = {
+                    let writer_fut = if pending_writer.is_idle() {
+                        Either::Left(futures::future::pending::<Option<Vec<WriteCompletion>>>())
+                    } else {
+                        Either::Right(pending_writer.tick())
+                    }
+                    .fuse();
+
+                    let runner_fut = if can_write {
+                        Either::Left(runner_manager.tick(&mut meters))
+                    } else {
+                        Either::Right(runner_manager.tick_lifecycle_only(&mut meters))
+                    }
+                    .fuse();
+
+                    let strategy_tick = strategy_timer.tick().fuse();
+                    let throughput_tick = throughout_meter_timer.tick().fuse();
+
+                    futures::pin_mut!(writer_fut, runner_fut, strategy_tick, throughput_tick);
+
+                    futures::select_biased! {
+                        completions = writer_fut => LoopEvent::WriterCompleted(completions),
+                        _ = strategy_tick => LoopEvent::StrategyTimer,
+                        _ = throughput_tick => LoopEvent::ThroughputTimer,
+                        tick = runner_fut => LoopEvent::Runner(tick),
+                    }
+                };
+
+                match event {
+                    LoopEvent::WriterCompleted(Some(completions)) => {
+                        check_completions(completions)
+                            .inspect_err(|_| runners_cancel_token.cancel())?;
+                    }
+                    LoopEvent::WriterCompleted(None) => {
+                        runners_cancel_token.cancel();
+                        return Err(TaskInstanceError::new_failed(TaskError::Other {
+                            message: "writer completion channel closed unexpectedly".to_string(),
+                        }));
+                    }
+                    LoopEvent::StrategyTimer => {
                         Self::strategy_control_timer_tick(
                             &mut runner_manager,
                             &mut strategy_control,
                             &mut max_concurrency,
-
                             &rt,
                             &adapter,
                             &runners_cancel_token,
                             &wg,
-
                             current_speed,
                             per_runner_avg_speed,
-                        ).await.inspect_err(|e| {
+                        )
+                        .await
+                        .inspect_err(|e| {
                             error!("failed to download strategy timer tick: {e:?}");
+                            runners_cancel_token.cancel();
                             self.sync_progress(&runner_manager);
                         })?;
                     }
-                    _ = throughout_meter_timer.tick().fuse() => {
+                    LoopEvent::ThroughputTimer => {
                         Self::throughout_meter_tick(
                             &rt,
                             &wg,
@@ -597,17 +667,19 @@ impl ConcurrentTaskInner {
                             &event_tx,
                         );
                     }
-                    tick = runner_manager.tick(&mut meters).fuse() => {
+                    LoopEvent::Runner(tick) => {
                         if let Some(chunk) = tick.downloaded {
-                            let file_writer = file_writer.clone();
-                            let wg = wg.clone();
-                            rt.spawn(async move {
-                                let _wg = wg;
-                                if let Err(e) = file_writer.write_range(chunk.range, chunk.bytes).await {
-                                    // TODO: notify the task to stop
-                                    error!("failed to write to file: {e:?}");
-                                }
-                            }).expect("should never spawn failed");
+                            pending_writer
+                                .write_range(chunk.range, chunk.bytes)
+                                .map_err(|error: WriterFullError| {
+                                    TaskInstanceError::new_failed(TaskError::Other {
+                                        message: format!(
+                                            "writer rejected write (invariant violation): {:?}",
+                                            error.0.range
+                                        ),
+                                    })
+                                })
+                                .inspect_err(|_| runners_cancel_token.cancel())?;
                         }
                         if tick.state == TaskState::Finished {
                             break;
@@ -618,12 +690,19 @@ impl ConcurrentTaskInner {
             Ok(())
         }
         .await;
+
+        if event_loop_result.is_err() {
+            runners_cancel_token.cancel();
+        }
         self.sync_progress(&runner_manager);
 
-        // Wait all message handlers to finish
         wg.wait().await;
 
+        let flush_result = check_completions(pending_writer.flush().await);
+        drop(pending_writer);
+
         event_loop_result?;
+        flush_result?;
 
         // TODO: add a finalizing state?
         file_writer.finalize().await.map_err(|e| {

@@ -8,7 +8,8 @@ use snafu::prelude::*;
 
 use super::{
     Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    FileWriterError, FileWriterFuture, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu,
+    WriteRangeSnafu,
 };
 
 enum Command {
@@ -22,54 +23,58 @@ pub struct CompioWriter {
 }
 
 impl FileRangeWriter for CompioWriter {
-    async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
-        let (tx, rx) = oneshot::channel();
-        let chunk = Chunk { range, data };
-        self.tx
-            .send(Command::Write(chunk.clone(), tx))
-            .await
-            .map_err(|e| {
-                let Command::Write(chunk, _) = e.into_inner() else {
-                    unreachable!()
-                };
-                FileWriterError::WriteRange {
-                    source: CommandError::Send,
+    fn write_range(&self, range: Range<u64>, data: Bytes) -> FileWriterFuture<'_> {
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            let chunk = Chunk { range, data };
+            self.tx
+                .send(Command::Write(chunk.clone(), tx))
+                .await
+                .map_err(|e| {
+                    let Command::Write(chunk, _) = e.into_inner() else {
+                        unreachable!()
+                    };
+                    FileWriterError::WriteRange {
+                        source: CommandError::Send,
+                        chunk: Some(chunk),
+                        path: self.path.clone(),
+                    }
+                })?;
+            rx.await
+                .map_err(|_| CommandError::Recv)
+                .with_context(|_| WriteRangeSnafu {
+                    chunk: Some(chunk.clone()),
+                    path: self.path.clone(),
+                })?
+                .map_err(CommandError::from)
+                .with_context(|_| WriteRangeSnafu {
                     chunk: Some(chunk),
                     path: self.path.clone(),
-                }
-            })?;
-        rx.await
-            .map_err(|_| CommandError::Recv)
-            .with_context(|_| WriteRangeSnafu {
-                chunk: Some(chunk.clone()),
-                path: self.path.clone(),
-            })?
-            .map_err(CommandError::from)
-            .with_context(|_| WriteRangeSnafu {
-                chunk: Some(chunk),
-                path: self.path.clone(),
-            })?;
-        Ok(())
+                })?;
+            Ok(())
+        })
     }
-    async fn finalize(self) -> Result<(), FileWriterError> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Finalize(tx))
-            .await
-            .map_err(|_| CommandError::Send)
-            .with_context(|_| FinalizeSnafu {
-                path: self.path.clone(),
-            })?;
-        rx.await
-            .map_err(|_| CommandError::Recv)
-            .with_context(|_| FinalizeSnafu {
-                path: self.path.clone(),
-            })?
-            .map_err(CommandError::from)
-            .with_context(|_| FinalizeSnafu {
-                path: self.path.clone(),
-            })?;
-        Ok(())
+    fn finalize(self) -> FileWriterFuture<'static> {
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            self.tx
+                .send(Command::Finalize(tx))
+                .await
+                .map_err(|_| CommandError::Send)
+                .with_context(|_| FinalizeSnafu {
+                    path: self.path.clone(),
+                })?;
+            rx.await
+                .map_err(|_| CommandError::Recv)
+                .with_context(|_| FinalizeSnafu {
+                    path: self.path.clone(),
+                })?
+                .map_err(CommandError::from)
+                .with_context(|_| FinalizeSnafu {
+                    path: self.path.clone(),
+                })?;
+            Ok(())
+        })
     }
 }
 
