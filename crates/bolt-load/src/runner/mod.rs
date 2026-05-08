@@ -1,14 +1,10 @@
-use std::{
-    cmp::Ordering,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::cmp::Ordering;
 
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, traits::*};
 use bolt_load_utils::telemetry::*;
 use bytes::{Bytes, BytesMut};
 use future::FlushBuffFuture;
-use futures::{FutureExt, Stream, StreamExt, stream::BoxStream};
+use futures::{FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
 
 use crate::{
@@ -89,165 +85,6 @@ impl LifecycleEvent {
     }
 }
 
-/// Legacy messages for runner -> manager consumers.
-#[derive(Debug)]
-pub struct RunnerMessage(pub RunnerId, pub RunnerMessageKind);
-
-#[derive(Debug)]
-pub enum RunnerMessageKind {
-    /// The task is started
-    Started,
-    /// Stopped with message
-    Stopped(StoppedReason),
-    /// Downloaded a chunk
-    Downloaded(Bytes),
-}
-
-impl RunnerMessageKind {
-    #[inline]
-    pub fn failed(e: TaskError) -> Self {
-        Self::Stopped(StoppedReason::Failed(e))
-    }
-
-    #[inline]
-    pub fn finished() -> Self {
-        Self::Stopped(StoppedReason::Finished)
-    }
-
-    #[inline]
-    pub fn downloaded(chunk: Bytes) -> Self {
-        Self::Downloaded(chunk)
-    }
-
-    #[inline]
-    pub fn started() -> Self {
-        Self::Started
-    }
-
-    #[inline]
-    pub const fn is_finished(&self) -> bool {
-        matches!(self, Self::Stopped(StoppedReason::Finished))
-    }
-
-    #[inline]
-    pub fn is_cancelled(&self) -> bool {
-        match self {
-            Self::Stopped(StoppedReason::Failed(e)) => e.is_cancelled(),
-            _ => false,
-        }
-    }
-}
-
-impl From<LifecycleEvent> for RunnerMessageKind {
-    fn from(event: LifecycleEvent) -> Self {
-        match event {
-            LifecycleEvent::Started => Self::Started,
-            LifecycleEvent::Stopped(reason) => Self::Stopped(reason),
-        }
-    }
-}
-
-/// Legacy merged stream used by the old runner-manager path.
-pub type RunnerMessageConsumer = BoxStream<'static, RunnerMessage>;
-
-pin_project_lite::pin_project! {
-    struct LegacyRunnerMessageConsumer {
-        runner_id: RunnerId,
-        #[pin]
-        lifecycle_rx: LifecycleReceiver,
-        #[pin]
-        data_rx: DataFrameReceiver,
-        pending_stop: Option<StoppedReason>,
-        lifecycle_done: bool,
-        data_done: bool,
-    }
-}
-
-impl Stream for LegacyRunnerMessageConsumer {
-    type Item = RunnerMessage;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-
-        loop {
-            if this.pending_stop.is_some() {
-                match Stream::poll_next(this.data_rx.as_mut(), cx) {
-                    Poll::Ready(Some(frame)) => {
-                        return Poll::Ready(Some(RunnerMessage(
-                            *this.runner_id,
-                            RunnerMessageKind::downloaded(frame.data),
-                        )));
-                    }
-                    Poll::Ready(None) | Poll::Pending => {
-                        let reason = this.pending_stop.take().expect("pending stop should exist");
-                        *this.data_done = true;
-                        return Poll::Ready(Some(RunnerMessage(
-                            *this.runner_id,
-                            RunnerMessageKind::Stopped(reason),
-                        )));
-                    }
-                }
-            }
-
-            if !*this.lifecycle_done {
-                match Stream::poll_next(this.lifecycle_rx.as_mut(), cx) {
-                    Poll::Ready(Some(LifecycleEvent::Started)) => {
-                        return Poll::Ready(Some(RunnerMessage(
-                            *this.runner_id,
-                            RunnerMessageKind::Started,
-                        )));
-                    }
-                    Poll::Ready(Some(LifecycleEvent::Stopped(reason))) => {
-                        *this.pending_stop = Some(reason);
-                        continue;
-                    }
-                    Poll::Ready(None) => {
-                        *this.lifecycle_done = true;
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            if !*this.data_done {
-                match Stream::poll_next(this.data_rx.as_mut(), cx) {
-                    Poll::Ready(Some(frame)) => {
-                        return Poll::Ready(Some(RunnerMessage(
-                            *this.runner_id,
-                            RunnerMessageKind::downloaded(frame.data),
-                        )));
-                    }
-                    Poll::Ready(None) => {
-                        *this.data_done = true;
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            if *this.lifecycle_done && *this.data_done {
-                return Poll::Ready(None);
-            }
-
-            return Poll::Pending;
-        }
-    }
-}
-
-pub(super) fn legacy_consumer(
-    runner_id: RunnerId,
-    lifecycle_rx: LifecycleReceiver,
-    data_rx: DataFrameReceiver,
-) -> RunnerMessageConsumer {
-    LegacyRunnerMessageConsumer {
-        runner_id,
-        lifecycle_rx,
-        data_rx,
-        pending_stop: None,
-        lifecycle_done: false,
-        data_done: false,
-    }
-    .boxed()
-}
-
 /// The reason why the task is stopped
 #[derive(Debug)]
 pub enum StoppedReason {
@@ -293,8 +130,6 @@ pub struct TaskRunner {
     data_tx: Option<DataFrameSender>,
     /// How long to wait for data frames to be consumed after the stream stops.
     data_drain_timeout: std::time::Duration,
-    /// Compatibility mode for the legacy merged message stream.
-    legacy_mode: bool,
     /// the cancel token
     cancel_token: CancellationToken,
     /// the shutdown signal, used for ensure the task runner is stopped
@@ -363,56 +198,6 @@ struct PendingFlushState {
 }
 
 impl TaskRunner {
-    pub fn new(
-        total: Option<u64>,
-        stream: AnyBytesStream,
-        runner_id: RunnerId,
-        receiver: ControlSignalReceiver,
-        cancel_token: CancellationToken,
-    ) -> (Self, RunnerMessageConsumer) {
-        TaskRunner::builder()
-            .stream(stream)
-            .runner_id(runner_id)
-            .control_signal(receiver)
-            .cancel_token(cancel_token)
-            .with_optional_total(total)
-            .build_legacy()
-            .expect("legacy constructor sets all required fields")
-    }
-
-    pub async fn new_with_async_and_callback(
-        total: Option<u64>,
-        stream: impl Future<Output = Result<AnyBytesStream, AdapterError>>,
-        runner_id: RunnerId,
-        receiver: ControlSignalReceiver,
-        cancel_token: CancellationToken,
-        on_channel_created: impl FnOnce(RunnerMessageConsumer),
-    ) -> Option<Self> {
-        let builder = TaskRunner::builder()
-            .runner_id(runner_id)
-            .control_signal(receiver)
-            .cancel_token(cancel_token)
-            .with_optional_total(total);
-        let (mut runner, legacy_rx) = builder
-            .build_legacy_without_stream()
-            .expect("legacy constructor sets all required fields except stream");
-        on_channel_created(legacy_rx);
-
-        match stream.await {
-            Ok(stream) => {
-                runner.stream = stream;
-                Some(runner)
-            }
-            Err(e) => {
-                let _ = runner
-                    .lifecycle_tx
-                    .push(LifecycleEvent::failed(TaskError::StreamError { source: e }))
-                    .await;
-                None
-            }
-        }
-    }
-
     /// Get the builder of the task runner
     pub fn builder() -> TaskRunnerBuilder {
         TaskRunnerBuilder::default()
@@ -461,10 +246,6 @@ impl TaskRunner {
     }
 
     fn should_wait_data_drain(&self, result: &Result<(), TaskRunError>) -> bool {
-        if self.legacy_mode {
-            return false;
-        }
-
         match result {
             Err(TaskRunError::Cancelled | TaskRunError::Failed(TaskError::Cancelled)) => false,
             Ok(()) => true,
@@ -2009,7 +1790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_with_async_and_callback_success() {
+    async fn test_builder_direct_stream_success() {
         let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
@@ -2078,7 +1859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_with_async_and_callback_stream_failure() {
+    async fn test_builder_direct_stream_failure() {
         let (_control_tx, control_rx) = async_channel::bounded(1);
         let cancel_token = CancellationToken::new();
         let runner_id = 42;
@@ -2230,7 +2011,6 @@ mod tests {
                             None => {
                                 runner1_finished = true;
                             }
-                            _ => {}
                         }
                     }
                     frame = data_rx1.next(), if !data1_done => {
@@ -2263,7 +2043,6 @@ mod tests {
                             None => {
                                 runner2_finished = true;
                             }
-                            _ => {}
                         }
                     }
                     frame = data_rx2.next(), if !data2_done => {
@@ -2286,7 +2065,6 @@ mod tests {
                             None => {
                                 runner3_finished = true;
                             }
-                            _ => {}
                         }
                     }
                     frame = data_rx3.next(), if !data3_done => {

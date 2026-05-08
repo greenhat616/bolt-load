@@ -12,12 +12,17 @@ use futures::{
 use futures_concurrency::future::FutureGroup;
 
 use crate::{
-    runner::{RunnerConnectorError, RunnerMessageConsumer},
+    runner::{DataFrameReceiver, LifecycleReceiver, RunnerConnectorError},
     task::RunnerId,
 };
 
 pub type PendingRunnerReceiver =
-    oneshot::Receiver<Result<RunnerMessageConsumer, RunnerConnectorError>>;
+    oneshot::Receiver<Result<RunnerBuilderOutput, RunnerConnectorError>>;
+
+pub struct RunnerBuilderOutput {
+    pub lifecycle_rx: LifecycleReceiver,
+    pub data_rx: DataFrameReceiver,
+}
 
 #[derive(Debug, Clone)]
 pub struct PendingRunnerContext {
@@ -50,7 +55,7 @@ pub enum PendingRunnerError {
 
 pub struct PendingRunnerOutput {
     pub context: PendingRunnerContext,
-    pub result: Result<RunnerMessageConsumer, PendingRunnerError>,
+    pub result: Result<RunnerBuilderOutput, PendingRunnerError>,
 }
 
 impl Future for PendingRunner {
