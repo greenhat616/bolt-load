@@ -1,7 +1,13 @@
 [package]
 name = "bolt-load"
-edition = "2024"
-version = "0.1.0"
+description = "A fast, async, multi-connection parallel download library for Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version = "1.88.0"
 
 [features]

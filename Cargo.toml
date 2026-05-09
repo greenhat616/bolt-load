@@ -8,6 +8,15 @@ members = [
 ]
 resolver = "3"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/greenhat616/bolt-load"
+homepage = "https://github.com/greenhat616/bolt-load"
+keywords = ["download", "async", "http", "parallel", "loader"]
+categories = ["network-programming", "asynchronous"]
+
 [workspace.dependencies]
 futures = "0.3"
 bytes = "1"
@@ -26,13 +35,3 @@ tokio-util = "0.7"
 pretty_assertions = "1"
 n0-tracing-test = { version = "0.3.0", features = ["pretty-log-printing"] }
 
-[patch.crates-io]
-futures-util = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures-task = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures-core = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures-channel = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures-executor = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures-macro = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures-sink = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures-io = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }
-futures = { git = "https://github.com/greenhat616/futures-rs.git", rev = "ec3ef7b6" }

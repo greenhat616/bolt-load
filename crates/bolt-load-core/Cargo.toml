@@ -1,7 +1,13 @@
 [package]
 name = "bolt-load-core"
-version = "0.1.0"
-edition = "2024"
+description = "Core traits and types for bolt-load: download sources, sinks, and error definitions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 snafu = { workspace = true }

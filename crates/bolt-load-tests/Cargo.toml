@@ -1,7 +1,11 @@
 [package]
 name = "bolt-load-tests"
-version = "0.1.0"
-edition = "2024"
+description = "Internal test utilities for bolt-load"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 tracing = ["bolt-load-utils/tracing", "dep:tracing"]
