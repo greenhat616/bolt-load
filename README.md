@@ -1,54 +1,158 @@
 <p align="center">
-    <img src="./.github/bolt-load-transparent.svg" alt="logo" width="200" height="200">
+    <img src="./.github/bolt-load-transparent.svg" alt="bolt-load" width="200" height="200">
 </p>
+
+<h3 align="center">High-performance, runtime-agnostic download engine for Rust</h3>
 
 <div align="center">
 
+[![CI](https://github.com/greenhat616/bolt-load/actions/workflows/ci.yml/badge.svg)](https://github.com/greenhat616/bolt-load/actions/workflows/ci.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/greenhat616/bolt-load)
+![MSRV](https://img.shields.io/badge/MSRV-1.88.0-blue)
+![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)
 
 </div>
 
-### Runner lifecycle API migration
+---
 
-The runner lifecycle refactor splits runner output into separate lifecycle and
-data receivers. Legacy APIs and types such as `TaskRunner::new`,
-`RunnerConnector`, `RunnerMessage`, and `RunnerMessageConsumer` are no longer
-available; callers should use `TaskRunner::builder().build()` and consume the
-returned `(TaskRunner, LifecycleReceiver, DataFrameReceiver)`.
+**bolt-load** is an embeddable Rust library for single-stream and multi-stream concurrent file downloads. It automatically detects HTTP range support, splits files into parallel byte-range chunks, and dynamically rebalances slow connections — all while staying runtime-agnostic.
 
-### Thread control algroithm
+## Highlights
 
-Split the process into 2 parts, slow start & max thread control
+- **Multi-runtime** — Tokio, Smol out of the box; custom runtimes via traits.
+- **Adaptive concurrency** — failure-rate monitoring with automatic degradation and recovery.
+- **Dynamic range splitting** — slow runners have their remaining ranges reassigned in real time.
+- **Multiple I/O backends** — mmap, pwrite thread pool, compio writer.
+- **Backpressure-aware** — lock-free SPSC ring-buffer channels prevent memory blow-up.
+- **Structured errors** — retryable vs. unretryable classification drives intelligent retry logic.
+- **Observable** — EMA speed sampling, progress events, `indicatif` progress bars, `tracing` spans.
 
-#### Slow start
+## Quick Start
 
-Start with minimum thread 1, then for each time period, split each thread into
-half. Stop the process when more thread can't get us significant boost. The
-$THREASHOLD_1$ should be large, since this process is just rough estimate.
+Add to your `Cargo.toml`:
 
-```math
-\begin{align}
-if \quad &|total\_speed_t - 2\times total\_speed_{t-1}| < THREASHOLD_1\\
-then \quad &thread_t = 2\times thread_{t-1} \\
-else \quad &break
-\end{align}
+```toml
+[dependencies]
+bolt-load = "0.1"
+reqwest = "0.13"
+tokio = { version = "1", features = ["full"] }
 ```
 
-#### Max thread control
+Download a file with concurrent range requests and a terminal progress bar:
 
-When we reached $THREASHOLD_1$, instead of spliting every thread, choose one
-task that has the longest unloaded range, then split the remaining chunk into to
-tasks.
+```rust,ignore
+use bolt_load::task::TaskBuilder;
+use bolt_load::adapter::reqwest::IntoReqwestAdapter;
+use bolt_load::runtime::ThreadedRuntimeImpl;
 
-$THREASHOLD_2$ represents the minimum allowed speed of a connection, if adding a
-thread can't gain enough speed, we'll stop adding new ones.
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let adapter = client.into_reqwest_adapter((
+        reqwest::Method::GET,
+        "https://example.com/large-file.bin".parse()?,
+    ));
 
-```math
-\begin{align}
-if \quad &|total\_speed_t - (total\_speed_{t-1} + thread\_average\_speed)| > THREASHOLD_2 \quad \&\& \quad thread_t < MAX\_THREADS \\
-then \quad &thread_t = thread_{t-1} + 1 \\
-else \quad & thread_t = thread_{t-1}
-\end{align}
+    let runtime = ThreadedRuntimeImpl::new_tokio_rt();
+
+    let mut task = TaskBuilder::default()
+        .adapter(Box::new(adapter))
+        .save_path("large-file.bin".into())
+        .threaded_runtime(runtime)
+        .build()
+        .await?;
+
+    task.with_progress_bar();
+    task.run().await?;
+    task.wait().await?;
+
+    Ok(())
+}
+```
+
+## Architecture
+
+```text
+┌──────────────────────────────────────────────────────┐
+│                       Task                           │
+│  ┌──────────────────┐   ┌──────────────────────────┐ │
+│  │  SingletonTask    │   │    ConcurrentTask        │ │
+│  │  (1 runner)       │   │    (N runners)           │ │
+│  └────────┬─────────┘   └────────┬─────────────────┘ │
+│           │                      │                    │
+│           ▼                      ▼                    │
+│       TaskRunner[]         RunnerManager              │
+│           │                ├─ ChunkPlanner            │
+│           │                ├─ StrategyControl         │
+│           │                ├─ SpeedSampler            │
+│           │                └─ FileWriter              │
+│           ▼                                           │
+│       AnyAdapter (BoltLoadAdapter trait)               │
+└──────────────────────────────────────────────────────┘
+```
+
+**Task** is the user-facing entry point. It selects between two download strategies automatically:
+
+| Mode | Condition | Behavior |
+|------|-----------|----------|
+| **Singleton** | Adapter lacks range support | Single `TaskRunner`, sequential stream |
+| **Concurrent** | Adapter supports byte ranges | N parallel `TaskRunner`s with dynamic splitting |
+
+### Concurrency Control
+
+The engine monitors runner failure rates over a sliding window:
+
+1. **Normal** — spawn up to CPU-core-count runners.
+2. **Degraded** — failure rate > 30% triggers stepwise concurrency reduction.
+3. **Recovering** — after 30 s cooldown, probe with +1 runner; commit if stable over 15 s.
+
+### File Writer Backends
+
+| Backend | Feature | Description |
+|---------|---------|-------------|
+| `MmapWriter` | `mmap` | Memory-mapped random-access writes |
+| `PoolWriter` | *(default)* | Thread-pool `pwrite` (portable) |
+| `CompioWriter` | `compio` | io_uring-based async writes (Linux) |
+| `NullWriter` | — | Discard output for benchmarking |
+
+## Workspace
+
+| Crate | Description |
+|-------|-------------|
+| [**bolt-load**](crates/bolt-load) | Main download engine |
+| [**bolt-load-core**](crates/bolt-load-core) | `BoltLoadAdapter` trait and error types |
+| [**bolt-load-adapter**](crates/bolt-load-adapter) | HTTP adapters: reqwest, ureq |
+| [**bolt-load-utils**](crates/bolt-load-utils) | HTTP parsing, cross-runtime streams, telemetry |
+| [**bolt-load-tests**](crates/bolt-load-tests) | Test adapters and HTTP server fixtures |
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `tokio` | ✓ | Tokio async runtime |
+| `smol` | | Smol async runtime |
+| `compio` | | Compio (io_uring) file writer |
+| `reqwest` | ✓ | Reqwest HTTP adapter |
+| `ureq2` | | Ureq 2.x adapter (blocking) |
+| `ureq3` | | Ureq 3.x adapter (blocking) |
+| `http` | | HTTP header parsing (Content-Disposition) |
+| `serde` | ✓ | Serialization for progress types |
+| `tracing` | ✓ | Distributed tracing instrumentation |
+| `progressbar` | ✓ | `indicatif` terminal progress bars |
+| `mmap` | ✓ | Memory-mapped file writer |
+
+## Custom Adapters
+
+Implement `BoltLoadAdapter` to download from any source (S3, FTP, in-memory, …):
+
+```rust,ignore
+#[async_trait]
+impl BoltLoadAdapter for MySource {
+    async fn is_range_stream_available(&self) -> bool { true }
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> { /* ... */ }
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> { /* ... */ }
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> { /* ... */ }
+}
 ```
 
 ## Development
@@ -62,15 +166,48 @@ lefthook install
 
 The configured Git hooks run the following checks:
 
-- `cargo fmt --all -- --check` for Rust formatting.
-- `cargo clippy --all-targets --all-features -- -D warnings` for Rust linting.
-- `deno fmt --check` for TypeScript and JavaScript formatting.
-- `deno lint` for TypeScript and JavaScript linting.
-- `deno run -A npm:@commitlint/cli --config commitlint.config.ts --edit {1}`
-  for commit message validation.
+- `cargo fmt --all -- --check` — Rust formatting.
+- `cargo clippy --all-targets --all-features -- -D warnings` — Rust linting.
+- `deno fmt --check` — TypeScript/JavaScript formatting.
+- `deno lint` — TypeScript/JavaScript linting.
+- `@commitlint/cli` — Conventional Commits validation.
 
-Commit messages must follow the Conventional Commits style, for example:
+Commit messages must follow Conventional Commits:
 
 ```text
 feat: add resumable download support
+fix: handle zero-length range responses
+refactor: migrate error types to snafu
 ```
+
+### Thread Control Algorithm
+
+The concurrent download engine uses a two-phase approach to find optimal parallelism:
+
+#### Slow Start
+
+Start with 1 runner, doubling each period until additional runners stop producing significant throughput gains:
+
+```math
+\begin{align}
+\text{if} \quad &|total\_speed_t - 2 \times total\_speed_{t-1}| < THRESHOLD_1 \\
+\text{then} \quad &thread_t = 2 \times thread_{t-1} \\
+\text{else} \quad &\text{break}
+\end{align}
+```
+
+#### Fine-Tuning
+
+After slow start, add one runner at a time by splitting the chunk with the longest remaining range:
+
+```math
+\begin{align}
+\text{if} \quad &|total\_speed_t - (total\_speed_{t-1} + avg\_speed)| > THRESHOLD_2 \;\&\&\; thread_t < MAX \\
+\text{then} \quad &thread_t = thread_{t-1} + 1 \\
+\text{else} \quad &thread_t = thread_{t-1}
+\end{align}
+```
+
+## MSRV
+
+Rust **1.88.0+** (Edition 2024)
