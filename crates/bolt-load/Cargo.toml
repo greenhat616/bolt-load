@@ -118,7 +118,7 @@ windows-sys = { version = "0.61", features = [
 
 
 [dev-dependencies]
-bolt-load-tests = { path = "../bolt-load-tests", version = "0.1" }
+bolt-load-tests = { path = "../bolt-load-tests" }
 
 pretty_assertions = { workspace = true }
 n0-tracing-test = { workspace = true }

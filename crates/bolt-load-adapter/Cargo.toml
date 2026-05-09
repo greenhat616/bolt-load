@@ -50,4 +50,4 @@ reqwest = { version = "0.13", default-features = true, features = ["stream"] }
 tokio = { workspace = true, features = ["full"] }
 pretty_assertions = { workspace = true }
 n0-tracing-test = { workspace = true }
-bolt-load-tests = { path = "../bolt-load-tests", version = "0.1" }
+bolt-load-tests = { path = "../bolt-load-tests" }
