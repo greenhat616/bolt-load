@@ -19,6 +19,7 @@
 
 ## Highlights
 
+- **Pluggable adapters** — bring any download source via the `BoltLoadAdapter` trait; ships with reqwest and ureq.
 - **Multi-runtime** — Tokio, Smol out of the box; custom runtimes via traits.
 - **Adaptive concurrency** — failure-rate monitoring with automatic degradation and recovery.
 - **Dynamic range splitting** — slow runners have their remaining ranges reassigned in real time.
