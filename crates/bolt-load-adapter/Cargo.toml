@@ -11,7 +11,7 @@ categories.workspace = true
 
 [features]
 default = ["reqwest"]
-reqwest = ["dep:reqwest", "bolt-load-utils/http", "dep:async-once-cell"]
+reqwest = ["dep:reqwest", "bolt-load-utils/http", "bolt-load-utils/tracing", "dep:async-once-cell"]
 ureq2 = [
     "dep:ureq2",
     "bolt-load-utils/reader",
