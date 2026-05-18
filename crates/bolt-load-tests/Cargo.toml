@@ -31,7 +31,7 @@ async-stream = "0.3"
 governor = "0.10.4"  # for rate limiting
 
 # for generate a random file
-rand = "0.9"
+rand = "0.10"
 
 # for hash verification in tests
 blake3 = "1"
