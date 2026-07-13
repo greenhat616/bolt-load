@@ -133,13 +133,13 @@ tracing-tracy = "0.11"
 console-subscriber = "0.5.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = { version = "0.32", features = ["metrics"] }
-opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
-opentelemetry-semantic-conventions = { version = "0.31", features = [
+opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = { version = "0.32", features = [
     "semconv_experimental",
 ] }
-opentelemetry-stdout = { version = "0.31", features = ["trace", "metrics"] }
+opentelemetry-stdout = { version = "0.32", features = ["trace", "metrics"] }
 
 # for benchmarks
 criterion = { version = "0.8", features = ["async_tokio"] }
