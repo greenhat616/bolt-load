@@ -33,6 +33,15 @@ pub(super) struct AttemptFailure {
     pub retryable: bool,
 }
 
+/// Bytes received from runners since the previous snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MeterSnapshot {
+    /// Runners that delivered data and have not stopped since.
+    pub runners: usize,
+    /// Bytes received before the planner clipped them.
+    pub bytes: usize,
+}
+
 /// Result of a single `RunnerManager::tick()` call.
 #[derive(Debug)]
 pub(super) struct RunnerTick {
@@ -187,6 +196,11 @@ pub struct RunnerManager {
     lifecycle_aggregator: LifecycleAggregator,
     /// Data aggregator for runners' data frames
     data_aggregator: DataAggregator,
+    /// Bytes received per runner since the last meter snapshot.
+    ///
+    /// An entry is created when a runner delivers data and removed when it
+    /// stops or is lost; snapshots reset the counts but keep the entries.
+    meters: HashMap<RunnerId, usize>,
 }
 
 impl RunnerManager {
@@ -204,6 +218,15 @@ impl RunnerManager {
             runner_outcome_sampler: RunnerOutcomeSampler::with_defaults(),
             lifecycle_aggregator: LifecycleAggregator::with_capacity(max_concurrency),
             data_aggregator: DataAggregator::with_capacity(max_concurrency),
+            meters: HashMap::with_capacity(max_concurrency),
+        }
+    }
+
+    /// Take the bytes received since the previous snapshot.
+    pub(super) fn take_meters_snapshot(&mut self) -> MeterSnapshot {
+        MeterSnapshot {
+            runners: self.meters.len(),
+            bytes: self.meters.values_mut().map(std::mem::take).sum(),
         }
     }
 
@@ -504,11 +527,7 @@ impl RunnerManager {
         false
     }
 
-    fn handle_lifecycle(
-        &mut self,
-        event: RunnerTaggedStreamItem<LifecycleEvent>,
-        meters: &mut HashMap<RunnerId, usize>,
-    ) -> RunnerTick {
+    fn handle_lifecycle(&mut self, event: RunnerTaggedStreamItem<LifecycleEvent>) -> RunnerTick {
         let runner_id = event.runner_id;
         let reason = match event.item {
             LifecycleEvent::Started => {
@@ -517,7 +536,7 @@ impl RunnerManager {
             }
             LifecycleEvent::Stopped(reason) => reason,
         };
-        meters.remove(&runner_id);
+        self.meters.remove(&runner_id);
         // Remove control channel when runner stops
         self.release_runner(runner_id);
         let kind = match reason {
@@ -601,13 +620,9 @@ impl RunnerManager {
     }
 
     /// Handle a runner whose stream closed without sending `Stopped`.
-    fn handle_runner_lost(
-        &mut self,
-        runner_id: RunnerId,
-        meters: &mut HashMap<RunnerId, usize>,
-    ) -> RunnerTick {
+    fn handle_runner_lost(&mut self, runner_id: RunnerId) -> RunnerTick {
         warn!("runner {runner_id} lifecycle stream closed unexpectedly");
-        meters.remove(&runner_id);
+        self.meters.remove(&runner_id);
         let unfinished_range = self
             .chunk_planner
             .mark_failed(runner_id)
@@ -626,16 +641,10 @@ impl RunnerManager {
         })
     }
 
-    fn handle_lifecycle_stream_event(
-        &mut self,
-        event: Option<LifecycleStreamEvent>,
-        meters: &mut HashMap<RunnerId, usize>,
-    ) -> RunnerTick {
+    fn handle_lifecycle_stream_event(&mut self, event: Option<LifecycleStreamEvent>) -> RunnerTick {
         match event {
-            Some(LifecycleStreamEvent::Event(tagged)) => self.handle_lifecycle(tagged, meters),
-            Some(LifecycleStreamEvent::Closed(runner_id)) => {
-                self.handle_runner_lost(runner_id, meters)
-            }
+            Some(LifecycleStreamEvent::Event(tagged)) => self.handle_lifecycle(tagged),
+            Some(LifecycleStreamEvent::Closed(runner_id)) => self.handle_runner_lost(runner_id),
             None => RunnerTick::downloading(),
         }
     }
@@ -649,14 +658,9 @@ impl RunnerManager {
     }
 
     /// Handle data frames from runners, returning the chunk ready for writing.
-    fn handle_data_frame(
-        &mut self,
-        runner_id: RunnerId,
-        mut data_frame: Bytes,
-        meters: &mut HashMap<RunnerId, usize>,
-    ) -> DownloadedChunk {
+    fn handle_data_frame(&mut self, runner_id: RunnerId, mut data_frame: Bytes) -> DownloadedChunk {
         let bytes_len = data_frame.len();
-        *meters.entry(runner_id).or_insert(0) += bytes_len;
+        *self.meters.entry(runner_id).or_insert(0) += bytes_len;
 
         let fixed_downloaded_range = self
             .chunk_planner
@@ -672,20 +676,20 @@ impl RunnerManager {
     }
 
     #[allow(private_interfaces)]
-    pub async fn tick(&mut self, meters: &mut HashMap<RunnerId, usize>) -> RunnerTick {
+    pub async fn tick(&mut self) -> RunnerTick {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
         let next_data = self.data_aggregator.next().fuse();
         let pending = self.pending_runners.next().fuse();
         futures::pin_mut!(next_lifecycle, next_data, pending);
         // Priority: lifecycle > pending > data (lifecycle is control-plane, must not be starved)
         futures::select_biased! {
-            event = next_lifecycle => self.handle_lifecycle_stream_event(event, meters),
+            event = next_lifecycle => self.handle_lifecycle_stream_event(event),
             pending = pending => self.handle_pending_stream_event(pending),
             data = next_data => {
                 if let Some(event) = data {
                     match event {
                         DataStreamEvent::Data(item) => {
-                            let chunk = self.handle_data_frame(item.runner_id, item.item.data, meters);
+                            let chunk = self.handle_data_frame(item.runner_id, item.item.data);
                             return RunnerTick::with_chunk(chunk);
                         }
                         DataStreamEvent::Closed(runner_id) => {
@@ -700,15 +704,12 @@ impl RunnerManager {
     }
 
     #[allow(private_interfaces)]
-    pub async fn tick_lifecycle_only(
-        &mut self,
-        meters: &mut HashMap<RunnerId, usize>,
-    ) -> RunnerTick {
+    pub async fn tick_lifecycle_only(&mut self) -> RunnerTick {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
         let pending = self.pending_runners.next().fuse();
         futures::pin_mut!(next_lifecycle, pending);
         futures::select_biased! {
-            event = next_lifecycle => self.handle_lifecycle_stream_event(event, meters),
+            event = next_lifecycle => self.handle_lifecycle_stream_event(event),
             pending = pending => self.handle_pending_stream_event(pending),
         }
     }
@@ -901,8 +902,7 @@ mod tests {
         .unwrap();
 
         // Tick to process the pending runner
-        let mut meters = HashMap::new();
-        let tick = manager.tick(&mut meters).await;
+        let tick = manager.tick().await;
 
         assert_eq!(tick.state, TaskState::Downloading);
         assert!(tick.downloaded.is_none());
@@ -947,8 +947,7 @@ mod tests {
         .unwrap();
 
         // Tick to process the pending runner
-        let mut meters = HashMap::new();
-        let tick = manager.tick(&mut meters).await;
+        let tick = manager.tick().await;
 
         assert_eq!(tick.state, TaskState::Downloading);
         assert!(tick.downloaded.is_none());
@@ -1011,9 +1010,7 @@ mod tests {
             .push(LifecycleEvent::Stopped(StoppedReason::Finished))
             .await
             .unwrap();
-
-        let mut meters = HashMap::new();
-        let tick = manager.tick(&mut meters).await;
+        let tick = manager.tick().await;
 
         assert_eq!(tick.state, TaskState::Downloading);
         assert!(tick.downloaded.is_none());
@@ -1041,9 +1038,7 @@ mod tests {
             )))
             .await
             .unwrap();
-
-        let mut meters = HashMap::new();
-        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick(&mut meters))
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick())
             .await
             .expect("exceeded-total-size lifecycle event should be observed");
 
@@ -1070,14 +1065,9 @@ mod tests {
             )))
             .await
             .unwrap();
-
-        let mut meters = HashMap::new();
-        let tick = tokio::time::timeout(
-            Duration::from_secs(1),
-            manager.tick_lifecycle_only(&mut meters),
-        )
-        .await
-        .expect("exceeded-total-size lifecycle event should be observed");
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick_lifecycle_only())
+            .await
+            .expect("exceeded-total-size lifecycle event should be observed");
 
         assert_eq!(tick.state, TaskState::Finished);
         assert!(tick.downloaded.is_none());
@@ -1094,9 +1084,7 @@ mod tests {
         let (lifecycle_prod, _data_prod) = register_test_channels(&mut manager, runner_id);
 
         drop(lifecycle_prod);
-
-        let mut meters = HashMap::new();
-        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick(&mut meters))
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick())
             .await
             .expect("closed lifecycle stream should be observed");
 
@@ -1115,14 +1103,9 @@ mod tests {
         let (lifecycle_prod, _data_prod) = register_test_channels(&mut manager, runner_id);
 
         drop(lifecycle_prod);
-
-        let mut meters = HashMap::new();
-        let tick = tokio::time::timeout(
-            Duration::from_secs(1),
-            manager.tick_lifecycle_only(&mut meters),
-        )
-        .await
-        .expect("closed lifecycle stream should be observed");
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick_lifecycle_only())
+            .await
+            .expect("closed lifecycle stream should be observed");
 
         assert_eq!(tick.state, TaskState::Finished);
         assert!(tick.downloaded.is_none());
@@ -1152,9 +1135,7 @@ mod tests {
         manager.register_runner_channels(runner_id, lifecycle_cons, data_cons);
 
         drop(data_prod);
-
-        let mut meters = HashMap::new();
-        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick(&mut meters))
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick())
             .await
             .expect("data channel close should be observed without blocking");
         assert_eq!(tick.state, TaskState::Downloading);
@@ -1167,7 +1148,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick(&mut meters))
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick())
             .await
             .expect("lifecycle stopped should still be handled after data closes");
         assert_eq!(tick.state, TaskState::Finished);
@@ -1208,14 +1189,9 @@ mod tests {
             )))
             .await
             .unwrap();
-
-        let mut meters = HashMap::new();
-        let tick = tokio::time::timeout(
-            Duration::from_secs(1),
-            manager.tick_lifecycle_only(&mut meters),
-        )
-        .await
-        .expect("lifecycle-only tick should not wait for writer capacity");
+        let tick = tokio::time::timeout(Duration::from_secs(1), manager.tick_lifecycle_only())
+            .await
+            .expect("lifecycle-only tick should not wait for writer capacity");
 
         assert_eq!(tick.state, TaskState::Downloading);
         assert!(tick.downloaded.is_none());
@@ -1254,11 +1230,9 @@ mod tests {
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
         });
-
-        let mut meters = HashMap::new();
         let tick = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let tick = manager.tick_lifecycle_only(&mut meters).await;
+                let tick = manager.tick_lifecycle_only().await;
                 if manager.get_runner_state(runner_id).is_none() {
                     break tick;
                 }
@@ -1314,12 +1288,108 @@ mod tests {
             .unwrap();
 
         // Tick to process data
-        let mut meters = HashMap::new();
-        let tick = manager.tick(&mut meters).await;
+        let tick = manager.tick().await;
 
         assert_eq!(tick.state, TaskState::Downloading);
         let chunk = tick.downloaded.expect("should have downloaded chunk");
         assert_eq!(chunk.range, 0..100);
         assert_eq!(chunk.bytes.len(), 100);
+    }
+
+    async fn push_frame(data_tx: &mut crate::runner::DataFrameSender, len: usize) {
+        use async_ringbuf::traits::AsyncProducer;
+
+        data_tx
+            .push(crate::runner::DataFrame {
+                data: Bytes::from(vec![1; len]),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_meters_count_bytes_before_clipping() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let runner_id = manager
+            .allocate_runner_with_chunk(0..100)
+            .unwrap()
+            .runner_id;
+        let (_lifecycle_tx, mut data_tx) = register_test_channels(&mut manager, runner_id);
+
+        push_frame(&mut data_tx, 150).await;
+        let chunk = manager.tick().await.downloaded.expect("a chunk");
+
+        assert_eq!(chunk.range, 0..100);
+        assert_eq!(
+            manager.take_meters_snapshot(),
+            MeterSnapshot {
+                runners: 1,
+                bytes: 150
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_meters_snapshot_resets_counts_but_keeps_entries() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let runner_id = manager
+            .allocate_runner_with_chunk(0..500)
+            .unwrap()
+            .runner_id;
+        let (_lifecycle_tx, mut data_tx) = register_test_channels(&mut manager, runner_id);
+
+        push_frame(&mut data_tx, 10).await;
+        manager.tick().await;
+
+        assert_eq!(
+            manager.take_meters_snapshot(),
+            MeterSnapshot {
+                runners: 1,
+                bytes: 10
+            }
+        );
+        assert_eq!(
+            manager.take_meters_snapshot(),
+            MeterSnapshot {
+                runners: 1,
+                bytes: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_meters_entry_is_removed_before_runner_id_is_reused() {
+        use async_ringbuf::traits::AsyncProducer;
+
+        let mut manager = RunnerManager::new(1000, 2);
+        let runner_id = manager
+            .allocate_runner_with_chunk(0..100)
+            .unwrap()
+            .runner_id;
+        let (mut lifecycle_tx, mut data_tx) = register_test_channels(&mut manager, runner_id);
+        push_frame(&mut data_tx, 10).await;
+        manager.tick().await;
+        lifecycle_tx
+            .push(LifecycleEvent::failed(TaskError::Timeout))
+            .await
+            .unwrap();
+        assert!(manager.tick().await.failure.is_some());
+
+        let reused = manager
+            .allocate_runner_with_chunk(10..100)
+            .unwrap()
+            .runner_id;
+        assert_eq!(reused, runner_id);
+        let (_lifecycle_tx, mut data_tx) = register_test_channels(&mut manager, reused);
+        push_frame(&mut data_tx, 5).await;
+        manager.tick().await;
+
+        assert_eq!(
+            manager.take_meters_snapshot(),
+            MeterSnapshot {
+                runners: 1,
+                bytes: 5
+            }
+        );
     }
 }

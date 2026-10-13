@@ -1,6 +1,5 @@
 use std::{
-    collections::HashMap,
-    ops::Range,
+    ops::{ControlFlow, Range},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -10,7 +9,7 @@ use async_waitgroup::WaitGroup;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
 use futures::{FutureExt, future::Either, task::SpawnExt};
-use runner_manager::TaskState;
+use runner_manager::{MeterSnapshot, RunnerTick, TaskState};
 use smol_cancellation_token::CancellationToken;
 
 use super::{
@@ -21,7 +20,7 @@ use super::{
 use crate::{
     adapter::{AnyAdapter, UnretryableError},
     runner::{StreamConnector, TaskError, TaskRunner},
-    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl, Timer, TimerBuilder},
+    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl, Timer, TimerBuilder, TimerImpl},
     task::{
         Progress, RunnerId, TaskOptions,
         instance::{
@@ -208,67 +207,110 @@ impl ConcurrentTaskInner {
         })
     }
 
-    /// Split the given task into two separate tasks
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip_all, fields(runner_id, range))
-    )]
-    #[allow(clippy::too_many_arguments)]
-    fn split_task(
-        runner_manager: &mut RunnerManager,
-
-        threaded_rt: &ThreadedRuntimeImpl,
-        wg: &WaitGroup,
-        runners_cancel_token: &CancellationToken,
-        incomplete_range: Range<u64>,
-        adapter: Arc<AnyAdapter>,
-        runner_id: RunnerId,
-        idle_timeout: Duration,
-    ) {
-        let half_size = (incomplete_range.end - incomplete_range.start) / 2;
-
-        runner_manager.resize_runner(runner_id, half_size);
-
-        // Create a new runner for the remaining range
-
-        let next_range = incomplete_range.start + half_size..incomplete_range.end;
-        runner_manager
-            .allocate_pending_runner_with_chunk(next_range.clone(), |runner_id, control_rx| {
-                Self::create_background_range_runner(
-                    threaded_rt,
-                    wg,
-                    next_range,
-                    adapter.clone(),
-                    control_rx,
-                    runner_id,
-                    runners_cancel_token.clone(),
-                    idle_timeout,
-                )
-            })
-            .expect("failed to allocate runner with chunk");
+    /// Download into the temporary file, then publish it or discard it.
+    ///
+    /// Returns only after every owned worker has exited.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+        let tmp_path = output_file::tmp_path_for(&self.path);
+        let transfer = self.download_to(&tmp_path, cancel_token).await;
+        output_file::commit(transfer, &tmp_path, &self.path, cancel_token).await
     }
 
+    /// Run the transfer and tear it down on every path: success, failure and
+    /// cancellation. Teardown never short-circuits, so all spawned work is joined.
+    async fn download_to(
+        &mut self,
+        tmp_path: &Path,
+        cancel_token: &CancellationToken,
+    ) -> Result<()> {
+        let total = self
+            .progress
+            .total
+            .expect("A concurrent task should have a total size");
+        let file_writer = self.create_file_writer(tmp_path).await?;
+
+        let runners_cancel_token = cancel_token.child_token();
+        // Fallback cancellation signal on unwinding; `DownloadLoop::finish` cancels explicitly.
+        let _runner_cancel_guard = runners_cancel_token.clone().drop_guard();
+        let spawner = RunnerSpawner::new(
+            self.rt.clone(),
+            self.adapter.clone(),
+            WaitGroup::new(),
+            runners_cancel_token,
+            self.options.stream_idle_timeout,
+        );
+
+        let mut download = DownloadLoop::new(
+            total,
+            spawner,
+            &file_writer,
+            self.event_tx.clone(),
+            &self.options,
+        );
+        let transfer_result = download.run(cancel_token).await;
+        let transfer_result = download.finish(transfer_result, &mut self.progress).await;
+        // Always join the writer workers, so the file handle is released before
+        // the temporary file is renamed or removed.
+        let finalize_result = file_writer.finalize().await.map_err(|e| {
+            TaskInstanceError::new_failed(TaskError::Other {
+                message: e.to_string(),
+            })
+        });
+
+        // The first error takes precedence.
+        transfer_result.and(finalize_result)
+    }
+}
+
+/// Spawns range runners for one download attempt.
+///
+/// Every spawned task holds a clone of the wait group until it has exited.
+struct RunnerSpawner {
+    rt: ThreadedRuntimeImpl,
+    adapter: Arc<AnyAdapter>,
+    wg: WaitGroup,
+    cancel_token: CancellationToken,
+    idle_timeout: Duration,
+}
+
+impl RunnerSpawner {
+    fn new(
+        rt: ThreadedRuntimeImpl,
+        adapter: Arc<AnyAdapter>,
+        wg: WaitGroup,
+        cancel_token: CancellationToken,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            rt,
+            adapter,
+            wg,
+            cancel_token,
+            idle_timeout,
+        }
+    }
+
+    /// Connect `range` and run a runner on it; the receiver yields its channels.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, fields(runner_id, range))
     )]
-    #[allow(clippy::too_many_arguments)]
-    fn create_background_range_runner(
-        threaded_rt: &ThreadedRuntimeImpl,
-        wg: &WaitGroup,
+    fn spawn(
+        &self,
         range: Range<u64>,
-        adapter: Arc<AnyAdapter>,
-        control_rx: ControlReceiver,
         runner_id: RunnerId,
-        cancel_token: CancellationToken,
-        idle_timeout: Duration,
+        control_rx: ControlReceiver,
     ) -> runner_manager::PendingRunnerReceiver {
         use runner_manager::pending::{PendingRunnerError, RunnerBuilderOutput};
 
         let (tx, rx) = oneshot::channel();
         let (start, end) = (range.start, range.end);
-        let wg = wg.clone();
-        let rt = threaded_rt.clone();
+        let wg = self.wg.clone();
+        let rt = self.rt.clone();
+        let adapter = self.adapter.clone();
+        let cancel_token = self.cancel_token.clone();
+        let idle_timeout = self.idle_timeout;
         let connector_task = async move {
             let wg = wg;
             trace!(
@@ -368,7 +410,7 @@ impl ConcurrentTaskInner {
                 range = ?start..end,
             ),
         );
-        if let Err(e) = threaded_rt.spawn(connector_task) {
+        if let Err(e) = self.rt.spawn(connector_task) {
             error!("failed to spawn background range runner connector: {e}");
             return runner_manager::pending::failed_receiver(PendingRunnerError::Spawn {
                 message: e.to_string(),
@@ -376,420 +418,357 @@ impl ConcurrentTaskInner {
         }
         rx
     }
+}
+
+/// Download and write throughput, sampled on the throughput timer.
+struct Throughput {
+    sampler: SpeedSampler,
+    write_sampler: SpeedSampler,
+    /// Bytes written since the last sample.
+    written_bytes: usize,
+    speed: f64,
+    per_runner_speed: f64,
+}
+
+impl Throughput {
+    fn new() -> Self {
+        Self {
+            sampler: SpeedSampler::new(),
+            write_sampler: SpeedSampler::new(),
+            written_bytes: 0,
+            speed: 0.0,
+            per_runner_speed: 0.0,
+        }
+    }
+
+    /// Returns the download and write speed.
+    fn sample(&mut self, meters: MeterSnapshot) -> (f64, f64) {
+        let MeterSnapshot { runners, mut bytes } = meters;
+        let (_, speed) = self.sampler.sample(&mut bytes);
+        let (_, write_speed) = self.write_sampler.sample(&mut self.written_bytes);
+        self.speed = speed;
+        self.per_runner_speed = if runners == 0 {
+            0.0
+        } else {
+            speed / runners as f64
+        };
+        (speed, write_speed)
+    }
+}
+
+enum LoopEvent {
+    Cancelled,
+    Deadline,
+    WriterCompleted(Option<Vec<WriteCompletion>>),
+    StrategyTimer,
+    ThroughputTimer,
+    Runner(RunnerTick),
+}
+
+fn check_completions(completions: Vec<WriteCompletion>) -> Result<usize> {
+    let mut written = 0usize;
+    for c in &completions {
+        match &c.result {
+            Ok(()) => {
+                written += (c.range.end - c.range.start) as usize;
+            }
+            Err(e) => {
+                return Err(TaskInstanceError::new_failed(TaskError::Other {
+                    message: format!("write failed at {:?}: {e}", c.range),
+                }));
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// The event loop of one concurrent download attempt.
+struct DownloadLoop {
+    spawner: RunnerSpawner,
+    manager: RunnerManager,
+    strategy: StrategyControl,
+    policy: FailurePolicy,
+    max_concurrency: usize,
+    throughput: Throughput,
+    writer: PendingWriter<FileWriter>,
+    event_tx: async_channel::Sender<TaskEvent>,
+    throughput_timer: TimerImpl,
+    strategy_timer: TimerImpl,
+    /// Woken at the no-progress deadline; re-armed lazily when progress moved it.
+    deadline_timer: async_io::Timer,
+}
+
+impl DownloadLoop {
+    fn new(
+        total: u64,
+        spawner: RunnerSpawner,
+        file_writer: &FileWriter,
+        event_tx: async_channel::Sender<TaskEvent>,
+        options: &TaskOptions,
+    ) -> Self {
+        let max_concurrency = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(DEFAULT_MAX_CONCURRENCY);
+        let manager = RunnerManager::new(total, max_concurrency);
+        let strategy = StrategyControl::new(max_concurrency);
+        let policy = FailurePolicy::new(options, Instant::now());
+        let writer = PendingWriter::new(
+            Arc::new(file_writer.clone()),
+            spawner.rt.clone(),
+            max_concurrency,
+        );
+        let throughput_timer = spawner.rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
+        let strategy_timer = spawner
+            .rt
+            .create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
+        let deadline_timer = async_io::Timer::at(policy.deadline());
+        Self {
+            spawner,
+            manager,
+            strategy,
+            policy,
+            max_concurrency,
+            throughput: Throughput::new(),
+            writer,
+            event_tx,
+            throughput_timer,
+            strategy_timer,
+            deadline_timer,
+        }
+    }
+
+    async fn run(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+        loop {
+            let completions = self.writer.try_tick();
+            self.record_completions(completions)?;
+
+            match self.next_event(cancel_token).await {
+                LoopEvent::Cancelled => {
+                    return Err(TaskInstanceError::new_failed(TaskError::Cancelled));
+                }
+                LoopEvent::Deadline => self.on_deadline()?,
+                LoopEvent::WriterCompleted(Some(completions)) => {
+                    self.record_completions(completions)?;
+                }
+                LoopEvent::WriterCompleted(None) => {
+                    return Err(TaskInstanceError::new_failed(TaskError::Other {
+                        message: "writer completion channel closed unexpectedly".into(),
+                    }));
+                }
+                LoopEvent::StrategyTimer => self.on_strategy_tick(),
+                LoopEvent::ThroughputTimer => self.on_throughput_tick(),
+                LoopEvent::Runner(tick) => {
+                    if self.on_runner(tick)?.is_break() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Priority: cancel > deadline > writer > strategy > throughput > runner.
+    async fn next_event(&mut self, cancel_token: &CancellationToken) -> LoopEvent {
+        let Self {
+            manager,
+            writer,
+            throughput_timer,
+            strategy_timer,
+            deadline_timer,
+            ..
+        } = self;
+        let can_write = writer.can_write();
+        let writer_fut = if writer.is_idle() {
+            Either::Left(futures::future::pending::<Option<Vec<WriteCompletion>>>())
+        } else {
+            Either::Right(writer.tick())
+        }
+        .fuse();
+        let runner_fut = if can_write {
+            Either::Left(manager.tick())
+        } else {
+            Either::Right(manager.tick_lifecycle_only())
+        }
+        .fuse();
+        let cancelled = cancel_token.cancelled().fuse();
+        let deadline = FutureExt::fuse(deadline_timer);
+        let strategy_tick = strategy_timer.tick().fuse();
+        let throughput_tick = throughput_timer.tick().fuse();
+
+        futures::pin_mut!(
+            cancelled,
+            deadline,
+            writer_fut,
+            runner_fut,
+            strategy_tick,
+            throughput_tick
+        );
+
+        futures::select_biased! {
+            _ = cancelled => LoopEvent::Cancelled,
+            _ = deadline => LoopEvent::Deadline,
+            completions = writer_fut => LoopEvent::WriterCompleted(completions),
+            _ = strategy_tick => LoopEvent::StrategyTimer,
+            _ = throughput_tick => LoopEvent::ThroughputTimer,
+            tick = runner_fut => LoopEvent::Runner(tick),
+        }
+    }
+
+    fn record_completions(&mut self, completions: Vec<WriteCompletion>) -> Result<()> {
+        let written = check_completions(completions)?;
+        self.throughput.written_bytes += written;
+        self.policy.on_write_ok(written);
+        Ok(())
+    }
+
+    fn on_deadline(&mut self) -> Result<()> {
+        if let Some(e) = self.policy.check(Instant::now()) {
+            return Err(TaskInstanceError::new_failed(e));
+        }
+        self.deadline_timer.set_at(self.policy.deadline());
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    fn on_strategy_tick(&mut self) {
+        let Some((strategy_name, actions)) = self.strategy.execute(
+            self.max_concurrency,
+            self.throughput.speed,
+            self.throughput.per_runner_speed,
+            &mut self.manager,
+        ) else {
+            return;
+        };
+        for action in actions {
+            trace!("[TASK] applying strategy: {strategy_name}, action: {action:?}");
+            self.apply(action);
+        }
+    }
 
     /// Sample the throughput and publish a periodic progress event; the event
     /// is dropped when the channel is full.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    #[allow(clippy::too_many_arguments)]
-    fn throughout_meter_tick(
-        runner_manager: &RunnerManager,
-
-        meters: &mut HashMap<RunnerId, usize>,
-        sampler: &mut SpeedSampler,
-        write_bytes_meter: &mut usize,
-        write_sampler: &mut SpeedSampler,
-        current_speed: &mut f64,
-        per_runner_avg_speed: &mut f64,
-
-        event_tx: &async_channel::Sender<TaskEvent>,
-    ) {
-        let count = meters.len();
-        let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
-        let (_, ema_speed) = sampler.sample(&mut total_bytes);
-        let (_, write_ema_speed) = write_sampler.sample(write_bytes_meter);
-        *current_speed = ema_speed;
-        *per_runner_avg_speed = if count == 0 {
-            0.0
-        } else {
-            ema_speed / count as f64
-        };
-
-        let downloaded_chunks = runner_manager.get_downloaded_ranges();
+    fn on_throughput_tick(&mut self) {
+        let meters = self.manager.take_meters_snapshot();
+        let (speed, write_speed) = self.throughput.sample(meters);
+        let downloaded_chunks = self.manager.get_downloaded_ranges();
         let downloaded = downloaded_chunks
             .iter()
             .map(|r| r.end - r.start)
             .sum::<u64>();
-        let _ = event_tx.try_send(TaskEvent::Downloading(ProgressWithSpeed::new(
-            Progress {
-                total: Some(runner_manager.total()),
-                downloaded,
-                downloaded_chunks,
-            },
-            ema_speed,
-            write_ema_speed,
-        )));
+        let _ = self
+            .event_tx
+            .try_send(TaskEvent::Downloading(ProgressWithSpeed::new(
+                Progress {
+                    total: Some(self.manager.total()),
+                    downloaded,
+                    downloaded_chunks,
+                },
+                speed,
+                write_speed,
+            )));
+    }
+
+    fn on_runner(&mut self, tick: RunnerTick) -> Result<ControlFlow<()>> {
+        if let Some(chunk) = tick.downloaded {
+            self.writer
+                .write_range(chunk.range, chunk.bytes)
+                .map_err(|e: WriterFullError| {
+                    TaskInstanceError::new_failed(TaskError::Other {
+                        message: format!(
+                            "writer full (invariant violation): {:?}",
+                            e.pending_write.range
+                        ),
+                    })
+                })?;
+            self.policy
+                .on_bytes_accepted(self.manager.get_total_downloaded(), Instant::now());
+        }
+        if let Some(failure) = tick.failure
+            && let Some(e) = self
+                .policy
+                .on_failure(&failure, self.manager.allocated_runner_count())
+        {
+            return Err(TaskInstanceError::new_failed(e));
+        }
+        Ok(if tick.state == TaskState::Finished {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn handle_strategy_action(
-        runner_manager: &mut RunnerManager,
-        max_concurrency: &mut usize,
-
-        action: StrategyAction,
-
-        threaded_rt: &ThreadedRuntimeImpl,
-        wg: &WaitGroup,
-        runners_cancel_token: &CancellationToken,
-        adapter: &Arc<AnyAdapter>,
-        idle_timeout: Duration,
-    ) -> Result<()> {
+    fn apply(&mut self, action: StrategyAction) {
         match action {
             // Split current all task into two separate tasks
             StrategyAction::SplitAllTask(planned_chunk_size) => {
                 trace!("[TASK] Strategy: split all task");
-                let states = runner_manager.get_incomplete_states(Some(planned_chunk_size));
+                let states = self.manager.get_incomplete_states(Some(planned_chunk_size));
                 for (runner_id, incomplete_range) in states {
                     trace!("split task: {runner_id}, {incomplete_range:?}");
-                    Self::split_task(
-                        runner_manager,
-                        threaded_rt,
-                        wg,
-                        runners_cancel_token,
-                        incomplete_range,
-                        adapter.clone(),
-                        runner_id,
-                        idle_timeout,
-                    );
+                    self.split(runner_id, incomplete_range);
                 }
             }
             // Split the given task into two separate tasks
             StrategyAction::SplitGivenTask(task_id) => {
                 trace!("[TASK] Strategy: split given task: {task_id}");
-                let incomplete_range = runner_manager
+                let incomplete_range = self
+                    .manager
                     .get_runner_state(task_id)
                     .map(|s| s.incomplete_range())
                     .expect("task id not found");
-                Self::split_task(
-                    runner_manager,
-                    threaded_rt,
-                    wg,
-                    runners_cancel_token,
-                    incomplete_range,
-                    adapter.clone(),
-                    task_id,
-                    idle_timeout,
-                );
+                self.split(task_id, incomplete_range);
             }
             // Change the max concurrency
             StrategyAction::ChangeMaxConcurrency(new_max_concurrency) => {
                 trace!("[TASK] Strategy: change max concurrency: {new_max_concurrency}");
-                *max_concurrency = new_max_concurrency;
+                self.max_concurrency = new_max_concurrency;
             }
             // Create background runners for specific range
             StrategyAction::CreateTask(range) => {
                 trace!("[TASK] Strategy: create task: {range:?}");
-                runner_manager
-                    .allocate_pending_runner_with_chunk(range.clone(), |runner_id, control_rx| {
-                        Self::create_background_range_runner(
-                            threaded_rt,
-                            wg,
-                            range,
-                            adapter.clone(),
-                            control_rx,
-                            runner_id,
-                            runners_cancel_token.clone(),
-                            idle_timeout,
-                        )
-                    })
-                    .expect("failed to allocate runner with chunk");
+                self.spawn_runner(range);
             }
         }
-        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    async fn strategy_control_timer_tick(
-        runner_manager: &mut RunnerManager,
-        strategy_control: &mut StrategyControl,
-        max_concurrency: &mut usize,
-
-        threaded_rt: &ThreadedRuntimeImpl,
-        adapter: &Arc<AnyAdapter>,
-        runners_cancel_token: &CancellationToken,
-        wg: &WaitGroup,
-
-        current_speed: f64,
-        per_runner_avg_speed: f64,
-        idle_timeout: Duration,
-    ) -> Result<()> {
-        if let Some((strategy_name, actions)) = strategy_control.execute(
-            *max_concurrency,
-            current_speed,
-            per_runner_avg_speed,
-            runner_manager,
-        ) {
-            for action in actions {
-                trace!("[TASK] applying strategy: {strategy_name}, action: {action:?}");
-                Self::handle_strategy_action(
-                    runner_manager,
-                    max_concurrency,
-                    action,
-                    threaded_rt,
-                    wg,
-                    runners_cancel_token,
-                    adapter,
-                    idle_timeout,
-                )?;
-            }
-        }
-        Ok(())
+    /// Split the given runner's incomplete range in two, spawning a runner for the second half.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(runner_id, range))
+    )]
+    fn split(&mut self, runner_id: RunnerId, incomplete_range: Range<u64>) {
+        let half_size = (incomplete_range.end - incomplete_range.start) / 2;
+        self.manager.resize_runner(runner_id, half_size);
+        self.spawn_runner(incomplete_range.start + half_size..incomplete_range.end);
     }
 
-    /// Sync the progress of the task
-    fn sync_progress(&mut self, runner_manager: &RunnerManager) {
-        self.progress.downloaded = runner_manager.get_total_downloaded();
-        self.progress.downloaded_chunks = runner_manager.get_downloaded_ranges();
-    }
-
-    /// Download into the temporary file, then publish it or discard it.
-    ///
-    /// Returns only after every owned worker has exited.
-    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
-        let tmp_path = output_file::tmp_path_for(&self.path);
-        let transfer = self.download_to(&tmp_path, cancel_token).await;
-        output_file::commit(transfer, &tmp_path, &self.path, cancel_token).await
-    }
-
-    /// Run the transfer and tear it down on every path: success, failure and
-    /// cancellation. Teardown never short-circuits, so all spawned work is joined.
-    async fn download_to(
-        &mut self,
-        tmp_path: &Path,
-        cancel_token: &CancellationToken,
-    ) -> Result<()> {
-        use file_writer::{PendingWriter, WriteCompletion, WriterFullError};
-        use runner_manager::RunnerTick;
-
-        let total = self
-            .progress
-            .total
-            .expect("A concurrent task should have a total size");
-        let adapter = self.adapter.clone();
-        let rt = self.rt.clone();
-        let event_tx = self.event_tx.clone();
-
-        let file_writer = self.create_file_writer(tmp_path).await?;
-
-        let wg = WaitGroup::new();
-        let runners_cancel_token = cancel_token.child_token();
-        // Fallback cancellation signal on unwinding; the normal paths cancel explicitly below.
-        let _runner_cancel_guard = runners_cancel_token.clone().drop_guard();
-
-        let initial_max_concurrency = std::thread::available_parallelism()
-            .map(|t| t.get())
-            .unwrap_or(DEFAULT_MAX_CONCURRENCY);
-        let mut max_concurrency = initial_max_concurrency;
-        let mut runner_manager = RunnerManager::new(total, initial_max_concurrency);
-        let mut strategy_control = StrategyControl::new(initial_max_concurrency);
-        let mut failure_policy = FailurePolicy::new(&self.options, Instant::now());
-        let mut meters: HashMap<RunnerId, usize> = HashMap::with_capacity(initial_max_concurrency);
-        let mut sampler = SpeedSampler::new();
-        let mut write_bytes_meter: usize = 0;
-        let mut write_sampler = SpeedSampler::new();
-        let mut current_speed = 0.0;
-        let mut per_runner_avg_speed = 0.0;
-
-        let mut pending_writer = PendingWriter::new(
-            Arc::new(file_writer.clone()),
-            rt.clone(),
-            initial_max_concurrency,
-        );
-
-        let mut throughout_meter_timer = rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL);
-        let mut strategy_timer = rt.create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
-        // Woken at the no-progress deadline; re-armed lazily when progress moved it.
-        let mut deadline_timer = async_io::Timer::at(failure_policy.deadline());
-
-        fn check_completions(completions: Vec<WriteCompletion>) -> Result<usize> {
-            let mut written = 0usize;
-            for c in &completions {
-                match &c.result {
-                    Ok(()) => {
-                        written += (c.range.end - c.range.start) as usize;
-                    }
-                    Err(e) => {
-                        return Err(TaskInstanceError::new_failed(TaskError::Other {
-                            message: format!("write failed at {:?}: {e}", c.range),
-                        }));
-                    }
-                }
-            }
-            Ok(written)
-        }
-
-        fn record_completions(
-            completions: Vec<WriteCompletion>,
-            write_bytes_meter: &mut usize,
-            failure_policy: &mut FailurePolicy,
-        ) -> Result<()> {
-            let written = check_completions(completions)?;
-            *write_bytes_meter += written;
-            failure_policy.on_write_ok(written);
-            Ok(())
-        }
-
-        enum LoopEvent {
-            Cancelled,
-            Deadline,
-            WriterCompleted(Option<Vec<WriteCompletion>>),
-            StrategyTimer,
-            ThroughputTimer,
-            Runner(RunnerTick),
-        }
-
-        let transfer_result: Result<()> = async {
-            loop {
-                record_completions(
-                    pending_writer.try_tick(),
-                    &mut write_bytes_meter,
-                    &mut failure_policy,
-                )?;
-
-                let can_write = pending_writer.can_write();
-
-                let event = {
-                    let writer_fut = if pending_writer.is_idle() {
-                        Either::Left(futures::future::pending::<Option<Vec<WriteCompletion>>>())
-                    } else {
-                        Either::Right(pending_writer.tick())
-                    }
-                    .fuse();
-
-                    let runner_fut = if can_write {
-                        Either::Left(runner_manager.tick(&mut meters))
-                    } else {
-                        Either::Right(runner_manager.tick_lifecycle_only(&mut meters))
-                    }
-                    .fuse();
-
-                    let cancelled = cancel_token.cancelled().fuse();
-                    let deadline = FutureExt::fuse(&mut deadline_timer);
-                    let strategy_tick = strategy_timer.tick().fuse();
-                    let throughput_tick = throughout_meter_timer.tick().fuse();
-
-                    futures::pin_mut!(
-                        cancelled,
-                        deadline,
-                        writer_fut,
-                        runner_fut,
-                        strategy_tick,
-                        throughput_tick
-                    );
-
-                    futures::select_biased! {
-                        _ = cancelled => LoopEvent::Cancelled,
-                        _ = deadline => LoopEvent::Deadline,
-                        completions = writer_fut => LoopEvent::WriterCompleted(completions),
-                        _ = strategy_tick => LoopEvent::StrategyTimer,
-                        _ = throughput_tick => LoopEvent::ThroughputTimer,
-                        tick = runner_fut => LoopEvent::Runner(tick),
-                    }
-                };
-
-                match event {
-                    LoopEvent::Cancelled => {
-                        return Err(TaskInstanceError::new_failed(TaskError::Cancelled));
-                    }
-                    LoopEvent::Deadline => {
-                        if let Some(e) = failure_policy.check(Instant::now()) {
-                            return Err(TaskInstanceError::new_failed(e));
-                        }
-                        deadline_timer.set_at(failure_policy.deadline());
-                    }
-                    LoopEvent::WriterCompleted(Some(completions)) => {
-                        record_completions(
-                            completions,
-                            &mut write_bytes_meter,
-                            &mut failure_policy,
-                        )?;
-                    }
-                    LoopEvent::WriterCompleted(None) => {
-                        return Err(TaskInstanceError::new_failed(TaskError::Other {
-                            message: "writer completion channel closed unexpectedly".into(),
-                        }));
-                    }
-                    LoopEvent::StrategyTimer => {
-                        Self::strategy_control_timer_tick(
-                            &mut runner_manager,
-                            &mut strategy_control,
-                            &mut max_concurrency,
-                            &rt,
-                            &adapter,
-                            &runners_cancel_token,
-                            &wg,
-                            current_speed,
-                            per_runner_avg_speed,
-                            self.options.stream_idle_timeout,
-                        )
-                        .await
-                        .inspect_err(|e| error!("failed to download strategy timer tick: {e:?}"))?;
-                    }
-                    LoopEvent::ThroughputTimer => {
-                        Self::throughout_meter_tick(
-                            &runner_manager,
-                            &mut meters,
-                            &mut sampler,
-                            &mut write_bytes_meter,
-                            &mut write_sampler,
-                            &mut current_speed,
-                            &mut per_runner_avg_speed,
-                            &event_tx,
-                        );
-                    }
-                    LoopEvent::Runner(tick) => {
-                        if let Some(chunk) = tick.downloaded {
-                            pending_writer
-                                .write_range(chunk.range, chunk.bytes)
-                                .map_err(|e: WriterFullError| {
-                                    TaskInstanceError::new_failed(TaskError::Other {
-                                        message: format!(
-                                            "writer full (invariant violation): {:?}",
-                                            e.pending_write.range
-                                        ),
-                                    })
-                                })?;
-                            failure_policy.on_bytes_accepted(
-                                runner_manager.get_total_downloaded(),
-                                Instant::now(),
-                            );
-                        }
-                        if let Some(failure) = tick.failure
-                            && let Some(e) = failure_policy
-                                .on_failure(&failure, runner_manager.allocated_runner_count())
-                        {
-                            return Err(TaskInstanceError::new_failed(e));
-                        }
-                        if tick.state == TaskState::Finished {
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        // ---- teardown: join everything we spawned, never short-circuit ----
-        runners_cancel_token.cancel();
-        self.sync_progress(&runner_manager);
-        // Releasing the receivers unblocks runners pushing lifecycle or data frames.
-        drop(runner_manager);
-        wg.wait().await;
-        let flush_result = check_completions(pending_writer.finish().await).map(drop);
-        // Always join the writer workers, so the file handle is released before
-        // the temporary file is renamed or removed.
-        let finalize_result = file_writer.finalize().await.map_err(|e| {
-            TaskInstanceError::new_failed(TaskError::Other {
-                message: e.to_string(),
+    fn spawn_runner(&mut self, range: Range<u64>) {
+        let spawner = &self.spawner;
+        self.manager
+            .allocate_pending_runner_with_chunk(range.clone(), |runner_id, control_rx| {
+                spawner.spawn(range, runner_id, control_rx)
             })
-        });
+            .expect("failed to allocate runner with chunk");
+    }
 
-        // The first error takes precedence.
-        transfer_result.and(flush_result).and(finalize_result)
+    /// Join every spawned worker and flush the pending writes, recording the
+    /// final progress. Never short-circuits; the first error takes precedence.
+    async fn finish(self, transfer_result: Result<()>, progress: &mut Progress) -> Result<()> {
+        let Self {
+            spawner,
+            manager,
+            writer,
+            ..
+        } = self;
+        spawner.cancel_token.cancel();
+        progress.downloaded = manager.get_total_downloaded();
+        progress.downloaded_chunks = manager.get_downloaded_ranges();
+        // Releasing the receivers unblocks runners pushing lifecycle or data frames.
+        drop(manager);
+        spawner.wg.wait().await;
+        let flush_result = check_completions(writer.finish().await).map(drop);
+        transfer_result.and(flush_result)
     }
 }
 
@@ -900,16 +879,14 @@ mod tests {
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range.clone(),
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter.clone(),
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range.clone(), runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -985,16 +962,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range,
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter,
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range, runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
         wg.wait().await;
 
@@ -1021,16 +996,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
 
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range,
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter,
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range, runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
 
         match result {
@@ -1053,16 +1026,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
 
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range,
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter,
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range, runner_id, control_rx);
         let result = tokio::time::timeout(Duration::from_secs(1), receiver)
             .await
             .expect("timed out waiting for spawn error")
@@ -1089,16 +1060,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range,
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter,
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token.clone(),
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range, runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -1147,16 +1116,14 @@ mod tests {
             .unwrap();
 
         let wg = WaitGroup::new();
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range.clone(),
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter,
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range.clone(), runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -1214,16 +1181,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range.clone(),
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter.clone(),
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range.clone(), runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -1293,16 +1258,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range,
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter,
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range, runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -1353,16 +1316,14 @@ mod tests {
 
             let handle = tokio::spawn(async move {
                 let wg = WaitGroup::new();
-                let receiver = ConcurrentTaskInner::create_background_range_runner(
-                    &rt_clone,
-                    &wg,
-                    range.clone(),
+                let receiver = RunnerSpawner::new(
+                    rt_clone.clone(),
                     adapter_clone,
-                    control_rx,
-                    runner_id,
+                    wg.clone(),
                     cancel_token,
                     crate::runner::DEFAULT_IDLE_TIMEOUT,
-                );
+                )
+                .spawn(range.clone(), runner_id, control_rx);
                 let result = receiver.await.expect("receiver closed");
                 let output = result.expect("connection failed");
                 let data_rx = output.data_rx;
@@ -1457,16 +1418,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
-        let receiver = ConcurrentTaskInner::create_background_range_runner(
-            &rt,
-            &wg,
-            range.clone(),
+        let receiver = RunnerSpawner::new(
+            rt.clone(),
             adapter.clone(),
-            control_rx,
-            runner_id,
+            wg.clone(),
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
-        );
+        )
+        .spawn(range.clone(), runner_id, control_rx);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
