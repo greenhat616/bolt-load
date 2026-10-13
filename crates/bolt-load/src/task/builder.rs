@@ -13,7 +13,7 @@ use super::{
     AtomicTaskState, DownloadMode, MetaRetry, Task, TaskInstanceImpl, TaskOptions, TaskState,
 };
 use crate::{
-    adapter::{AnyAdapter, BoltLoadAdapterMeta},
+    adapter::{AnyAdapter, BoltLoadAdapter, BoltLoadAdapterMeta, DynBoltLoadAdapter},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     task::{TaskStateChangedCallback, instance::TaskEvent},
 };
@@ -24,7 +24,7 @@ pub struct TaskBuilder {
     threaded_runtime: Option<ThreadedRuntimeImpl>,
     local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     meta: OnceCell<BoltLoadAdapterMeta>,
-    adapter: Option<AnyAdapter>,
+    adapter: Option<Arc<AnyAdapter>>,
     prefer_mode: Option<DownloadMode>,
     save_path: Option<PathBuf>,
     /// a directory to save the file, It is used to save the file, prefer the filename retrieved from the adapter
@@ -131,7 +131,12 @@ impl TaskBuilder {
     }
 
     /// set the adapter
-    pub fn adapter(mut self, adapter: AnyAdapter) -> Self {
+    pub fn adapter(self, adapter: impl BoltLoadAdapter + 'static) -> Self {
+        self.adapter_arc(DynBoltLoadAdapter::new_arc(adapter))
+    }
+
+    /// set an already type-erased, shared adapter
+    pub fn adapter_arc(mut self, adapter: Arc<AnyAdapter>) -> Self {
         self.adapter = Some(adapter);
         self
     }
@@ -292,7 +297,7 @@ impl TaskBuilder {
         }
 
         Ok(Task {
-            adapter: Arc::new(adapter),
+            adapter,
             mode,
             save_path,
             meta: self.meta.take().unwrap(),

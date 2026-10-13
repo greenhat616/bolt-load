@@ -79,7 +79,7 @@ HTTP status codes are mapped to structured `AdapterError` variants:
 
 Core dependencies include `bolt-load-core` (adapter trait),
 `bolt-load-utils` (HTTP header parsing, cross-runtime streams),
-`url`, `bytes`, `futures`, `async-trait`, and `async-lock`.
+`url`, `bytes`, `futures`, and `async-lock`.
 
 ## License
 

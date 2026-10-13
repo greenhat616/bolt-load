@@ -19,7 +19,7 @@ use tempfile::TempDir;
 
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
-    adapter::{AdapterError, BoltLoadAdapter},
+    adapter::AdapterError,
     runner::TaskError,
     runtime::ThreadedRuntimeImpl,
     task::{
@@ -56,7 +56,7 @@ fn builder(
     options: TaskOptions,
 ) -> TaskBuilder {
     TaskBuilder::default()
-        .adapter(Box::new(adapter.clone()) as Box<dyn BoltLoadAdapter + Send>)
+        .adapter(adapter.clone())
         .save_path(dest.to_path_buf())
         .cancel_token(token.clone())
         .threaded_runtime(ThreadedRuntimeImpl::new_tokio_rt())

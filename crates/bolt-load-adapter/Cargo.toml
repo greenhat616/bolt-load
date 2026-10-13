@@ -3,6 +3,7 @@ name = "bolt-load-adapter"
 description = "Pluggable HTTP adapters for bolt-load: reqwest, ureq, and custom backends"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -27,7 +28,6 @@ bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
 futures = { workspace = true }
 snafu = { workspace = true }
 
-async-trait = { workspace = true }
 async-lock = { workspace = true }
 async-once-cell = { version = "0.5.4", optional = true }
 blocking = { workspace = true, optional = true }

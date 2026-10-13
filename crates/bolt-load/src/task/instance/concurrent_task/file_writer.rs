@@ -355,7 +355,7 @@ mod tests {
         super::{RunnerManager, RunnerSpawner, runner_manager::TaskState},
         *,
     };
-    use crate::{adapter::BoltLoadAdapter, runtime::ThreadedRuntimeImpl};
+    use crate::runtime::ThreadedRuntimeImpl;
 
     #[test]
     #[cfg(feature = "compio")]
@@ -696,7 +696,7 @@ mod tests {
             .build()
             .expect("adapter should build");
         let expected_hash = adapter.expected_hash().to_string();
-        let adapter = Arc::new(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>);
+        let adapter = crate::adapter::DynBoltLoadAdapter::new_arc(adapter);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("slow_backpressure_multi_runner.bin");

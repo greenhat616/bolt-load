@@ -10,10 +10,11 @@ pulling in the full framework.
 ## Adapter Trait
 
 The central abstraction is [`BoltLoadAdapter`], an async trait for
-streaming content delivery:
+streaming content delivery. Implementations write plain `async fn`s whose
+futures must be `Send`; [dynosaur](https://crates.io/crates/dynosaur)
+generates the type-erased `DynBoltLoadAdapter`.
 
 ```rust,ignore
-#[async_trait]
 pub trait BoltLoadAdapter: Send + Sync {
     /// Whether this source supports byte-range requests.
     async fn is_range_stream_available(&self) -> bool { false }
@@ -44,7 +45,7 @@ pub struct BoltLoadAdapterMeta {
 |-------|-----------|
 | `AnyBytesStream` | `BoxStream<'static, Result<Bytes, AdapterError>>` |
 | `AnyStream<'a, T>` | `BoxStream<'a, T>` |
-| `AnyAdapter` | `Box<dyn BoltLoadAdapter + Send>` |
+| `AnyAdapter` | `DynBoltLoadAdapter<'static>`, usually held as `Arc<AnyAdapter>` |
 
 ## Error Model
 
@@ -86,7 +87,7 @@ thread-safe.
 |-------|---------|
 | `snafu` | Structured error context |
 | `futures` | `BoxStream` and stream utilities |
-| `async-trait` | Async methods in traits |
+| `dynosaur` | Dynamic dispatch for the async adapter trait |
 | `bytes` | Zero-copy byte buffers |
 
 ## License

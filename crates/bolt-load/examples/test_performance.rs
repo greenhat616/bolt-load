@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use bolt_load::{
-    adapter::BoltLoadAdapter,
     runtime::ThreadedRuntimeImpl,
     task::{DownloadMode, TaskBuilder},
 };
@@ -191,7 +190,7 @@ async fn main() {
     let save_path = temp_dir.path().join("concurrent_performance_test.bin");
 
     let mut concurrent_task = TaskBuilder::default()
-        .adapter(Box::new(adapter) as Box<dyn BoltLoadAdapter + Send>)
+        .adapter(adapter)
         .save_path(save_path.clone())
         .prefer_mode(DownloadMode::Concurrent)
         .cancel_token(CancellationToken::new())

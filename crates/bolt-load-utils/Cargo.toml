@@ -3,6 +3,7 @@ name = "bolt-load-utils"
 description = "Utility functions for bolt-load: HTTP header parsing, async readers, and tracing helpers"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

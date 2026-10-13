@@ -8,7 +8,7 @@ use futures::FutureExt;
 
 use super::MetaRetry;
 use crate::{
-    adapter::{AdapterError, AnyAdapter, BoltLoadAdapterMeta},
+    adapter::{AdapterError, AnyAdapter, BoltLoadAdapter, BoltLoadAdapterMeta},
     runtime::{Sleep, ThreadedRuntimeImpl, TimerBuilder},
 };
 
@@ -65,7 +65,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::adapter::{AnyBytesStream, BoltLoadAdapter, RetryableError, UnretryableError};
+    use crate::adapter::{
+        AnyBytesStream, BoltLoadAdapter, DynBoltLoadAdapter, RetryableError, UnretryableError,
+    };
 
     /// Fails `failures` times with `error`, then succeeds.
     struct FlakyAdapter {
@@ -86,7 +88,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl BoltLoadAdapter for FlakyAdapter {
         async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -122,7 +123,7 @@ mod tests {
     }
 
     async fn run(adapter: FlakyAdapter, retry: &MetaRetry) -> Result<u64, AdapterError> {
-        let adapter: AnyAdapter = Box::new(adapter);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
         retrieve_meta(&adapter, retry, None)
             .await
             .map(|meta| meta.content_size)
@@ -161,7 +162,7 @@ mod tests {
     #[tokio::test]
     async fn delay_is_capped_after_jitter() {
         let (adapter, _) = FlakyAdapter::new(usize::MAX, true);
-        let adapter: AnyAdapter = Box::new(adapter);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
         // A min delay equal to the max lets the jitter push every wait past the cap.
         let retry = MetaRetry::default()
             .max_retries(8)
@@ -177,7 +178,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn sleeps_on_the_runtime_timer() {
         let (adapter, calls) = FlakyAdapter::new(1, true);
-        let adapter: AnyAdapter = Box::new(adapter);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let meta = retrieve_meta(&adapter, &fast_retry(1), Some(&rt)).await;
         assert_eq!(meta.unwrap().content_size, 42);
@@ -188,7 +189,7 @@ mod tests {
     #[test]
     fn sleeps_on_the_smol_timer() {
         let (adapter, calls) = FlakyAdapter::new(1, true);
-        let adapter: AnyAdapter = Box::new(adapter);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
         let rt = ThreadedRuntimeImpl::new_smol_rt();
         let meta = futures::executor::block_on(retrieve_meta(&adapter, &fast_retry(1), Some(&rt)));
         assert_eq!(meta.unwrap().content_size, 42);

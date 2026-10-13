@@ -18,7 +18,7 @@ use super::{
     output_file,
 };
 use crate::{
-    adapter::{AnyAdapter, UnretryableError},
+    adapter::{AnyAdapter, BoltLoadAdapter, UnretryableError},
     runner::{StreamConnector, TaskError, TaskRunner},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl, Timer, TimerBuilder, TimerImpl},
     task::{
@@ -788,7 +788,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        adapter::BoltLoadAdapter,
+        adapter::{BoltLoadAdapter, DynBoltLoadAdapter},
         runner::{LifecycleEvent, StoppedReason},
         runtime::{
             DowncastLocalRuntime, DynTimer, ThreadedRuntime, ThreadedRuntimeImpl, Timer,
@@ -844,10 +844,8 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_success() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(10240).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let range = 1000u64..3000u64;
         let runner_id = 1;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -928,8 +926,7 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_adapter_failure() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(Box::new(SimpleTestAdapter::new(1024).with_failure(true))
-            as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        let adapter = DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024).with_failure(true));
         let range = 0u64..500u64;
         let runner_id = 2;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -960,10 +957,8 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_reports_connector_spawn_error() {
         let rt = ThreadedRuntimeImpl::new_other_rt(FailOnSpawnRuntime::new(0));
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(1024).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024).with_range_support(true));
         let range = 0u64..500u64;
         let runner_id = 8;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -993,10 +988,8 @@ mod tests {
         let runtime = FailOnSpawnRuntime::new(1);
         let spawns = runtime.calls.clone();
         let rt = ThreadedRuntimeImpl::new_other_rt(runtime);
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(1024).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024).with_range_support(true));
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
         let wg = WaitGroup::new();
 
@@ -1035,10 +1028,8 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_cancellation() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(10240).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let range = 0u64..5000u64;
         let runner_id = 3;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -1083,10 +1074,8 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_small_range_runner_with_control_messages() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(10240).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let old_total = 10240u64;
         let range = 0u64..old_total;
         let runner_id = 4;
@@ -1155,9 +1144,9 @@ mod tests {
     async fn test_create_background_range_runner_edge_ranges() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
         let content_size = 1000;
-        let adapter = Arc::new(Box::new(
+        let adapter = DynBoltLoadAdapter::new_arc(
             SimpleTestAdapter::new(content_size).with_range_support(true),
-        ) as Box<dyn crate::adapter::BoltLoadAdapter + Send>);
+        );
 
         // Test boundary range: start from end of file
         let range = 900u64..1000u64;
@@ -1231,10 +1220,8 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_zero_length_range() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(1000).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1000).with_range_support(true));
 
         // Test zero-length range
         let range = 500u64..500u64;
@@ -1278,10 +1265,8 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_multiple_runners() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(4000).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(4000).with_range_support(true));
 
         // Create multiple concurrent range runners
         let ranges = vec![
@@ -1393,10 +1378,8 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_hash_verification() {
         let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let adapter = Arc::new(
-            Box::new(SimpleTestAdapter::new(5000).with_range_support(true))
-                as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
-        );
+        let adapter =
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(5000).with_range_support(true));
         let range = 1500u64..3500u64;
         let runner_id = 7;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
@@ -1478,9 +1461,7 @@ mod tests {
         let spawns = rt.calls.clone();
         let spawner = RunnerSpawner::new(
             ThreadedRuntimeImpl::new_other_rt(rt),
-            Arc::new(Box::new(
-                SimpleTestAdapter::new(1000).with_range_support(true),
-            )),
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1000).with_range_support(true)),
             WaitGroup::new(),
             CancellationToken::new(),
             crate::runner::DEFAULT_IDLE_TIMEOUT,

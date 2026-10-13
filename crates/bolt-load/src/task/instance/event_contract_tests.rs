@@ -3,7 +3,6 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
@@ -17,7 +16,9 @@ use tempfile::TempDir;
 use super::{TaskEvent, TaskInstance, TaskInstanceError, TaskInstanceImpl};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
-    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta},
+    adapter::{
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, DynBoltLoadAdapter,
+    },
     runner::TaskError,
     runtime::ThreadedRuntimeImpl,
     task::DownloadMode,
@@ -66,7 +67,7 @@ fn start_with_channel(
 ) -> (TaskInstanceImpl, async_channel::Receiver<TaskEvent>) {
     let mut task = TaskInstanceImpl::new(mode, ThreadedRuntimeImpl::new_tokio_rt(), None);
     task.run(
-        Arc::new(Box::new(adapter)),
+        DynBoltLoadAdapter::new_arc(adapter),
         dest.to_path_buf(),
         event_tx,
         token.clone(),
@@ -211,7 +212,6 @@ async fn test_finished_event_observes_committed_file() {
 #[derive(Clone)]
 struct UnknownSizeAdapter(SimpleTestAdapter);
 
-#[async_trait::async_trait]
 impl BoltLoadAdapter for UnknownSizeAdapter {
     async fn is_range_stream_available(&self) -> bool {
         false

@@ -456,7 +456,6 @@ impl SimpleTestAdapter {
     }
 }
 
-#[async_trait::async_trait]
 impl BoltLoadAdapter for SimpleTestAdapter {
     async fn is_range_stream_available(&self) -> bool {
         info!(
