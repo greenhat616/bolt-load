@@ -19,6 +19,8 @@ use std::{
     sync::Arc,
 };
 
+use async_channel::Sender;
+use async_waitgroup::WaitGroup;
 use bytes::Bytes;
 use fs_err::{File, OpenOptions};
 use snafu::prelude::*;
@@ -229,6 +231,34 @@ async fn open_file(path: PathBuf, size: u64) -> Result<File, FileWriterError> {
     })
     .await?;
     Ok(file)
+}
+
+type CommandAck = oneshot::Sender<Result<(), std::io::Error>>;
+
+/// Ask a channel-driven backend to finalize, then wait until all of its
+/// workers have exited and released their file and mapping handles.
+///
+/// Workers are always joined, even when the finalize command fails.
+async fn finalize_and_join<C>(
+    tx: Sender<C>,
+    worker_wg: WaitGroup,
+    path: PathBuf,
+    finalize_command: impl FnOnce(CommandAck) -> C,
+) -> Result<(), FileWriterError> {
+    let result = async {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(finalize_command(ack_tx))
+            .await
+            .map_err(|_| CommandError::Send)?;
+        ack_rx.await.map_err(|_| CommandError::Recv)??;
+        Ok::<_, CommandError>(())
+    }
+    .await
+    .context(FinalizeSnafu { path });
+    // Closing the channel lets idle workers exit.
+    drop(tx);
+    worker_wg.wait().await;
+    result
 }
 
 #[derive(Clone)]

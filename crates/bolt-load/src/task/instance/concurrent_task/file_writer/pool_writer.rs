@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use async_channel::{Receiver, Sender};
+use async_waitgroup::WaitGroup;
 use bytes::Bytes;
 use fs::File;
 use fs_err as fs;
@@ -8,12 +9,13 @@ use snafu::prelude::*;
 
 use super::{
     Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu, finalize_and_join,
 };
 
 pub struct PoolWriter {
     pub file: File,
     tx: Sender<Command>,
+    worker_wg: WaitGroup,
 }
 
 enum Command {
@@ -23,25 +25,14 @@ enum Command {
 
 impl FileRangeWriter for PoolWriter {
     async fn finalize(self) -> Result<(), FileWriterError> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Finalize(tx))
-            .await
-            .map_err(|_| CommandError::Send)
-            .with_context(|_| FinalizeSnafu {
-                path: self.file.path().to_path_buf(),
-            })?;
-        rx.await
-            .map_err(|_| CommandError::Recv)
-            .with_context(|_| FinalizeSnafu {
-                path: self.file.path().to_path_buf(),
-            })?
-            .map_err(CommandError::from)
-            .with_context(|_| FinalizeSnafu {
-                path: self.file.path().to_path_buf(),
-            })?;
-        self.tx.close();
-        Ok(())
+        let Self {
+            file,
+            tx,
+            worker_wg,
+        } = self;
+        let path = file.path().to_path_buf();
+        drop(file);
+        finalize_and_join(tx, worker_wg, path, Command::Finalize).await
     }
 
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
@@ -142,20 +133,32 @@ impl PoolWriterBuilder {
         let parallel = self
             .parallel
             .unwrap_or(std::thread::available_parallelism().unwrap().get());
+        // Clone every handle before spawning, so a failure never leaves workers behind.
+        let worker_files = (0..parallel)
+            .map(|_| {
+                file.try_clone()
+                    .map_err(CommandError::from)
+                    .with_context(|_| OpenOrCreateFileSnafu {
+                        path: file.path().to_path_buf(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let (tx, rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
-        for _ in 0..parallel {
-            let file = file
-                .try_clone()
-                .map_err(CommandError::from)
-                .with_context(|_| OpenOrCreateFileSnafu {
-                    path: file.path().to_path_buf(),
-                })?;
+        let worker_wg = WaitGroup::new();
+        for worker_file in worker_files {
             let rx = rx.clone();
-            blocking::unblock(move || file_writer_task(&file, &rx)).detach();
+            let worker_guard = worker_wg.clone();
+            blocking::unblock(move || {
+                file_writer_task(&worker_file, &rx);
+                drop(worker_file);
+                drop(worker_guard);
+            })
+            .detach();
         }
         Ok(PoolWriter {
             file,
-            tx: tx.clone(),
+            tx,
+            worker_wg,
         })
     }
 }
