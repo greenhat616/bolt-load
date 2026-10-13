@@ -17,6 +17,7 @@ bolt-load-utils = { path = "../bolt-load-utils", version = "0.1", features = [
 ] }
 
 scopeguard = "1.2.0"
+async-channel = "2" # runtime-neutral fault injection gates
 
 tracing = { workspace = true, optional = true }
 
