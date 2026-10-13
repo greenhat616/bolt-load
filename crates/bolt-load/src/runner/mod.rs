@@ -31,8 +31,9 @@ pub use guard::*;
 // TODO: make it configurable or detect the local disk performance?
 const BUFFER_SIZE: usize = 32 * 1024; // 32KB
 
-/// The timeout for the slow stream
-const SLOW_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The default period without non-empty upstream data after which a runner
+/// fails with a retryable [`TaskError::Timeout`]
+pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DATA_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub const LIFECYCLE_CHANNEL_CAPACITY: usize = 2;
@@ -131,6 +132,8 @@ pub struct TaskRunner {
     data_tx: Option<DataFrameSender>,
     /// How long to wait for data frames to be consumed after the stream stops.
     data_drain_timeout: std::time::Duration,
+    /// How long the upstream may yield no non-empty data before failing with `Timeout`.
+    idle_timeout: std::time::Duration,
     /// the cancel token
     cancel_token: CancellationToken,
     /// the shutdown signal, used for ensure the task runner is stopped
@@ -141,8 +144,8 @@ pub struct TaskRunner {
 enum EventLoopStep {
     /// The task is cancelled
     Cancelled,
-    /// The stream is too slow, and transfer 0 bytes in the last SLOW_STREAM_TIMEOUT
-    SlowTransfer,
+    /// The stream yielded no non-empty data within the idle timeout
+    IdleTimeout,
     /// The control signal is received (point-to-point, no need for RunnerId filtering)
     Control(Result<ControlEvent, async_channel::RecvError>),
     /// The download event is received
@@ -184,6 +187,8 @@ enum PendingPostAction {
     FinishSuccess,
     /// Stream had an error, propagate it after flush
     PropagateError(AdapterError),
+    /// Stream was idle for too long, fail with `Timeout` after flush
+    IdleTimeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,8 +214,10 @@ impl TaskRunner {
     /// run the task runner
     /// This function will block until the task is finished or cancelled
     /// It should be called in a new thread or async spawn context
-    #[cfg(feature = "tracing")]
-    #[tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.id))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.id))
+    )]
     pub async fn run(&mut self) {
         let mut result = self.run_inner().await;
         if Self::should_wait_data_drain(&result) {
@@ -253,7 +260,9 @@ impl TaskRunner {
             result,
             Ok(())
                 | Err(TaskRunError::Failed(
-                    TaskError::ExceededTotalSize | TaskError::StreamError { .. },
+                    TaskError::ExceededTotalSize
+                        | TaskError::StreamError { .. }
+                        | TaskError::Timeout,
                 ))
         )
     }
@@ -447,7 +456,8 @@ impl TaskRunner {
         let _guard = shutdown_tx.shutdown_guard();
         self.shutdown_rx = Some(shutdown_rx);
         let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
-        let mut slow_transfer_timer = async_io::Timer::after(SLOW_STREAM_TIMEOUT);
+        let idle_timeout = self.idle_timeout;
+        let mut idle_timer = async_io::Timer::after(idle_timeout);
         let mut pending_state: Option<PendingFlushState> = None;
         let mut deferred_control_error: Option<TaskRunError> = None;
         let mut control_channel_closed = false;
@@ -478,17 +488,16 @@ impl TaskRunner {
                     // NORMAL MODE: full event loop
                     let control_signal = self.control_signal.recv().fuse();
                     let download = self.stream.next().fuse();
-                    let slow_transfer = slow_transfer_timer.next().fuse();
-                    futures::pin_mut!(control_signal, download, slow_transfer);
+                    let idle = FutureExt::fuse(&mut idle_timer);
+                    futures::pin_mut!(control_signal, download, idle);
                     futures::select_biased! {
                         _ = cancelled => EventLoopStep::Cancelled,
                         signal = control_signal => EventLoopStep::Control(signal),
-                        _ = slow_transfer => {
-                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
-                            EventLoopStep::SlowTransfer
-                        }
+                        _ = idle => EventLoopStep::IdleTimeout,
                         result = download => {
-                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
+                            if matches!(&result, Some(Ok(bytes)) if !bytes.is_empty()) {
+                                idle_timer.set_after(idle_timeout);
+                            }
                             EventLoopStep::Download(result)
                         },
                     }
@@ -537,11 +546,18 @@ impl TaskRunner {
                         break Err(err);
                     }
                 },
-                EventLoopStep::SlowTransfer => {
-                    warn!(
-                        "runner: very slow stream, transfer 0 bytes in the last {} seconds",
-                        SLOW_STREAM_TIMEOUT.as_secs()
-                    );
+                EventLoopStep::IdleTimeout => {
+                    warn!("runner: no data received in the last {idle_timeout:?}");
+                    match self.flush_buff(&mut buff)? {
+                        Some(flush) => {
+                            pending_state = Some(PendingFlushState {
+                                future: flush.future,
+                                flushed_bytes: flush.flushed_bytes,
+                                post_action: PendingPostAction::IdleTimeout,
+                            });
+                        }
+                        None => break Err(TaskError::Timeout.into()),
+                    }
                 }
                 EventLoopStep::Download(item) => match self.handle_stream_event(item, &mut buff) {
                     Ok(Some(StreamEventOperation::FlushBuff {
@@ -598,7 +614,7 @@ impl TaskRunner {
 
                     match state.post_action {
                         PendingPostAction::Resume => {
-                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
+                            idle_timer.set_after(idle_timeout);
                         }
                         PendingPostAction::ContinueItem { item, offset } => {
                             let remaining_in_item = item.len().saturating_sub(offset);
@@ -661,12 +677,13 @@ impl TaskRunner {
                                 });
                                 continue;
                             }
-                            slow_transfer_timer.set_after(SLOW_STREAM_TIMEOUT);
+                            idle_timer.set_after(idle_timeout);
                         }
                         PendingPostAction::FinishSuccess => break Ok(()),
                         PendingPostAction::PropagateError(error) => {
                             break Err(TaskError::StreamError { source: error }.into());
                         }
+                        PendingPostAction::IdleTimeout => break Err(TaskError::Timeout.into()),
                     }
                 }
             }
