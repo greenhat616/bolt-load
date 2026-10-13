@@ -217,8 +217,6 @@ impl LocalSpawn for SmolLocalRuntime {
 
 #[cfg(test)]
 mod tests {
-    use bolt_load_utils::telemetry::*;
-
     use super::*;
 
     #[test]
