@@ -531,7 +531,6 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "pretty_assertions",
- "ranges",
  "regex",
  "serde",
  "smol",
@@ -2747,12 +2746,6 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
-
-[[package]]
-name = "ranges"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "350932f7e8b2d0333d2537f42671a837473576c00e128fbee84c819ea08783b5"
 
 [[package]]
 name = "raw-cpuid"
