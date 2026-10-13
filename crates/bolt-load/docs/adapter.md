@@ -36,6 +36,18 @@ Custom adapters can be implemented by providing a
 - **Unretryable** — `NotFound` (404), `Unauthorized` (401/403),
   `ServiceUnavailable` (429/503), `RangeStreamNotSupported`, etc.
 
+A task retries retryable failures up to its consecutive failure budget
+and fails on the first unretryable one. The only exception is
+`ServiceUnavailable` (429/503) while other attempts are in flight: it is
+answered by lowering concurrency instead (see the task module's
+*Termination* section).
+
+# Cancellation
+
+Requests are cancelled by dropping their futures and streams. An adapter
+should not detach work that outlives a dropped future: such work is not
+owned by bolt-load and cannot be awaited by [`Task::stop`](crate::task::Task::stop).
+
 # Key Type Aliases
 
 - [`AnyBytesStream`] — `BoxStream<'static, Result<Bytes, AdapterError>>`
