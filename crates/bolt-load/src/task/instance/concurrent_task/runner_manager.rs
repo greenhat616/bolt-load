@@ -97,7 +97,9 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 }
 
 use super::{
-    ChunkPlanner, PlannerGuard, chunk_planner::ChunkState, strategy::RunnerOutcomeSampler,
+    ChunkPlanner, PlannerGuard,
+    chunk_planner::{ChunkState, Resize},
+    strategy::RunnerOutcomeSampler,
 };
 use crate::{
     runner::{DataFrameReceiver, LifecycleEvent, LifecycleReceiver, StoppedReason, TaskError},
@@ -488,28 +490,34 @@ impl RunnerManager {
         Ok(unfinished_range)
     }
 
+    /// Shrink the runner's chunk to end `new_size` bytes after its downloaded
+    /// part, and limit the runner to match.
+    ///
+    /// On error nothing changes and no control message is sent.
     #[inline]
-    pub fn resize_runner(&mut self, runner_id: RunnerId, new_size: u64) {
+    pub fn resize_runner(
+        &mut self,
+        runner_id: RunnerId,
+        new_size: u64,
+    ) -> Result<(), super::chunk_planner::Error> {
         let Self {
             chunk_planner,
             control_channels,
             ..
         } = self;
         let mut guard = PlannerGuard::new(chunk_planner);
-        // Limit the total size of the runner
-        let downloaded_size = guard
-            .planner()
-            .resize_runner_state(runner_id, new_size)
-            .expect("chunk planner should not fail");
+        let limit = match guard.planner().resize_runner_state(runner_id, new_size)? {
+            Resize::Unchanged => return Ok(()),
+            Resize::Shrunk { limit } => limit,
+        };
 
+        // Limit the total size of the runner
         control_channels
-            .send_message(
-                runner_id,
-                ControlEvent::LimitTotal(downloaded_size + new_size),
-            )
+            .send_message(runner_id, ControlEvent::LimitTotal(limit))
             .expect("Manager control channel should never full or closed");
 
         guard.commit();
+        Ok(())
     }
 
     /// Returns true if the task is complete
@@ -794,6 +802,44 @@ mod tests {
         // Verify chunk is allocated
         let state = manager.get_runner_state(reg.runner_id).unwrap();
         assert_eq!(state.allocated, 0..500);
+    }
+
+    #[test]
+    fn test_resize_runner_shrinks_and_limits_the_runner() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let reg = manager.allocate_runner_with_chunk(0..500).unwrap();
+        manager.update_progress(reg.runner_id, 100).unwrap();
+
+        manager.resize_runner(reg.runner_id, 150).unwrap();
+        assert_eq!(
+            manager.get_runner_state(reg.runner_id).unwrap().allocated,
+            0..250
+        );
+        assert!(matches!(
+            reg.control_rx.try_recv(),
+            Ok(ControlEvent::LimitTotal(250))
+        ));
+    }
+
+    #[test]
+    fn test_resize_runner_rejected_or_unchanged_sends_nothing() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let reg = manager.allocate_runner_with_chunk(0..500).unwrap();
+        manager.update_progress(reg.runner_id, 100).unwrap();
+
+        // Growing is rejected, keeping the chunk.
+        assert!(matches!(
+            manager.resize_runner(reg.runner_id, 600),
+            Err(super::super::chunk_planner::Error::InvalidResize { .. })
+        ));
+        // The same end is a no-op.
+        manager.resize_runner(reg.runner_id, 400).unwrap();
+
+        assert_eq!(
+            manager.get_runner_state(reg.runner_id).unwrap().allocated,
+            0..500
+        );
+        assert!(reg.control_rx.try_recv().is_err());
     }
 
     #[test]
