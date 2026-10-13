@@ -740,6 +740,7 @@ mod tests {
                         control_rx,
                         runner_id,
                         token,
+                        crate::runner::DEFAULT_IDLE_TIMEOUT,
                     )
                 })
                 .expect("runner slot should be available");

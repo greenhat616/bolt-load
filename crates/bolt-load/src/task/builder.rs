@@ -6,9 +6,10 @@ use std::{
 use async_lock::OnceCell;
 use bolt_load_core::adapter::AdapterError;
 use bolt_load_utils::telemetry::*;
+use futures::FutureExt;
 use smol_cancellation_token::CancellationToken;
 
-use super::{AtomicTaskState, DownloadMode, Task, TaskInstanceImpl, TaskState};
+use super::{AtomicTaskState, DownloadMode, Task, TaskInstanceImpl, TaskOptions, TaskState};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
@@ -27,6 +28,7 @@ pub struct TaskBuilder {
     /// a directory to save the file, It is used to save the file, prefer the filename retrieved from the adapter
     save_dir: Option<PathBuf>,
     on_task_state_changed: Option<Vec<TaskStateChangedCallback>>,
+    options: TaskOptions,
 }
 
 impl Default for TaskBuilder {
@@ -41,6 +43,7 @@ impl Default for TaskBuilder {
             local_runtime_builder: None,
             cancel_token: None,
             on_task_state_changed: None,
+            options: TaskOptions::default(),
         }
     }
 }
@@ -55,6 +58,26 @@ pub enum TaskManagerBuildError {
     AdapterError { source: AdapterError },
     #[snafu(transparent)]
     IOError { source: std::io::Error },
+    /// The cancel token was cancelled before the task was built
+    #[snafu(display("task build is cancelled"))]
+    Cancelled,
+}
+
+/// Run `fut` unless `token` is cancelled first; the future is dropped on cancellation.
+async fn until_cancelled<T>(
+    token: &CancellationToken,
+    fut: impl Future<Output = Result<T, TaskManagerBuildError>>,
+) -> Result<T, TaskManagerBuildError> {
+    if token.is_cancelled() {
+        return Err(TaskManagerBuildError::Cancelled);
+    }
+    let fut = fut.fuse();
+    let cancelled = token.cancelled().fuse();
+    futures::pin_mut!(fut, cancelled);
+    futures::select_biased! {
+        _ = cancelled => Err(TaskManagerBuildError::Cancelled),
+        res = fut => res,
+    }
 }
 
 async fn try_get_or_init_meta<'a>(
@@ -101,6 +124,12 @@ impl TaskBuilder {
     /// set the cancel token
     pub fn cancel_token(mut self, cancel_token: CancellationToken) -> Self {
         self.cancel_token = Some(cancel_token);
+        self
+    }
+
+    /// set the termination options, see [`TaskOptions`]
+    pub fn options(mut self, options: TaskOptions) -> Self {
+        self.options = options;
         self
     }
 
@@ -193,9 +222,12 @@ impl TaskBuilder {
                 message: "cancel token is not set".to_string(),
             });
         }
+        self.options.validate()?;
         let cancel_token = self.cancel_token.take().unwrap();
-        // retrieve the meta
-        let _ = self.retrieve_meta().await?;
+        until_cancelled(&cancel_token, async {
+            self.retrieve_meta().await.map(drop)
+        })
+        .await?;
         self.validate()?;
 
         let adapter = self.adapter.take().unwrap();
@@ -207,7 +239,11 @@ impl TaskBuilder {
             .is_some_and(|m| m == DownloadMode::Singleton)
         {
             DownloadMode::Singleton
-        } else if adapter.is_range_stream_available().await {
+        } else if until_cancelled(&cancel_token, async {
+            Ok(adapter.is_range_stream_available().await)
+        })
+        .await?
+        {
             DownloadMode::Concurrent
         } else {
             DownloadMode::Singleton
@@ -240,22 +276,19 @@ impl TaskBuilder {
             });
         }
 
-        let mut temp_path = save_path.clone();
-        if let Some(filename) = temp_path.file_name() {
-            let mut file_name = filename.to_os_string();
-            file_name.push(".partial");
-            temp_path.set_file_name(file_name);
-        }
-
         Ok(Task {
             adapter: Arc::new(adapter),
             mode,
             save_path,
             meta: self.meta.take().unwrap(),
-            tmp_path: temp_path,
             threaded_rt: runtime.clone(),
             local_runtime_builder: self.local_runtime_builder.clone(),
-            task: TaskInstanceImpl::new(mode, runtime, self.local_runtime_builder.clone()),
+            task: TaskInstanceImpl::with_options(
+                mode,
+                runtime,
+                self.local_runtime_builder.clone(),
+                self.options.clone(),
+            ),
             cancel_token,
             on_task_state_changed: Arc::new(self.on_task_state_changed.take().unwrap_or_default()),
             task_state: Arc::new(AtomicTaskState::new(TaskState::Idle)),

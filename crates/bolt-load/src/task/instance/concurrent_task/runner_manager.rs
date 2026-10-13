@@ -22,11 +22,23 @@ pub(super) struct DownloadedChunk {
     pub bytes: Bytes,
 }
 
+/// A failed attempt of a single runner (connect or transfer).
+///
+/// Each attempt is reported at most once.
+#[derive(Debug, Clone)]
+pub(super) struct AttemptFailure {
+    #[allow(dead_code)]
+    pub runner_id: RunnerId,
+    pub error: TaskError,
+    pub retryable: bool,
+}
+
 /// Result of a single `RunnerManager::tick()` call.
 #[derive(Debug)]
 pub(super) struct RunnerTick {
     pub state: TaskState,
     pub downloaded: Option<DownloadedChunk>,
+    pub failure: Option<AttemptFailure>,
 }
 
 impl RunnerTick {
@@ -34,6 +46,7 @@ impl RunnerTick {
         Self {
             state: TaskState::Downloading,
             downloaded: None,
+            failure: None,
         }
     }
 
@@ -41,6 +54,7 @@ impl RunnerTick {
         Self {
             state: TaskState::Finished,
             downloaded: None,
+            failure: None,
         }
     }
 
@@ -48,8 +62,29 @@ impl RunnerTick {
         Self {
             state: TaskState::Downloading,
             downloaded: Some(chunk),
+            failure: None,
         }
     }
+
+    fn with_failure(failure: AttemptFailure) -> Self {
+        Self {
+            state: TaskState::Downloading,
+            downloaded: None,
+            failure: Some(failure),
+        }
+    }
+}
+
+/// Whether another attempt on the same range may succeed.
+///
+/// Besides adapter-retryable errors, a prematurely closed stream or channel is
+/// treated as transient.
+fn is_attempt_retryable(error: &TaskError) -> bool {
+    error.is_retryable()
+        || matches!(
+            error,
+            TaskError::SmallerThanTotalSize | TaskError::ChannelClosed
+        )
 }
 
 use super::{
@@ -454,8 +489,6 @@ impl RunnerManager {
         guard.commit();
     }
 
-    /// Handle lifecycle events from the new two-channel architecture
-    ///
     /// Returns true if the task is complete
     fn mark_runner_completed(&mut self, runner_id: RunnerId) -> bool {
         self.chunk_planner
@@ -475,91 +508,96 @@ impl RunnerManager {
         &mut self,
         event: RunnerTaggedStreamItem<LifecycleEvent>,
         meters: &mut HashMap<RunnerId, usize>,
-    ) -> bool {
-        match event.item {
+    ) -> RunnerTick {
+        let runner_id = event.runner_id;
+        let reason = match event.item {
             LifecycleEvent::Started => {
-                trace!("runner {} started", event.runner_id);
+                trace!("runner {runner_id} started");
+                return RunnerTick::downloading();
             }
-            LifecycleEvent::Stopped(reason) => {
-                meters.remove(&event.runner_id);
-                // Remove control channel when runner stops
-                self.release_runner(event.runner_id);
-                match reason {
-                    StoppedReason::Finished => {
-                        trace!("runner {} finished", event.runner_id);
-                        if self.mark_runner_completed(event.runner_id) {
-                            return true;
-                        }
-                    }
-                    StoppedReason::Failed(kind) => {
-                        error!("runner {} failed: {kind:?}", event.runner_id);
-                        match kind {
-                            TaskError::ExceededTotalSize => {
-                                if self.mark_runner_completed(event.runner_id) {
-                                    return true;
-                                }
-                            }
-                            _ => {
-                                let unfinished_range = self
-                                    .chunk_planner
-                                    .mark_failed(event.runner_id)
-                                    .expect("chunk planner should not fail");
-                                if kind.is_retryable() {
-                                    self.runner_outcome_sampler
-                                        .record_stream_closed(RunnerFailureKind::Retryable);
-                                } else {
-                                    self.runner_outcome_sampler
-                                        .record_stream_closed(RunnerFailureKind::Unretryable);
-                                }
-                                trace!(
-                                    "runner {} failed, released range: {:?}",
-                                    event.runner_id, unfinished_range
-                                );
-                            }
-                        }
-                    }
-                }
+            LifecycleEvent::Stopped(reason) => reason,
+        };
+        meters.remove(&runner_id);
+        // Remove control channel when runner stops
+        self.release_runner(runner_id);
+        let kind = match reason {
+            StoppedReason::Finished | StoppedReason::Failed(TaskError::ExceededTotalSize) => {
+                trace!("runner {runner_id} finished");
+                return if self.mark_runner_completed(runner_id) {
+                    RunnerTick::finished()
+                } else {
+                    RunnerTick::downloading()
+                };
             }
+            StoppedReason::Failed(kind) => kind,
+        };
+        error!("runner {runner_id} failed: {kind:?}");
+        let unfinished_range = self
+            .chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        trace!("runner {runner_id} failed, released range: {unfinished_range:?}");
+        if kind.is_cancelled() {
+            return RunnerTick::downloading();
         }
-        false
+        self.runner_outcome_sampler
+            .record_stream_closed(if kind.is_retryable() {
+                RunnerFailureKind::Retryable
+            } else {
+                RunnerFailureKind::Unretryable
+            });
+        RunnerTick::with_failure(AttemptFailure {
+            runner_id,
+            retryable: is_attempt_retryable(&kind),
+            error: kind,
+        })
     }
 
     /// Handle pending runners
-    fn handle_pending(&mut self, pending: PendingRunnerOutput) {
-        match pending.result {
+    fn handle_pending(&mut self, pending: PendingRunnerOutput) -> RunnerTick {
+        let runner_id = pending.context.runner_id;
+        let error = match pending.result {
             Ok(output) => {
                 self.chunk_planner
-                    .mark_running(pending.context.runner_id)
+                    .mark_running(runner_id)
                     .expect("chunk planner should not fail");
-                self.register_runner_channels(
-                    pending.context.runner_id,
-                    output.lifecycle_rx,
-                    output.data_rx,
-                );
+                self.register_runner_channels(runner_id, output.lifecycle_rx, output.data_rx);
+                return RunnerTick::downloading();
             }
-            Err(error) => {
-                error!("failed to create runner: {error:?}");
-                // Update planner state first for stronger atomicity
-                self.chunk_planner
-                    .mark_failed(pending.context.runner_id)
-                    .expect("chunk planner should not fail");
-                // Release runner slot after planner state transition
-                // Note: release_runner() is no-op for unregistered runners (safe)
-                self.release_runner(pending.context.runner_id);
-                self.runner_outcome_sampler
-                    .record_connect_failed(match error {
-                        PendingRunnerError::ReceiverClosed => RunnerFailureKind::Retryable,
-                        PendingRunnerError::Connection { source } => {
-                            if source.is_retryable() {
-                                RunnerFailureKind::Retryable
-                            } else {
-                                RunnerFailureKind::Unretryable
-                            }
-                        }
-                        PendingRunnerError::Spawn { .. } => RunnerFailureKind::Unretryable,
-                    });
+            Err(error) => error,
+        };
+        error!("failed to create runner: {error:?}");
+        // Update planner state first for stronger atomicity
+        self.chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        // Release runner slot after planner state transition
+        // Note: release_runner() is no-op for unregistered runners (safe)
+        self.release_runner(runner_id);
+        let (error, retryable) = match error {
+            PendingRunnerError::ReceiverClosed => (TaskError::ChannelClosed, true),
+            PendingRunnerError::Connection { source } => {
+                let retryable = source.is_retryable();
+                (
+                    TaskError::StreamError {
+                        source: source.source,
+                    },
+                    retryable,
+                )
             }
-        }
+            PendingRunnerError::Spawn { message } => (TaskError::Other { message }, false),
+        };
+        self.runner_outcome_sampler
+            .record_connect_failed(if retryable {
+                RunnerFailureKind::Retryable
+            } else {
+                RunnerFailureKind::Unretryable
+            });
+        RunnerTick::with_failure(AttemptFailure {
+            runner_id,
+            error,
+            retryable,
+        })
     }
 
     /// Handle a runner whose stream closed without sending `Stopped`.
@@ -567,7 +605,8 @@ impl RunnerManager {
         &mut self,
         runner_id: RunnerId,
         meters: &mut HashMap<RunnerId, usize>,
-    ) -> bool {
+    ) -> RunnerTick {
+        warn!("runner {runner_id} lifecycle stream closed unexpectedly");
         meters.remove(&runner_id);
         let unfinished_range = self
             .chunk_planner
@@ -577,7 +616,36 @@ impl RunnerManager {
             .record_stream_closed(RunnerFailureKind::Retryable);
         self.release_runner(runner_id);
         trace!("runner {runner_id} lost, released range: {unfinished_range:?}");
-        self.chunk_planner.is_complete()
+        if self.chunk_planner.is_complete() {
+            return RunnerTick::finished();
+        }
+        RunnerTick::with_failure(AttemptFailure {
+            runner_id,
+            error: TaskError::ChannelClosed,
+            retryable: true,
+        })
+    }
+
+    fn handle_lifecycle_stream_event(
+        &mut self,
+        event: Option<LifecycleStreamEvent>,
+        meters: &mut HashMap<RunnerId, usize>,
+    ) -> RunnerTick {
+        match event {
+            Some(LifecycleStreamEvent::Event(tagged)) => self.handle_lifecycle(tagged, meters),
+            Some(LifecycleStreamEvent::Closed(runner_id)) => {
+                self.handle_runner_lost(runner_id, meters)
+            }
+            None => RunnerTick::downloading(),
+        }
+    }
+
+    fn handle_pending_stream_event(&mut self, pending: Option<PendingRunnerOutput>) -> RunnerTick {
+        match pending {
+            Some(pending) => self.handle_pending(pending),
+            None if self.chunk_planner.is_complete() => RunnerTick::finished(),
+            None => RunnerTick::downloading(),
+        }
     }
 
     /// Handle data frames from runners, returning the chunk ready for writing.
@@ -611,35 +679,8 @@ impl RunnerManager {
         futures::pin_mut!(next_lifecycle, next_data, pending);
         // Priority: lifecycle > pending > data (lifecycle is control-plane, must not be starved)
         futures::select_biased! {
-            event = next_lifecycle => {
-                if let Some(event) = event {
-                    match event {
-                        LifecycleStreamEvent::Event(tagged) => {
-                            if self.handle_lifecycle(tagged, meters) {
-                                return RunnerTick::finished();
-                            }
-                        }
-                        LifecycleStreamEvent::Closed(runner_id) => {
-                            warn!("runner {runner_id} lifecycle stream closed unexpectedly");
-                            if self.handle_runner_lost(runner_id, meters) {
-                                return RunnerTick::finished();
-                            }
-                        }
-                    }
-                }
-            }
-            pending = pending => {
-                match pending {
-                    Some(pending) => {
-                        self.handle_pending(pending);
-                    }
-                    None => {
-                        if self.chunk_planner.is_complete() {
-                            return RunnerTick::finished();
-                        }
-                    }
-                }
-            }
+            event = next_lifecycle => self.handle_lifecycle_stream_event(event, meters),
+            pending = pending => self.handle_pending_stream_event(pending),
             data = next_data => {
                 if let Some(event) = data {
                     match event {
@@ -653,9 +694,9 @@ impl RunnerManager {
                         }
                     }
                 }
+                RunnerTick::downloading()
             }
         }
-        RunnerTick::downloading()
     }
 
     #[allow(private_interfaces)]
@@ -667,37 +708,9 @@ impl RunnerManager {
         let pending = self.pending_runners.next().fuse();
         futures::pin_mut!(next_lifecycle, pending);
         futures::select_biased! {
-            event = next_lifecycle => {
-                if let Some(event) = event {
-                    match event {
-                        LifecycleStreamEvent::Event(tagged) => {
-                            if self.handle_lifecycle(tagged, meters) {
-                                return RunnerTick::finished();
-                            }
-                        }
-                        LifecycleStreamEvent::Closed(runner_id) => {
-                            warn!("runner {runner_id} lifecycle stream closed unexpectedly");
-                            if self.handle_runner_lost(runner_id, meters) {
-                                return RunnerTick::finished();
-                            }
-                        }
-                    }
-                }
-            }
-            pending = pending => {
-                match pending {
-                    Some(pending) => {
-                        self.handle_pending(pending);
-                    }
-                    None => {
-                        if self.chunk_planner.is_complete() {
-                            return RunnerTick::finished();
-                        }
-                    }
-                }
-            }
+            event = next_lifecycle => self.handle_lifecycle_stream_event(event, meters),
+            pending = pending => self.handle_pending_stream_event(pending),
         }
-        RunnerTick::downloading()
     }
 }
 

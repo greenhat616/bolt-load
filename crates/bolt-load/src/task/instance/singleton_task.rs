@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_fs::{File, OpenOptions};
 use async_io::Timer;
@@ -9,15 +13,15 @@ use smol_cancellation_token::CancellationToken;
 use statig::prelude::*;
 
 use super::{
-    Result, TaskInstance, TaskInstanceError,
+    Result, TaskInstance, TaskInstanceError, output_file,
     sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
 };
 use crate::{
     adapter::AnyAdapter,
-    runner::{LifecycleEvent, StoppedReason, TaskRunner, TaskRunnerGuard},
+    runner::{LifecycleEvent, StoppedReason, TaskError, TaskRunner, TaskRunnerGuard},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
-        Progress, RunnerId,
+        Progress, RunnerId, TaskOptions,
         instance::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
     },
     utils::ShutdownGuardExt,
@@ -30,6 +34,7 @@ pub struct SingletonTask {
     threaded_rt: ThreadedRuntimeImpl,
     local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     task: Option<TaskControl>,
+    options: TaskOptions,
 }
 
 impl SingletonTask {
@@ -37,10 +42,19 @@ impl SingletonTask {
         threaded_rt: ThreadedRuntimeImpl,
         local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     ) -> Self {
+        Self::with_options(threaded_rt, local_runtime_builder, TaskOptions::default())
+    }
+
+    pub fn with_options(
+        threaded_rt: ThreadedRuntimeImpl,
+        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
+        options: TaskOptions,
+    ) -> Self {
         Self {
             threaded_rt,
             local_runtime_builder,
             task: None,
+            options,
         }
     }
 }
@@ -60,6 +74,7 @@ impl TaskInstance for SingletonTask {
         let token = cancel_token.clone();
         let threaded_rt = self.threaded_rt.clone();
         let local_rt_builder = self.local_runtime_builder.clone();
+        let options = self.options.clone();
         trace!("[SINGLETON TASK] Attempting to spawn state machine task");
         let task = ::blocking::unblock(move || {
             let local_rt = threaded_rt
@@ -68,10 +83,11 @@ impl TaskInstance for SingletonTask {
             let task = async move {
                 trace!("[SINGLETON TASK] State machine starting");
                 let mut context = Context::default();
-                let mut state_machine = SingletonTaskInner::new(path, event_tx, threaded_rt)
-                    .uninitialized_state_machine()
-                    .init_with_context(&mut context)
-                    .await;
+                let mut state_machine =
+                    SingletonTaskInner::new(path, event_tx, threaded_rt, options)
+                        .uninitialized_state_machine()
+                        .init_with_context(&mut context)
+                        .await;
 
                 trace!("[SINGLETON TASK] State machine initialized, handling Run event");
                 state_machine
@@ -122,7 +138,7 @@ impl TaskInstance for SingletonTask {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        if let Some(mut task) = self.task.take() {
+        if let Some(task) = self.task.as_mut() {
             task.stop().await;
         }
         Ok(())
@@ -133,12 +149,10 @@ impl TaskInstance for SingletonTask {
             "[SINGLETON TASK] wait() called, task present: {}",
             self.task.is_some()
         );
-        if let Some(mut task) = self.task.take() {
+        if let Some(task) = self.task.as_mut() {
             trace!("[SINGLETON TASK] waiting for task to complete");
             task.wait().await;
             trace!("[SINGLETON TASK] task completed");
-        } else {
-            warn!("[SINGLETON TASK] WARNING: No task to wait for!");
         }
         Ok(())
     }
@@ -152,6 +166,7 @@ struct SingletonTaskInner {
     adapter: Option<Arc<AnyAdapter>>,
     event_tx: async_channel::Sender<TaskEvent>,
     rt: ThreadedRuntimeImpl,
+    options: TaskOptions,
 }
 
 impl SingletonTaskInner {
@@ -159,6 +174,7 @@ impl SingletonTaskInner {
         path: PathBuf,
         event_tx: async_channel::Sender<TaskEvent>,
         rt: ThreadedRuntimeImpl,
+        options: TaskOptions,
     ) -> Self {
         Self {
             total: None,
@@ -168,6 +184,7 @@ impl SingletonTaskInner {
             adapter: None,
             event_tx,
             rt,
+            options,
         }
     }
 }
@@ -230,6 +247,7 @@ impl SingletonTaskInner {
     fn handle_timer_tick(
         &self,
         wg: &WaitGroup,
+        cancel_token: &CancellationToken,
         speed: &mut f64,
         sampler: &mut SpeedSampler,
         meter: &mut usize,
@@ -245,35 +263,69 @@ impl SingletonTaskInner {
         let event_tx = self.event_tx.clone();
         let speed = *speed;
         let wg = wg.clone();
+        let cancel_token = cancel_token.clone();
         let _ = self.rt.spawn(async move {
             let _wg = wg;
-            let _ = event_tx
+            let send = event_tx
                 .send(TaskEvent::Downloading(ProgressWithSpeed::new(
                     progress, speed, 0.0,
                 )))
-                .await;
+                .fuse();
+            let cancelled = cancel_token.cancelled().fuse();
+            futures::pin_mut!(send, cancelled);
+            futures::select_biased! {
+                _ = cancelled => {}
+                _ = send => {}
+            }
         });
     }
 
-    /// Download the file
-    async fn download(&mut self, cancel_token: &mut CancellationToken) -> Result<()> {
+    /// Download into the temporary file, then publish it or discard it.
+    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
         trace!(
             "[SINGLETON TASK] download() method called, path: {:?}",
             self.path
         );
-        let stream = self
-            .adapter
-            .as_ref()
-            .unwrap()
-            .full_stream()
-            .await
-            .map_err(TaskInstanceError::new_stream_failed)?;
+        let tmp_path = output_file::tmp_path_for(&self.path);
+        let transfer = self.download_to(&tmp_path, cancel_token).await;
+        output_file::commit(transfer, &tmp_path, &self.path, cancel_token).await
+    }
+
+    /// Run the transfer; returns only after the runner and progress tasks have exited.
+    async fn download_to(
+        &mut self,
+        tmp_path: &Path,
+        cancel_token: &CancellationToken,
+    ) -> Result<()> {
+        // A child token: finishing or failing must never cancel the caller's token.
+        let runner_token = cancel_token.child_token();
+        let _runner_cancel_guard = runner_token.clone().drop_guard();
+
+        let stream = {
+            let adapter = self.adapter.clone().unwrap();
+            let connect = async move { adapter.full_stream().await }.fuse();
+            let cancelled = runner_token.cancelled().fuse();
+            let timeout = FutureExt::fuse(Timer::after(self.options.no_progress_timeout));
+            futures::pin_mut!(connect, cancelled, timeout);
+            futures::select_biased! {
+                _ = cancelled => {
+                    return Err(TaskInstanceError::new_failed(TaskError::Cancelled));
+                }
+                _ = timeout => {
+                    return Err(TaskInstanceError::new_failed(TaskError::NoProgress {
+                        timeout: self.options.no_progress_timeout,
+                    }));
+                }
+                res = connect => res.map_err(TaskInstanceError::new_stream_failed)?,
+            }
+        };
         trace!("[SINGLETON TASK] stream obtained successfully");
 
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&self.path)
+            .truncate(true)
+            .open(tmp_path)
             .await
             .map_err(TaskInstanceError::new_write_chunk_failed)?;
 
@@ -285,7 +337,7 @@ impl SingletonTaskInner {
 
         let wg = WaitGroup::new();
         let (control_tx, control_rx) = TaskRunnerGuard::create_control_channel();
-        let guard = TaskRunnerGuard::new(STATIC_RUNNER_ID, cancel_token.clone(), control_tx);
+        let guard = TaskRunnerGuard::new(STATIC_RUNNER_ID, runner_token.clone(), control_tx);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let _shutdown_guard = shutdown_tx.shutdown_guard();
 
@@ -294,7 +346,8 @@ impl SingletonTaskInner {
             .stream(stream)
             .runner_id(STATIC_RUNNER_ID)
             .control_signal(control_rx)
-            .cancel_token(cancel_token.clone());
+            .cancel_token(runner_token.clone())
+            .idle_timeout(self.options.stream_idle_timeout);
 
         if let Some(total) = self.total {
             builder = builder.total(total);
@@ -303,7 +356,6 @@ impl SingletonTaskInner {
         let (mut runner, lifecycle_rx, data_rx) =
             builder.build().expect("failed to build task runner");
 
-        let _cancel_guard = cancel_token.clone().drop_guard();
         self.instance = Some((guard, shutdown_rx));
 
         let mut meter = 0;
@@ -311,6 +363,8 @@ impl SingletonTaskInner {
         let mut sampler = SpeedSampler::new();
         let mut timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
 
+        // The runner is driven inline; leaving this block drops it, which stops
+        // it and releases the upstream stream.
         let result = async {
             let mut is_finished = false;
             let mut runner_stopped = false;
@@ -337,7 +391,13 @@ impl SingletonTaskInner {
 
                 futures::select_biased! {
                     _ = timer.next().fuse() => {
-                        self.handle_timer_tick(&wg, &mut speed, &mut sampler, &mut meter);
+                        self.handle_timer_tick(
+                            &wg,
+                            &runner_token,
+                            &mut speed,
+                            &mut sampler,
+                            &mut meter,
+                        );
                     }
                     _ = fut => (),
                     frame = data_next => {
@@ -375,7 +435,7 @@ impl SingletonTaskInner {
                                 lifecycle_done = true;
                                 if !runner_stopped {
                                     return Err(TaskInstanceError::new_failed(
-                                        crate::runner::TaskError::ChannelClosed,
+                                        TaskError::ChannelClosed,
                                     ));
                                 }
                                 if data_done {
@@ -390,15 +450,17 @@ impl SingletonTaskInner {
         }
         .await;
 
-        if let Err(e) = file.flush().await {
-            warn!("failed to flush file: {e:?}");
-        }
-
+        // ---- teardown: never short-circuit ----
+        runner_token.cancel();
+        self.instance = None;
+        let flush = file
+            .flush()
+            .await
+            .map_err(TaskInstanceError::new_write_chunk_failed);
+        drop(file);
         wg.wait().await;
 
-        result?;
-
-        Ok(())
+        result.and(flush)
     }
 
     async fn before_transition(&mut self, _source: &State, target: &State, _context: &mut Context) {

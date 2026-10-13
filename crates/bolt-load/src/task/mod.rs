@@ -23,9 +23,13 @@ mod builder;
 mod comprehensive_tests;
 /// Task instance implementations (singleton and concurrent).
 pub mod instance;
+mod options;
+#[cfg(test)]
+mod termination_tests;
 
 pub use builder::*;
 use instance::*;
+pub use options::*;
 
 pub type RunnerId = usize;
 
@@ -156,8 +160,6 @@ pub struct Task {
     mode: DownloadMode,
     /// the save path of this task
     save_path: PathBuf,
-    /// the tmp path of this task
-    tmp_path: PathBuf,
     /// the meta of this task
     meta: BoltLoadAdapterMeta,
     /// the cancel token of this task
@@ -234,30 +236,38 @@ impl Task {
         self.on_task_state_changed = Arc::new(cb);
     }
 
-    /// cancel the task, and do the cleanup work
+    /// Cancel the task and wait until all of its owned work has exited
+    /// and the temporary file has been cleaned up.
+    ///
+    /// Use [`Task::wait`] to retrieve the terminal error.
     pub async fn stop(&mut self) {
         self.cancel_token.cancel();
-        self.task.stop().await.unwrap();
+        let _ = self.task.stop().await;
+        let _ = self.wait().await;
     }
 
+    /// Wait until the task and its event handler have exited, then return the
+    /// terminal error, if any.
+    ///
+    /// It is safe to call repeatedly, before [`Task::run`], or again after a
+    /// previous `wait` future was dropped.
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub async fn wait(&mut self) -> Result<(), TaskInstanceError> {
-        if matches!(
-            self.task_state.load(Ordering::Acquire),
-            TaskState::Spawning | TaskState::Initializing | TaskState::Downloading
-        ) {
-            self.task.wait().await?;
-            if let Some(handle) = self.event_handler_handle.take() {
-                handle.await;
-            }
+        let joined = self.task.wait().await;
+        // Join the event handler even if joining the instance failed.
+        if let Some(handle) = self.event_handler_handle.as_mut() {
+            handle.await;
+            self.event_handler_handle = None;
         }
-        let current_state = self.task_state.load(Ordering::Acquire);
-        trace!("[TASK] Task::wait, current_state: {current_state:?}");
-        if matches!(current_state, TaskState::Failed) {
-            let error = self.last_error.lock().unwrap().clone().unwrap();
-            return Err(error);
+        joined?;
+        trace!(
+            "[TASK] Task::wait, current_state: {:?}",
+            self.task_state.load(Ordering::Acquire)
+        );
+        match self.last_error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument)]
@@ -267,6 +277,8 @@ impl Task {
         let on_task_state_changed = self.on_task_state_changed.clone();
         let task_state = self.task_state.clone();
         let last_error = self.last_error.clone();
+        // A new run must not report the error of a previous one.
+        last_error.lock().unwrap().take();
         task_state.store(TaskState::Spawning, Ordering::Release);
 
         let fut = async move {
@@ -289,8 +301,8 @@ impl Task {
                     TaskEvent::Failed(error) => {
                         #[cfg(test)]
                         trace!("[TASK] TaskEvent::Failed");
-                        task_state.store(TaskState::Failed, Ordering::Release);
                         last_error.lock().unwrap().replace(error.clone());
+                        task_state.store(TaskState::Failed, Ordering::Release);
                     }
                 }
                 for callback in on_task_state_changed.iter() {
