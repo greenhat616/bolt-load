@@ -51,7 +51,8 @@ async fn retrieve_meta_with(
         // The jitter is added after `max_delay` caps the base delay.
         .adjust(move |_, delay| delay.map(|d| d.min(cap)))
         .notify(|e, delay| {
-            trace!("[TASK] retrieve_meta failed: {e}, retrying in {delay:?}");
+            // The error text may carry the request URL and its credentials.
+            trace!("[TASK] retrieve_meta failed with a retryable error, retrying in {delay:?}");
             notify(e, delay);
         })
         .await
@@ -193,8 +194,6 @@ mod tests {
     /// A custom runtime's default sleep ticks its delayed timer twice.
     #[test]
     fn sleeps_on_a_custom_runtime_timer() {
-        use std::sync::atomic::AtomicUsize;
-
         use crate::runtime::{DowncastLocalRuntime, DynTimer, ThreadedRuntime, Timer, TimerImpl};
 
         struct CountingTimer(Arc<AtomicUsize>);
