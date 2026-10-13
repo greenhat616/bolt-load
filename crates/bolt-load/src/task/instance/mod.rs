@@ -11,6 +11,7 @@ use crate::{
 
 /// Concurrent download task implementation.
 pub mod concurrent_task;
+mod drive;
 mod id;
 mod output_file;
 mod sampler;
@@ -130,7 +131,6 @@ impl TaskControl {
     }
 }
 
-// TODO: maybe we can share the same state machine for both task impl?
 #[enum_dispatch::enum_dispatch]
 pub enum TaskInstanceImpl {
     Singleton(SingletonTask),
@@ -180,12 +180,6 @@ impl TaskInstanceError {
 }
 
 type Result<T, E = TaskInstanceError> = std::result::Result<T, E>;
-
-#[derive(Clone)]
-pub struct RunningPayload {
-    adapter: Arc<AnyAdapter>,
-    cancel_token: CancellationToken,
-}
 
 /// The abstract trait of the task
 ///

@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -9,19 +8,20 @@ use async_io::Timer;
 use bolt_load_utils::telemetry::*;
 use futures::{AsyncWriteExt, FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
-use statig::prelude::*;
 
 use super::{
-    Result, TaskInstance, TaskInstanceError, output_file,
+    Result, TaskInstance, TaskInstanceError,
+    drive::{self, Transfer},
+    output_file,
     sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
 };
 use crate::{
     adapter::AnyAdapter,
     runner::{LifecycleEvent, StoppedReason, TaskError, TaskRunner},
-    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
+    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     task::{
         Progress, RunnerId, TaskOptions,
-        instance::{ProgressWithSpeed, RunningPayload, TaskControl, TaskEvent},
+        instance::{ProgressWithSpeed, TaskControl, TaskEvent},
     },
 };
 
@@ -71,68 +71,23 @@ impl TaskInstance for SingletonTask {
         event_tx: async_channel::Sender<TaskEvent>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
-        let token = cancel_token.clone();
-        let threaded_rt = self.threaded_rt.clone();
-        let local_rt_builder = self.local_runtime_builder.clone();
         let options = self.options.clone();
-        trace!("[SINGLETON TASK] Attempting to spawn state machine task");
-        let task = ::blocking::unblock(move || {
-            let local_rt = threaded_rt
-                .downcast_local(local_rt_builder)
-                .expect("failed to downcast the runtime");
-            let task = async move {
-                trace!("[SINGLETON TASK] State machine starting");
-                let mut context = Context::default();
-                let mut state_machine = SingletonTaskInner::new(path, event_tx, options)
-                    .uninitialized_state_machine()
-                    .init_with_context(&mut context)
-                    .await;
-
-                trace!("[SINGLETON TASK] State machine initialized, handling Run event");
-                state_machine
-                    .handle_with_context(
-                        &Event::Run(RunningPayload {
-                            adapter,
-                            cancel_token,
-                        }),
-                        &mut context,
-                    )
-                    .await;
-
-                trace!(
-                    "[SINGLETON TASK] Run event handled, starting event loop with {} items in poll",
-                    context.poll.len()
+        let task = drive::spawn_on_local(
+            self.threaded_rt.clone(),
+            self.local_runtime_builder.clone(),
+            cancel_token.clone(),
+            move |_| {
+                let inner = SingletonTaskInner::new(adapter, path, event_tx.clone(), options);
+                let task = drive::drive(inner, event_tx, cancel_token);
+                #[cfg(feature = "tracing")]
+                let task = tracing::Instrument::instrument(
+                    task,
+                    tracing::trace_span!(parent: None, "SingletonTask::background_task"),
                 );
-                while context.poll.pop_front().is_some() {
-                    trace!("[SINGLETON TASK] Processing Step event");
-                    state_machine
-                        .handle_with_context(&Event::Step, &mut context)
-                        .await;
-                    trace!(
-                        "[SINGLETON TASK] Step event handled, {} items remaining in poll",
-                        context.poll.len()
-                    );
-                }
-                trace!("[SINGLETON TASK] Event loop completed");
-
-                debug_assert!(
-                    matches!(state_machine.state(), State::Stopped { .. }),
-                    "the task should be stopped after the state machine is finished"
-                );
-            };
-            #[cfg(feature = "tracing")]
-            let task = tracing::Instrument::instrument(
-                task,
-                tracing::trace_span!(
-                    parent: None,
-                    "SingletonTask::background_task",
-                ),
-            );
-            local_rt.block_on(Box::pin(task))
-        });
-        trace!("[SINGLETON TASK] State machine task spawned successfully");
-        self.task = Some(TaskControl::new(token, task));
-        trace!("[SINGLETON TASK] TaskControl created and stored");
+                task
+            },
+        );
+        self.task = Some(task);
         Ok(())
     }
 
@@ -161,13 +116,14 @@ struct SingletonTaskInner {
     total: Option<u64>,
     downloaded: u64,
     path: PathBuf,
-    adapter: Option<Arc<AnyAdapter>>,
+    adapter: Arc<AnyAdapter>,
     event_tx: async_channel::Sender<TaskEvent>,
     options: TaskOptions,
 }
 
 impl SingletonTaskInner {
     fn new(
+        adapter: Arc<AnyAdapter>,
         path: PathBuf,
         event_tx: async_channel::Sender<TaskEvent>,
         options: TaskOptions,
@@ -176,7 +132,7 @@ impl SingletonTaskInner {
             total: None,
             downloaded: 0,
             path,
-            adapter: None,
+            adapter,
             event_tx,
             options,
         }
@@ -189,8 +145,6 @@ impl SingletonTaskInner {
         // TODO: use backon to retry
         let meta = self
             .adapter
-            .as_ref()
-            .unwrap()
             .retrieve_meta()
             .await
             .map_err(TaskInstanceError::new_retrieve_meta_failed)?;
@@ -238,18 +192,14 @@ impl SingletonTaskInner {
     }
 
     /// Publish a periodic progress sample; it is dropped when the channel is full.
-    #[allow(clippy::single_range_in_vec_init)]
     fn handle_timer_tick(&self, sampler: &mut SpeedSampler, meter: &mut usize) {
         let (_, ema_speed) = sampler.sample(meter);
-        let progress = Progress {
-            total: self.total,
-            downloaded: self.downloaded,
-            downloaded_chunks: [0..self.downloaded].to_vec(),
-        };
         let _ = self
             .event_tx
             .try_send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                progress, ema_speed, 0.0,
+                Transfer::progress(self),
+                ema_speed,
+                0.0,
             )));
     }
 
@@ -275,7 +225,7 @@ impl SingletonTaskInner {
         let _runner_cancel_guard = runner_token.clone().drop_guard();
 
         let stream = {
-            let adapter = self.adapter.clone().unwrap();
+            let adapter = self.adapter.clone();
             let connect = async move { adapter.full_stream().await }.fuse();
             let cancelled = runner_token.cancelled().fuse();
             let timeout = FutureExt::fuse(Timer::after(self.options.no_progress_timeout));
@@ -422,172 +372,31 @@ impl SingletonTaskInner {
 
         result.and(flush)
     }
-
-    async fn before_transition(&mut self, _source: &State, target: &State, _context: &mut Context) {
-        match target {
-            State::Stopped { reason } => match reason.clone() {
-                Some(Ok(())) => {
-                    let progress = Progress {
-                        total: Some(self.total.unwrap_or(self.downloaded)),
-                        downloaded: self.downloaded,
-                        #[allow(clippy::single_range_in_vec_init)]
-                        downloaded_chunks: vec![0..self.downloaded],
-                    };
-                    let _ = self.event_tx.send(TaskEvent::Finished(progress)).await;
-                }
-                Some(Err(e)) => {
-                    let _ = self.event_tx.send(TaskEvent::Failed(e)).await;
-                }
-                None => unreachable!(),
-            },
-            State::Initializing { .. } => {
-                let _ = self.event_tx.send(TaskEvent::Initializing).await;
-            }
-            State::Downloading { .. } => {
-                let progress = Progress {
-                    total: self.total,
-                    downloaded: self.downloaded,
-                    #[allow(clippy::single_range_in_vec_init)]
-                    downloaded_chunks: vec![0..self.downloaded],
-                };
-                let _ = self
-                    .event_tx
-                    .send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                        progress, 0.0, 0.0,
-                    )))
-                    .await;
-            }
-        }
-    }
 }
 
-enum Event {
-    Run(RunningPayload),
-    /// Step the state machine to get the next state
-    Step,
-}
+impl Transfer for SingletonTaskInner {
+    async fn prepare(&mut self) -> Result<()> {
+        self.retrieve_meta().await
+    }
 
-#[derive(Default)]
-struct Context {
-    poll: VecDeque<()>,
-}
-
-#[state_machine(
-    initial = "State::stopped(None)",
-    state(derive(Debug)),
-    superstate(derive(Debug)),
-    before_transition = "Self::before_transition"
-)]
-#[allow(unused_variables)]
-impl SingletonTaskInner {
-    #[state]
-    fn stopped(
-        &mut self,
-        context: &mut Context,
-        reason: &mut Option<Result<()>>,
-        event: &Event,
-    ) -> Outcome<State> {
-        match event {
-            Event::Run(payload) => {
-                context.poll.push_back(());
-                self.adapter = Some(payload.adapter.clone());
-                Transition(State::initializing(payload.cancel_token.clone()))
-            }
-            _ => Super,
+    fn progress(&self) -> Progress {
+        Progress {
+            total: self.total,
+            downloaded: self.downloaded,
+            #[allow(clippy::single_range_in_vec_init)]
+            downloaded_chunks: vec![0..self.downloaded],
         }
     }
 
-    #[superstate]
-    fn running(event: &Event) -> Outcome<State> {
-        Super
-    }
-
-    #[state(superstate = "running")]
-    async fn initializing(
-        &mut self,
-        cancel_token: &mut CancellationToken,
-        context: &mut Context,
-        event: &Event,
-    ) -> Outcome<State> {
-        trace!(
-            "[STATE MACHINE] initializing state entered, event: {:?}",
-            match event {
-                Event::Step => "Step",
-                Event::Run(_) => "Run",
-            }
-        );
-        match event {
-            Event::Step => {
-                trace!("[STATE MACHINE] processing Step event in initializing");
-                let task = async {
-                    match self.retrieve_meta().await {
-                        Ok(()) => {
-                            trace!(
-                                "[STATE MACHINE] retrieve_meta successful, transitioning to \
-                                 downloading"
-                            );
-                            context.poll.push_back(());
-                            Transition(State::downloading(cancel_token.clone()))
-                        }
-                        Err(e) => {
-                            trace!("[STATE MACHINE] retrieve_meta failed: {:?}", e);
-                            Transition(State::stopped(Some(Err(e))))
-                        }
-                    }
-                }
-                .fuse();
-                futures::pin_mut!(task);
-
-                futures::select_biased! {
-                    _ = cancel_token.cancelled().fuse() => {
-                        trace!("[STATE MACHINE] initializing cancelled");
-                        Transition(State::stopped(Some(Err(TaskInstanceError::new_failed(
-                            crate::runner::TaskError::Cancelled,
-                        )))))
-                    }
-                    res = task => {
-                        trace!("[STATE MACHINE] initializing task completed: {:?}", match &res {
-                            Transition(State::Downloading { .. }) => "Downloading transition",
-                            Transition(State::Stopped { .. }) => "Stopped transition",
-                            _ => "Other transition",
-                        });
-                        res
-                    },
-                }
-            }
-            _ => Super,
+    /// An unknown total is reported as the downloaded size once finished.
+    fn final_progress(&self) -> Progress {
+        Progress {
+            total: Some(self.total.unwrap_or(self.downloaded)),
+            ..Transfer::progress(self)
         }
     }
 
-    #[state(superstate = "running")]
-    async fn downloading(
-        &mut self,
-        cancel_token: &mut CancellationToken,
-        context: &mut Context,
-        event: &Event,
-    ) -> Outcome<State> {
-        trace!(
-            "[STATE MACHINE] downloading state entered, event: {:?}",
-            match event {
-                Event::Step => "Step",
-                Event::Run(_) => "Run",
-            }
-        );
-        match event {
-            Event::Step => {
-                trace!("[STATE MACHINE] calling download method");
-                match self.download(cancel_token).await {
-                    Ok(()) => {
-                        trace!("[STATE MACHINE] download completed successfully");
-                        Transition(State::stopped(Some(Ok(()))))
-                    }
-                    Err(e) => {
-                        trace!("[STATE MACHINE] download failed: {:?}", e);
-                        Transition(State::stopped(Some(Err(e))))
-                    }
-                }
-            }
-            _ => Super,
-        }
+    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+        SingletonTaskInner::download(self, cancel_token).await
     }
 }
