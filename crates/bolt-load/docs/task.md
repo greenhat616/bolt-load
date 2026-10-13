@@ -89,16 +89,19 @@ before the rename starts discards the result; once the rename starts,
 its outcome decides. On failure the temporary file is removed and an
 existing file at the save path is never touched.
 
-# State Machine Internals
+# Task Lifecycle
 
-Both [`SingletonTask`] and [`ConcurrentTask`] are driven by `statig`
-async state machines with three states:
+Both [`SingletonTask`] and [`ConcurrentTask`] run the same sequential
+lifecycle on a local runtime, reporting each step as a [`TaskEvent`]:
 
-1. **Stopped** — initial/terminal state, holds the final result.
-2. **Initializing** — calls [`retrieve_meta()`] to get content size
-   and filename, pre-allocates the output file.
-3. **Downloading** — spawns runner(s), samples speed, publishes
-   [`TaskEvent`] progress updates.
+1. **Initializing** — calls [`retrieve_meta()`] to get the content size.
+   Cancellation during this step fails the task with `Cancelled`, and
+   wins when both are ready.
+2. **Downloading** — publishes a snapshot with zero speed, then spawns
+   runner(s) and publishes sampled progress. Periodic samples are
+   dropped while the event channel is full; they never stall the transfer.
+3. **Finished** / **Failed** — sent last, after every runner and writer
+   has been joined and the output file has been committed or removed.
 
 # Concurrent Task Components
 
