@@ -2063,4 +2063,227 @@ mod tests {
         );
         println!("  - Runner3 downloaded: {runner3_downloaded} bytes (expected: 6 chunks)");
     }
+
+    struct SpawnedRunner {
+        control_tx: async_channel::Sender<ControlEvent>,
+        lifecycle_rx: LifecycleReceiver,
+        data_rx: DataFrameReceiver,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_started_runner(stream: AnyBytesStream, total: Option<u64>) -> SpawnedRunner {
+        let (control_tx, control_rx) = async_channel::bounded(4);
+        let mut builder = TaskRunner::builder()
+            .stream(stream)
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(CancellationToken::new());
+        if let Some(total) = total {
+            builder = builder.total(total);
+        }
+        let (mut runner, mut lifecycle_rx, data_rx) = builder.build().unwrap();
+        let handle = tokio::spawn(async move { runner.run().await });
+        let started = timeout(Duration::from_secs(2), lifecycle_rx.next())
+            .await
+            .expect("timed out waiting for runner start");
+        assert!(matches!(started, Some(LifecycleEvent::Started)));
+        SpawnedRunner {
+            control_tx,
+            lifecycle_rx,
+            data_rx,
+            handle,
+        }
+    }
+
+    /// Drain data frames until the runner stops, returning the received byte
+    /// count and the stop reason.
+    async fn drain_until_stopped(
+        lifecycle_rx: &mut LifecycleReceiver,
+        data_rx: &mut DataFrameReceiver,
+    ) -> (usize, StoppedReason) {
+        let mut received = 0;
+        let mut data_done = false;
+        let mut reason = None;
+        timeout(Duration::from_secs(5), async {
+            while !(data_done && reason.is_some()) {
+                tokio::select! {
+                    frame = data_rx.next(), if !data_done => match frame {
+                        Some(frame) => received += frame.data.len(),
+                        None => data_done = true,
+                    },
+                    event = lifecycle_rx.next(), if reason.is_none() => match event {
+                        Some(LifecycleEvent::Stopped(r)) => reason = Some(r),
+                        Some(LifecycleEvent::Started) => panic!("started twice"),
+                        None => panic!("lifecycle channel closed before Stopped"),
+                    },
+                }
+            }
+        })
+        .await
+        .expect("timed out draining runner output");
+        (received, reason.unwrap())
+    }
+
+    /// Yields `frames` full buffers, signals, then yields `tail`.
+    ///
+    /// The runner forwards a buffer only when the next item arrives, so once
+    /// `frames == DATA_FRAME_CHANNEL_CAPACITY + 1` the data channel is full
+    /// and handling `tail` blocks on pushing the last buffer. On a
+    /// current-thread runtime the runner is parked there before the signal is
+    /// observed.
+    fn blocking_stream(
+        frames: usize,
+        signal_tx: async_channel::Sender<()>,
+        tail: Result<Bytes, AdapterError>,
+    ) -> AnyBytesStream {
+        Box::pin(stream! {
+            for i in 0..frames {
+                yield Ok(Bytes::from(vec![i as u8; BUFFER_SIZE]));
+            }
+            let _ = signal_tx.try_send(());
+            yield tail;
+            std::future::pending::<()>().await;
+        })
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_wins_over_deferred_control_error() {
+        let frames = DATA_FRAME_CHANNEL_CAPACITY + 1;
+        let total = ((frames + 8) * BUFFER_SIZE) as u64;
+        let (signal_tx, signal_rx) = async_channel::unbounded();
+        let stream = blocking_stream(frames, signal_tx, Err(stream_io_error("boom")));
+        let mut runner = spawn_started_runner(stream, Some(total)).await;
+
+        signal_rx.recv().await.unwrap();
+        // Not a reduction, so it is rejected; the error is deferred until the push completes.
+        runner
+            .control_tx
+            .send(ControlEvent::LimitTotal(total))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let (received, reason) =
+            drain_until_stopped(&mut runner.lifecycle_rx, &mut runner.data_rx).await;
+        runner.handle.await.unwrap();
+        assert!(
+            matches!(&reason, StoppedReason::Failed(err) if err.is_stream_error()),
+            "got {reason:?}"
+        );
+        assert_eq!(received, frames * BUFFER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_push_failure_wins_over_stream_error() {
+        let frames = DATA_FRAME_CHANNEL_CAPACITY + 1;
+        let total = ((frames + 8) * BUFFER_SIZE) as u64;
+        let (signal_tx, signal_rx) = async_channel::unbounded();
+        let stream = blocking_stream(frames, signal_tx, Err(stream_io_error("boom")));
+        let SpawnedRunner {
+            control_tx,
+            mut lifecycle_rx,
+            data_rx,
+            handle,
+        } = spawn_started_runner(stream, Some(total)).await;
+
+        signal_rx.recv().await.unwrap();
+        control_tx
+            .send(ControlEvent::LimitTotal(total))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        drop(data_rx);
+
+        let stopped = timeout(Duration::from_secs(5), lifecycle_rx.next())
+            .await
+            .expect("timed out waiting for runner stop");
+        handle.await.unwrap();
+        assert!(
+            matches!(
+                stopped,
+                Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+                    TaskError::ChannelClosed
+                )))
+            ),
+            "got {stopped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_deferred_control_error_is_preserved() {
+        let frames = DATA_FRAME_CHANNEL_CAPACITY + 1;
+        let total = ((frames + 8) * BUFFER_SIZE) as u64;
+        let (signal_tx, signal_rx) = async_channel::unbounded();
+        let tail = Ok(Bytes::from(vec![0xff; BUFFER_SIZE]));
+        let stream = blocking_stream(frames, signal_tx, tail);
+        let SpawnedRunner {
+            control_tx,
+            mut lifecycle_rx,
+            mut data_rx,
+            handle,
+        } = spawn_started_runner(stream, Some(total)).await;
+
+        signal_rx.recv().await.unwrap();
+        control_tx
+            .send(ControlEvent::LimitTotal(total))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        // A second error while the push is still blocked must not replace the first.
+        drop(control_tx);
+        tokio::task::yield_now().await;
+
+        let (received, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+        handle.await.unwrap();
+        assert!(
+            matches!(reason, StoppedReason::Failed(TaskError::ExceededTotalSize)),
+            "got {reason:?}"
+        );
+        assert_eq!(received, frames * BUFFER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_limit_total_equal_is_rejected() {
+        let stream = Box::pin(futures::stream::pending::<Result<Bytes, AdapterError>>());
+        let mut runner = spawn_started_runner(stream, Some(100)).await;
+
+        runner
+            .control_tx
+            .send(ControlEvent::LimitTotal(100))
+            .await
+            .unwrap();
+
+        let (received, reason) =
+            drain_until_stopped(&mut runner.lifecycle_rx, &mut runner.data_rx).await;
+        runner.handle.await.unwrap();
+        assert!(
+            matches!(reason, StoppedReason::Failed(TaskError::ExceededTotalSize)),
+            "got {reason:?}"
+        );
+        assert_eq!(received, 0);
+    }
+
+    #[tokio::test]
+    async fn test_limit_total_unknown_is_ignored() {
+        let (release_tx, release_rx) = async_channel::bounded::<()>(1);
+        let stream = Box::pin(stream! {
+            let _ = release_rx.recv().await;
+            yield Ok(Bytes::from(vec![7; 20]));
+        });
+        let mut runner = spawn_started_runner(stream, None).await;
+
+        runner
+            .control_tx
+            .send(ControlEvent::LimitTotal(10))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        release_tx.close();
+
+        let (received, reason) =
+            drain_until_stopped(&mut runner.lifecycle_rx, &mut runner.data_rx).await;
+        runner.handle.await.unwrap();
+        assert!(matches!(reason, StoppedReason::Finished), "got {reason:?}");
+        assert_eq!(received, 20);
+    }
 }
