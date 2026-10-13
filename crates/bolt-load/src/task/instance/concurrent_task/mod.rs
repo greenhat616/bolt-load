@@ -423,11 +423,11 @@ impl ConcurrentTaskInner {
         rx
     }
 
+    /// Sample the throughput and publish a periodic progress event; the event
+    /// is dropped when the channel is full.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     #[allow(clippy::too_many_arguments)]
     fn throughout_meter_tick(
-        rt: &ThreadedRuntimeImpl,
-        wg: &WaitGroup,
         runner_manager: &RunnerManager,
 
         meters: &mut HashMap<RunnerId, usize>,
@@ -438,7 +438,6 @@ impl ConcurrentTaskInner {
         per_runner_avg_speed: &mut f64,
 
         event_tx: &async_channel::Sender<TaskEvent>,
-        cancel_token: &CancellationToken,
     ) {
         let count = meters.len();
         let mut total_bytes = meters.values_mut().map(std::mem::take).sum::<usize>();
@@ -451,39 +450,20 @@ impl ConcurrentTaskInner {
             ema_speed / count as f64
         };
 
-        let event_tx = event_tx.clone();
-        let total = runner_manager.total();
         let downloaded_chunks = runner_manager.get_downloaded_ranges();
         let downloaded = downloaded_chunks
             .iter()
             .map(|r| r.end - r.start)
             .sum::<u64>();
-        let wg = wg.clone();
-        let cancel_token = cancel_token.clone();
-        let _ = rt.spawn(async move {
-            let _wg = wg;
-            let send = event_tx
-                .send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                    Progress {
-                        total: Some(total),
-                        downloaded,
-                        downloaded_chunks,
-                    },
-                    ema_speed,
-                    write_ema_speed,
-                )))
-                .fuse();
-            let cancelled = cancel_token.cancelled().fuse();
-            futures::pin_mut!(send, cancelled);
-            futures::select_biased! {
-                _ = cancelled => {}
-                res = send => {
-                    if let Err(e) = res {
-                        error!("failed to send downloading event: {e:?}");
-                    }
-                }
-            }
-        });
+        let _ = event_tx.try_send(TaskEvent::Downloading(ProgressWithSpeed::new(
+            Progress {
+                total: Some(runner_manager.total()),
+                downloaded,
+                downloaded_chunks,
+            },
+            ema_speed,
+            write_ema_speed,
+        )));
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -796,8 +776,6 @@ impl ConcurrentTaskInner {
                     }
                     LoopEvent::ThroughputTimer => {
                         Self::throughout_meter_tick(
-                            &rt,
-                            &wg,
                             &runner_manager,
                             &mut meters,
                             &mut sampler,
@@ -806,7 +784,6 @@ impl ConcurrentTaskInner {
                             &mut current_speed,
                             &mut per_runner_avg_speed,
                             &event_tx,
-                            &runners_cancel_token,
                         );
                     }
                     LoopEvent::Runner(tick) => {

@@ -11,9 +11,10 @@ use smol_cancellation_token::CancellationToken;
 use crate::{
     adapter::{AdapterError, AnyBytesStream},
     task::{ControlEvent, RunnerId},
-    utils::ShutdownGuardExt,
 };
 
+/// Type alias for the control signal sender (point-to-point channel)
+pub type ControlSignalSender = async_channel::Sender<ControlEvent>;
 /// Type alias for the control signal receiver
 /// Using async_channel for point-to-point communication instead of broadcast
 pub type ControlSignalReceiver = async_channel::Receiver<ControlEvent>;
@@ -22,11 +23,9 @@ mod builder;
 mod connector;
 mod error;
 mod future;
-mod guard;
 pub use builder::*;
 pub use connector::*;
 pub use error::*;
-pub use guard::*;
 
 // TODO: make it configurable or detect the local disk performance?
 const BUFFER_SIZE: usize = 32 * 1024; // 32KB
@@ -136,8 +135,6 @@ pub struct TaskRunner {
     idle_timeout: std::time::Duration,
     /// the cancel token
     cancel_token: CancellationToken,
-    /// the shutdown signal, used for ensure the task runner is stopped
-    shutdown_rx: Option<oneshot::Receiver<()>>,
 }
 
 /// The step of the event loop
@@ -452,9 +449,6 @@ impl TaskRunner {
             .await
             .map_err(|_| TaskRunError::Failed(TaskError::ChannelClosed))?;
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let _guard = shutdown_tx.shutdown_guard();
-        self.shutdown_rx = Some(shutdown_rx);
         let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
         let idle_timeout = self.idle_timeout;
         let mut idle_timer = async_io::Timer::after(idle_timeout);
@@ -717,14 +711,6 @@ impl TaskRunner {
             }
         }
         Ok(())
-    }
-
-    /// Cancel the current task runner,
-    pub async fn cancel(&mut self) {
-        self.cancel_token.cancel();
-        if let Some(shutdown_rx) = self.shutdown_rx.take() {
-            let _ = shutdown_rx.await;
-        }
     }
 }
 
