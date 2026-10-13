@@ -26,6 +26,69 @@ Idle ──► Spawning ──► Initializing ──► Downloading ──► F
 [`TaskState`] is stored as an atomic enum for lock-free reads from
 any thread.
 
+# Termination
+
+Every task ends in `Finished` or `Failed`; it never retries forever.
+
+- **Progress** means new, non-empty bytes accepted for writing. Opening
+  a connection or receiving empty frames is not progress.
+- **No progress**: when no progress is made for
+  [`TaskOptions::no_progress_timeout`] the task fails with
+  `TaskError::NoProgress`. The deadline keeps running while no runner is
+  active and while the writer applies backpressure.
+- **Consecutive failures** (concurrent mode): a failed attempt is a
+  failed connect or a runner stopping with an error. After
+  [`TaskOptions::max_consecutive_failures`] retryable failures without a
+  successful non-empty write in between, the task fails with
+  `TaskError::RetryLimitExceeded`, which carries the last error.
+- **Unretryable failures** end the task with the adapter's original
+  error. The one exception is `ServiceUnavailable` (429/503) while other
+  attempts are still in flight: it is a concurrency signal for the
+  concurrency strategy, still bounded by the no-progress deadline.
+- **Idle streams**: a runner whose upstream yields no non-empty data
+  for [`TaskOptions::stream_idle_timeout`] fails with the retryable
+  `TaskError::Timeout`. In singleton mode there is no retry, so this
+  ends the task; there `no_progress_timeout` bounds establishing the
+  connection.
+
+| Option | Default |
+|--------|---------|
+| `no_progress_timeout` | 60 s |
+| `max_consecutive_failures` | `max(8, 2 × CPU count)` |
+| `stream_idle_timeout` | 30 s |
+
+Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a
+stalled stream ends the task with `NoProgress` before its runner can time
+out and be retried.
+
+# Cancellation and Cleanup
+
+The cancel token passed to [`TaskBuilder`] is owned by the caller: the
+task only ever cancels child tokens, so finishing or failing never
+cancels it. Cancelling it aborts [`TaskBuilder::build`] (metadata and
+range probe requests) with `TaskManagerBuildError::Cancelled`, and a
+running task with `TaskError::Cancelled`.
+
+Success, failure and cancellation share one teardown path: cancel the
+runners, wait for connectors, runners, progress senders, write tasks and
+writer workers to exit, then publish or discard the temporary file.
+`TaskEvent::Failed` is emitted only after this teardown.
+
+- [`Task::stop`] is a join barrier: it cancels and returns once all
+  work owned by bolt-load has exited. Work an adapter detaches on its
+  own, or a write blocked forever by the OS, cannot be bounded.
+- [`Task::wait`] joins the same way and returns the terminal error. Both
+  are safe to call repeatedly, before [`Task::run`], or after a dropped
+  `wait` future.
+
+# Temporary File and Commit Rule
+
+Both modes download into `<save path>.downloading` and rename it to the
+save path only after a successful transfer. A cancellation observed
+before the rename starts discards the result; once the rename starts,
+its outcome decides. On failure the temporary file is removed and an
+existing file at the save path is never touched.
+
 # State Machine Internals
 
 Both [`SingletonTask`] and [`ConcurrentTask`] are driven by `statig`
@@ -67,8 +130,10 @@ The concurrent download path includes several sub-systems:
 # Builder
 
 [`TaskBuilder`] validates configuration and constructs a [`Task`]:
-- Requires an adapter and save path.
+- Requires an adapter, save path and cancel token.
+- Accepts [`TaskOptions`] via [`TaskBuilder::options`].
 - Auto-selects download mode based on range stream availability.
+- Metadata retrieval and the range probe are cancellable.
 - Validates parent directory exists and target is not a directory.
 - Optionally attaches a progress bar (feature `progressbar`).
 

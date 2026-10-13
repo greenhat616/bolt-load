@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use smol_cancellation_token::CancellationToken;
 
-use super::{DownloadMode, Progress};
+use super::{DownloadMode, Progress, TaskOptions};
 use crate::{
     adapter::{AdapterError, AnyAdapter},
     runner::TaskError,
@@ -12,6 +12,7 @@ use crate::{
 /// Concurrent download task implementation.
 pub mod concurrent_task;
 mod id;
+mod output_file;
 mod sampler;
 mod singleton_task;
 
@@ -111,9 +112,12 @@ impl TaskControl {
         }
     }
 
+    /// Join the background task. The handle is kept until the join completes,
+    /// so dropping this future does not detach the task.
     pub async fn wait(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.as_mut() {
             handle.await;
+            self.handle = None;
         }
     }
 
@@ -206,13 +210,31 @@ impl TaskInstanceImpl {
         threaded_rt: ThreadedRuntimeImpl,
         local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
     ) -> Self {
+        Self::with_options(
+            mode,
+            threaded_rt,
+            local_runtime_builder,
+            TaskOptions::default(),
+        )
+    }
+
+    pub fn with_options(
+        mode: DownloadMode,
+        threaded_rt: ThreadedRuntimeImpl,
+        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
+        options: TaskOptions,
+    ) -> Self {
         match mode {
-            DownloadMode::Singleton => {
-                Self::Singleton(SingletonTask::new(threaded_rt, local_runtime_builder))
-            }
-            DownloadMode::Concurrent => {
-                Self::Concurrent(ConcurrentTask::new(threaded_rt, local_runtime_builder))
-            }
+            DownloadMode::Singleton => Self::Singleton(SingletonTask::with_options(
+                threaded_rt,
+                local_runtime_builder,
+                options,
+            )),
+            DownloadMode::Concurrent => Self::Concurrent(ConcurrentTask::with_options(
+                threaded_rt,
+                local_runtime_builder,
+                options,
+            )),
         }
     }
 }

@@ -4,10 +4,12 @@ use bolt_load_utils::telemetry::*;
 
 mod concurrency_control_strategy;
 mod dynamic_strategy;
+mod failure_policy;
 mod runner_outcome_sampler;
 
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
+pub use failure_policy::FailurePolicy;
 pub use runner_outcome_sampler::{FailureKind as RunnerFailureKind, RunnerOutcomeSampler};
 
 pub const DEFAULT_STRATEGY_TICK_INTERVAL: Duration = Duration::from_millis(1500); // 1.5 seconds

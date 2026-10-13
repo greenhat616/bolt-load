@@ -111,7 +111,11 @@ impl ConcurrencyControlStrategy {
         context: &ConcurrencyControlContext,
         now: Instant,
     ) -> Vec<StrategyAction> {
-        let new_concurrency = context.active_runners;
+        // Never degrade to zero: with no active runner nothing would be scheduled again.
+        let new_concurrency = context
+            .active_runners
+            .max(self.config.min_concurrency)
+            .max(1);
 
         self.state = StrategyState::Degraded {
             target_concurrency: new_concurrency,
@@ -348,5 +352,34 @@ impl Strategy for ConcurrencyControlStrategy {
 
         // No Action
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{super::runner_outcome_sampler::FailureKind, *};
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn test_immediate_degradation_never_drops_to_zero() {
+        let mut strategy = ConcurrencyControlStrategy::with_default_config(4);
+        let mut sampler = RunnerOutcomeSampler::with_defaults();
+        let mut context = ConcurrencyControlContext {
+            max_concurrency: 4,
+            active_runners: 0,
+            sampler: &mut sampler,
+            available_chunks: vec![0..100],
+        };
+        // The first step only schedules the initial runners.
+        strategy.step(&mut context);
+
+        context
+            .sampler
+            .record_connect_failed(FailureKind::Unretryable);
+        let actions = strategy.step(&mut context);
+        assert!(
+            matches!(actions.as_slice(), [StrategyAction::ChangeMaxConcurrency(n)] if *n >= 1),
+            "unexpected actions: {actions:?}"
+        );
     }
 }

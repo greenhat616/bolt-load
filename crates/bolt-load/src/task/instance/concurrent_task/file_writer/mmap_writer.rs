@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use async_channel::{Receiver, Sender};
+use async_waitgroup::WaitGroup;
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use fs::File;
@@ -10,34 +11,25 @@ use snafu::prelude::*;
 
 use super::{
     Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu, finalize_and_join,
 };
 
 pub struct MmapWriter {
     pub file: File,
     tx: Sender<Command>,
+    worker_wg: WaitGroup,
 }
 
 impl FileRangeWriter for MmapWriter {
     async fn finalize(self) -> Result<(), FileWriterError> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Finalize(tx))
-            .await
-            .map_err(|_| CommandError::Send)
-            .with_context(|_| FinalizeSnafu {
-                path: self.file.path().to_path_buf(),
-            })?;
-        rx.await
-            .map_err(|_| CommandError::Recv)
-            .with_context(|_| FinalizeSnafu {
-                path: self.file.path().to_path_buf(),
-            })?
-            .map_err(CommandError::from)
-            .with_context(|_| FinalizeSnafu {
-                path: self.file.path().to_path_buf(),
-            })?;
-        Ok(())
+        let Self {
+            file,
+            tx,
+            worker_wg,
+        } = self;
+        let path = file.path().to_path_buf();
+        drop(file);
+        finalize_and_join(tx, worker_wg, path, Command::Finalize).await
     }
 
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
@@ -187,19 +179,33 @@ impl MmapWriterBuilder {
             .with_context(|_| OpenOrCreateFileSnafu {
                 path: file.path().to_path_buf(),
             })?;
-        blocking::unblock(move || mmap_writer_task(ready_tx, &file_clone, &chunk_rx)).detach();
+        let worker_wg = WaitGroup::new();
+        let worker_guard = worker_wg.clone();
+        blocking::unblock(move || {
+            mmap_writer_task(ready_tx, &file_clone, &chunk_rx);
+            // Release the mapping and file handle before reporting the exit.
+            drop(file_clone);
+            drop(worker_guard);
+        })
+        .detach();
 
-        ready_rx
+        let ready = ready_rx
             .await
             .map_err(|_| CommandError::Recv)
+            .and_then(|r| r.map_err(CommandError::from))
             .with_context(|_| OpenOrCreateFileSnafu {
                 path: file.path().to_path_buf(),
-            })?
-            .map_err(CommandError::from)
-            .with_context(|_| OpenOrCreateFileSnafu {
-                path: file.path().to_path_buf(),
-            })?;
-        Ok(MmapWriter { file, tx: chunk_tx })
+            });
+        if let Err(e) = ready {
+            drop(chunk_tx);
+            worker_wg.wait().await;
+            return Err(e.into());
+        }
+        Ok(MmapWriter {
+            file,
+            tx: chunk_tx,
+            worker_wg,
+        })
     }
 }
 

@@ -9,6 +9,7 @@
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use async_channel::{Receiver, Sender};
+use async_waitgroup::WaitGroup;
 use bytes::Bytes;
 use futures::task::SpawnExt;
 
@@ -110,6 +111,10 @@ pub struct PendingWriter<F> {
 
     /// Once a write error is observed, stop dispatching pending writes.
     saw_error: bool,
+
+    /// Tracks spawned write tasks until they have fully exited.
+    #[debug(skip)]
+    write_wg: WaitGroup,
 }
 
 impl<F> PendingWriter<F>
@@ -131,6 +136,7 @@ where
             completion_rx: rx,
             pending_write: None,
             saw_error: false,
+            write_wg: WaitGroup::new(),
         }
     }
 
@@ -262,6 +268,18 @@ where
         completions
     }
 
+    /// Like [`flush`](Self::flush), but also waits until every spawned write
+    /// task has exited, so no task still references the underlying writer.
+    ///
+    /// The buffered pending write is dropped if an error was observed.
+    pub async fn finish(mut self) -> Vec<WriteCompletion> {
+        // Drain completions first so write tasks never block on a full channel.
+        let completions = self.flush().await;
+        let Self { write_wg, .. } = self;
+        write_wg.wait().await;
+        completions
+    }
+
     // ── internals ────────────────────────────────────────────────────
 
     fn completions_have_error(completions: &[WriteCompletion]) -> bool {
@@ -280,6 +298,7 @@ where
 
         let writer = Arc::clone(&self.writer);
         let tx = self.completion_tx.clone();
+        let wg_guard = self.write_wg.clone();
         let task_range = range.clone();
         let completion_range = range.clone();
         let guard_range = range.clone();
@@ -302,6 +321,9 @@ where
                 })
                 .await;
             guard.disarm();
+            drop(guard);
+            drop(writer);
+            drop(wg_guard);
         }) {
             self.completion_tx
                 .try_send(WriteCompletion {
@@ -487,6 +509,35 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 0..4);
         assert_eq!(&writes[0].1[..], b"test");
+    }
+
+    #[tokio::test]
+    async fn finish_waits_for_blocked_write_task_to_exit() {
+        let (release_tx, release_rx) = async_channel::unbounded();
+        let writer = Arc::new(ControlledWriter::new(release_rx));
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+        pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
+
+        let finish = tokio::spawn(pending.finish());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !finish.is_finished(),
+            "finish must wait for the blocked write"
+        );
+
+        release_tx.send(()).await.unwrap();
+        let completions = tokio::time::timeout(Duration::from_secs(1), finish)
+            .await
+            .expect("finish should return once the write is released")
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        assert!(completions[0].result.is_ok());
+        assert_eq!(
+            Arc::strong_count(&writer),
+            1,
+            "no write task may still hold the writer"
+        );
     }
 
     #[tokio::test]

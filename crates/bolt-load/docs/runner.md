@@ -29,8 +29,13 @@ Runners accept [`ControlSignal`] messages for dynamic adjustments:
 
 # Timeout & Error Handling
 
-- **Slow stream detection**: if no data arrives for 5 seconds, emits
-  a warning and eventually yields a [`TaskError::Timeout`].
+- **Idle stream detection**: if no non-empty data arrives within the
+  idle timeout (default 30 s, configured per task via
+  [`TaskOptions::stream_idle_timeout`](crate::task::TaskOptions::stream_idle_timeout)
+  or per runner via [`TaskRunnerBuilder::idle_timeout`]), buffered bytes are flushed and the
+  runner fails with the retryable [`TaskError::Timeout`]. Empty frames do
+  not reset the timer; waiting for the consumer (backpressure) does not
+  count as idle.
 - **Data drain timeout**: when the stream ends, waits up to 5 seconds
   for the consumer to accept remaining buffered data.
 - **Size validation**: checks that downloaded bytes match the declared
@@ -51,7 +56,7 @@ Runners accept [`ControlSignal`] messages for dynamic adjustments:
 | Name | Value | Purpose |
 |------|-------|---------|
 | `BUFFER_SIZE` | 32 KB | Internal read buffer |
-| `SLOW_STREAM_TIMEOUT` | 5 s | No-data warning threshold |
+| `DEFAULT_IDLE_TIMEOUT` | 30 s | No-data threshold before `Timeout` |
 | `DATA_DRAIN_TIMEOUT` | 5 s | Backpressure wait on stream end |
 | `LIFECYCLE_CHANNEL_CAPACITY` | 2 | Lifecycle ring-buffer slots |
 | `DATA_FRAME_CHANNEL_CAPACITY` | 32 | Data frame ring-buffer slots |

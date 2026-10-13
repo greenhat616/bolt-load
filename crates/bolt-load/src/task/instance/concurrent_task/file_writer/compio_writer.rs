@@ -8,7 +8,7 @@ use snafu::prelude::*;
 
 use super::{
     Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu, finalize_and_join,
 };
 
 enum Command {
@@ -19,6 +19,7 @@ enum Command {
 pub struct CompioWriter {
     path: PathBuf,
     tx: Sender<Command>,
+    worker_wg: WaitGroup,
 }
 
 impl FileRangeWriter for CompioWriter {
@@ -52,24 +53,12 @@ impl FileRangeWriter for CompioWriter {
         Ok(())
     }
     async fn finalize(self) -> Result<(), FileWriterError> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Finalize(tx))
-            .await
-            .map_err(|_| CommandError::Send)
-            .with_context(|_| FinalizeSnafu {
-                path: self.path.clone(),
-            })?;
-        rx.await
-            .map_err(|_| CommandError::Recv)
-            .with_context(|_| FinalizeSnafu {
-                path: self.path.clone(),
-            })?
-            .map_err(CommandError::from)
-            .with_context(|_| FinalizeSnafu {
-                path: self.path.clone(),
-            })?;
-        Ok(())
+        let Self {
+            path,
+            tx,
+            worker_wg,
+        } = self;
+        finalize_and_join(tx, worker_wg, path, Command::Finalize).await
     }
 }
 
@@ -164,16 +153,27 @@ impl CompioWriterBuilder {
         let (tx, rx) = async_channel::bounded::<Command>(super::FILE_WRITER_QUEUE_SIZE);
         let (ready_tx, ready_rx) = oneshot::channel();
         let path_clone = path.clone();
-        blocking::unblock(move || compio_file_writer_task(path_clone, ready_tx, &rx)).detach();
-        ready_rx
+        let worker_wg = WaitGroup::new();
+        let worker_guard = worker_wg.clone();
+        blocking::unblock(move || {
+            compio_file_writer_task(path_clone, ready_tx, &rx);
+            drop(worker_guard);
+        })
+        .detach();
+        let ready = ready_rx
             .await
             .map_err(|_| CommandError::Recv)
-            .with_context(|_| OpenOrCreateFileSnafu { path: path.clone() })?
-            .map_err(CommandError::from)
-            .with_context(|_| OpenOrCreateFileSnafu { path: path.clone() })?;
+            .and_then(|r| r.map_err(CommandError::from))
+            .with_context(|_| OpenOrCreateFileSnafu { path: path.clone() });
+        if let Err(e) = ready {
+            drop(tx);
+            worker_wg.wait().await;
+            return Err(e.into());
+        }
         Ok(CompioWriter {
             path,
-            tx: tx.clone(),
+            tx,
+            worker_wg,
         })
     }
 }
@@ -239,6 +239,7 @@ mod tests {
         let writer = CompioWriter {
             path: std::path::PathBuf::from("/tmp/debug_test.bin"),
             tx: async_channel::bounded::<Command>(1).0,
+            worker_wg: WaitGroup::new(),
         };
         let debug_str = format!("{:?}", writer);
         assert!(debug_str.contains("CompioWriter"));

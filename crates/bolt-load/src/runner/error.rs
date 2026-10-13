@@ -1,3 +1,5 @@
+use std::{sync::Arc, time::Duration};
+
 use bolt_load_core::adapter::AdapterError;
 
 /// The kind of the task failed
@@ -30,6 +32,15 @@ pub enum TaskError {
     SmallerThanTotalSize,
     #[snafu(display("stream error: {source}"))]
     StreamError { source: AdapterError },
+    /// No new bytes were accepted within the configured period
+    #[snafu(display("no progress within {timeout:?}"))]
+    NoProgress { timeout: Duration },
+    /// Too many consecutive attempts failed without progress in between
+    #[snafu(display("retry limit of {limit} consecutive failures exceeded, last error: {source}"))]
+    RetryLimitExceeded {
+        limit: usize,
+        source: Arc<TaskError>,
+    },
     /// The other error
     #[snafu(display("other error: {message}"))]
     Other { message: String },
