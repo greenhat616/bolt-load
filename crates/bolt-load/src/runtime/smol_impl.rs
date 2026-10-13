@@ -162,9 +162,10 @@ pub struct SmolDelayedTimer {
 }
 
 impl SmolDelayedTimer {
+    /// The first tick completes immediately, like `tokio::time::interval`.
     pub fn new(duration: Duration) -> Self {
         Self {
-            timer: smol::Timer::after(duration),
+            timer: smol::Timer::at(std::time::Instant::now()),
             duration,
         }
     }
@@ -259,6 +260,21 @@ mod tests {
         rt.block_on(async move {
             assert_eq!(handle.abort().await, None);
         });
+    }
+
+    #[test]
+    fn test_delayed_timer_ticks_immediately_then_periodically() {
+        use futures::FutureExt;
+
+        let mut timer = SmolDelayedTimer::new(Duration::from_secs(3600));
+        assert!(
+            timer.tick().now_or_never().is_some(),
+            "first tick must be immediate"
+        );
+        assert!(
+            timer.tick().now_or_never().is_none(),
+            "later ticks wait a period"
+        );
     }
 
     #[test]
