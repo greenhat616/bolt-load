@@ -9,11 +9,13 @@ use std::{
 
 use bolt_load_core::adapter::{
     AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta,
-    error::unretryable::{InternalSnafu, RangeStreamNotSupportedSnafu},
+    error::unretryable::{InternalSnafu, RangeStreamNotSupportedSnafu, ServiceUnavailableSnafu},
 };
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use governor::{Quota, RateLimiter};
+
+use super::fault::{CounterGuard, FaultKind, FaultPlan, Gate};
 
 /// Creates a deterministic test content with specified size for hash verification
 pub fn create_deterministic_content(size: usize) -> Vec<u8> {
@@ -70,6 +72,23 @@ pub struct SimpleTestAdapterBuilder {
     connecting_delay: Option<Duration>,
     /// Maximum number of concurrent streams
     max_concurrent_streams: Option<usize>,
+    /// Fault injection settings
+    faults: Faults,
+}
+
+/// Fault injection settings shared by the builder and the adapter.
+#[derive(Clone, Debug, Default)]
+struct Faults {
+    meta_gate: Option<Gate>,
+    range_probe_gate: Option<Gate>,
+    range_connect_plan: FaultPlan,
+    full_connect_plan: FaultPlan,
+    /// Absolute offset at which every body stream stops yielding data.
+    stall_after_bytes: Option<u64>,
+    /// While stalled, yield empty frames instead of pending forever.
+    stall_with_empty_frames: bool,
+    /// Absolute offset at which every body stream yields an error.
+    fail_body_after_bytes: Option<(u64, FaultKind)>,
 }
 
 pub type GlobalRateLimiter = Arc<
@@ -92,6 +111,7 @@ impl Default for SimpleTestAdapterBuilder {
             max_per_stream_speed: None,
             connecting_delay: None,
             max_concurrent_streams: None,
+            faults: Faults::default(),
         }
     }
 }
@@ -171,6 +191,49 @@ impl SimpleTestAdapterBuilder {
         self
     }
 
+    /// `retrieve_meta` waits at this gate.
+    pub fn meta_gate(mut self, gate: Gate) -> Self {
+        self.faults.meta_gate = Some(gate);
+        self
+    }
+
+    /// `is_range_stream_available` waits at this gate.
+    pub fn range_probe_gate(mut self, gate: Gate) -> Self {
+        self.faults.range_probe_gate = Some(gate);
+        self
+    }
+
+    /// How `range_stream` connection attempts behave.
+    pub fn range_connect_plan(mut self, plan: FaultPlan) -> Self {
+        self.faults.range_connect_plan = plan;
+        self
+    }
+
+    /// How `full_stream` connection attempts behave.
+    pub fn full_connect_plan(mut self, plan: FaultPlan) -> Self {
+        self.faults.full_connect_plan = plan;
+        self
+    }
+
+    /// Every body stream stops yielding data at this absolute offset, so a
+    /// replacement runner cannot get past it either.
+    pub fn stall_after_bytes(mut self, offset: u64) -> Self {
+        self.faults.stall_after_bytes = Some(offset);
+        self
+    }
+
+    /// While stalled, keep yielding empty frames instead of pending.
+    pub fn stall_with_empty_frames(mut self, enabled: bool) -> Self {
+        self.faults.stall_with_empty_frames = enabled;
+        self
+    }
+
+    /// Every body stream yields an error at this absolute offset.
+    pub fn fail_body_after_bytes(mut self, offset: u64, kind: FaultKind) -> Self {
+        self.faults.fail_body_after_bytes = Some((offset, kind));
+        self
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub fn build(self) -> Result<SimpleTestAdapter, SimpleTestAdapterBuildError> {
         let Some(content_size) = self.content_size else {
@@ -199,8 +262,19 @@ impl SimpleTestAdapterBuilder {
             connecting_delay: self.connecting_delay,
             max_concurrent_streams: self.max_concurrent_streams,
             current_concurrency: Arc::new(AtomicUsize::new(0)),
+            faults: self.faults,
+            counters: Counters::default(),
         })
     }
+}
+
+/// Live resource counters, shared between clones of an adapter.
+#[derive(Clone, Debug, Default)]
+struct Counters {
+    active_requests: Arc<AtomicUsize>,
+    active_streams: Arc<AtomicUsize>,
+    range_attempts: Arc<AtomicUsize>,
+    full_attempts: Arc<AtomicUsize>,
 }
 
 /// Simple test adapter for testing Task and TaskBuilder
@@ -224,6 +298,8 @@ pub struct SimpleTestAdapter {
     max_concurrent_streams: Option<usize>,
     /// Current number of concurrent streams
     current_concurrency: Arc<AtomicUsize>,
+    faults: Faults,
+    counters: Counters,
 }
 
 impl SimpleTestAdapter {
@@ -255,6 +331,8 @@ impl SimpleTestAdapter {
             connecting_delay: self.connecting_delay,
             max_concurrent_streams: self.max_concurrent_streams,
             current_concurrency: Arc::new(AtomicUsize::new(0)),
+            faults: self.faults.clone(),
+            counters: Counters::default(),
         }
     }
 
@@ -302,6 +380,80 @@ impl SimpleTestAdapter {
     pub fn content(&self) -> &Bytes {
         &self.content
     }
+
+    /// Number of in-flight adapter requests (meta, probe or stream connect).
+    pub fn active_requests(&self) -> usize {
+        self.counters.active_requests.load(Ordering::SeqCst)
+    }
+
+    /// Number of body streams that have not been dropped yet.
+    pub fn active_streams(&self) -> usize {
+        self.counters.active_streams.load(Ordering::SeqCst)
+    }
+
+    /// Number of `range_stream` connection attempts so far.
+    pub fn range_attempts(&self) -> usize {
+        self.counters.range_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Build the body stream for the absolute range `start..end`.
+    fn body_stream(&self, start: usize, end: usize, guard: impl Send + 'static) -> AnyBytesStream {
+        let content = self.content.clone();
+        let end = end.min(content.len());
+        let chunk_size = self.chunk_size;
+        let rate_limiter = self.rate_limiter.clone();
+        let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
+            let quota = Quota::per_second(
+                NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32")).unwrap(),
+            );
+            Arc::new(RateLimiter::direct(quota))
+        });
+        let stall_at = self.faults.stall_after_bytes.map(|o| o as usize);
+        let stall_with_empty_frames = self.faults.stall_with_empty_frames;
+        let fail_at = self
+            .faults
+            .fail_body_after_bytes
+            .map(|(o, kind)| (o as usize, kind));
+        let stream_guard = CounterGuard::new(&self.counters.active_streams);
+
+        let stream = async_stream::stream! {
+            let _guard = guard;
+            let _stream_guard = stream_guard;
+            let mut pos = start;
+            while pos < end {
+                if let Some((at, kind)) = fail_at && pos >= at {
+                    yield Err(kind.error("body"));
+                    return;
+                }
+                if stall_at.is_some_and(|at| pos >= at) {
+                    loop {
+                        if stall_with_empty_frames {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            yield Ok(Bytes::new());
+                        } else {
+                            futures::future::pending::<()>().await;
+                        }
+                    }
+                }
+                let mut next = (pos + chunk_size).min(end);
+                for limit in [stall_at, fail_at.map(|(at, _)| at)].into_iter().flatten() {
+                    if limit > pos {
+                        next = next.min(limit);
+                    }
+                }
+                let chunk_len = NonZeroU32::new((next - pos) as u32).unwrap();
+                if let Some(rate_limiter) = rate_limiter.clone() {
+                    rate_limiter.until_n_ready(chunk_len).await.unwrap();
+                }
+                if let Some(stream_rate_limiter) = stream_rate_limiter.clone() {
+                    stream_rate_limiter.until_n_ready(chunk_len).await.unwrap();
+                }
+                yield Ok(content.slice(pos..next));
+                pos = next;
+            }
+        };
+        Box::pin(stream)
+    }
 }
 
 #[async_trait::async_trait]
@@ -312,12 +464,20 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             self.support_range
         );
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        let _request = CounterGuard::new(&self.counters.active_requests);
+        if let Some(gate) = &self.faults.range_probe_gate {
+            gate.pass().await;
+        }
         self.support_range
     }
 
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         info!("[TEST ADAPTER] retrieve_meta() called");
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        let _request = CounterGuard::new(&self.counters.active_requests);
+        if let Some(gate) = &self.faults.meta_gate {
+            gate.pass().await;
+        }
 
         if self.should_fail {
             info!("[TEST ADAPTER] retrieve_meta() returning failure");
@@ -345,6 +505,12 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             self.content.len()
         );
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        let _request = CounterGuard::new(&self.counters.active_requests);
+        let attempt = self.counters.full_attempts.fetch_add(1, Ordering::SeqCst);
+        self.faults
+            .full_connect_plan
+            .apply(attempt, "full_stream connect")
+            .await?;
 
         // Simulate connection delay
         if let Some(delay) = self.connecting_delay {
@@ -378,47 +544,29 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         if let Some(max_concurrent_streams) = self.max_concurrent_streams
             && current_concurrency >= max_concurrent_streams
         {
-            return Err(InternalSnafu {
-                message: "Max concurrent streams reached".to_string(),
+            return Err(ServiceUnavailableSnafu {
+                status: "429".to_string(),
+                description: "Max concurrent streams reached".to_string(),
             }
             .build()
             .into());
         }
 
-        let content = self.content.clone();
-        let chunk_size = NonZeroU32::new(self.chunk_size as u32).unwrap();
-        let rate_limiter = self.rate_limiter.clone();
-        let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
-            let quota = Quota::per_second(
-                NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32")).unwrap(),
-            );
-            Arc::new(RateLimiter::direct(quota))
-        });
-
         info!(
             "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
-            chunk_size
+            self.chunk_size
         );
-
-        let stream = async_stream::stream! {
-            let _guard = guard;
-            for chunk in content.chunks(chunk_size.get() as usize) {
-                let chunk_len = NonZeroU32::new(chunk.len() as u32).unwrap();
-                if let Some(rate_limiter) = rate_limiter.clone() {
-                    rate_limiter.until_n_ready(chunk_len).await.unwrap();
-                }
-                if let Some(stream_rate_limiter) = stream_rate_limiter.clone() {
-                    stream_rate_limiter.until_n_ready(chunk_len).await.unwrap();
-                }
-                yield Ok(Bytes::from(chunk.to_vec()));
-            }
-        };
-
-        Ok(Box::pin(stream))
+        Ok(self.body_stream(0, self.content.len(), guard))
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
+        let _request = CounterGuard::new(&self.counters.active_requests);
+        let attempt = self.counters.range_attempts.fetch_add(1, Ordering::SeqCst);
+        self.faults
+            .range_connect_plan
+            .apply(attempt, "range_stream connect")
+            .await?;
 
         // Simulate connection delay
         if let Some(delay) = self.connecting_delay {
@@ -455,41 +603,15 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         if let Some(max_concurrent_streams) = self.max_concurrent_streams
             && current_concurrency >= max_concurrent_streams
         {
-            return Err(InternalSnafu {
-                message: "Max concurrent streams reached".to_string(),
+            return Err(ServiceUnavailableSnafu {
+                status: "429".to_string(),
+                description: "Max concurrent streams reached".to_string(),
             }
             .build()
             .into());
         }
 
-        let start = start as usize;
-        let end = end as usize;
-        let content = self.content.slice(start..end.min(self.content.len()));
-        let chunk_size = NonZeroU32::new(self.chunk_size as u32).unwrap();
-        let rate_limiter = self.rate_limiter.clone();
-        let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
-            let quota = Quota::per_second(
-                NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32")).unwrap(),
-            );
-            Arc::new(RateLimiter::direct(quota))
-        });
-
-        let stream = async_stream::stream! {
-            let _guard = guard;
-
-            for chunk in content.chunks(chunk_size.get() as usize) {
-                let chunk_len = NonZeroU32::new(chunk.len() as u32).unwrap();
-                if let Some(rate_limiter) = rate_limiter.clone() {
-                    rate_limiter.until_n_ready(chunk_len).await.unwrap();
-                }
-                if let Some(stream_rate_limiter) = stream_rate_limiter.clone() {
-                    stream_rate_limiter.until_n_ready(chunk_len).await.unwrap();
-                }
-                yield Ok(Bytes::from(chunk.to_vec()));
-            }
-        };
-
-        Ok(Box::pin(stream))
+        Ok(self.body_stream(start as usize, end as usize, guard))
     }
 }
 

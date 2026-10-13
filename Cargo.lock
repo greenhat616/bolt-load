@@ -590,6 +590,7 @@ name = "bolt-load-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-stream",
  "async-trait",
  "axum",
