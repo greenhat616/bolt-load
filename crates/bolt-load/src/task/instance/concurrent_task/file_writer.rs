@@ -340,7 +340,7 @@ impl FileRangeWriter for FileWriter {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeSet, HashMap},
+        collections::BTreeSet,
         io::{Read, Seek, SeekFrom},
         sync::Arc,
         time::Duration,
@@ -352,7 +352,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        super::{ConcurrentTaskInner, RunnerManager, runner_manager::TaskState},
+        super::{RunnerManager, RunnerSpawner, runner_manager::TaskState},
         *,
     };
     use crate::{adapter::BoltLoadAdapter, runtime::ThreadedRuntimeImpl};
@@ -732,21 +732,18 @@ mod tests {
 
             runner_manager
                 .allocate_pending_runner_with_chunk(range, |runner_id, control_rx| {
-                    ConcurrentTaskInner::create_background_range_runner(
-                        &rt,
-                        &wg,
-                        runner_range,
+                    RunnerSpawner::new(
+                        rt.clone(),
                         adapter,
-                        control_rx,
-                        runner_id,
+                        wg.clone(),
                         token,
                         crate::runner::DEFAULT_IDLE_TIMEOUT,
                     )
+                    .spawn(runner_range, runner_id, control_rx)
                 })
                 .expect("runner slot should be available");
         }
 
-        let mut meters = HashMap::with_capacity(RUNNER_COUNT);
         let mut written_bytes = 0usize;
         let mut write_count = 0usize;
         let mut downloaded_chunks = 0usize;
@@ -771,7 +768,7 @@ mod tests {
                     continue;
                 }
 
-                let tick = runner_manager.tick(&mut meters).await;
+                let tick = runner_manager.tick().await;
                 if let Some(chunk) = tick.downloaded {
                     downloaded_chunks += 1;
                     touched_partitions.insert(
