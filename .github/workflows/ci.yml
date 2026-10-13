@@ -76,3 +76,65 @@ jobs:
       - name: Build
         timeout-minutes: 10
         run: cargo build --verbose
+
+  # Observation only: does `-Zhigher-ranked-assumptions` change whether the
+  # download attempt futures are `Send` (rust-lang/rust#100013)? See
+  # `crates/bolt-load/src/task/instance/probe_send.rs`.
+  hra-probe:
+    name: Send probe (higher-ranked assumptions)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-hra-probe-${{ hashFiles('**/Cargo.lock') }}
+
+      # RUSTFLAGS replaces `build.rustflags` from .cargo/config.toml, so
+      # `--cfg tokio_unstable` is repeated here.
+      - name: Probe without the flag (control)
+        id: control
+        continue-on-error: true
+        run: |
+          set +e
+          RUSTFLAGS="--cfg tokio_unstable --cfg bolt_load_probe_send" \
+            cargo +nightly check -p bolt-load --tests 2>&1 | tee probe-control.log
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Probe with -Zhigher-ranked-assumptions
+        id: hra
+        continue-on-error: true
+        run: |
+          set +e
+          RUSTFLAGS="--cfg tokio_unstable --cfg bolt_load_probe_send -Zhigher-ranked-assumptions" \
+            cargo +nightly check -p bolt-load --tests 2>&1 | tee probe-hra.log
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### Send probe"
+            echo "| Probe | Exit status |"
+            echo "|---|---|"
+            echo "| control | ${{ steps.control.outputs.status }} |"
+            echo "| -Zhigher-ranked-assumptions | ${{ steps.hra.outputs.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hra-probe-logs
+          path: probe-*.log

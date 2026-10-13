@@ -39,6 +39,10 @@ compio = ["dep:compio"]
 
 tracing = ["dep:tracing", "bolt-load-utils/tracing"]
 
+[lints.rust]
+# `bolt_load_probe_send` enables the nightly `Send` probe, see `task/instance/probe_send.rs`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bolt_load_probe_send)'] }
+
 [lib]
 doctest = false
 name = "bolt_load"
