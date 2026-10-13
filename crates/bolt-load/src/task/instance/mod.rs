@@ -20,6 +20,9 @@ mod singleton_task;
 mod tests;
 
 #[cfg(test)]
+mod event_contract_tests;
+
+#[cfg(test)]
 mod integration_test;
 
 #[allow(ambiguous_glob_reexports)]
