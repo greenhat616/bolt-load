@@ -291,7 +291,8 @@ impl RunnerSpawner {
         }
     }
 
-    /// Connect `range` and run a runner on it; the receiver yields its channels.
+    /// Connect `range` and run a runner on it in one spawned task; the receiver
+    /// yields the runner's channels.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, fields(runner_id, range))
@@ -307,18 +308,16 @@ impl RunnerSpawner {
         let (tx, rx) = oneshot::channel();
         let (start, end) = (range.start, range.end);
         let wg = self.wg.clone();
-        let rt = self.rt.clone();
         let adapter = self.adapter.clone();
         let cancel_token = self.cancel_token.clone();
         let idle_timeout = self.idle_timeout;
-        let connector_task = async move {
-            let wg = wg;
-            trace!(
-                "[TASK] create background range runner connector: id: {runner_id}, range: \
-                 {range:?}"
-            );
+        let worker = async move {
+            // Declared first, so the runner and its upstream stream drop before
+            // the wait group is released.
+            let _wg = wg;
+            trace!("[TASK] background range runner: id: {runner_id}, range: {range:?}");
 
-            // 1. Connect stream using StreamConnector, abandoning the request on cancellation
+            // Connect the stream, abandoning the request on cancellation
             let connector =
                 StreamConnector::from(async move { adapter.range_stream(start, end).await });
             let connected = {
@@ -333,76 +332,51 @@ impl RunnerSpawner {
             if cancel_token.is_cancelled() {
                 return;
             }
-
-            match connected {
-                Ok(stream) => {
-                    // 2. Build TaskRunner with new architecture
-                    let result = TaskRunner::builder()
-                        .total(end - start)
-                        .stream(stream)
-                        .runner_id(runner_id)
-                        .control_signal(control_rx)
-                        .cancel_token(cancel_token.clone())
-                        .idle_timeout(idle_timeout)
-                        .build();
-
-                    match result {
-                        Ok((runner, lifecycle_rx, data_rx)) => {
-                            // 3. Spawn runner
-                            let wg = wg.clone();
-                            let runner_task = async move {
-                                // Declared after the guard, so the runner and its
-                                // upstream stream drop before the wait group is released.
-                                let _wg = wg;
-                                let mut runner = runner;
-                                runner.run().await;
-                            };
-
-                            #[cfg(feature = "tracing")]
-                            let runner_task = tracing::Instrument::instrument(
-                                runner_task,
-                                tracing::trace_span!(
-                                    parent: tracing::Span::current(),
-                                    "background_task::runner",
-                                ),
-                            );
-                            match rt.spawn(runner_task) {
-                                Ok(()) => {
-                                    let output = RunnerBuilderOutput {
-                                        data_rx,
-                                        lifecycle_rx,
-                                    };
-                                    if let Err(e) = tx.send(Ok(output)) {
-                                        error!(
-                                            "failed to send channels to pending receiver: {e:?}"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("failed to spawn background range runner: {e}");
-                                    let _ = tx.send(Err(PendingRunnerError::Spawn {
-                                        message: e.to_string(),
-                                    }));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Build error - should not happen with proper setup
-                            error!("failed to build task runner: {e:?}");
-                            let _ = tx.send(Err(PendingRunnerError::ReceiverClosed));
-                        }
-                    }
-                }
+            let stream = match connected {
+                Ok(stream) => stream,
                 Err(e) => {
-                    // Connection error
-                    error!("failed to create background range runner connector: {e:?}");
+                    error!("failed to connect background range runner: {e:?}");
                     let _ = tx.send(Err(PendingRunnerError::Connection { source: e }));
+                    return;
                 }
+            };
+
+            let built = TaskRunner::builder()
+                .total(end - start)
+                .stream(stream)
+                .runner_id(runner_id)
+                .control_signal(control_rx)
+                .cancel_token(cancel_token)
+                .idle_timeout(idle_timeout)
+                .build();
+            let (mut runner, lifecycle_rx, data_rx) = match built {
+                Ok(built) => built,
+                Err(e) => {
+                    // Build error - should not happen with proper setup
+                    error!("failed to build task runner: {e:?}");
+                    let _ = tx.send(Err(PendingRunnerError::ReceiverClosed));
+                    return;
+                }
+            };
+            if let Err(e) = tx.send(Ok(RunnerBuilderOutput {
+                data_rx,
+                lifecycle_rx,
+            })) {
+                error!("failed to send channels to pending receiver: {e:?}");
+                return;
             }
+
+            let run = runner.run();
+            #[cfg(feature = "tracing")]
+            let run = tracing::Instrument::instrument(
+                run,
+                tracing::trace_span!("background_task::runner"),
+            );
+            run.await;
         };
         #[cfg(feature = "tracing")]
-        let connector_task = tracing::Instrument::instrument(
-            connector_task,
+        let worker = tracing::Instrument::instrument(
+            worker,
             tracing::trace_span!(
                 parent: None,
                 "background_task::runner_connector",
@@ -410,8 +384,8 @@ impl RunnerSpawner {
                 range = ?start..end,
             ),
         );
-        if let Err(e) = self.rt.spawn(connector_task) {
-            error!("failed to spawn background range runner connector: {e}");
+        if let Err(e) = self.rt.spawn(worker) {
+            error!("failed to spawn background range runner: {e}");
             return runner_manager::pending::failed_receiver(PendingRunnerError::Spawn {
                 message: e.to_string(),
             });
@@ -1014,36 +988,47 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
-    async fn test_create_background_range_runner_reports_runner_spawn_error() {
-        let rt = ThreadedRuntimeImpl::new_other_rt(FailOnSpawnRuntime::new(1));
+    async fn test_create_background_range_runner_spawns_once() {
+        // A second spawn would fail; connecting and running share one task.
+        let runtime = FailOnSpawnRuntime::new(1);
+        let spawns = runtime.calls.clone();
+        let rt = ThreadedRuntimeImpl::new_other_rt(runtime);
         let adapter = Arc::new(
             Box::new(SimpleTestAdapter::new(1024).with_range_support(true))
                 as Box<dyn crate::adapter::BoltLoadAdapter + Send>,
         );
-        let range = 0u64..500u64;
-        let runner_id = 9;
         let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
-        let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
 
         let receiver = RunnerSpawner::new(
-            rt.clone(),
+            rt,
             adapter,
             wg.clone(),
-            cancel_token,
+            CancellationToken::new(),
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range, runner_id, control_rx);
-        let result = tokio::time::timeout(Duration::from_secs(1), receiver)
+        .spawn(0..500, 9, control_rx);
+        let output = tokio::time::timeout(Duration::from_secs(1), receiver)
             .await
-            .expect("timed out waiting for spawn error")
-            .expect("receiver closed");
+            .expect("timed out waiting for runner channels")
+            .expect("receiver closed")
+            .expect("runner should start");
 
-        match result {
-            Err(PendingRunnerError::Spawn { message }) => assert!(!message.is_empty()),
-            other => panic!("expected Spawn error, got: {other:?}"),
+        let mut data_rx = pin!(output.data_rx);
+        let mut lifecycle_rx = pin!(output.lifecycle_rx);
+        let mut received = 0;
+        while let Some(frame) = data_rx.next().await {
+            received += frame.data.len();
+        }
+        let mut finished = false;
+        while let Some(event) = lifecycle_rx.next().await {
+            finished |= event.is_finished();
         }
         wg.wait().await;
+
+        assert!(finished);
+        assert_eq!(received, 500);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

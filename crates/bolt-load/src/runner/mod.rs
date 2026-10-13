@@ -2088,6 +2088,14 @@ mod tests {
             assert!(matches!(emit.await, Ok(None)));
         }
         assert_eq!(runner.downloaded, DATA_FRAME_CHANNEL_CAPACITY as u64 + 1);
+
+        drop(runner);
+        let mut expected = vec![Bytes::from_static(b"x"); DATA_FRAME_CHANNEL_CAPACITY - 1];
+        expected.push(Bytes::from_static(b"y"));
+        assert_eq!(
+            data_rx.map(|frame| frame.data).collect::<Vec<_>>().await,
+            expected
+        );
     }
 
     #[tokio::test]
