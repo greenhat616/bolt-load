@@ -28,16 +28,14 @@ mod integration_test;
 #[cfg(all(test, bolt_load_probe_send))]
 mod probe_send;
 
-#[allow(ambiguous_glob_reexports)]
 pub use concurrent_task::*;
 use id::Generator;
-#[allow(ambiguous_glob_reexports)]
 pub use singleton_task::*;
 
 /// The default capacity of the control channel
 ///
 /// It is used to control the task runner
-#[allow(dead_code)]
+#[expect(dead_code, reason = "reserved for the task control channel")]
 const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone)]

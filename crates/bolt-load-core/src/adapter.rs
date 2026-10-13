@@ -26,6 +26,7 @@ pub trait BoltLoadAdapter: Send + Sync {
 
     /// Get a range content stream from the adapter
     /// Note: the range is followed as [start, end)
+    // Not `expect`: dynosaur copies the attribute into code that uses the arguments.
     #[allow(unused_variables)]
     fn range_stream(
         &self,

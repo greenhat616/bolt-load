@@ -1,5 +1,4 @@
 #![doc = include_str!("../../docs/runtime.md")]
-#![allow(dead_code)]
 use std::{rc::Rc, sync::Arc};
 
 use futures::task::{LocalSpawn, Spawn, SpawnError};
@@ -33,7 +32,10 @@ pub enum TimerImpl {
 }
 
 impl Timer for TimerImpl {
-    #[allow(clippy::manual_async_fn)]
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "spelled out to declare the `Send` bound"
+    )]
     fn tick(&mut self) -> impl std::future::Future<Output = ()> + Send {
         async move {
             match self {

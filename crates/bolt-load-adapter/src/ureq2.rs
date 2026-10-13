@@ -115,7 +115,10 @@ impl UreqAdapter {
         }
     }
 
-    #[allow(clippy::result_large_err)] // The error type if returned by ureq, we can't do anything about it
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error type is returned by ureq"
+    )]
     fn apply_call(
         call: Arc<Option<CallFn>>,
         builder: Request,

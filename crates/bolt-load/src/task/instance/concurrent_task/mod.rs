@@ -47,10 +47,13 @@ use strategy::*;
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
 
 /// Default capacity for control channels
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "only used by tests"))]
 const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the initial progress is kept for resumable downloads"
+)]
 pub struct ConcurrentTask {
     threaded_rt: ThreadedRuntimeImpl,
     local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
@@ -152,7 +155,7 @@ pub struct ConcurrentTaskInner {
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "reserved for persisting runner states")]
 enum RunnerStatus {
     Running,
     Finished,

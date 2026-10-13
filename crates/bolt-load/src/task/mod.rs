@@ -122,10 +122,10 @@ pub enum TaskCommand {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "state control is not wired up yet")]
 struct TaskStateControl(Option<(TaskState, async_channel::Sender<TaskState>)>);
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "state control is not wired up yet")]
 impl TaskStateControl {
     pub fn new(state: TaskState, sender: Sender<TaskState>) -> Self {
         Self(Some((state, sender)))
@@ -146,7 +146,7 @@ impl TaskStateControl {
 
 #[non_exhaustive]
 #[derive(derive_more::Debug)]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "some fields are kept for restarting the task")]
 pub struct Task {
     /// the async runtime passed from the client
     #[debug(ignore)]

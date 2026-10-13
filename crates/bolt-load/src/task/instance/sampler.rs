@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
-#[allow(dead_code)]
 const DEFAULT_EMA_ALPHA: f64 = 0.33;
 
 /// Speed sampler
@@ -61,7 +60,7 @@ impl SpeedSampler {
 
     /// Growth rate; return `None` if prev is 0
     #[inline]
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "only used by tests"))]
     pub fn growth_rate(prev: f64, next: f64) -> Option<f64> {
         if prev == 0.0 {
             None

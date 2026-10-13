@@ -27,8 +27,11 @@ use crate::{
 };
 
 /// Create test runtime
-#[allow(clippy::needless_return)]
-#[allow(unreachable_code)]
+#[expect(
+    clippy::needless_return,
+    reason = "each runtime returns from its own cfg block"
+)]
+#[allow(unreachable_code)] // Only with both runtime features enabled.
 fn create_test_runtime() -> ThreadedRuntimeImpl {
     #[cfg(feature = "tokio")]
     {
