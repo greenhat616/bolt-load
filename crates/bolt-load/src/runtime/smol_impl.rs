@@ -11,7 +11,16 @@ use super::{DowncastLocalRuntime, LocalRuntimeImpl, Timer, TimerBuilder, TimerIm
 #[derive(Clone)]
 pub struct SmolThreadedRuntime {
     executor: Arc<smol::Executor<'static>>,
-    shutdown_signal: async_broadcast::Sender<()>,
+    shutdown: Arc<ShutdownOnDrop>,
+}
+
+/// Stops the executor threads once the last runtime clone is dropped.
+struct ShutdownOnDrop(async_broadcast::Sender<()>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.try_broadcast(());
+    }
 }
 
 impl TimerBuilder for SmolThreadedRuntime {
@@ -48,7 +57,7 @@ impl SmolThreadedRuntime {
         }
         Self {
             executor,
-            shutdown_signal: shutdown_tx,
+            shutdown: Arc::new(ShutdownOnDrop(shutdown_tx)),
         }
     }
 
@@ -73,14 +82,9 @@ impl SmolThreadedRuntime {
         smol::future::block_on(async move { self.executor.run(future).await })
     }
 
+    /// Stop the executor threads of this runtime and all of its clones.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_signal.try_broadcast(());
-    }
-}
-
-impl Drop for SmolThreadedRuntime {
-    fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown.0.try_broadcast(());
     }
 }
 
@@ -255,5 +259,16 @@ mod tests {
         rt.block_on(async move {
             assert_eq!(handle.abort().await, None);
         });
+    }
+
+    #[test]
+    fn test_dropping_a_clone_keeps_the_executor_running() {
+        let rt = SmolThreadedRuntime::build_with_threads(2);
+        drop(rt.clone());
+        // Executor threads poll for shutdown every 100 ms.
+        std::thread::sleep(Duration::from_millis(300));
+        let (tx, rx) = oneshot::channel();
+        rt.spawn(async move { tx.send(()).unwrap() }).detach();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(()));
     }
 }
