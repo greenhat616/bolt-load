@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bolt-load = "0.1"
+bolt-load = "0.2"
 reqwest = "0.13"
 tokio = { version = "1", features = ["full"] }
 ```
