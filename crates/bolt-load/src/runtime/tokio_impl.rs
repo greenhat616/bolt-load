@@ -2,7 +2,7 @@ use std::{rc::Rc, time::Duration};
 
 use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
 
-use super::{DowncastLocalRuntime, LocalRuntimeImpl, Timer, TimerBuilder, TimerImpl};
+use super::{DowncastLocalRuntime, LocalRuntimeImpl, Sleep, Timer, TimerBuilder, TimerImpl};
 
 #[derive(Clone)]
 enum TokioLocalRuntimeImpl {
@@ -20,6 +20,20 @@ impl TimerBuilder for LocalTokioRuntime {
     fn create_delayed_timer(&self, duration: Duration) -> TimerImpl {
         TimerImpl::Tokio(TokioDelayedTimer::new(duration))
     }
+
+    fn sleep(&self, duration: Duration) -> Sleep {
+        match &self.rt {
+            TokioLocalRuntimeImpl::Runtime(rt) => sleep_on(rt.handle(), duration),
+            TokioLocalRuntimeImpl::Handle(handle) => sleep_on(handle, duration),
+        }
+    }
+}
+
+/// A tokio sleep registered with `handle`'s timer, so it can be created and
+/// polled outside a tokio context.
+fn sleep_on(handle: &tokio::runtime::Handle, duration: Duration) -> Sleep {
+    let _guard = handle.enter();
+    Box::pin(tokio::time::sleep(duration))
 }
 
 tokio::task_local! {
@@ -38,6 +52,7 @@ impl LocalTokioRuntime {
         Self {
             rt: TokioLocalRuntimeImpl::Runtime(Rc::new(
                 tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
                     .build()
                     .unwrap(),
             )),
@@ -86,6 +101,13 @@ pub enum TokioThreadedRuntime {
 impl TimerBuilder for TokioThreadedRuntime {
     fn create_delayed_timer(&self, duration: Duration) -> TimerImpl {
         TimerImpl::Tokio(TokioDelayedTimer::new(duration))
+    }
+
+    fn sleep(&self, duration: Duration) -> Sleep {
+        match self {
+            TokioThreadedRuntime::Runtime(rt) => sleep_on(rt.handle(), duration),
+            TokioThreadedRuntime::Handle(handle) => sleep_on(handle, duration),
+        }
     }
 }
 

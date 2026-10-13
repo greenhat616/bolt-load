@@ -4,7 +4,7 @@ use bolt_load_utils::telemetry::*;
 use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
 use smol::future::FutureExt;
 
-use super::{DowncastLocalRuntime, LocalRuntimeImpl, Timer, TimerBuilder, TimerImpl};
+use super::{DowncastLocalRuntime, LocalRuntimeImpl, Sleep, Timer, TimerBuilder, TimerImpl};
 
 /// SmolRuntime is a dead simple runtime for smol.
 /// It is used to run tasks via by `bolt-load` client.
@@ -26,6 +26,12 @@ impl Drop for ShutdownOnDrop {
 impl TimerBuilder for SmolThreadedRuntime {
     fn create_delayed_timer(&self, duration: Duration) -> TimerImpl {
         TimerImpl::Smol(SmolDelayedTimer::new(duration))
+    }
+
+    fn sleep(&self, duration: Duration) -> Sleep {
+        Box::pin(async move {
+            smol::Timer::after(duration).await;
+        })
     }
 }
 
@@ -131,6 +137,12 @@ pub struct SmolLocalRuntime {
 impl TimerBuilder for SmolLocalRuntime {
     fn create_delayed_timer(&self, duration: Duration) -> TimerImpl {
         TimerImpl::Smol(SmolDelayedTimer::new(duration))
+    }
+
+    fn sleep(&self, duration: Duration) -> Sleep {
+        Box::pin(async move {
+            smol::Timer::after(duration).await;
+        })
     }
 }
 

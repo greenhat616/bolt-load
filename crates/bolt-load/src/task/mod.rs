@@ -23,6 +23,9 @@ mod builder;
 mod comprehensive_tests;
 /// Task instance implementations (singleton and concurrent).
 pub mod instance;
+mod meta;
+#[cfg(test)]
+mod meta_retry_tests;
 mod options;
 #[cfg(test)]
 mod termination_tests;

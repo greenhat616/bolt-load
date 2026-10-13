@@ -50,12 +50,18 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   `TaskError::Timeout`. In singleton mode there is no retry, so this
   ends the task; there `no_progress_timeout` bounds establishing the
   connection.
+- **Metadata request**: [`TaskBuilder::build`],
+  [`TaskBuilder::retrieve_meta`] and both task modes retry retryable
+  metadata errors as [`TaskOptions::meta_retry`] allows, with jittered
+  exponential backoff on the runtime's timer, then report the last error.
+  Unretryable errors are reported at once.
 
 | Option | Default |
 |--------|---------|
 | `no_progress_timeout` | 60 s |
 | `max_consecutive_failures` | `max(8, 2 × CPU count)` |
 | `stream_idle_timeout` | 30 s |
+| `meta_retry` | 3 retries, 200 ms – 2 s per wait |
 
 Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a
 stalled stream ends the task with `NoProgress` before its runner can time
