@@ -111,7 +111,6 @@ impl TaskRunnerBuilder {
             cancel_token: self
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
-            shutdown_rx: None,
         };
         Ok((runner, lifecycle_cons, data_cons))
     }

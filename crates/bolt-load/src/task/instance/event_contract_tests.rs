@@ -51,8 +51,20 @@ fn start(
     dest: &Path,
     token: &CancellationToken,
 ) -> (TaskInstanceImpl, async_channel::Receiver<TaskEvent>) {
+    start_with_channel(mode, adapter, dest, token, async_channel::unbounded())
+}
+
+fn start_with_channel(
+    mode: DownloadMode,
+    adapter: impl BoltLoadAdapter + 'static,
+    dest: &Path,
+    token: &CancellationToken,
+    (event_tx, event_rx): (
+        async_channel::Sender<TaskEvent>,
+        async_channel::Receiver<TaskEvent>,
+    ),
+) -> (TaskInstanceImpl, async_channel::Receiver<TaskEvent>) {
     let mut task = TaskInstanceImpl::new(mode, ThreadedRuntimeImpl::new_tokio_rt(), None);
-    let (event_tx, event_rx) = async_channel::unbounded();
     task.run(
         Arc::new(Box::new(adapter)),
         dest.to_path_buf(),
@@ -251,4 +263,103 @@ async fn test_singleton_unknown_total_final_progress() {
         other => panic!("expected Finished last, got {other:?}"),
     }
     assert_eq!(std::fs::read(&dest).unwrap().len(), SIZE);
+}
+
+/// Throttled so that the transfer spans several progress samples.
+fn slow_adapter() -> SimpleTestAdapter {
+    adapter_builder()
+        .max_speed(SIZE as u64 / 2)
+        .build()
+        .unwrap()
+}
+
+// The runner fails with `ChannelClosed` as soon as its control channel closes,
+// so a transfer spanning several samples proves the sender outlives it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_singleton_control_sender_lives_until_runner_exit() {
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("control.bin");
+    let token = CancellationToken::new();
+    let (mut task, event_rx) = start(DownloadMode::Singleton, slow_adapter(), &dest, &token);
+
+    let events = collect(event_rx).await;
+    watchdog(task.wait()).await.unwrap();
+
+    assert!(
+        matches!(events.last(), Some(TaskEvent::Finished(_))),
+        "{events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_periodic_progress_full_channel_is_lossy_and_nonblocking() {
+    for mode in MODES {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("lossy.bin");
+        let token = CancellationToken::new();
+        let (mut task, event_rx) = start_with_channel(
+            mode,
+            slow_adapter(),
+            &dest,
+            &token,
+            async_channel::bounded(1),
+        );
+
+        assert!(matches!(
+            watchdog(event_rx.recv()).await,
+            Ok(TaskEvent::Initializing)
+        ));
+        assert!(matches!(
+            watchdog(event_rx.recv()).await,
+            Ok(TaskEvent::Downloading(_))
+        ));
+        // Nobody reads while the transfer runs; it must still complete.
+        watchdog(async {
+            while !dest.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let events = collect(event_rx).await;
+        watchdog(task.wait()).await.unwrap();
+        assert!(
+            matches!(events.last(), Some(TaskEvent::Finished(_))),
+            "{mode:?}: {events:?}"
+        );
+        assert!(
+            events.len() <= 2,
+            "{mode:?}: samples beyond the channel capacity must be dropped: {events:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_periodic_progress_preserves_snapshot_order() {
+    for mode in MODES {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("order.bin");
+        let token = CancellationToken::new();
+        let (mut task, event_rx) = start(mode, slow_adapter(), &dest, &token);
+
+        let events = collect(event_rx).await;
+        watchdog(task.wait()).await.unwrap();
+
+        let downloaded: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::Downloading(progress) => Some(progress.downloaded()),
+                TaskEvent::Finished(progress) => Some(progress.downloaded),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            downloaded.len() > 2,
+            "{mode:?}: expected periodic samples, got {events:?}"
+        );
+        assert!(
+            downloaded.is_sorted(),
+            "{mode:?}: progress went backwards: {downloaded:?}"
+        );
+    }
 }

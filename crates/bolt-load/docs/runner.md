@@ -46,8 +46,6 @@ Runners accept [`ControlSignal`] messages for dynamic adjustments:
 
 - [`TaskRunner`] — the stream consumer itself.
 - [`TaskRunnerBuilder`] — fluent builder with validation.
-- [`TaskRunnerGuard`] — RAII handle held by the runner manager;
-  auto-cancels the runner on drop.
 - [`StreamConnector`] — lazy or pre-connected stream source.
 - [`TaskError`] — comprehensive error enum with retryability classification.
 
