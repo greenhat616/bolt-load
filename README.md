@@ -36,6 +36,7 @@ Add to your `Cargo.toml`:
 [dependencies]
 bolt-load = "0.2"
 reqwest = "0.13"
+smol-cancellation-token = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -45,6 +46,7 @@ Download a file with concurrent range requests and a terminal progress bar:
 use bolt_load::task::TaskBuilder;
 use bolt_load::adapter::reqwest::IntoReqwestAdapter;
 use bolt_load::runtime::ThreadedRuntimeImpl;
+use smol_cancellation_token::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -60,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .adapter(adapter)
         .save_path("large-file.bin".into())
         .threaded_runtime(runtime)
+        .cancel_token(CancellationToken::new())
         .build()
         .await?;
 

@@ -174,15 +174,60 @@ mod tests {
         assert!(delays.iter().all(|d| *d <= retry.max_delay), "{delays:?}");
     }
 
+    /// Polled outside any tokio context, so the backoff must be registered
+    /// with the runtime's own timer.
     #[cfg(feature = "tokio")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn sleeps_on_the_runtime_timer() {
+    #[test]
+    fn sleeps_on_the_tokio_timer_outside_its_context() {
+        use crate::runtime::TokioThreadedRuntime;
+
         let (adapter, calls) = FlakyAdapter::new(1, true);
         let adapter = DynBoltLoadAdapter::new_box(adapter);
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
-        let meta = retrieve_meta(&adapter, &fast_retry(1), Some(&rt)).await;
+        let rt = ThreadedRuntimeImpl::Tokio(TokioThreadedRuntime::new());
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let meta = futures::executor::block_on(retrieve_meta(&adapter, &fast_retry(1), Some(&rt)));
         assert_eq!(meta.unwrap().content_size, 42);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A custom runtime's default sleep ticks its delayed timer twice.
+    #[test]
+    fn sleeps_on_a_custom_runtime_timer() {
+        use std::sync::atomic::AtomicUsize;
+
+        use crate::runtime::{DowncastLocalRuntime, DynTimer, ThreadedRuntime, Timer, TimerImpl};
+
+        struct CountingTimer(Arc<AtomicUsize>);
+        impl Timer for CountingTimer {
+            async fn tick(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct TimerOnlyRuntime(Arc<AtomicUsize>);
+        impl futures::task::Spawn for TimerOnlyRuntime {
+            fn spawn_obj(
+                &self,
+                _: futures::future::FutureObj<'static, ()>,
+            ) -> Result<(), futures::task::SpawnError> {
+                Err(futures::task::SpawnError::shutdown())
+            }
+        }
+        impl DowncastLocalRuntime for TimerOnlyRuntime {}
+        impl TimerBuilder for TimerOnlyRuntime {
+            fn create_delayed_timer(&self, _: Duration) -> TimerImpl {
+                TimerImpl::Custom(DynTimer::new_box(CountingTimer(self.0.clone())))
+            }
+        }
+        impl ThreadedRuntime for TimerOnlyRuntime {}
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let rt = ThreadedRuntimeImpl::new_other_rt(TimerOnlyRuntime(ticks.clone()));
+        let (adapter, calls) = FlakyAdapter::new(2, true);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
+        let meta = futures::executor::block_on(retrieve_meta(&adapter, &fast_retry(2), Some(&rt)));
+        assert_eq!(meta.unwrap().content_size, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(ticks.load(Ordering::SeqCst), 4, "two ticks per retry");
     }
 
     #[cfg(feature = "smol")]
