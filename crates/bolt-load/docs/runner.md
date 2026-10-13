@@ -46,6 +46,7 @@ Runners accept [`ControlSignal`] messages for dynamic adjustments:
 
 - [`TaskRunner`] — the stream consumer itself.
 - [`TaskRunnerBuilder`] — fluent builder with validation.
+  A runner is stopped by cancelling the token passed to its builder.
 - [`StreamConnector`] — lazy or pre-connected stream source.
 - [`TaskError`] — comprehensive error enum with retryability classification.
 

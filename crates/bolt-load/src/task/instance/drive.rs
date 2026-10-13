@@ -21,7 +21,7 @@ pub(super) trait Transfer {
     /// Download and publish or discard the output file.
     ///
     /// Cancellation is handled inside, so when this returns every spawned
-    /// worker has been joined and the output file has been committed.
+    /// worker has been joined and the output file has been published or removed.
     async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()>;
 }
 
