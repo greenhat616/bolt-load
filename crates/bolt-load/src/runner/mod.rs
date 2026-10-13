@@ -109,6 +109,10 @@ impl From<TaskError> for TaskRunError {
 #[derive(derive_more::Debug)]
 pub struct TaskRunner {
     /// The id of the runner
+    #[cfg_attr(
+        not(feature = "tracing"),
+        expect(dead_code, reason = "only read by tracing spans")
+    )]
     id: RunnerId,
     /// The total size of the this chunk or file
     /// possible None if the total size is unknown

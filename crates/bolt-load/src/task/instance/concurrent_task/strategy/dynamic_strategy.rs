@@ -61,7 +61,7 @@ impl Strategy for DynamicStrategy {
     }
 
     fn step(&mut self, context: &mut Self::Context<'static>) -> Vec<StrategyAction> {
-        tracing::trace!(
+        bolt_load_utils::telemetry::trace!(
             "Strategy context {:?}, current stage {:?}",
             context,
             self.current_stage
