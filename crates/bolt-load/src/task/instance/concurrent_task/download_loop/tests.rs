@@ -20,7 +20,6 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{
     super::{
-        DEFAULT_CONTROL_CHANNEL_CAPACITY,
         file_writer::{FileRangeWriter, FileRangeWriterKind, FileWriter},
         test_support::FailOnSpawnRuntime,
     },
@@ -57,7 +56,7 @@ async fn test_split_after_failed_resize_does_not_allocate_tail() {
         event_tx,
         &TaskOptions::default(),
     );
-    let reg = download.manager.allocate_runner_with_chunk(0..100).unwrap();
+    let mut reg = download.manager.allocate_runner_with_chunk(0..100).unwrap();
 
     // Half of this range would grow the chunk past its end.
     download.split(reg.runner_id, 0..400);
@@ -72,7 +71,7 @@ async fn test_split_after_failed_resize_does_not_allocate_tail() {
     );
     assert_eq!(download.manager.get_available_ranges(), vec![100..1000]);
     assert_eq!(spawns.load(Ordering::SeqCst), 0, "no runner may be spawned");
-    assert!(reg.control_rx.try_recv().is_err());
+    assert_eq!(reg.limits.try_recv(), None);
     drop(download);
     file_writer.finalize().await.unwrap();
 }
@@ -785,11 +784,12 @@ impl crate::adapter::BoltLoadAdapter for HandshakeAdapter {
     }
 }
 
-/// Split runner 0 nine times, one more than its control channel holds, and
-/// check that the ninth split is skipped.
-async fn split_connecting_runner_beyond_its_control_channel(download: &mut DownloadLoop) {
+/// Split runner 0 more often than any bounded queue of limits would hold,
+/// and check that it is left with the latest limit.
+fn split_connecting_runner_repeatedly(download: &mut DownloadLoop) {
+    const SPLITS: u32 = 12;
     let total = download.manager.total();
-    for _ in 0..=DEFAULT_CONTROL_CHANNEL_CAPACITY {
+    for _ in 0..SPLITS {
         let incomplete = download
             .manager
             .get_runner_state(0)
@@ -798,32 +798,29 @@ async fn split_connecting_runner_beyond_its_control_channel(download: &mut Downl
         download.split(0, incomplete);
     }
     assert_eq!(
-        download.manager.queued_controls(0),
-        DEFAULT_CONTROL_CHANNEL_CAPACITY
-    );
-    assert_eq!(
         download.manager.get_runner_state(0).unwrap().allocated,
-        0..total >> DEFAULT_CONTROL_CHANNEL_CAPACITY
+        0..total >> SPLITS
     );
+    assert_eq!(download.manager.unread_limit(0), Some(total >> SPLITS));
     assert_eq!(
         download.manager.allocated_runner_count(),
-        DEFAULT_CONTROL_CHANNEL_CAPACITY + 1
+        SPLITS as usize + 1
     );
 }
 
 #[tokio::test]
-async fn test_split_parked_runner_beyond_its_control_channel() {
-    const TOTAL: u64 = 1 << 20;
+async fn test_split_parked_runner_keeps_the_latest_limit() {
+    const TOTAL: u64 = 1 << 30;
     let (mut download, file_writer) = parked_loop(TOTAL, 64).await;
     download.spawn_runner(0..TOTAL);
-    split_connecting_runner_beyond_its_control_channel(&mut download).await;
+    split_connecting_runner_repeatedly(&mut download);
     drop(download);
     file_writer.finalize().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_split_handshaking_runner_beyond_its_control_channel() {
-    const TOTAL: u64 = 1 << 20;
+async fn test_split_handshaking_runner_keeps_the_latest_limit() {
+    const TOTAL: u64 = 1 << 30;
     let (connecting, connects) = async_channel::unbounded();
     let (mut download, file_writer) = connecting_loop(
         ThreadedRuntimeImpl::new_tokio_rt(),
@@ -834,7 +831,7 @@ async fn test_split_handshaking_runner_beyond_its_control_channel() {
     .await;
     download.spawn_runner(0..TOTAL);
     assert_eq!(with_watchdog(connects.recv()).await.unwrap(), 0);
-    split_connecting_runner_beyond_its_control_channel(&mut download).await;
+    split_connecting_runner_repeatedly(&mut download);
 
     let (cancel, wg) = (
         download.spawner.cancel_token.clone(),
@@ -846,20 +843,13 @@ async fn test_split_handshaking_runner_beyond_its_control_channel() {
     file_writer.finalize().await.unwrap();
 }
 
-/// What the strategy did to the connecting runners in [`probe_strategy`].
-#[derive(Debug, Default)]
-struct StrategyProbe {
-    /// Runners each `SplitAllTask` targeted, per round.
-    rounds: Vec<Vec<crate::task::RunnerId>>,
-    /// Splits skipped because the target's control channel was full.
-    rejected: usize,
-    /// The most limits queued for one connecting runner.
-    max_queued: usize,
-}
-
 /// Drive the real strategy with one running runner while every runner it
-/// spawns stays connecting.
-async fn probe_strategy(max_concurrency: usize, ticks: usize) -> StrategyProbe {
+/// spawns stays connecting; returns the runners each `SplitAllTask` targeted,
+/// per round.
+///
+/// Every target must be split, and every connecting runner must be left with
+/// its latest limit: the length of its chunk.
+async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::task::RunnerId>> {
     use async_ringbuf::{AsyncHeapRb, traits::Split};
 
     use super::super::{runner_manager::pending::RunnerBuilderOutput, strategy::StrategyAction};
@@ -870,15 +860,15 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> StrategyProbe {
     const TOTAL: u64 = 1 << 34;
     let (mut download, file_writer) = parked_loop(TOTAL, max_concurrency).await;
     let (tx, rx) = oneshot::channel();
-    let mut control = None;
+    let mut limits = None;
     download
         .manager
-        .allocate_pending_runner_with_chunk(0..TOTAL, |_, control_rx| {
-            control = Some(control_rx);
+        .allocate_pending_runner_with_chunk(0..TOTAL, |_, runner_limits| {
+            limits = Some(runner_limits);
             rx
         })
         .unwrap();
-    let control = control.unwrap();
+    let mut limits = limits.unwrap();
     let (_data_tx, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
     let (_lifecycle_tx, lifecycle_rx) =
         AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY).split();
@@ -896,7 +886,7 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> StrategyProbe {
     // A steady 2 MiB/s keeps the dynamic strategy in its quick start stage.
     download.throughput.speed = 2.0 * 1024.0 * 1024.0;
     download.throughput.per_runner_speed = download.throughput.speed;
-    let mut probe = StrategyProbe::default();
+    let mut rounds = Vec::new();
     for _ in 0..ticks {
         // `on_strategy_tick`, observing each split.
         let Some((_, actions)) = download.strategy.execute(
@@ -916,63 +906,45 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> StrategyProbe {
             download.apply(action);
             for (runner_id, incomplete) in &targets {
                 let state = download.manager.get_runner_state(*runner_id).unwrap();
-                if state.allocated.end == incomplete.end {
-                    assert_eq!(
-                        download.manager.queued_controls(*runner_id),
-                        DEFAULT_CONTROL_CHANNEL_CAPACITY,
-                        "runner {runner_id} was not split for another reason"
-                    );
-                    probe.rejected += 1;
-                }
+                assert!(
+                    state.allocated.end < incomplete.end,
+                    "runner {runner_id} was not split"
+                );
             }
-            probe
-                .rounds
-                .push(targets.into_iter().map(|(id, _)| id).collect());
+            rounds.push(targets.into_iter().map(|(id, _)| id).collect());
         }
-        // The running runner drains its control channel.
-        while control.try_recv().is_ok() {}
-        let queued = (0..max_concurrency).map(|id| download.manager.queued_controls(id));
-        probe.max_queued = probe.max_queued.max(queued.max().unwrap());
+        // The running runner reads its limits.
+        limits.try_recv();
+        for runner_id in 1..max_concurrency {
+            if let Some(limit) = download.manager.unread_limit(runner_id) {
+                let allocated = &download
+                    .manager
+                    .get_runner_state(runner_id)
+                    .unwrap()
+                    .allocated;
+                assert_eq!(limit, allocated.end - allocated.start, "runner {runner_id}");
+            }
+        }
     }
     drop(download);
     file_writer.finalize().await.unwrap();
-    probe
+    rounds
 }
 
 /// Each quick start round splits every runner, connecting ones included, and
-/// doubles the concurrency. The runner spawned by the first round stays
-/// connecting through the later rounds and is sent one limit per round: eight
-/// at a max concurrency of 1024, which just fits its control channel.
+/// doubles the concurrency, so the runner spawned by the first round is sent
+/// one limit per later round while it connects.
 #[tokio::test]
-async fn test_strategy_split_rounds_fit_connecting_control_channel() {
-    for (max_concurrency, rounds) in [(4, 1), (16, 3), (64, 5), (256, 7), (1024, 9)] {
-        let probe = probe_strategy(max_concurrency, 64).await;
-        assert_eq!(
-            probe.rounds.len(),
-            rounds,
-            "max_concurrency {max_concurrency}"
-        );
-        for (round, targets) in probe.rounds.iter().enumerate() {
+async fn test_strategy_split_rounds_leave_connecting_runners_their_latest_limit() {
+    for (max_concurrency, expected) in [(4, 1), (16, 3), (64, 5), (1024, 9), (1025, 10)] {
+        let rounds = probe_strategy(max_concurrency, 64).await;
+        assert_eq!(rounds.len(), expected, "max_concurrency {max_concurrency}");
+        for (round, targets) in rounds.iter().enumerate() {
             assert_eq!(
                 targets.len(),
                 1 << round,
                 "max_concurrency {max_concurrency}"
             );
         }
-        assert_eq!(probe.rejected, 0, "max_concurrency {max_concurrency}");
-        assert_eq!(
-            probe.max_queued,
-            rounds - 1,
-            "max_concurrency {max_concurrency}"
-        );
     }
-}
-
-/// One more round than the control channel of the first spawned runner holds.
-#[tokio::test]
-async fn test_strategy_split_rounds_beyond_control_channel() {
-    let probe = probe_strategy(1025, 64).await;
-    assert_eq!(probe.rounds.len(), 10);
-    assert_eq!(probe.rejected, 1);
-    assert_eq!(probe.max_queued, DEFAULT_CONTROL_CHANNEL_CAPACITY);
 }

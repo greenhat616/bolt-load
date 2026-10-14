@@ -33,12 +33,6 @@ pub struct RunnerTaggedStreamItem<T> {
     pub item: T,
 }
 
-impl<T> RunnerTaggedStreamItem<T> {
-    pub fn new(runner_id: RunnerId, item: T) -> Self {
-        Self { runner_id, item }
-    }
-}
-
 pub enum RunnerStreamEvent<T> {
     Item(RunnerTaggedStreamItem<T>),
     Closed(RunnerId),

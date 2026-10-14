@@ -8,7 +8,7 @@ use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use tokio::time::{sleep, timeout};
 
-use super::{run_loop::drain::DataDrainOutcome, *};
+use super::{limit_mailbox, run_loop::drain::DataDrainOutcome, *};
 use crate::{
     adapter::{AdapterError, UnretryableError},
     task::ControlEvent,
@@ -136,6 +136,53 @@ async fn test_last_item_outlives_the_final_push() {
             TaskError::Cancelled
         )))
     ));
+}
+
+#[tokio::test]
+async fn test_runner_applies_only_the_latest_limit() {
+    let total = 10 * BUFFER_SIZE as u64;
+    let (limit_tx, limits) = limit_mailbox();
+    // A queue of limits would overflow; only the last one counts.
+    for frames in (3..10).rev() {
+        assert!(limit_tx.send(frames * BUFFER_SIZE as u64));
+    }
+    let stream = futures::stream::iter((0..10).map(|_| Ok(Bytes::from(vec![1; BUFFER_SIZE]))));
+    let (mut runner, mut lifecycle_rx, mut data_rx) = TaskRunner::builder()
+        .total(total)
+        .stream(Box::pin(stream))
+        .runner_id(1)
+        .limit_receiver(limits)
+        .cancel_token(CancellationToken::new())
+        .build()
+        .unwrap();
+    let handle = tokio::spawn(async move { runner.run().await });
+    let (received, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+    handle.await.unwrap();
+    drop(limit_tx);
+    assert!(matches!(reason, StoppedReason::Finished), "got {reason:?}");
+    assert_eq!(received, 3 * BUFFER_SIZE);
+}
+
+#[tokio::test]
+async fn test_runner_fails_once_its_limits_close() {
+    let (limit_tx, limits) = limit_mailbox();
+    drop(limit_tx);
+    let (mut runner, mut lifecycle_rx, mut data_rx) = TaskRunner::builder()
+        .total(10)
+        .stream(Box::pin(futures::stream::pending()))
+        .runner_id(1)
+        .limit_receiver(limits)
+        .cancel_token(CancellationToken::new())
+        .build()
+        .unwrap();
+    let handle = tokio::spawn(async move { runner.run().await });
+    let (received, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+    handle.await.unwrap();
+    assert!(
+        matches!(reason, StoppedReason::Failed(TaskError::ChannelClosed)),
+        "got {reason:?}"
+    );
+    assert_eq!(received, 0);
 }
 
 #[tokio::test]

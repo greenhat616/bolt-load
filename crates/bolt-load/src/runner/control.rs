@@ -1,16 +1,43 @@
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bolt_load_utils::telemetry::*;
 use futures::Stream;
 
+pub(crate) use self::mailbox::{LimitReceiver, LimitSender, limit_mailbox};
 use super::{TaskError, TaskRunError, TaskRunner};
 use crate::task::ControlEvent;
+
+mod mailbox;
 
 /// Type alias for the control signal sender (point-to-point channel)
 pub type ControlSignalSender = async_channel::Sender<ControlEvent>;
 /// Type alias for the control signal receiver
 /// Using async_channel for point-to-point communication instead of broadcast
 pub type ControlSignalReceiver = async_channel::Receiver<ControlEvent>;
+
+/// Where a runner's control signals come from.
+pub(super) enum ControlSource {
+    /// Every signal, in order, each validated; see
+    /// [`TaskRunnerBuilder::control_signal`](super::TaskRunnerBuilder::control_signal).
+    Channel(Pin<Box<ControlSignalReceiver>>),
+    /// Only the latest limit the runner manager sent.
+    Latest(LimitReceiver),
+}
+
+impl ControlSource {
+    #[inline]
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<ControlEvent>> {
+        match self {
+            Self::Channel(signals) => signals.as_mut().poll_next(cx),
+            Self::Latest(limits) => limits
+                .poll_recv(cx)
+                .map(|limit| limit.map(ControlEvent::LimitTotal)),
+        }
+    }
+}
 
 impl TaskRunner {
     /// The next control signal; `ChannelClosed` once the manager released the runner.
@@ -19,8 +46,7 @@ impl TaskRunner {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<ControlEvent, TaskRunError>> {
-        self.control_signal
-            .as_mut()
+        self.control
             .poll_next(cx)
             .map(|signal| signal.ok_or(TaskRunError::Failed(TaskError::ChannelClosed)))
     }

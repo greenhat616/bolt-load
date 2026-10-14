@@ -5,10 +5,10 @@ use bolt_load_utils::telemetry::*;
 use futures::{FutureExt, task::SpawnExt};
 use smol_cancellation_token::CancellationToken;
 
-use super::{ControlReceiver, runner_manager};
+use super::runner_manager;
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter},
-    runner::{StreamConnector, TaskRunner},
+    runner::{LimitReceiver, StreamConnector, TaskRunner},
     runtime::ThreadedRuntimeImpl,
     task::RunnerId,
 };
@@ -51,7 +51,7 @@ impl RunnerSpawner {
         &self,
         range: Range<u64>,
         runner_id: RunnerId,
-        control_rx: ControlReceiver,
+        limits: LimitReceiver,
     ) -> runner_manager::PendingRunnerReceiver {
         use runner_manager::pending::{PendingRunnerError, RunnerBuilderOutput};
 
@@ -95,7 +95,7 @@ impl RunnerSpawner {
                 .total(end - start)
                 .stream(stream)
                 .runner_id(runner_id)
-                .control_signal(control_rx)
+                .limit_receiver(limits)
                 .cancel_token(cancel_token)
                 .idle_timeout(idle_timeout)
                 .build();
@@ -155,15 +155,11 @@ mod tests {
     use runner_manager::pending::PendingRunnerError;
     use smol_cancellation_token::CancellationToken;
 
-    use super::{
-        super::{DEFAULT_CONTROL_CHANNEL_CAPACITY, test_support::FailOnSpawnRuntime},
-        *,
-    };
+    use super::{super::test_support::FailOnSpawnRuntime, *};
     use crate::{
         adapter::{BoltLoadAdapter, DynBoltLoadAdapter},
         runner::{LifecycleEvent, StoppedReason},
         runtime::ThreadedRuntimeImpl,
-        task::ControlEvent,
     };
 
     #[tokio::test(flavor = "multi_thread")]
@@ -174,7 +170,7 @@ mod tests {
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let range = 1000u64..3000u64;
         let runner_id = 1;
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
         let receiver = RunnerSpawner::new(
@@ -184,7 +180,7 @@ mod tests {
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range.clone(), runner_id, control_rx);
+        .spawn(range.clone(), runner_id, limits);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -255,7 +251,7 @@ mod tests {
         let adapter = DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024).with_failure(true));
         let range = 0u64..500u64;
         let runner_id = 2;
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -266,7 +262,7 @@ mod tests {
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range, runner_id, control_rx);
+        .spawn(range, runner_id, limits);
         let result = receiver.await.expect("receiver closed");
         wg.wait().await;
 
@@ -287,7 +283,7 @@ mod tests {
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024).with_range_support(true));
         let range = 0u64..500u64;
         let runner_id = 8;
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
         let wg = WaitGroup::new();
 
@@ -298,7 +294,7 @@ mod tests {
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range, runner_id, control_rx);
+        .spawn(range, runner_id, limits);
         let result = receiver.await.expect("receiver closed");
 
         match result {
@@ -316,7 +312,7 @@ mod tests {
         let rt = ThreadedRuntimeImpl::new_other_rt(runtime);
         let adapter =
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024).with_range_support(true));
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let wg = WaitGroup::new();
 
         let receiver = RunnerSpawner::new(
@@ -326,7 +322,7 @@ mod tests {
             CancellationToken::new(),
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(0..500, 9, control_rx);
+        .spawn(0..500, 9, limits);
         let output = tokio::time::timeout(Duration::from_secs(1), receiver)
             .await
             .expect("timed out waiting for runner channels")
@@ -358,7 +354,7 @@ mod tests {
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let range = 0u64..5000u64;
         let runner_id = 3;
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -369,7 +365,7 @@ mod tests {
             cancel_token.clone(),
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range, runner_id, control_rx);
+        .spawn(range, runner_id, limits);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -405,15 +401,12 @@ mod tests {
         let old_total = 10240u64;
         let range = 0u64..old_total;
         let runner_id = 4;
-        let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
 
         // Send control message before creating the runner
         let new_total = 1000u64;
-        control_tx
-            .send(ControlEvent::LimitTotal(new_total))
-            .await
-            .unwrap();
+        assert!(limit_tx.send(new_total));
 
         let wg = WaitGroup::new();
         let receiver = RunnerSpawner::new(
@@ -423,7 +416,7 @@ mod tests {
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range.clone(), runner_id, control_rx);
+        .spawn(range.clone(), runner_id, limits);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -477,7 +470,7 @@ mod tests {
         // Test boundary range: start from end of file
         let range = 900u64..1000u64;
         let runner_id = 5;
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -488,7 +481,7 @@ mod tests {
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range.clone(), runner_id, control_rx);
+        .spawn(range.clone(), runner_id, limits);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -552,7 +545,7 @@ mod tests {
         // Test zero-length range
         let range = 500u64..500u64;
         let runner_id = 6;
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -563,7 +556,7 @@ mod tests {
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range, runner_id, control_rx);
+        .spawn(range, runner_id, limits);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -607,7 +600,7 @@ mod tests {
         for (runner_id, range) in ranges {
             let rt_clone = rt.clone();
             let adapter_clone = adapter.clone();
-            let (control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+            let (limit_tx, limits) = crate::runner::limit_mailbox();
             let cancel_token = CancellationToken::new();
 
             let handle = tokio::spawn(async move {
@@ -619,14 +612,14 @@ mod tests {
                     cancel_token,
                     crate::runner::DEFAULT_IDLE_TIMEOUT,
                 )
-                .spawn(range.clone(), runner_id, control_rx);
+                .spawn(range.clone(), runner_id, limits);
                 let result = receiver.await.expect("receiver closed");
                 let output = result.expect("connection failed");
                 let data_rx = output.data_rx;
                 let lifecycle_rx = output.lifecycle_rx;
 
-                // Keep the control channel sender alive
-                let _control_tx = control_tx;
+                // Keep the limit sender alive
+                let _limit_tx = limit_tx;
 
                 // Wait for start
                 let mut lifecycle_rx = pin!(lifecycle_rx);
@@ -708,7 +701,7 @@ mod tests {
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(5000).with_range_support(true));
         let range = 1500u64..3500u64;
         let runner_id = 7;
-        let (_control_tx, control_rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
         let cancel_token = CancellationToken::new();
 
         let wg = WaitGroup::new();
@@ -719,7 +712,7 @@ mod tests {
             cancel_token,
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
-        .spawn(range.clone(), runner_id, control_rx);
+        .spawn(range.clone(), runner_id, limits);
         let result = receiver.await.expect("receiver closed");
         assert!(result.is_ok());
         let output = result.unwrap();

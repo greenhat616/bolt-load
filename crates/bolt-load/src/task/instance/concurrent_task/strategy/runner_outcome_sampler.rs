@@ -29,25 +29,12 @@ pub enum RunnerOutcome {
 
 impl RunnerOutcome {
     #[inline]
-    pub const fn is_success(&self) -> bool {
-        matches!(self, Self::Completed)
-    }
-
-    #[inline]
     pub const fn is_unretryable(&self) -> bool {
         matches!(
             self,
             Self::ConnectFailed(FailureKind::Unretryable)
                 | Self::StreamClosed(FailureKind::Unretryable)
         )
-    }
-
-    #[inline]
-    pub const fn failure_kind(&self) -> Option<FailureKind> {
-        match self {
-            Self::Completed => None,
-            Self::ConnectFailed(k) | Self::StreamClosed(k) => Some(*k),
-        }
     }
 }
 
@@ -87,20 +74,6 @@ impl OutcomeStats {
             return 0.0;
         }
         self.total_failures() as f64 / self.total as f64
-    }
-
-    /// The number of unretryable failures
-    #[inline]
-    pub fn unretryable_failures(&self) -> usize {
-        self.connect_failed_unretryable + self.stream_closed_unretryable
-    }
-
-    /// The connection failure rate (may indicate high concurrency)
-    pub fn connect_failure_rate(&self) -> f64 {
-        if self.total == 0 {
-            return 0.0;
-        }
-        (self.connect_failed_retryable + self.connect_failed_unretryable) as f64 / self.total as f64
     }
 }
 
@@ -234,20 +207,5 @@ impl RunnerOutcomeSampler {
             return true;
         }
         false
-    }
-
-    /// Reset the sampler
-    pub fn reset(&mut self) {
-        self.records.clear();
-        self.last_unretryable_at = None;
-    }
-
-    /// The number of records within the current window
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
     }
 }
