@@ -669,3 +669,130 @@ fn test_cancel_after_registration_wakes_loop() {
         harness.teardown().await;
     });
 }
+
+// ── Connecting runners: control messages queued before the runner starts ─
+
+/// A loop whose runner connects never complete, so every spawned runner
+/// stays connecting and nobody drains its control channel.
+async fn connecting_loop(total: u64, max_concurrency: usize) -> (DownloadLoop, FileWriter) {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let file_writer = FileWriter::new_with_kind(Path::new(""), total, FileRangeWriterKind::Null)
+        .await
+        .unwrap();
+    let spawner = RunnerSpawner::new(
+        ThreadedRuntimeImpl::new_other_rt(rt),
+        // Never connected, so its content is never read.
+        DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
+        WaitGroup::new(),
+        CancellationToken::new(),
+        crate::runner::DEFAULT_IDLE_TIMEOUT,
+    );
+    let (event_tx, _events) = async_channel::unbounded();
+    let mut download = DownloadLoop::new(
+        total,
+        spawner,
+        &file_writer,
+        event_tx,
+        &TaskOptions::default(),
+    );
+    download.max_concurrency = max_concurrency;
+    download.manager = RunnerManager::new(total, max_concurrency);
+    download.strategy = StrategyControl::new(max_concurrency);
+    (download, file_writer)
+}
+
+#[tokio::test]
+#[ignore = "fixed in Phase C: a connecting runner does not drain its control channel"]
+async fn test_split_connecting_runner_repeatedly() {
+    const TOTAL: u64 = 1 << 20;
+    let (mut download, file_writer) = connecting_loop(TOTAL, 64).await;
+    download.spawn_runner(0..TOTAL);
+    // One more split than the control channel holds; each one queues a
+    // `LimitTotal` for the connecting runner 0.
+    for _ in 0..9 {
+        let incomplete = download
+            .manager
+            .get_runner_state(0)
+            .unwrap()
+            .incomplete_range();
+        download.split(0, incomplete);
+    }
+    assert_eq!(
+        download.manager.get_runner_state(0).unwrap().allocated,
+        0..TOTAL >> 9
+    );
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// Drive the real strategy with one running runner while every runner it
+/// spawns stays connecting; report whether some control channel overflowed.
+async fn strategy_overflows_connecting_runner(max_concurrency: usize, ticks: usize) -> bool {
+    use async_ringbuf::{AsyncHeapRb, traits::Split};
+
+    use super::super::runner_manager::pending::RunnerBuilderOutput;
+    use crate::runner::{
+        DATA_FRAME_CHANNEL_CAPACITY, DataFrame, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent,
+    };
+
+    const TOTAL: u64 = 1 << 34;
+    let (mut download, file_writer) = connecting_loop(TOTAL, max_concurrency).await;
+    let (tx, rx) = oneshot::channel();
+    let mut control = None;
+    download
+        .manager
+        .allocate_pending_runner_with_chunk(0..TOTAL, |_, control_rx| {
+            control = Some(control_rx);
+            rx
+        })
+        .unwrap();
+    let control = control.unwrap();
+    let (_data_tx, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
+    let (_lifecycle_tx, lifecycle_rx) =
+        AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY).split();
+    tx.send(Ok(RunnerBuilderOutput {
+        data_rx,
+        lifecycle_rx,
+    }))
+    .unwrap();
+    download.manager.tick().await;
+    assert_eq!(
+        download.manager.get_runner_state(0).unwrap().status,
+        super::super::chunk_planner::ChunkStatus::Running
+    );
+
+    // A steady 2 MiB/s keeps the dynamic strategy in its quick start stage.
+    download.throughput.speed = 2.0 * 1024.0 * 1024.0;
+    download.throughput.per_runner_speed = download.throughput.speed;
+    let overflowed = std::panic::AssertUnwindSafe(|| {
+        for _ in 0..ticks {
+            download.on_strategy_tick();
+            // The running runner drains its control channel.
+            while control.try_recv().is_ok() {}
+        }
+    });
+    let overflowed = std::panic::catch_unwind(overflowed).is_err();
+    drop(download);
+    file_writer.finalize().await.unwrap();
+    overflowed
+}
+
+/// Each quick start round splits every runner, connecting ones included, and
+/// doubles the concurrency. The runner spawned by the first round stays
+/// connecting through the later rounds and is sent one limit per round: eight
+/// at a concurrency of 1024, which just fits its control channel.
+#[tokio::test]
+async fn test_strategy_split_rounds_fit_connecting_control_channel() {
+    for max_concurrency in [4, 16, 64, 256, 1024] {
+        assert!(
+            !strategy_overflows_connecting_runner(max_concurrency, 64).await,
+            "max_concurrency {max_concurrency}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "fixed in Phase C: a connecting runner does not drain its control channel"]
+async fn test_strategy_split_rounds_beyond_control_channel() {
+    assert!(!strategy_overflows_connecting_runner(1025, 64).await);
+}
