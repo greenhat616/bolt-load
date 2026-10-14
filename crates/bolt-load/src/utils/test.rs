@@ -34,8 +34,8 @@ pub async fn init_tracing() {
     let subscriber = tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer);
-    let tokio_console_layer = console_subscriber::spawn();
-    let subscriber = subscriber.with(tokio_console_layer);
+    #[cfg(tokio_unstable)]
+    let subscriber = subscriber.with(console_subscriber::spawn());
 
     subscriber.init();
 }
