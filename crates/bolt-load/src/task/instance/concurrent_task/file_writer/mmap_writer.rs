@@ -10,13 +10,14 @@ use memmap2::MmapMut;
 use snafu::prelude::*;
 
 use super::{
-    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu, finalize_and_join,
+    Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
+    FileWriterCapability, FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    WriteReply, finalize_and_join,
 };
 
 pub struct MmapWriter {
     pub file: File,
-    tx: Sender<Command>,
+    pub(super) tx: Sender<Command>,
     worker_wg: WaitGroup,
 }
 
@@ -36,7 +37,7 @@ impl FileRangeWriter for MmapWriter {
         let (tx, rx) = oneshot::channel();
         let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(chunk.clone(), tx))
+            .send(Command::Write(chunk.clone(), WriteReply::Awaited(tx)))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
@@ -63,11 +64,6 @@ impl FileRangeWriter for MmapWriter {
     }
 }
 
-enum Command {
-    Write(Chunk, oneshot::Sender<Result<(), std::io::Error>>),
-    Finalize(oneshot::Sender<Result<(), std::io::Error>>),
-}
-
 #[derive(Default)]
 pub struct MmapWriterBuilder {
     pub file: Option<File>,
@@ -79,11 +75,38 @@ impl FileWriterCapability for MmapWriterBuilder {
     }
 }
 
+fn execute_write(mmap: &mut MmapMut, Chunk { range, data }: Chunk) -> std::io::Result<()> {
+    mmap[range.start as usize..range.end as usize].copy_from_slice(&data);
+    #[cfg(unix)]
+    {
+        use memmap2::UncheckedAdvice;
+        unsafe {
+            if let Err(e) = mmap.unchecked_advise_range(
+                UncheckedAdvice::DontNeed,
+                range.start as usize,
+                (range.end - range.start) as usize,
+            ) {
+                error!("failed to advise range: {e:?}");
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        evict_working_set_range(
+            mmap,
+            range.start as usize,
+            (range.end - range.start) as usize,
+        );
+    }
+    Ok(())
+}
+
 fn mmap_writer_task(
     ready_tx: oneshot::Sender<Result<(), std::io::Error>>,
     file: &File,
     command_rx: &Receiver<Command>,
 ) {
+    let _close_on_exit = CloseOnExit(command_rx);
     let mut mmap = unsafe {
         match MmapMut::map_mut(file) {
             Ok(mmap) => mmap,
@@ -97,30 +120,8 @@ fn mmap_writer_task(
     let _ = ready_tx.send(Ok(()));
     while let Ok(command) = command_rx.recv_blocking() {
         match command {
-            Command::Write(Chunk { range, data }, tx) => {
-                mmap[range.start as usize..range.end as usize].copy_from_slice(&data);
-                #[cfg(unix)]
-                {
-                    use memmap2::UncheckedAdvice;
-                    unsafe {
-                        if let Err(e) = mmap.unchecked_advise_range(
-                            UncheckedAdvice::DontNeed,
-                            range.start as usize,
-                            (range.end - range.start) as usize,
-                        ) {
-                            error!("failed to advise range: {e:?}");
-                        }
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    evict_working_set_range(
-                        &mut mmap,
-                        range.start as usize,
-                        (range.end - range.start) as usize,
-                    );
-                }
-                let _ = tx.send(Ok(()));
+            Command::Write(chunk, reply) => {
+                reply.complete(execute_write(&mut mmap, chunk), file.path());
             }
             Command::Finalize(tx) => {
                 let _ = match mmap.flush() {
