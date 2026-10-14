@@ -20,13 +20,14 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{
     super::{
+        DEFAULT_CONTROL_CHANNEL_CAPACITY,
         file_writer::{FileRangeWriter, FileRangeWriterKind, FileWriter},
         test_support::FailOnSpawnRuntime,
     },
     *,
 };
 use crate::{
-    adapter::DynBoltLoadAdapter,
+    adapter::{AdapterError, DynBoltLoadAdapter},
     runtime::{
         DowncastLocalRuntime, DynTimer, ThreadedRuntime, ThreadedRuntimeImpl, Timer, TimerBuilder,
         TimerImpl,
@@ -672,17 +673,20 @@ fn test_cancel_after_registration_wakes_loop() {
 
 // ── Connecting runners: control messages queued before the runner starts ─
 
-/// A loop whose runner connects never complete, so every spawned runner
-/// stays connecting and nobody drains its control channel.
-async fn connecting_loop(total: u64, max_concurrency: usize) -> (DownloadLoop, FileWriter) {
-    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+/// A loop on `rt` whose runners connect through `adapter`, with the given
+/// concurrency.
+async fn connecting_loop(
+    rt: ThreadedRuntimeImpl,
+    adapter: Arc<crate::adapter::AnyAdapter>,
+    total: u64,
+    max_concurrency: usize,
+) -> (DownloadLoop, FileWriter) {
     let file_writer = FileWriter::new_with_kind(Path::new(""), total, FileRangeWriterKind::Null)
         .await
         .unwrap();
     let spawner = RunnerSpawner::new(
-        ThreadedRuntimeImpl::new_other_rt(rt),
-        // Never connected, so its content is never read.
-        DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
+        rt,
+        adapter,
         WaitGroup::new(),
         CancellationToken::new(),
         crate::runner::DEFAULT_IDLE_TIMEOUT,
@@ -701,14 +705,52 @@ async fn connecting_loop(total: u64, max_concurrency: usize) -> (DownloadLoop, F
     (download, file_writer)
 }
 
-#[tokio::test]
-async fn test_split_connecting_runner_beyond_its_control_channel() {
-    const TOTAL: u64 = 1 << 20;
-    let (mut download, file_writer) = connecting_loop(TOTAL, 64).await;
-    download.spawn_runner(0..TOTAL);
-    // Each split queues a `LimitTotal` for the connecting runner 0; the ninth
-    // finds its control channel full and is skipped.
-    for _ in 0..9 {
+/// A loop whose spawned runners are parked before their first poll, so they
+/// never start connecting.
+async fn parked_loop(total: u64, max_concurrency: usize) -> (DownloadLoop, FileWriter) {
+    connecting_loop(
+        ThreadedRuntimeImpl::new_other_rt(ScriptedRuntime::new(TimerKind::Scripted)),
+        // Never connected, so its content is never read.
+        DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
+        total,
+        max_concurrency,
+    )
+    .await
+}
+
+/// Reports the start of every range connect, then never completes it.
+struct HandshakeAdapter {
+    connecting: async_channel::Sender<u64>,
+}
+
+impl crate::adapter::BoltLoadAdapter for HandshakeAdapter {
+    async fn is_range_stream_available(&self) -> bool {
+        true
+    }
+
+    async fn retrieve_meta(&self) -> Result<crate::adapter::BoltLoadAdapterMeta, AdapterError> {
+        unreachable!("the loop is given its total")
+    }
+
+    async fn full_stream(&self) -> Result<crate::adapter::AnyBytesStream, AdapterError> {
+        unreachable!("the loop only connects ranges")
+    }
+
+    async fn range_stream(
+        &self,
+        start: u64,
+        _end: u64,
+    ) -> Result<crate::adapter::AnyBytesStream, AdapterError> {
+        self.connecting.try_send(start).unwrap();
+        futures::future::pending().await
+    }
+}
+
+/// Split runner 0 nine times, one more than its control channel holds, and
+/// check that the ninth split is skipped.
+async fn split_connecting_runner_beyond_its_control_channel(download: &mut DownloadLoop) {
+    let total = download.manager.total();
+    for _ in 0..=DEFAULT_CONTROL_CHANNEL_CAPACITY {
         let incomplete = download
             .manager
             .get_runner_state(0)
@@ -717,26 +759,77 @@ async fn test_split_connecting_runner_beyond_its_control_channel() {
         download.split(0, incomplete);
     }
     assert_eq!(
-        download.manager.get_runner_state(0).unwrap().allocated,
-        0..TOTAL >> 8
+        download.manager.queued_controls(0),
+        DEFAULT_CONTROL_CHANNEL_CAPACITY
     );
-    assert_eq!(download.manager.allocated_runner_count(), 9);
+    assert_eq!(
+        download.manager.get_runner_state(0).unwrap().allocated,
+        0..total >> DEFAULT_CONTROL_CHANNEL_CAPACITY
+    );
+    assert_eq!(
+        download.manager.allocated_runner_count(),
+        DEFAULT_CONTROL_CHANNEL_CAPACITY + 1
+    );
+}
+
+#[tokio::test]
+async fn test_split_parked_runner_beyond_its_control_channel() {
+    const TOTAL: u64 = 1 << 20;
+    let (mut download, file_writer) = parked_loop(TOTAL, 64).await;
+    download.spawn_runner(0..TOTAL);
+    split_connecting_runner_beyond_its_control_channel(&mut download).await;
     drop(download);
     file_writer.finalize().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_split_handshaking_runner_beyond_its_control_channel() {
+    const TOTAL: u64 = 1 << 20;
+    let (connecting, connects) = async_channel::unbounded();
+    let (mut download, file_writer) = connecting_loop(
+        ThreadedRuntimeImpl::new_tokio_rt(),
+        DynBoltLoadAdapter::new_arc(HandshakeAdapter { connecting }),
+        TOTAL,
+        64,
+    )
+    .await;
+    download.spawn_runner(0..TOTAL);
+    assert_eq!(with_watchdog(connects.recv()).await.unwrap(), 0);
+    split_connecting_runner_beyond_its_control_channel(&mut download).await;
+
+    let (cancel, wg) = (
+        download.spawner.cancel_token.clone(),
+        download.spawner.wg.clone(),
+    );
+    drop(download);
+    cancel.cancel();
+    with_watchdog(wg.wait()).await;
+    file_writer.finalize().await.unwrap();
+}
+
+/// What the strategy did to the connecting runners in [`probe_strategy`].
+#[derive(Debug, Default)]
+struct StrategyProbe {
+    /// Runners each `SplitAllTask` targeted, per round.
+    rounds: Vec<Vec<crate::task::RunnerId>>,
+    /// Splits skipped because the target's control channel was full.
+    rejected: usize,
+    /// The most limits queued for one connecting runner.
+    max_queued: usize,
+}
+
 /// Drive the real strategy with one running runner while every runner it
-/// spawns stays connecting; report whether some control channel overflowed.
-async fn strategy_overflows_connecting_runner(max_concurrency: usize, ticks: usize) -> bool {
+/// spawns stays connecting.
+async fn probe_strategy(max_concurrency: usize, ticks: usize) -> StrategyProbe {
     use async_ringbuf::{AsyncHeapRb, traits::Split};
 
-    use super::super::runner_manager::pending::RunnerBuilderOutput;
+    use super::super::{runner_manager::pending::RunnerBuilderOutput, strategy::StrategyAction};
     use crate::runner::{
         DATA_FRAME_CHANNEL_CAPACITY, DataFrame, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent,
     };
 
     const TOTAL: u64 = 1 << 34;
-    let (mut download, file_writer) = connecting_loop(TOTAL, max_concurrency).await;
+    let (mut download, file_writer) = parked_loop(TOTAL, max_concurrency).await;
     let (tx, rx) = oneshot::channel();
     let mut control = None;
     download
@@ -764,34 +857,83 @@ async fn strategy_overflows_connecting_runner(max_concurrency: usize, ticks: usi
     // A steady 2 MiB/s keeps the dynamic strategy in its quick start stage.
     download.throughput.speed = 2.0 * 1024.0 * 1024.0;
     download.throughput.per_runner_speed = download.throughput.speed;
-    let overflowed = std::panic::AssertUnwindSafe(|| {
-        for _ in 0..ticks {
-            download.on_strategy_tick();
-            // The running runner drains its control channel.
-            while control.try_recv().is_ok() {}
+    let mut probe = StrategyProbe::default();
+    for _ in 0..ticks {
+        // `on_strategy_tick`, observing each split.
+        let Some((_, actions)) = download.strategy.execute(
+            download.max_concurrency,
+            download.throughput.speed,
+            download.throughput.per_runner_speed,
+            &mut download.manager,
+        ) else {
+            continue;
+        };
+        for action in actions {
+            let StrategyAction::SplitAllTask(planned) = action else {
+                download.apply(action);
+                continue;
+            };
+            let targets = download.manager.get_incomplete_states(Some(planned));
+            download.apply(action);
+            for (runner_id, incomplete) in &targets {
+                let state = download.manager.get_runner_state(*runner_id).unwrap();
+                if state.allocated.end == incomplete.end {
+                    assert_eq!(
+                        download.manager.queued_controls(*runner_id),
+                        DEFAULT_CONTROL_CHANNEL_CAPACITY,
+                        "runner {runner_id} was not split for another reason"
+                    );
+                    probe.rejected += 1;
+                }
+            }
+            probe
+                .rounds
+                .push(targets.into_iter().map(|(id, _)| id).collect());
         }
-    });
-    let overflowed = std::panic::catch_unwind(overflowed).is_err();
+        // The running runner drains its control channel.
+        while control.try_recv().is_ok() {}
+        let queued = (0..max_concurrency).map(|id| download.manager.queued_controls(id));
+        probe.max_queued = probe.max_queued.max(queued.max().unwrap());
+    }
     drop(download);
     file_writer.finalize().await.unwrap();
-    overflowed
+    probe
 }
 
 /// Each quick start round splits every runner, connecting ones included, and
 /// doubles the concurrency. The runner spawned by the first round stays
 /// connecting through the later rounds and is sent one limit per round: eight
-/// at a concurrency of 1024, which just fits its control channel.
+/// at a max concurrency of 1024, which just fits its control channel.
 #[tokio::test]
 async fn test_strategy_split_rounds_fit_connecting_control_channel() {
-    for max_concurrency in [4, 16, 64, 256, 1024] {
-        assert!(
-            !strategy_overflows_connecting_runner(max_concurrency, 64).await,
+    for (max_concurrency, rounds) in [(4, 1), (16, 3), (64, 5), (256, 7), (1024, 9)] {
+        let probe = probe_strategy(max_concurrency, 64).await;
+        assert_eq!(
+            probe.rounds.len(),
+            rounds,
+            "max_concurrency {max_concurrency}"
+        );
+        for (round, targets) in probe.rounds.iter().enumerate() {
+            assert_eq!(
+                targets.len(),
+                1 << round,
+                "max_concurrency {max_concurrency}"
+            );
+        }
+        assert_eq!(probe.rejected, 0, "max_concurrency {max_concurrency}");
+        assert_eq!(
+            probe.max_queued,
+            rounds - 1,
             "max_concurrency {max_concurrency}"
         );
     }
 }
 
+/// One more round than the control channel of the first spawned runner holds.
 #[tokio::test]
 async fn test_strategy_split_rounds_beyond_control_channel() {
-    assert!(!strategy_overflows_connecting_runner(1025, 64).await);
+    let probe = probe_strategy(1025, 64).await;
+    assert_eq!(probe.rounds.len(), 10);
+    assert_eq!(probe.rejected, 1);
+    assert_eq!(probe.max_queued, DEFAULT_CONTROL_CHANNEL_CAPACITY);
 }

@@ -2223,4 +2223,214 @@ mod tests {
         );
         assert_eq!(received, 3, "buffered bytes are flushed before failing");
     }
+
+    // ── Priority when several sources are ready at once ──
+
+    /// Run `test` on a tokio, a smol (when enabled) and a bare executor.
+    fn on_each_executor<F: Future<Output = ()>>(test: impl Fn() -> F) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(test());
+        #[cfg(feature = "smol")]
+        smol::block_on(test());
+        futures::executor::block_on(test());
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadyControl {
+        Pending,
+        /// A limit that is not a reduction, failing with `ExceededTotalSize`.
+        Rejected,
+        Closed,
+    }
+
+    /// The sources a streaming runner finds ready on its first poll.
+    #[derive(Clone, Copy, Debug)]
+    struct Ready {
+        cancel: bool,
+        control: ReadyControl,
+        idle: bool,
+        /// The stream yields the whole total.
+        stream: bool,
+    }
+
+    /// What a runner whose sources are ready as given selected first: the
+    /// result of its streaming loop, and whether the control and the stream
+    /// were consumed.
+    async fn first_selected(ready: Ready) -> (Result<(), TaskRunError>, bool, bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const TOTAL: u64 = 10;
+        let polled = Arc::new(AtomicBool::new(false));
+        let stream_polled = polled.clone();
+        let mut item = ready
+            .stream
+            .then(|| Ok(Bytes::from_static(&[1; TOTAL as usize])));
+        let stream = Box::pin(futures::stream::poll_fn(move |_| {
+            stream_polled.store(true, Ordering::Relaxed);
+            match item.take() {
+                Some(item) => std::task::Poll::Ready(Some(item)),
+                None => std::task::Poll::Pending,
+            }
+        }));
+        let (control_tx, control_rx) = async_channel::bounded(1);
+        match ready.control {
+            ReadyControl::Pending => {}
+            ReadyControl::Rejected => control_tx
+                .try_send(ControlEvent::LimitTotal(TOTAL))
+                .unwrap(),
+            ReadyControl::Closed => {
+                control_tx.close();
+            }
+        }
+        let token = CancellationToken::new();
+        if ready.cancel {
+            token.cancel();
+        }
+        let idle_timeout = if ready.idle {
+            Duration::ZERO
+        } else {
+            DEFAULT_IDLE_TIMEOUT
+        };
+        let (mut runner, _lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .total(TOTAL)
+            .stream(stream)
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(token)
+            .idle_timeout(idle_timeout)
+            .build()
+            .unwrap();
+        // Not `run`: draining may replace the result with `Cancelled`.
+        let result = runner.run_inner().await;
+        let control_consumed = control_tx.is_empty();
+        (result, control_consumed, polled.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn test_streaming_priority_cancel_control_idle_stream() {
+        use ReadyControl::*;
+        let cases = [
+            (
+                Ready {
+                    cancel: true,
+                    control: Rejected,
+                    idle: true,
+                    stream: true,
+                },
+                "cancelled",
+            ),
+            (
+                Ready {
+                    cancel: false,
+                    control: Rejected,
+                    idle: true,
+                    stream: true,
+                },
+                "exceeded",
+            ),
+            (
+                Ready {
+                    cancel: false,
+                    control: Closed,
+                    idle: true,
+                    stream: true,
+                },
+                "closed",
+            ),
+            (
+                Ready {
+                    cancel: false,
+                    control: Pending,
+                    idle: true,
+                    stream: true,
+                },
+                "timeout",
+            ),
+            (
+                Ready {
+                    cancel: false,
+                    control: Pending,
+                    idle: false,
+                    stream: true,
+                },
+                "finished",
+            ),
+        ];
+        on_each_executor(|| async move {
+            for (ready, expected) in cases {
+                let (result, control_consumed, stream_polled) = first_selected(ready).await;
+                let got = match result {
+                    Err(TaskRunError::Cancelled) => "cancelled",
+                    Err(TaskRunError::Failed(TaskError::ExceededTotalSize)) => "exceeded",
+                    Err(TaskRunError::Failed(TaskError::ChannelClosed)) => "closed",
+                    Err(TaskRunError::Failed(TaskError::Timeout)) => "timeout",
+                    Ok(()) => "finished",
+                    other => panic!("{ready:?}: unexpected {other:?}"),
+                };
+                assert_eq!(got, expected, "{ready:?}");
+                if expected == "cancelled" {
+                    assert!(!control_consumed, "{ready:?}: control consumed");
+                }
+                assert_eq!(stream_polled, expected == "finished", "{ready:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn test_emit_priority_cancel_over_vacancy() {
+        on_each_executor(|| async {
+            let (mut runner, _control_tx, token, mut data_rx) = idle_runner(None);
+            fill_data_channel(&mut runner).await;
+            {
+                let mut emit = pin!(runner.emit(Bytes::from_static(b"y")));
+                assert!(futures::poll!(emit.as_mut()).is_pending());
+                token.cancel();
+                assert!(data_rx.try_pop().is_some());
+                assert!(matches!(emit.await, Err(TaskRunError::Cancelled)));
+            }
+            assert_eq!(runner.downloaded, DATA_FRAME_CHANNEL_CAPACITY as u64);
+        });
+    }
+
+    #[test]
+    fn test_emit_priority_control_over_vacancy() {
+        on_each_executor(|| async {
+            let (mut runner, control_tx, _token, mut data_rx) = idle_runner(Some(100));
+            fill_data_channel(&mut runner).await;
+            let mut emit = pin!(runner.emit(Bytes::from_static(b"y")));
+            assert!(futures::poll!(emit.as_mut()).is_pending());
+            control_tx.try_send(ControlEvent::LimitTotal(100)).unwrap();
+            assert!(data_rx.try_pop().is_some());
+            // The rejected limit is seen before the push completes.
+            assert!(matches!(
+                emit.await,
+                Ok(Some(TaskRunError::Failed(TaskError::ExceededTotalSize)))
+            ));
+        });
+    }
+
+    #[test]
+    fn test_drain_priority() {
+        on_each_executor(|| async {
+            // Cancellation wins over a drained channel.
+            let (mut runner, _control_tx, token, _data_rx) = idle_runner(None);
+            token.cancel();
+            assert_eq!(
+                runner.wait_data_drained().await,
+                DataDrainOutcome::Cancelled
+            );
+
+            // A drained or closed channel wins over an expired timeout.
+            let (mut runner, _control_tx, _token, data_rx) = idle_runner(None);
+            runner.data_drain_timeout = Duration::ZERO;
+            assert_eq!(runner.wait_data_drained().await, DataDrainOutcome::Drained);
+            fill_data_channel(&mut runner).await;
+            assert_eq!(runner.wait_data_drained().await, DataDrainOutcome::TimedOut);
+            drop(data_rx);
+            assert_eq!(runner.wait_data_drained().await, DataDrainOutcome::Drained);
+        });
+    }
 }
