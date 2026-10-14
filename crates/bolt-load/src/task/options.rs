@@ -16,6 +16,8 @@ fn default_max_consecutive_failures() -> usize {
 }
 /// Default for [`TaskOptions::stream_idle_timeout`].
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = crate::runner::DEFAULT_IDLE_TIMEOUT;
+/// Default for [`TaskOptions::connect_timeout`].
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = crate::runner::DEFAULT_CONNECT_TIMEOUT;
 
 /// Default for [`MetaRetry::max_retries`].
 pub const DEFAULT_META_MAX_RETRIES: usize = 3;
@@ -99,8 +101,15 @@ pub struct TaskOptions {
     /// A runner reports a retryable `Timeout` when its upstream yields no
     /// non-empty data for this long. Must be non-zero.
     pub stream_idle_timeout: Duration,
+    /// A range runner reports a retryable `Timeout` when it is not connected
+    /// this long after it started connecting, however much other runners
+    /// progress meanwhile. Must be non-zero.
+    pub connect_timeout: Duration,
     /// Retry policy of the metadata request, see [`MetaRetry`].
     pub meta_retry: MetaRetry,
+    /// Replaces the CPU count as the concurrent task's concurrency limit.
+    #[cfg(test)]
+    pub(crate) max_concurrency: Option<usize>,
 }
 
 impl Default for TaskOptions {
@@ -109,7 +118,10 @@ impl Default for TaskOptions {
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
             max_consecutive_failures: default_max_consecutive_failures(),
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             meta_retry: MetaRetry::default(),
+            #[cfg(test)]
+            max_concurrency: None,
         }
     }
 }
@@ -130,6 +142,11 @@ impl TaskOptions {
         self
     }
 
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
     pub fn meta_retry(mut self, retry: MetaRetry) -> Self {
         self.meta_retry = retry;
         self
@@ -142,6 +159,8 @@ impl TaskOptions {
             "max_consecutive_failures must be at least 1"
         } else if self.stream_idle_timeout.is_zero() {
             "stream_idle_timeout must be greater than zero"
+        } else if self.connect_timeout.is_zero() {
+            "connect_timeout must be greater than zero"
         } else if let Some(message) = self.meta_retry.validate() {
             message
         } else {
@@ -164,6 +183,7 @@ mod tests {
         assert_eq!(options.no_progress_timeout, DEFAULT_NO_PROGRESS_TIMEOUT);
         assert!(options.max_consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_FAILURES);
         assert_eq!(options.stream_idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT);
+        assert_eq!(options.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
         assert_eq!(options.meta_retry, MetaRetry::default());
     }
 
@@ -173,6 +193,7 @@ mod tests {
             TaskOptions::default().no_progress_timeout(Duration::ZERO),
             TaskOptions::default().max_consecutive_failures(0),
             TaskOptions::default().stream_idle_timeout(Duration::ZERO),
+            TaskOptions::default().connect_timeout(Duration::ZERO),
             TaskOptions::default().meta_retry(MetaRetry::default().min_delay(Duration::ZERO)),
             TaskOptions::default().meta_retry(MetaRetry::default().max_delay(Duration::ZERO)),
             TaskOptions::default().meta_retry(

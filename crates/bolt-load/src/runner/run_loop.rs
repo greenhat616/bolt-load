@@ -5,7 +5,7 @@
 //!
 //! | Phase | Priority |
 //! |---|---|
-//! | `Connecting` | cancel > control > connection |
+//! | `Connecting` | cancel > control > connect timeout > connection |
 //! | `PublishingStarted` | lifecycle vacancy |
 //! | `Streaming`, reading | cancel > control > idle timeout > stream |
 //! | `Streaming`, emitting | cancel > control > data vacancy |
@@ -23,6 +23,7 @@ use bytes::Bytes;
 use smol_cancellation_token::WaitForCancellationFutureOwned;
 
 use self::{
+    connect::ConnectingState,
     drain::{DataDrainOutcome, DrainState},
     emit::EmitResult,
     stream::StreamingState,
@@ -45,7 +46,7 @@ type Cancelled = Pin<Box<WaitForCancellationFutureOwned>>;
 enum Phase {
     /// Limits received meanwhile apply once streaming; the range requested
     /// from the server is already fixed.
-    Connecting,
+    Connecting(ConnectingState),
     PublishingStarted,
     Streaming(StreamingState),
     Draining(DrainState),
@@ -68,6 +69,7 @@ enum Continuation {
 pub(super) enum Step {
     #[debug("Connected(..)")]
     Connected(Result<AnyBytesStream, AdapterError>),
+    ConnectTimeout,
     Started(RunResult),
     Cancelled,
     Control(Result<ControlEvent, TaskRunError>),
@@ -106,7 +108,10 @@ impl<'a> RunnerLoop<'a> {
         let cancelled = Box::pin(runner.cancel_token.clone().cancelled_owned());
         let phase = match runner.input {
             RunnerInput::Connected(_) => Phase::PublishingStarted,
-            RunnerInput::Connecting(_) => Phase::Connecting,
+            RunnerInput::Connecting(_) => Phase::Connecting(ConnectingState::new(
+                runner.connect_timeout,
+                runner.built_at,
+            )),
             RunnerInput::Abandoned => Phase::Stopped,
         };
         Self {
@@ -127,12 +132,15 @@ impl<'a> RunnerLoop<'a> {
     /// Poll the sources of the current phase, see the module docs.
     pub(super) fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
         match &self.phase {
-            Phase::Connecting => {
+            Phase::Connecting(_) => {
                 if let Poll::Ready(()) = self.poll_cancel(cx) {
                     return Poll::Ready(Step::Cancelled);
                 }
                 if let Poll::Ready(event) = self.runner.poll_control(cx) {
                     return Poll::Ready(Step::Control(event));
+                }
+                if let Poll::Ready(()) = self.poll_connect_timeout(cx) {
+                    return Poll::Ready(Step::ConnectTimeout);
                 }
                 self.poll_connect(cx).map(Step::Connected)
             }
@@ -171,6 +179,13 @@ impl<'a> RunnerLoop<'a> {
                 warn!("runner: failed to connect: {source}");
                 self.begin_stop(Err(TaskError::StreamError { source }.into()));
             }
+            Step::ConnectTimeout => {
+                warn!(
+                    phase = "connecting",
+                    "runner: not connected within {:?}", self.runner.connect_timeout
+                );
+                self.begin_stop(Err(TaskError::Timeout.into()));
+            }
             Step::Started(Ok(())) => {
                 trace!("runner: started");
                 self.phase = Phase::Streaming(StreamingState::new(self.runner.idle_timeout));
@@ -208,7 +223,7 @@ impl<'a> RunnerLoop<'a> {
     /// Stop with `result`, draining the data channel first when the
     /// delivered bytes count.
     fn begin_stop(&mut self, result: RunResult) {
-        if matches!(self.phase, Phase::Connecting) {
+        if matches!(self.phase, Phase::Connecting(_)) {
             // Release the connection before reporting the stop.
             self.runner.input = RunnerInput::Abandoned;
         }

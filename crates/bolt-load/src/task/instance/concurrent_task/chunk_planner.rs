@@ -402,7 +402,10 @@ impl ChunkPlanner {
         self.accepted_bytes
     }
 
-    /// Get incomplete states from occupied ranges
+    /// Get the incomplete ranges of running runners, which may be split.
+    ///
+    /// A connecting runner is left alone: its request already covers its
+    /// whole range.
     pub fn get_incomplete_states(
         &self,
         min_chunk_size: Option<u64>,
@@ -410,7 +413,7 @@ impl ChunkPlanner {
         self.chunks
             .values()
             .filter(|c| {
-                c.status != ChunkStatus::Finished
+                c.status == ChunkStatus::Running
                     && c.downloaded.end < c.allocated.end
                     && c.remaining() // For split check
                         >= min_chunk_size
@@ -1312,6 +1315,11 @@ mod tests {
         assert!(planner.allocate_chunk(0..large_chunk_size, Some(1)));
         assert!(planner.allocate_chunk(large_chunk_size..2 * large_chunk_size, Some(2)));
         assert!(planner.allocate_chunk(2 * large_chunk_size..3 * large_chunk_size, Some(3)));
+        // Still connecting, so never split.
+        assert!(planner.allocate_chunk(3 * large_chunk_size..10 * 1024 * 1024, Some(4)));
+        for runner_id in 1..=3 {
+            planner.mark_running(runner_id).unwrap();
+        }
 
         // Add some download progress, but retain sufficient remaining space for splitting
         assert!(planner.update_progress(1, 500 * 1024).is_ok()); // 500KB downloaded
@@ -1330,6 +1338,7 @@ mod tests {
         assert!(incomplete_ids.contains(&1));
         assert!(incomplete_ids.contains(&2));
         assert!(!incomplete_ids.contains(&3));
+        assert!(!incomplete_ids.contains(&4));
     }
 
     #[test]
