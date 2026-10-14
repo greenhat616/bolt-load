@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let runtime = ThreadedRuntimeImpl::new_tokio_rt();
 
     let mut task = TaskBuilder::default()
-        .adapter(Box::new(adapter))
+        .adapter(adapter)
         .save_path("large-file.bin".into())
         .threaded_runtime(runtime)
         .build()
@@ -147,7 +147,6 @@ The engine monitors runner failure rates over a sliding window:
 Implement `BoltLoadAdapter` to download from any source (S3, FTP, in-memory, …):
 
 ```rust,ignore
-#[async_trait]
 impl BoltLoadAdapter for MySource {
     async fn is_range_stream_available(&self) -> bool { true }
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> { /* ... */ }
@@ -155,6 +154,10 @@ impl BoltLoadAdapter for MySource {
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> { /* ... */ }
 }
 ```
+
+The futures must be `Send`. Pass the adapter with `TaskBuilder::adapter(source)`,
+or share a type-erased one built by `DynBoltLoadAdapter::new_arc` with
+`TaskBuilder::adapter_arc`.
 
 ## Development
 

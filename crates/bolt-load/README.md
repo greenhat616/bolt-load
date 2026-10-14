@@ -34,7 +34,7 @@ let adapter = client.into_reqwest_adapter((
 let runtime = ThreadedRuntimeImpl::new_tokio_rt();
 
 let mut task = TaskBuilder::default()
-    .adapter(Box::new(adapter))
+    .adapter(adapter)
     .save_path("large-file.bin".into())
     .threaded_runtime(runtime)
     .build()
@@ -133,7 +133,7 @@ Implement the `BoltLoadAdapter` trait to download from any source:
 ```rust,ignore
 use bolt_load_core::adapter::*;
 
-#[async_trait]
+// Plain `async fn`s; the futures must be `Send`.
 impl BoltLoadAdapter for MyAdapter {
     async fn is_range_stream_available(&self) -> bool { /* ... */ }
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> { /* ... */ }

@@ -1,7 +1,6 @@
 use std::{pin::Pin, sync::Arc};
 
 use async_once_cell::OnceCell;
-use async_trait::async_trait;
 use bolt_load_core::adapter::error::unretryable::{
     NotFoundSnafu, ServiceUnavailableSnafu, UnauthorizedSnafu,
 };
@@ -267,7 +266,6 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
     });
 }
 
-#[async_trait]
 impl BoltLoadAdapter for ReqwestAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         let context = self.get_context().await?;

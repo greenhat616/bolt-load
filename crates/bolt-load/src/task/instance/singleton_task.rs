@@ -16,7 +16,7 @@ use super::{
     sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
 };
 use crate::{
-    adapter::AnyAdapter,
+    adapter::{AnyAdapter, BoltLoadAdapter},
     runner::{LifecycleEvent, StoppedReason, TaskError, TaskRunner},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     task::{

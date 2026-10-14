@@ -168,7 +168,6 @@ impl Stream for UreqStream {
     }
 }
 
-#[async_trait::async_trait]
 impl BoltLoadAdapter for UreqAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         let response = self.perform_head().await?;

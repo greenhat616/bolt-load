@@ -9,7 +9,6 @@ single import point for all adapter-related types.
 [`BoltLoadAdapter`] defines the content delivery interface:
 
 ```rust,ignore
-#[async_trait]
 pub trait BoltLoadAdapter: Send + Sync {
     async fn is_range_stream_available(&self) -> bool;
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError>;
@@ -25,8 +24,12 @@ pub trait BoltLoadAdapter: Send + Sync {
 | [`ReqwestAdapter`] | `reqwest` | `bolt-load-adapter` |
 | [`UreqAdapter`] | `ureq2` | `bolt-load-adapter` |
 
-Custom adapters can be implemented by providing a
-`Box<dyn BoltLoadAdapter + Send>` ([`AnyAdapter`]).
+Custom adapters implement [`BoltLoadAdapter`] with plain `async fn`s
+whose futures are `Send`, and are passed to
+[`TaskBuilder::adapter`](crate::task::TaskBuilder::adapter). An already
+type-erased adapter, built with [`DynBoltLoadAdapter::new_arc`], is
+passed to [`TaskBuilder::adapter_arc`](crate::task::TaskBuilder::adapter_arc);
+a `Box<AnyAdapter>` implements the trait itself.
 
 # Error Model
 
@@ -51,4 +54,4 @@ owned by bolt-load and cannot be awaited by [`Task::stop`](crate::task::Task::st
 # Key Type Aliases
 
 - [`AnyBytesStream`] — `BoxStream<'static, Result<Bytes, AdapterError>>`
-- [`AnyAdapter`] — `Box<dyn BoltLoadAdapter + Send>`
+- [`AnyAdapter`] — `DynBoltLoadAdapter<'static>`, shared as `Arc<AnyAdapter>`

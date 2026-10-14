@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use async_stream::stream;
 use bolt_load_utils::telemetry::*;
@@ -9,7 +9,8 @@ use tempfile::TempDir;
 use super::{TaskEvent, TaskInstance, TaskInstanceImpl};
 use crate::{
     adapter::{
-        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, UnretryableError,
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, DynBoltLoadAdapter,
+        UnretryableError,
     },
     runtime::ThreadedRuntimeImpl,
     task::DownloadMode,
@@ -60,7 +61,6 @@ impl MockAdapter {
     }
 }
 
-#[async_trait::async_trait]
 impl BoltLoadAdapter for MockAdapter {
     async fn is_range_stream_available(&self) -> bool {
         self.support_range
@@ -165,8 +165,7 @@ async fn wait_for_completion(
 async fn test_singleton_task_basic_download() {
     let rt = create_test_runtime();
     let content = create_test_content(5000);
-    let adapter =
-        Arc::new(Box::new(MockAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>);
+    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
 
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_singleton.txt");
@@ -203,8 +202,7 @@ async fn test_singleton_task_basic_download() {
 async fn test_concurrent_task_basic_download() {
     let rt = create_test_runtime();
     let content = create_test_content(10000);
-    let adapter =
-        Arc::new(Box::new(MockAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>);
+    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
 
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_concurrent.txt");
@@ -248,7 +246,7 @@ async fn test_concurrent_task_basic_download() {
 async fn test_singleton_task_cancellation() {
     let rt = create_test_runtime();
     let content = create_test_content(100000); // Large file to ensure cancellation timing
-    let adapter = Arc::new(Box::new(MockAdapter::new(content)) as Box<dyn BoltLoadAdapter + Send>);
+    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content));
 
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_cancel.txt");
@@ -276,7 +274,7 @@ async fn test_singleton_task_cancellation() {
 #[n0_tracing_test::traced_test]
 async fn test_concurrent_task_zero_size_failure() {
     let rt = create_test_runtime();
-    let adapter = Arc::new(Box::new(MockAdapter::zero_size()) as Box<dyn BoltLoadAdapter + Send>);
+    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::zero_size());
 
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_zero_size.txt");
@@ -300,9 +298,7 @@ async fn test_concurrent_task_zero_size_failure() {
 #[n0_tracing_test::traced_test]
 async fn test_singleton_task_adapter_failure() {
     let rt = create_test_runtime();
-    let adapter =
-        Arc::new(Box::new(MockAdapter::new(vec![]).with_failure(true))
-            as Box<dyn BoltLoadAdapter + Send>);
+    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(vec![]).with_failure(true));
 
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_fail.txt");
@@ -337,8 +333,7 @@ async fn test_singleton_task_adapter_failure() {
 async fn test_progress_tracking() {
     let rt = create_test_runtime();
     let content = create_test_content(8000);
-    let adapter =
-        Arc::new(Box::new(MockAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>);
+    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
 
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_progress.txt");
@@ -388,8 +383,7 @@ async fn test_concurrent_vs_singleton_comparison() {
     let content = create_test_content(20000);
 
     // Test concurrent task
-    let adapter_concurrent =
-        Arc::new(Box::new(MockAdapter::new(content.clone())) as Box<dyn BoltLoadAdapter + Send>);
+    let adapter_concurrent = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
     let temp_dir_concurrent = TempDir::new().unwrap();
     let file_path_concurrent = temp_dir_concurrent.path().join("concurrent.txt");
 
@@ -407,9 +401,8 @@ async fn test_concurrent_vs_singleton_comparison() {
         .unwrap();
 
     // Test singleton task
-    let adapter_singleton = Arc::new(Box::new(
-        MockAdapter::new(content.clone()).with_range_support(false),
-    ) as Box<dyn BoltLoadAdapter + Send>);
+    let adapter_singleton =
+        DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()).with_range_support(false));
     let temp_dir_singleton = TempDir::new().unwrap();
     let file_path_singleton = temp_dir_singleton.path().join("singleton.txt");
 

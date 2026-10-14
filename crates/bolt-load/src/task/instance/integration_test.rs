@@ -13,7 +13,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use bolt_load_tests::adapter::simple::{
         SimpleTestAdapter, SimpleTestAdapterBuilder, calculate_blake3,
@@ -23,7 +23,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        adapter::BoltLoadAdapter,
+        adapter::DynBoltLoadAdapter,
         runtime::ThreadedRuntimeImpl,
         task::{
             DownloadMode,
@@ -77,7 +77,7 @@ mod tests {
     async fn test_singleton_basic_functionality() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
         let content_hash = simple_adapter.expected_hash().to_string();
-        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
+        let adapter = DynBoltLoadAdapter::new_arc(simple_adapter);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("singleton_test.bin");
@@ -145,7 +145,7 @@ mod tests {
             .build()
             .expect("Failed to build adapter");
         let content_hash = simple_adapter.expected_hash().to_string();
-        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
+        let adapter = DynBoltLoadAdapter::new_arc(simple_adapter);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("concurrent_test.bin");
@@ -203,7 +203,7 @@ mod tests {
     async fn test_task_cancellation() {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE).with_chunk_size(CHUNK_SIZE);
         let _content_hash = simple_adapter.expected_hash().to_string();
-        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
+        let adapter = DynBoltLoadAdapter::new_arc(simple_adapter);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("cancel_test.bin");
@@ -244,7 +244,7 @@ mod tests {
         let simple_adapter = SimpleTestAdapter::new(TEST_FILE_SIZE)
             .with_chunk_size(CHUNK_SIZE)
             .with_failure(true);
-        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
+        let adapter = DynBoltLoadAdapter::new_arc(simple_adapter);
 
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("failure_test.bin");
@@ -279,7 +279,7 @@ mod tests {
             .with_chunk_size(CHUNK_SIZE)
             .with_range_support(true);
         let content_hash = simple_adapter.expected_hash().to_string();
-        let adapter = Arc::new(Box::new(simple_adapter) as Box<dyn BoltLoadAdapter + Send>);
+        let adapter = DynBoltLoadAdapter::new_arc(simple_adapter);
 
         // Test singleton mode
 

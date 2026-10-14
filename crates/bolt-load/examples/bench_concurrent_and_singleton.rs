@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use bolt_load::{
-    adapter::BoltLoadAdapter,
     runtime::ThreadedRuntimeImpl,
     task::{DownloadMode, TaskBuilder},
 };
@@ -188,7 +187,7 @@ async fn test_concurrent_vs_singleton_performance() {
     let concurrent_path = temp_dir.path().join("concurrent.bin");
 
     let mut concurrent_task = TaskBuilder::default()
-        .adapter(Box::new(adapter1) as Box<dyn BoltLoadAdapter + Send>)
+        .adapter(adapter1)
         .save_path(concurrent_path.clone())
         .prefer_mode(DownloadMode::Concurrent)
         .cancel_token(CancellationToken::new())
@@ -202,7 +201,7 @@ async fn test_concurrent_vs_singleton_performance() {
     // let singleton_path = temp_dir.path().join("singleton.bin");
 
     // let mut singleton_task = TaskBuilder::default()
-    //     .adapter(Box::new(adapter2) as Box<dyn BoltLoadAdapter + Send>)
+    //     .adapter(adapter2)
     //     .save_path(singleton_path.clone())
     //     .prefer_mode(DownloadMode::Singleton)
     //     .cancel_token(CancellationToken::new())

@@ -497,7 +497,6 @@ dependencies = [
  "async-lock",
  "async-ringbuf",
  "async-stream",
- "async-trait",
  "async-waitgroup",
  "atomic_enum",
  "backon",
@@ -554,7 +553,6 @@ version = "0.1.0"
 dependencies = [
  "async-lock",
  "async-once-cell",
- "async-trait",
  "blocking",
  "bolt-load-core",
  "bolt-load-tests",
@@ -576,8 +574,8 @@ dependencies = [
 name = "bolt-load-core"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
+ "dynosaur",
  "futures",
  "snafu",
 ]
@@ -589,7 +587,6 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-stream",
- "async-trait",
  "axum",
  "axum-extra 0.12.6",
  "axum-range",

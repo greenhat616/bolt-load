@@ -3,6 +3,7 @@ name = "bolt-load-core"
 description = "Core traits and types for bolt-load: download sources, sinks, and error definitions"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -12,5 +13,5 @@ categories.workspace = true
 [dependencies]
 snafu = { workspace = true }
 futures = { workspace = true }
-async-trait = "0.1"
+dynosaur = "0.3"
 bytes = { workspace = true }

@@ -12,7 +12,10 @@ use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
 use crate::{
-    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError},
+    adapter::{
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, DynBoltLoadAdapter,
+        RetryableError,
+    },
     runner::TaskError,
     runtime::ThreadedRuntimeImpl,
     task::{
@@ -52,7 +55,6 @@ impl SignalAdapter {
     }
 }
 
-#[async_trait::async_trait]
 impl BoltLoadAdapter for SignalAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -79,7 +81,7 @@ fn slow_retry() -> TaskOptions {
 async fn test_builder_rejects_invalid_retry_before_requesting() {
     let (adapter, _, calls) = SignalAdapter::new(false);
     let mut builder = TaskBuilder::default()
-        .adapter(Box::new(adapter))
+        .adapter(adapter)
         .options(TaskOptions::default().meta_retry(MetaRetry::default().min_delay(Duration::ZERO)));
     let result = builder.retrieve_meta().await;
     assert!(
@@ -97,7 +99,7 @@ async fn assert_build_cancelled(hang: bool) {
     let dir = TempDir::new().unwrap();
     let token = CancellationToken::new();
     let build = TaskBuilder::default()
-        .adapter(Box::new(adapter))
+        .adapter(adapter)
         .threaded_runtime(ThreadedRuntimeImpl::new_tokio_rt())
         .cancel_token(token.clone())
         .save_path(dir.path().join("file.bin"))
@@ -138,7 +140,7 @@ async fn assert_instance_cancelled(mode: DownloadMode, hang: bool) {
         slow_retry(),
     );
     task.run(
-        Arc::new(Box::new(adapter)),
+        DynBoltLoadAdapter::new_arc(adapter),
         dir.path().join("file.bin"),
         event_tx,
         token.clone(),
