@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{io, ops::Range};
 
 use async_channel::{Receiver, Sender};
 use async_waitgroup::WaitGroup;
@@ -74,34 +74,55 @@ pub struct PoolWriterBuilder {
 
 impl FileWriterCapability for PoolWriterBuilder {}
 
+/// A file written at explicit offsets.
+trait WriteAt {
+    /// Write a prefix of `buf` at `offset`, returning its length.
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
+}
+
+impl WriteAt for File {
+    #[cfg(unix)]
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        fs::os::unix::fs::FileExt::write_at(self, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        fs::os::windows::fs::FileExt::seek_write(self, buf, offset)
+    }
+}
+
+/// Write the whole of `buf` at `offset`, retrying short and interrupted writes.
+fn write_all_at(file: &impl WriteAt, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.write_at(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(written) => {
+                buf = &buf[written..];
+                offset += written as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn file_writer_task(file: &File, command_rx: &Receiver<Command>) {
     while let Ok(command) = command_rx.recv_blocking() {
         match command {
             Command::Write(chunk, tx) => {
-                #[cfg(windows)]
-                {
-                    use fs::os::windows::fs::FileExt;
-                    let _ = match file.seek_write(&chunk.data, chunk.range.start) {
-                        Ok(_) => tx.send(Ok(())),
-                        Err(e) => tx.send(Err(e)),
-                    };
-                }
-                #[cfg(unix)]
-                {
-                    use fs::os::unix::fs::FileExt;
-                    let _ = match file.write_at(&chunk.data, chunk.range.start) {
-                        Ok(_) => tx.send(Ok(())),
-                        Err(e) => tx.send(Err(e)),
-                    };
-                }
+                let _ = tx.send(write_all_at(file, &chunk.data, chunk.range.start));
             }
             Command::Finalize(tx) => {
                 // The `flush` on unix and windows is a no-op,
                 // and we can just use `sync_all` for synchronizing all data to disk.
-                let _ = match file.sync_all() {
-                    Ok(_) => tx.send(Ok(())),
-                    Err(e) => tx.send(Err(e)),
-                };
+                let _ = tx.send(file.sync_all());
                 break;
             }
         }
@@ -170,6 +191,67 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    /// One `write_at` call of [`ScriptedFile`].
+    enum Step {
+        /// Write at most this many bytes.
+        Short(usize),
+        Interrupted,
+        Zero,
+    }
+
+    /// An in-memory file whose writes follow a script, then complete in full.
+    struct ScriptedFile {
+        content: std::cell::RefCell<Vec<u8>>,
+        script: std::cell::RefCell<std::collections::VecDeque<Step>>,
+    }
+
+    impl ScriptedFile {
+        fn new(len: usize, script: impl IntoIterator<Item = Step>) -> Self {
+            Self {
+                content: vec![0; len].into(),
+                script: std::cell::RefCell::new(script.into_iter().collect()),
+            }
+        }
+    }
+
+    impl WriteAt for ScriptedFile {
+        fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+            let written = match self.script.borrow_mut().pop_front() {
+                None => buf.len(),
+                Some(Step::Short(max)) => buf.len().min(max),
+                Some(Step::Interrupted) => return Err(io::ErrorKind::Interrupted.into()),
+                Some(Step::Zero) => return Ok(0),
+            };
+            let offset = offset as usize;
+            self.content.borrow_mut()[offset..offset + written].copy_from_slice(&buf[..written]);
+            Ok(written)
+        }
+    }
+
+    #[test]
+    fn test_write_all_at_retries_short_and_interrupted_writes() {
+        let file = ScriptedFile::new(
+            12,
+            [
+                Step::Short(3),
+                Step::Interrupted,
+                Step::Short(1),
+                Step::Short(2),
+            ],
+        );
+        write_all_at(&file, b"abcdefghij", 2).unwrap();
+        assert_eq!(&file.content.borrow()[..], b"\0\0abcdefghij");
+        assert!(file.script.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_write_all_at_fails_when_nothing_is_written() {
+        let file = ScriptedFile::new(4, [Step::Short(1), Step::Zero]);
+        let err = write_all_at(&file, b"abcd", 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(&file.content.borrow()[..], b"a\0\0\0");
+    }
 
     #[test]
     fn test_pool_writer_builder_new() {
