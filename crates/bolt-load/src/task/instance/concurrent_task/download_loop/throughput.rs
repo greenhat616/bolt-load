@@ -1,28 +1,46 @@
-use super::{super::runner_manager::MeterSnapshot, DownloadLoop};
-use crate::task::{
-    Progress,
-    instance::{ProgressWithSpeed, TaskEvent, sampler::SpeedSampler},
+use std::task::{Context, Poll};
+
+use super::{super::runner_manager::MeterSnapshot, DownloadLoop, LoopEvent};
+use crate::{
+    runtime::EventTimer,
+    task::{
+        Progress,
+        instance::{ProgressWithSpeed, TaskEvent, sampler::SpeedSampler},
+    },
 };
 
-/// Download and write throughput, sampled on the throughput timer.
-pub(super) struct Throughput {
+/// Download and write throughput, sampled on its timer.
+pub(super) struct ThroughputSampler {
+    timer: EventTimer,
     sampler: SpeedSampler,
     write_sampler: SpeedSampler,
     /// Bytes written since the last sample.
-    pub(super) written_bytes: usize,
+    written_bytes: usize,
     pub(super) speed: f64,
     pub(super) per_runner_speed: f64,
 }
 
-impl Throughput {
-    pub(super) fn new() -> Self {
+impl ThroughputSampler {
+    pub(super) fn new(timer: EventTimer) -> Self {
         Self {
+            timer,
             sampler: SpeedSampler::new(),
             write_sampler: SpeedSampler::new(),
             written_bytes: 0,
             speed: 0.0,
             per_runner_speed: 0.0,
         }
+    }
+
+    #[inline]
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<LoopEvent> {
+        self.timer
+            .poll_tick(cx)
+            .map(|()| LoopEvent::ThroughputTimer)
+    }
+
+    pub(super) fn record_written(&mut self, bytes: usize) {
+        self.written_bytes += bytes;
     }
 
     /// Returns the download and write speed.

@@ -8,7 +8,6 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    future::poll_fn,
     ops::Range,
     task::{Context, Poll},
 };
@@ -547,12 +546,14 @@ impl RunnerManager {
         }
     }
 
+    #[cfg(test)]
     pub async fn tick(&mut self) -> RunnerTick {
-        poll_fn(|cx| self.poll_tick(cx, true)).await
+        std::future::poll_fn(|cx| self.poll_tick(cx, true)).await
     }
 
+    #[cfg(test)]
     pub async fn tick_lifecycle_only(&mut self) -> RunnerTick {
-        poll_fn(|cx| self.poll_tick(cx, false)).await
+        std::future::poll_fn(|cx| self.poll_tick(cx, false)).await
     }
 }
 
