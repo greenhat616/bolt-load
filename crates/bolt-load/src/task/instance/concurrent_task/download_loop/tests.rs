@@ -55,6 +55,7 @@ async fn test_split_after_failed_resize_does_not_allocate_tail() {
         &file_writer,
         event_tx,
         &TaskOptions::default(),
+        CancellationToken::new(),
     );
     let mut reg = download.manager.allocate_runner_with_chunk(0..100).unwrap();
 
@@ -333,12 +334,20 @@ impl LoopHarness {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         );
         let (event_tx, events) = async_channel::unbounded();
-        let download = DownloadLoop::new(LOOP_TOTAL, spawner, &file_writer, event_tx, &options);
+        let cancel = CancellationToken::new();
+        let download = DownloadLoop::new(
+            LOOP_TOTAL,
+            spawner,
+            &file_writer,
+            event_tx,
+            &options,
+            cancel.clone(),
+        );
         Self {
             download,
             file_writer,
             rt,
-            cancel: CancellationToken::new(),
+            cancel,
             events,
         }
     }
@@ -379,7 +388,7 @@ impl LoopHarness {
 
     /// Run the loop until it returns on its own.
     async fn run_to_end(&mut self) -> Result<()> {
-        with_watchdog(self.download.run(&self.cancel)).await
+        with_watchdog(self.download.run()).await
     }
 
     async fn teardown(self) {
@@ -395,9 +404,11 @@ fn progress_events(events: &async_channel::Receiver<TaskEvent>) -> usize {
         .count()
 }
 
-/// Pairs `(higher, lower)` that `run` already orders correctly.
+/// Pairs `(higher, lower)`: every pair of the six sources.
 const PRIORITY_PAIRS: &[(Source, Source)] = &[
     (Source::Cancel, Source::Deadline),
+    (Source::Cancel, Source::Writer),
+    (Source::Deadline, Source::Writer),
     (Source::Cancel, Source::Strategy),
     (Source::Cancel, Source::Throughput),
     (Source::Cancel, Source::Runner),
@@ -420,7 +431,7 @@ async fn assert_priority(high: Source, low: Source) {
     harness.make_ready(high);
     let cancel = harness.cancel.clone();
     let result = {
-        let mut run = pin!(harness.download.run(&cancel));
+        let mut run = pin!(harness.download.run());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         // One poll handles every event that is already ready.
         match run.as_mut().poll(&mut cx) {
@@ -463,18 +474,6 @@ fn test_loop_priority_pairs() {
 }
 
 #[test]
-#[ignore = "fixed in Phase 3b: run() drains writer completions before polling cancel"]
-fn test_loop_priority_cancel_beats_writer() {
-    on_each_executor(|| assert_priority(Source::Cancel, Source::Writer));
-}
-
-#[test]
-#[ignore = "fixed in Phase 3b: run() drains writer completions before polling the deadline"]
-fn test_loop_priority_deadline_beats_writer() {
-    on_each_executor(|| assert_priority(Source::Deadline, Source::Writer));
-}
-
-#[test]
 fn test_custom_timer_survives_other_events() {
     on_each_executor(|| async {
         let mut harness = LoopHarness::scripted(false).await;
@@ -495,7 +494,7 @@ fn test_custom_timer_survives_other_events() {
         let waker = futures::task::waker(wakes.clone());
         let mut cx = Context::from_waker(&waker);
         let result = {
-            let mut run = pin!(harness.download.run(&cancel));
+            let mut run = pin!(harness.download.run());
             assert!(run.as_mut().poll(&mut cx).is_pending());
 
             // Writer completions and a lost connection arrive while it waits.
@@ -557,7 +556,7 @@ fn test_timer_rearms_after_consecutive_ticks() {
         let waker = futures::task::waker(wakes.clone());
         let mut cx = Context::from_waker(&waker);
         let result = {
-            let mut run = pin!(harness.download.run(&cancel));
+            let mut run = pin!(harness.download.run());
             assert!(run.as_mut().poll(&mut cx).is_pending());
             for tick in 1..=3 {
                 let seen = wakes.get();
@@ -694,7 +693,7 @@ fn test_cancel_after_registration_wakes_loop() {
         let waker = futures::task::waker(wakes.clone());
         let mut cx = Context::from_waker(&waker);
         let result = {
-            let mut run = pin!(harness.download.run(&cancel));
+            let mut run = pin!(harness.download.run());
             assert!(run.as_mut().poll(&mut cx).is_pending());
             let seen = wakes.get();
             cancel.cancel();
@@ -736,6 +735,7 @@ async fn connecting_loop(
         &file_writer,
         event_tx,
         &TaskOptions::default(),
+        CancellationToken::new(),
     );
     download.max_concurrency = max_concurrency;
     download.manager = RunnerManager::new(total, max_concurrency);

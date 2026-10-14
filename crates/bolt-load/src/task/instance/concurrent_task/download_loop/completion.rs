@@ -1,4 +1,6 @@
-use super::{DownloadLoop, WriteCompletion};
+use std::task::{Context, Poll};
+
+use super::{DownloadLoop, LoopEvent, WriteCompletion};
 use crate::{
     runner::TaskError,
     task::instance::{Result, TaskInstanceError},
@@ -22,9 +24,18 @@ pub(super) fn check_completions(completions: Vec<WriteCompletion>) -> Result<usi
 }
 
 impl DownloadLoop {
+    /// Pending while no write is in flight: only the loop itself dispatches
+    /// writes, and it polls again after handling the event that did.
+    #[inline]
+    pub(super) fn poll_writer(&mut self, cx: &mut Context<'_>) -> Poll<LoopEvent> {
+        self.writer
+            .poll_completions(cx)
+            .map(LoopEvent::WriterCompleted)
+    }
+
     pub(super) fn record_completions(&mut self, completions: Vec<WriteCompletion>) -> Result<()> {
         let written = check_completions(completions)?;
-        self.throughput.written_bytes += written;
+        self.throughput.record_written(written);
         self.policy.on_write_ok(written);
         Ok(())
     }
