@@ -74,8 +74,8 @@ impl DownloadLoop {
     pub(super) fn spawn_runner(&mut self, range: Range<u64>) {
         let spawner = &self.spawner;
         self.manager
-            .allocate_pending_runner_with_chunk(range.clone(), |runner_id, control_rx| {
-                spawner.spawn(range, runner_id, control_rx)
+            .allocate_pending_runner_with_chunk(range.clone(), |runner_id, limits| {
+                spawner.spawn(range, runner_id, limits)
             })
             .expect("failed to allocate runner with chunk");
     }

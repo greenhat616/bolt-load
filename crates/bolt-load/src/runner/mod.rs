@@ -12,7 +12,9 @@ mod error;
 mod run_loop;
 pub use builder::*;
 pub use connector::*;
-pub use control::*;
+use control::ControlSource;
+pub use control::{ControlSignalReceiver, ControlSignalSender};
+pub(crate) use control::{LimitReceiver, LimitSender, limit_mailbox};
 pub use error::*;
 
 // TODO: make it configurable or detect the local disk performance?
@@ -112,9 +114,9 @@ pub struct TaskRunner {
     /// the adapter of the task
     #[debug(skip)]
     stream: AnyBytesStream,
-    /// the receiver of the manager messages (point-to-point channel)
+    /// the control signals from the manager
     #[debug(skip)]
-    control_signal: std::pin::Pin<Box<ControlSignalReceiver>>,
+    control: ControlSource,
     /// the sender of the lifecycle events
     #[debug(skip)]
     lifecycle_tx: LifecycleSender,
