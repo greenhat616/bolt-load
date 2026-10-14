@@ -149,3 +149,7 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 [[bench]]
 name = "file_writer"
 harness = false
+
+[[bench]]
+name = "coordination"
+harness = false
