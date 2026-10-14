@@ -119,7 +119,7 @@ pub use lifecycle::{LifecycleAggregator, LifecycleStreamEvent};
 pub use pending::PendingRunnerReceiver;
 
 /// Default capacity for control channels
-const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
+pub(super) const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
 
 /// Type alias for control message sender
 pub type ControlSender = Sender<ControlEvent>;
@@ -314,6 +314,12 @@ impl RunnerManager {
         message: ControlEvent,
     ) -> Result<(), SendError> {
         self.control_channels.send_message(runner_id, message)
+    }
+
+    /// Control messages waiting for the runner to receive them.
+    #[cfg(test)]
+    pub(super) fn queued_controls(&self, runner_id: RunnerId) -> usize {
+        self.control_channels.get(&runner_id).map_or(0, Sender::len)
     }
 
     // ==================== Runner Notification Related Methods ====================

@@ -23,7 +23,7 @@ impl DownloadLoop {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    fn apply(&mut self, action: StrategyAction) {
+    pub(super) fn apply(&mut self, action: StrategyAction) {
         match action {
             // Split current all task into two separate tasks
             StrategyAction::SplitAllTask(planned_chunk_size) => {
