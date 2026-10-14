@@ -711,7 +711,10 @@ impl DownloadLoop {
     )]
     fn split(&mut self, runner_id: RunnerId, incomplete_range: Range<u64>) {
         let half_size = (incomplete_range.end - incomplete_range.start) / 2;
-        self.manager.resize_runner(runner_id, half_size);
+        if let Err(e) = self.manager.resize_runner(runner_id, half_size) {
+            trace!("[TASK] skip splitting runner {runner_id}: {e}");
+            return;
+        }
         self.spawn_runner(incomplete_range.start + half_size..incomplete_range.end);
     }
 
@@ -1464,5 +1467,50 @@ mod tests {
         let downloaded_hash = calculate_blake3(&downloaded_data);
         let reference_hash = calculate_blake3(&reference_data);
         assert_eq!(downloaded_hash, reference_hash);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_split_after_failed_resize_does_not_allocate_tail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_writer = FileWriter::new(&dir.path().join("file.bin"), 1000)
+            .await
+            .unwrap();
+        let rt = FailOnSpawnRuntime::new(usize::MAX);
+        let spawns = rt.calls.clone();
+        let spawner = RunnerSpawner::new(
+            ThreadedRuntimeImpl::new_other_rt(rt),
+            Arc::new(Box::new(
+                SimpleTestAdapter::new(1000).with_range_support(true),
+            )),
+            WaitGroup::new(),
+            CancellationToken::new(),
+            crate::runner::DEFAULT_IDLE_TIMEOUT,
+        );
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let mut download = DownloadLoop::new(
+            1000,
+            spawner,
+            &file_writer,
+            event_tx,
+            &TaskOptions::default(),
+        );
+        let reg = download.manager.allocate_runner_with_chunk(0..100).unwrap();
+
+        // Half of this range would grow the chunk past its end.
+        download.split(reg.runner_id, 0..400);
+
+        assert_eq!(
+            download
+                .manager
+                .get_runner_state(reg.runner_id)
+                .unwrap()
+                .allocated,
+            0..100
+        );
+        assert_eq!(download.manager.get_available_ranges(), vec![100..1000]);
+        assert_eq!(spawns.load(Ordering::SeqCst), 0, "no runner may be spawned");
+        assert!(reg.control_rx.try_recv().is_err());
+        drop(download);
+        file_writer.finalize().await.unwrap();
     }
 }

@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
-use std::{collections::HashMap, num::NonZeroUsize, ops::Range};
-
-use ranges::{GenericRange, OperationResult, Ranges};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
+    ops::Range,
+};
 
 use crate::task::RunnerId;
 
@@ -50,6 +52,17 @@ pub enum Error {
     ChunkNotFound { runner_id: RunnerId },
     #[snafu(display("Invalid split position: {position}"))]
     InvalidSplitPosition { position: u64 },
+    #[snafu(display("Invalid resize of runner {runner_id} to {new_size} remaining bytes"))]
+    InvalidResize { runner_id: RunnerId, new_size: u64 },
+}
+
+/// The outcome of [`ChunkPlanner::resize_runner_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resize {
+    /// The chunk already ends there; nothing changed.
+    Unchanged,
+    /// The chunk shrank; the runner may download at most `limit` bytes in total.
+    Shrunk { limit: u64 },
 }
 
 impl ChunkState {
@@ -114,10 +127,10 @@ pub struct ChunkPlanner {
     pub min_chunk_size: u64,
     /// Maximum number of concurrent chunks
     pub max_chunk_count: Option<NonZeroUsize>,
-    /// All chunks indexed by their allocated range
-    chunks: HashMap<GenericRange<u64>, ChunkState>,
-    /// Runner ID to chunk mapping for quick lookup
-    runner_to_chunk: HashMap<RunnerId, GenericRange<u64>>,
+    /// All chunks keyed by `allocated.start`; their allocated ranges never overlap
+    chunks: BTreeMap<u64, ChunkState>,
+    /// Runner ID to chunk start mapping for quick lookup
+    runner_to_chunk: HashMap<RunnerId, u64>,
 }
 
 impl ChunkPlanner {
@@ -126,7 +139,7 @@ impl ChunkPlanner {
             total,
             min_chunk_size: DEFAULT_MIN_CHUNK_SIZE,
             max_chunk_count: None,
-            chunks: HashMap::new(),
+            chunks: BTreeMap::new(),
             runner_to_chunk: HashMap::new(),
         }
     }
@@ -184,22 +197,22 @@ impl ChunkPlanner {
             return false;
         }
 
-        let generic_range = GenericRange::from(range.clone());
-
-        // Check for overlaps
-        for existing_range in self.chunks.keys() {
-            if existing_range.intersect(generic_range) != OperationResult::Empty {
-                return false;
-            }
+        // Chunks never overlap, so only the last chunk starting before the
+        // end can overlap the range.
+        if let Some((_, pred)) = self.chunks.range(..range.end).next_back()
+            && pred.allocated.end > range.start
+        {
+            return false;
         }
 
         // Create new chunk state
+        let start = range.start;
         let chunk_state = ChunkState::new(range, runner_id, status);
-        self.chunks.insert(generic_range, chunk_state);
+        self.chunks.insert(start, chunk_state);
 
         // Update runner mapping
         if let Some(id) = runner_id {
-            self.runner_to_chunk.insert(id, generic_range);
+            self.runner_to_chunk.insert(id, start);
         }
 
         true
@@ -221,8 +234,8 @@ impl ChunkPlanner {
             .get_mut(range)
             .ok_or_else(|| format!("Chunk for runner {runner_id} not found"))?;
 
-        // Update downloaded range
-        let new_end = (chunk.downloaded.end + bytes_downloaded).min(chunk.allocated.end);
+        // Update downloaded range, adding at most the remaining length
+        let new_end = chunk.downloaded.end + bytes_downloaded.min(chunk.remaining());
         let previous_end = std::mem::replace(&mut chunk.downloaded.end, new_end);
 
         // Check if complete
@@ -288,9 +301,8 @@ impl ChunkPlanner {
                 chunk.allocated.end = chunk.downloaded.end;
                 chunk.status = ChunkStatus::Finished; // The downloaded portion should be marked as finished
                 chunk.runner_id = None;
-                // Re-insert the chunk with updated range
-                let new_range = GenericRange::from(chunk.allocated.clone());
-                self.chunks.insert(new_range, chunk);
+                // Re-insert the chunk; its start is unchanged
+                self.chunks.insert(range, chunk);
                 Ok(unfinished)
             }
         } else {
@@ -336,32 +348,29 @@ impl ChunkPlanner {
         let second_chunk = ChunkState::from_runner_id(second_range.clone(), Some(new_runner_id));
 
         // Insert both chunks
-        let first_generic_range = GenericRange::from(first_range);
-        let second_generic_range = GenericRange::from(second_range.clone());
-
-        self.chunks.insert(first_generic_range, first_chunk);
-        self.chunks.insert(second_generic_range, second_chunk);
+        self.chunks.insert(first_range.start, first_chunk);
+        self.chunks.insert(split_pos, second_chunk);
 
         // Update runner mappings
-        self.runner_to_chunk.insert(runner_id, first_generic_range);
-        self.runner_to_chunk
-            .insert(new_runner_id, second_generic_range);
+        self.runner_to_chunk.insert(runner_id, first_range.start);
+        self.runner_to_chunk.insert(new_runner_id, split_pos);
 
         Ok(second_range)
     }
 
     /// Get available ranges (not allocated to any chunk)
     pub fn get_available_ranges(&self) -> Vec<Range<u64>> {
-        let occupied = Ranges::from_iter(self.chunks.keys().cloned());
-        let full_range = Ranges::from(GenericRange::from(0..self.total));
-        let available = full_range - occupied;
-
-        let mut ranges: Vec<_> = available
-            .as_slice()
-            .iter()
-            .map(convert_generic_range_to_std_range)
-            .collect();
-        ranges.sort_by_key(|r| r.start);
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        for chunk in self.chunks.values() {
+            if cursor < chunk.allocated.start {
+                ranges.push(cursor..chunk.allocated.start);
+            }
+            cursor = chunk.allocated.end;
+        }
+        if cursor < self.total {
+            ranges.push(cursor..self.total);
+        }
         ranges
     }
 
@@ -468,33 +477,38 @@ impl ChunkPlanner {
             .and_then(|range| self.chunks.get(range))
     }
 
-    /// Get mut state ref of a specific runner
-    pub fn get_runner_state_mut(&mut self, runner_id: RunnerId) -> Option<&mut ChunkState> {
-        self.runner_to_chunk
-            .get(&runner_id)
-            .and_then(|range| self.chunks.get_mut(range))
-    }
-
-    /// Resize the runner state by the given size
+    /// Shrink the runner's chunk to end `new_size` bytes after its downloaded part.
+    ///
+    /// The chunk may only shrink and must stay non-empty; otherwise nothing
+    /// changes and [`Error::InvalidResize`] is returned.
     pub fn resize_runner_state(
         &mut self,
         runner_id: RunnerId,
         new_size: u64,
-    ) -> Result<u64, Error> {
-        let chunk = self
+    ) -> Result<Resize, Error> {
+        let start = *self
             .runner_to_chunk
-            .remove(&runner_id)
+            .get(&runner_id)
             .ok_or(Error::RunnerNotFound { runner_id })?;
-        let mut state = self
+        let state = self
             .chunks
-            .remove(&chunk)
+            .get_mut(&start)
             .ok_or(Error::ChunkNotFound { runner_id })?;
-        let downloaded_size = state.downloaded.end - state.downloaded.start;
-        state.allocated.end = state.downloaded.end + new_size;
-        let new_chunk = GenericRange::from(state.allocated.clone());
-        self.chunks.insert(new_chunk, state);
-        self.runner_to_chunk.insert(runner_id, new_chunk);
-        Ok(downloaded_size)
+        let new_end = match state.downloaded.end.checked_add(new_size) {
+            Some(end) if end == state.allocated.end => return Ok(Resize::Unchanged),
+            Some(end) if state.allocated.start < end && end < state.allocated.end => end,
+            _ => {
+                return Err(Error::InvalidResize {
+                    runner_id,
+                    new_size,
+                });
+            }
+        };
+        // The start, and so the key, is unchanged.
+        state.allocated.end = new_end;
+        Ok(Resize::Shrunk {
+            limit: new_end - state.allocated.start,
+        })
     }
 
     /// Check if all chunks are finished
@@ -552,20 +566,6 @@ impl Drop for PlannerGuard<'_> {
             *self.planner = self.snapshot.clone();
         }
     }
-}
-
-/// Convert a generic range to a standard range
-fn convert_generic_range_to_std_range(range: &GenericRange<u64>) -> Range<u64> {
-    use std::ops::{Bound, RangeBounds};
-    let start = match range.start_bound() {
-        Bound::Included(v) => *v,
-        _ => unreachable!(),
-    };
-    let end = match range.end_bound() {
-        Bound::Excluded(v) => *v,
-        _ => unreachable!(),
-    };
-    start..end
 }
 
 /// Merge adjacent ranges
@@ -924,9 +924,113 @@ mod tests {
         assert!(planner.update_progress(1, 100).is_ok());
 
         // Resize
-        assert!(planner.resize_runner_state(1, 200).is_ok());
+        assert_eq!(
+            planner.resize_runner_state(1, 200).unwrap(),
+            Resize::Shrunk { limit: 300 }
+        );
         let state = planner.get_runner_state(1).unwrap();
         assert_eq!(state.allocated, 100..400); // 200 + 200 = 400
+    }
+
+    /// Both maps, compared by content.
+    fn snapshot(planner: &ChunkPlanner) -> (Vec<String>, Vec<(RunnerId, Range<u64>)>) {
+        let mut chunks: Vec<_> = planner.iter_chunks().map(|c| format!("{c:?}")).collect();
+        chunks.sort();
+        let mut runners: Vec<_> = planner
+            .iter_chunks()
+            .filter_map(|c| c.runner_id)
+            .map(|id| (id, planner.get_runner_state(id).unwrap().allocated.clone()))
+            .collect();
+        runners.sort_by_key(|(id, _)| *id);
+        (chunks, runners)
+    }
+
+    fn assert_invalid_resize(planner: &mut ChunkPlanner, runner_id: RunnerId, new_size: u64) {
+        let before = snapshot(planner);
+        assert!(matches!(
+            planner.resize_runner_state(runner_id, new_size),
+            Err(Error::InvalidResize { .. })
+        ));
+        assert_eq!(
+            snapshot(planner),
+            before,
+            "a rejected resize must not change the maps"
+        );
+    }
+
+    #[test]
+    fn test_resize_cannot_grow() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..10, Some(1)));
+        assert!(planner.allocate_chunk(20..30, Some(2)));
+        assert_invalid_resize(&mut planner, 1, 40);
+    }
+
+    #[test]
+    fn test_resize_to_empty_rejected() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(10..20, Some(1)));
+        assert_invalid_resize(&mut planner, 1, 0);
+    }
+
+    #[test]
+    fn test_resize_overflow_rejected() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(10..20, Some(1)));
+        assert!(planner.update_progress(1, 5).is_ok());
+        assert_invalid_resize(&mut planner, 1, u64::MAX);
+    }
+
+    #[test]
+    fn test_resize_unchanged_is_noop() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(10..20, Some(1)));
+        assert!(planner.update_progress(1, 4).is_ok());
+        let before = snapshot(&planner);
+        assert_eq!(
+            planner.resize_runner_state(1, 6).unwrap(),
+            Resize::Unchanged
+        );
+        assert_eq!(snapshot(&planner), before);
+    }
+
+    #[test]
+    fn test_progress_near_u64_max_does_not_overflow() {
+        let mut planner = ChunkPlanner::new(u64::MAX);
+        assert!(planner.allocate_chunk(u64::MAX - 10..u64::MAX, Some(1)));
+        assert!(planner.update_progress(1, 5).is_ok());
+        assert_eq!(
+            planner.update_progress(1, u64::MAX).unwrap(),
+            u64::MAX - 5..u64::MAX
+        );
+        assert!(planner.get_runner_state(1).unwrap().is_complete());
+    }
+
+    #[test]
+    fn test_guard_drop_restores_both_maps() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..50, Some(1)));
+        let before = snapshot(&planner);
+        {
+            let mut guard = PlannerGuard::new(&mut planner);
+            guard.planner().resize_runner_state(1, 20).unwrap();
+            assert!(guard.planner().allocate_chunk(20..50, Some(2)));
+        }
+        assert_eq!(snapshot(&planner), before);
+    }
+
+    #[test]
+    fn test_guard_commit_keeps_changes() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..50, Some(1)));
+        {
+            let mut guard = PlannerGuard::new(&mut planner);
+            guard.planner().resize_runner_state(1, 20).unwrap();
+            assert!(guard.planner().allocate_chunk(20..50, Some(2)));
+            guard.commit();
+        }
+        assert_eq!(planner.get_runner_state(1).unwrap().allocated, 0..20);
+        assert_eq!(planner.get_runner_state(2).unwrap().allocated, 20..50);
     }
 
     // === Complex scenario tests ===
@@ -1210,10 +1314,96 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_generic_range_to_std_range() {
-        let generic_range = GenericRange::from(100..500);
-        let std_range = convert_generic_range_to_std_range(&generic_range);
-        assert_eq!(std_range, 100..500);
+    fn test_overlap_with_predecessor_rejected() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(10..30, None));
+        assert!(!planner.allocate_chunk(20..40, None));
+        assert!(!planner.allocate_chunk(15..20, None));
+    }
+
+    #[test]
+    fn test_overlap_with_chunk_starting_inside_request_rejected() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(10..20, None));
+        assert!(planner.allocate_chunk(50..60, None));
+        assert!(!planner.allocate_chunk(30..55, None));
+        assert!(!planner.allocate_chunk(0..100, None));
+    }
+
+    #[test]
+    fn test_adjacent_allowed() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(10..20, None));
+        assert!(planner.allocate_chunk(20..30, None));
+        assert!(planner.allocate_chunk(0..10, None));
+        assert_eq!(planner.get_available_ranges(), vec![30..100]);
+    }
+
+    #[test]
+    fn test_available_ranges_empty_full_and_gaps_at_both_ends() {
+        let mut planner = ChunkPlanner::new(100);
+        assert_eq!(planner.get_available_ranges(), vec![0..100]);
+        assert!(planner.allocate_chunk(40..60, None));
+        assert_eq!(planner.get_available_ranges(), vec![0..40, 60..100]);
+        assert!(planner.allocate_chunk(0..40, None));
+        assert!(planner.allocate_chunk(60..100, None));
+        assert!(planner.get_available_ranges().is_empty());
+        assert!(ChunkPlanner::new(0).get_available_ranges().is_empty());
+    }
+
+    #[test]
+    fn test_failed_prefix_then_tail_reallocation() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..100, Some(1)));
+        planner.update_progress(1, 30).unwrap();
+        assert_eq!(planner.mark_failed(1).unwrap(), 30..100);
+        assert_eq!(planner.get_available_ranges(), vec![30..100]);
+        assert!(planner.allocate_chunk(30..100, Some(2)));
+        assert_eq!(planner.get_runner_state(2).unwrap().allocated, 30..100);
+        assert!(planner.get_available_ranges().is_empty());
+    }
+
+    #[test]
+    fn test_rejected_split_restores_maps() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..100, Some(1)));
+        planner.update_progress(1, 50).unwrap();
+        let before = snapshot(&planner);
+        assert!(planner.split_chunk(1, 40, 2).is_err());
+        assert_eq!(snapshot(&planner), before);
+        assert!(planner.get_runner_state(2).is_none());
+    }
+
+    #[test]
+    fn test_split_mappings() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..100, Some(1)));
+        planner.update_progress(1, 10).unwrap();
+        assert_eq!(planner.split_chunk(1, 60, 2).unwrap(), 60..100);
+        let first = planner.get_runner_state(1).unwrap();
+        assert_eq!(
+            (first.allocated.clone(), first.downloaded.clone()),
+            (0..60, 0..10)
+        );
+        let second = planner.get_runner_state(2).unwrap();
+        assert_eq!(
+            (second.allocated.clone(), second.downloaded.clone()),
+            (60..100, 60..60)
+        );
+        planner.update_progress(2, 5).unwrap();
+        assert_eq!(planner.get_runner_state(2).unwrap().downloaded, 60..65);
+    }
+
+    #[test]
+    fn test_shrink_then_reallocate_freed_tail() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..100, Some(1)));
+        planner.update_progress(1, 20).unwrap();
+        planner.resize_runner_state(1, 30).unwrap();
+        assert_eq!(planner.get_available_ranges(), vec![50..100]);
+        assert!(planner.allocate_chunk(50..100, Some(2)));
+        assert_eq!(planner.get_runner_state(1).unwrap().allocated, 0..50);
+        assert!(planner.get_available_ranges().is_empty());
     }
 
     // === Integration tests ===
