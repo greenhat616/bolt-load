@@ -8,7 +8,7 @@ use smol_cancellation_token::CancellationToken;
 use super::runner_manager::{RunnerChannels, SpawnFailed};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter},
-    runner::{LimitReceiver, StreamConnector, TaskRunner},
+    runner::{LimitReceiver, TaskRunner},
     runtime::ThreadedRuntimeImpl,
     task::RunnerId,
 };
@@ -67,9 +67,7 @@ impl RunnerSpawner {
         let adapter = self.adapter.clone();
         let (runner, lifecycle_rx, data_rx) = TaskRunner::builder()
             .total(end - start)
-            .connector(StreamConnector::from(async move {
-                adapter.range_stream(start, end).await
-            }))
+            .connector(async move { adapter.range_stream(start, end).await })
             .runner_id(runner_id)
             .limit_receiver(limits)
             .cancel_token(self.cancel_token.clone())

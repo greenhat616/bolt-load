@@ -13,6 +13,8 @@ use crate::task::RunnerId;
 #[derive(Debug, snafu::Snafu)]
 pub enum TaskRunnerBuilderError {
     #[snafu(display("neither a stream nor a connector is set"))]
+    /// Neither [`TaskRunnerBuilder::stream`] nor
+    /// [`TaskRunnerBuilder::connector`] was called.
     StreamNotSet,
     #[snafu(display("runner id is not set"))]
     RunnerIdNotSet,
@@ -51,7 +53,7 @@ impl TaskRunnerBuilder {
         self
     }
 
-    /// set the stream of the task
+    /// set the stream of the task, replacing [`Self::connector`]
     pub fn stream(mut self, stream: AnyBytesStream) -> Self {
         self.input = Some(RunnerInput::Connected(stream));
         self
@@ -63,8 +65,8 @@ impl TaskRunnerBuilder {
     /// [`Started`](super::LifecycleEvent::Started); a failed connection stops
     /// the runner with [`TaskError::StreamError`](super::TaskError::StreamError)
     /// without reporting `Started`.
-    pub fn connector(mut self, connector: StreamConnector) -> Self {
-        self.input = Some(match connector {
+    pub fn connector(mut self, connector: impl Into<StreamConnector>) -> Self {
+        self.input = Some(match connector.into() {
             StreamConnector::DirectStream(stream) => RunnerInput::Connected(stream),
             StreamConnector::StreamConnector(connect) => RunnerInput::Connecting(connect),
         });
@@ -112,7 +114,8 @@ impl TaskRunnerBuilder {
     /// The time runs from the runner's first poll and is not extended by
     /// control signals; on expiry the runner fails with the retryable
     /// [`TaskError::Timeout`](super::TaskError::Timeout) without reporting
-    /// `Started`.
+    /// `Started`. It does not apply to a [`Self::stream`], which is
+    /// connected already.
     pub fn connect_timeout(mut self, connect_timeout: std::time::Duration) -> Self {
         self.connect_timeout = Some(connect_timeout);
         self
