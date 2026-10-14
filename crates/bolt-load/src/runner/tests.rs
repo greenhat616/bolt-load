@@ -2214,3 +2214,91 @@ fn test_connecting_priority_cancel_control_connection() {
         assert_eq!(first(false, false).await, "connected");
     });
 }
+
+#[tokio::test]
+async fn test_connect_timeout_is_not_extended_by_limits() {
+    use super::run_loop::{RunnerLoop, Step};
+
+    let (limit_tx, limits) = limit_mailbox();
+    let (mut runner, mut lifecycle_rx, _data_rx) = TaskRunner::builder()
+        .total(1000)
+        .connector(StreamConnector::from(futures::future::pending()))
+        .runner_id(1)
+        .limit_receiver(limits)
+        .cancel_token(CancellationToken::new())
+        .connect_timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let mut run = RunnerLoop::new(&mut runner);
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(run.poll_step(&mut cx).is_pending());
+
+    // Limits win over the expired timeout, but do not extend it.
+    sleep(Duration::from_millis(200)).await;
+    for limit in (990..1000).rev() {
+        assert!(limit_tx.send(limit));
+        let std::task::Poll::Ready(step @ Step::Control(Ok(_))) = run.poll_step(&mut cx) else {
+            panic!("a waiting limit wins over the expired timeout");
+        };
+        run.handle_step(step);
+    }
+    let std::task::Poll::Ready(step @ Step::ConnectTimeout) = run.poll_step(&mut cx) else {
+        panic!("the timeout was extended");
+    };
+    run.handle_step(step);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let step = std::future::poll_fn(|cx| run.poll_step(cx)).await;
+            let published = matches!(step, Step::StoppedPublished);
+            run.handle_step(step);
+            if published {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        lifecycle_rx.try_pop(),
+        Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+            TaskError::Timeout
+        )))
+    ));
+    assert!(lifecycle_rx.try_pop().is_none());
+    drop(limit_tx);
+}
+
+#[test]
+fn test_connecting_priority_control_timeout_connection() {
+    use super::run_loop::{RunnerLoop, Step};
+
+    /// The first event of a connecting runner whose connect timeout and
+    /// connection, and its control as given, are ready.
+    async fn first(control: bool) -> &'static str {
+        let (limit_tx, limits) = limit_mailbox();
+        if control {
+            assert!(limit_tx.send(5));
+        }
+        let (mut runner, _lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .total(10)
+            .connector(StreamConnector::from(async { Ok(frames(1)) }))
+            .runner_id(1)
+            .limit_receiver(limits)
+            .cancel_token(CancellationToken::new())
+            .connect_timeout(Duration::ZERO)
+            .build()
+            .unwrap();
+        let mut run = RunnerLoop::new(&mut runner);
+        match std::future::poll_fn(|cx| run.poll_step(cx)).await {
+            Step::Control(Ok(_)) => "control",
+            Step::ConnectTimeout => "timeout",
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    on_each_executor(|| async {
+        assert_eq!(first(true).await, "control");
+        assert_eq!(first(false).await, "timeout");
+    });
+}

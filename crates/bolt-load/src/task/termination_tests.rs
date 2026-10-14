@@ -200,6 +200,37 @@ async fn test_concurrent_recovers_after_transient_failures() {
     assert!(!token.is_cancelled());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_hung_connect_times_out_while_others_progress() {
+    const SIZE: usize = 32 * 1024 * 1024;
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("connect_timeout.bin");
+    // The first runner keeps progressing, so the no-progress deadline never
+    // comes; only the connect timeout ends the hung second connect.
+    let adapter = SimpleTestAdapterBuilder::new()
+        .content_size(SIZE)
+        .support_range(true)
+        .max_per_stream_speed(4 * 1024 * 1024)
+        .range_connect_plan(FaultPlan::HangAt(1))
+        .build()
+        .unwrap();
+    let mut options = TaskOptions::default().connect_timeout(Duration::from_millis(300));
+    // Room for the strategy to split, whatever the CPU count.
+    options.max_concurrency = Some(4);
+    let token = CancellationToken::new();
+    let mut task = start(&adapter, &dest, &token, options, DownloadMode::Concurrent).await;
+
+    watchdog(task.wait())
+        .await
+        .expect("the hung range should be retried");
+    assert_downloaded(&adapter, &dest);
+    assert!(
+        adapter.range_attempts() >= 3,
+        "{}",
+        adapter.range_attempts()
+    );
+}
+
 // T6
 #[tokio::test(flavor = "multi_thread")]
 async fn test_stop_while_connecting_joins_requests() {
@@ -409,7 +440,6 @@ async fn test_singleton_never_hangs() {
     }
 }
 
-// T11
 #[tokio::test(flavor = "multi_thread")]
 async fn test_singleton_success_keeps_caller_token() {
     let dir = TempDir::new().unwrap();

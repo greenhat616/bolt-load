@@ -65,6 +65,8 @@ impl DownloadLoop {
         let max_concurrency = std::thread::available_parallelism()
             .map(|t| t.get())
             .unwrap_or(DEFAULT_MAX_CONCURRENCY);
+        #[cfg(test)]
+        let max_concurrency = options.max_concurrency.unwrap_or(max_concurrency);
         let manager = RunnerManager::new(total, max_concurrency);
         let strategy = StrategyControl::new(max_concurrency);
         let policy = FailurePolicy::new(options, Instant::now());

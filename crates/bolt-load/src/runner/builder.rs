@@ -4,8 +4,9 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{
     ControlSignalReceiver, ControlSource, DATA_DRAIN_TIMEOUT, DATA_FRAME_CHANNEL_CAPACITY,
-    DEFAULT_IDLE_TIMEOUT, DataFrame, DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent,
-    LifecycleReceiver, LimitReceiver, RunnerInput, StreamConnector, TaskRunner,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT, DataFrame, DataFrameReceiver,
+    LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver, LimitReceiver, RunnerInput,
+    StreamConnector, TaskRunner,
 };
 use crate::task::RunnerId;
 
@@ -39,6 +40,8 @@ pub struct TaskRunnerBuilder {
     data_drain_timeout: Option<std::time::Duration>,
     /// how long the stream may yield no non-empty data before the runner fails with `Timeout`
     idle_timeout: Option<std::time::Duration>,
+    /// how long connecting may take before the runner fails with `Timeout`
+    connect_timeout: Option<std::time::Duration>,
 }
 
 impl TaskRunnerBuilder {
@@ -103,6 +106,18 @@ impl TaskRunnerBuilder {
         self
     }
 
+    /// set how long the [`Self::connector`] may take, defaults to
+    /// [`DEFAULT_CONNECT_TIMEOUT`]
+    ///
+    /// The time runs from the runner's first poll and is not extended by
+    /// control signals; on expiry the runner fails with the retryable
+    /// [`TaskError::Timeout`](super::TaskError::Timeout) without reporting
+    /// `Started`.
+    pub fn connect_timeout(mut self, connect_timeout: std::time::Duration) -> Self {
+        self.connect_timeout = Some(connect_timeout);
+        self
+    }
+
     #[cfg(test)]
     pub fn data_drain_timeout(mut self, data_drain_timeout: std::time::Duration) -> Self {
         self.data_drain_timeout = Some(data_drain_timeout);
@@ -134,6 +149,8 @@ impl TaskRunnerBuilder {
             data_tx: Some(data_prod),
             data_drain_timeout: self.data_drain_timeout.unwrap_or(DATA_DRAIN_TIMEOUT),
             idle_timeout: self.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            built_at: std::time::Instant::now(),
             cancel_token: self
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
