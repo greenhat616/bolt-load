@@ -297,7 +297,9 @@ impl Strategy for ConcurrencyControlStrategy {
             .sampler
             .has_recent_unretryable(self.config.unretryable_detection_window)
         {
-            tracing::trace!("[CONTROL STRATEGY] Has recent unretryable, degraded");
+            bolt_load_utils::telemetry::trace!(
+                "[CONTROL STRATEGY] Has recent unretryable, degraded"
+            );
             return self.handle_immediate_degradation(context, now);
         }
 
