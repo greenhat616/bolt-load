@@ -29,15 +29,14 @@
 //! (`variant:runners:frame_size:iterations[:write_cost_ns]`).
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    collections::HashMap,
-    future::poll_fn,
+    collections::{BTreeMap, HashMap},
+    future::{IntoFuture, poll_fn},
     hint::black_box,
     ops::{ControlFlow, Range},
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, ready},
     time::{Duration, Instant},
@@ -48,7 +47,7 @@ use bolt_load::runtime::{DynTimer, Timer, TimerImpl, TokioDelayedTimer};
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use futures::{FutureExt, Stream, StreamExt, future::Fuse};
-use futures_concurrency::stream::StreamGroup;
+use futures_concurrency::{future::FutureGroup, stream::StreamGroup};
 use tokio::runtime::Runtime;
 
 type RunnerId = u64;
@@ -686,9 +685,15 @@ struct LoopConfig {
     write: WriteMode,
     runners: usize,
     frame_size: usize,
+    /// Bytes per loop run.
+    total: u64,
+    /// In-flight write limit (`PendingWriter::capacity`).
+    capacity: usize,
     /// Backend command queue capacity.
     queue: usize,
     write_cost_ns: u64,
+    /// Odd runners connect 1 ms late, so connections complete under load.
+    stagger_connect: bool,
     stop: Stop,
 }
 
@@ -700,9 +705,24 @@ impl LoopConfig {
             write: WriteMode::SpawnOneshot,
             runners,
             frame_size,
+            total: LOOP_TOTAL,
+            capacity: std::thread::available_parallelism().map_or(4, |n| n.get()),
             queue: WRITER_QUEUE,
             write_cost_ns: 0,
+            stagger_connect: false,
             stop: Stop::Complete,
+        }
+    }
+
+    /// A one-slot backend queue below the in-flight limit with slow writes, so the
+    /// direct path must fall back.
+    fn queue_full(self) -> Self {
+        Self {
+            capacity: 8,
+            queue: 1,
+            write_cost_ns: 5_000,
+            stagger_connect: true,
+            ..self
         }
     }
 }
@@ -820,10 +840,9 @@ struct WriteCommand {
     reply: WriteReply,
 }
 
-/// Fallbacks to the spawned `send().await` when the backend queue was full.
-static WRITE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-
-/// Mirrors `PendingWriter<FileWriter>` over a single-worker backend (like mmap).
+/// Mirrors `PendingWriter<FileWriter>` over a single-worker backend (like mmap):
+/// `capacity` writes in flight plus one buffered pending write, flushed once a
+/// completion batch has been settled.
 struct LoopWriter {
     mode: WriteMode,
     commands: async_channel::Sender<WriteCommand>,
@@ -831,16 +850,20 @@ struct LoopWriter {
     done_rx: Pin<Box<async_channel::Receiver<Range<u64>>>>,
     in_flight: usize,
     capacity: usize,
+    pending_write: Option<(Range<u64>, Bytes)>,
     /// Every dispatched write must complete exactly once.
     dispatched: u64,
     completed: u64,
+    /// Direct submissions that found the backend queue full.
+    fallbacks: u64,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LoopWriter {
-    fn new(mode: WriteMode, queue: usize, write_cost_ns: u64) -> Self {
-        let capacity = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let (commands, command_rx) = async_channel::bounded::<WriteCommand>(queue);
+    fn new(cfg: &LoopConfig) -> Self {
+        let capacity = cfg.capacity;
+        let write_cost_ns = cfg.write_cost_ns;
+        let (commands, command_rx) = async_channel::bounded::<WriteCommand>(cfg.queue);
         let (done_tx, done_rx) = async_channel::bounded(capacity + 1);
         let worker = std::thread::spawn(move || {
             while let Ok(command) = command_rx.recv_blocking() {
@@ -854,21 +877,34 @@ impl LoopWriter {
             }
         });
         Self {
-            mode,
+            mode: cfg.write,
             commands,
             done_tx,
             done_rx: Box::pin(done_rx),
             in_flight: 0,
             capacity,
+            pending_write: None,
             dispatched: 0,
             completed: 0,
+            fallbacks: 0,
             worker: Some(worker),
         }
     }
 
+    /// `PendingWriter::can_write`.
     #[inline]
     fn can_write(&self) -> bool {
-        self.in_flight < self.capacity
+        self.in_flight < self.capacity || self.pending_write.is_none()
+    }
+
+    /// `PendingWriter::write_range`.
+    fn write_range(&mut self, range: Range<u64>, data: Bytes) {
+        if self.in_flight < self.capacity {
+            self.dispatch(range, data);
+        } else {
+            assert!(self.pending_write.is_none(), "writer full");
+            self.pending_write = Some((range, data));
+        }
     }
 
     fn dispatch(&mut self, range: Range<u64>, data: Bytes) {
@@ -900,7 +936,7 @@ impl LoopWriter {
                 match commands.try_send(command) {
                     Ok(()) => {}
                     Err(async_channel::TrySendError::Full(command)) => {
-                        WRITE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                        self.fallbacks += 1;
                         tokio::spawn(async move {
                             let _ = commands.send(command).await;
                         });
@@ -911,42 +947,56 @@ impl LoopWriter {
         }
     }
 
-    fn ack(&mut self, n: usize) {
-        self.in_flight = self.in_flight.checked_sub(n).expect("duplicate completion");
-        self.completed += n as u64;
+    /// Ack a batch, then flush the pending write into the freed slot.
+    fn settle(&mut self, mut batch: Vec<Range<u64>>) -> Vec<Range<u64>> {
+        while let Ok(range) = self.done_rx.try_recv() {
+            batch.push(range);
+        }
+        self.in_flight = self
+            .in_flight
+            .checked_sub(batch.len())
+            .expect("duplicate completion");
+        self.completed += batch.len() as u64;
+        if self.in_flight < self.capacity
+            && let Some((range, data)) = self.pending_write.take()
+        {
+            self.dispatch(range, data);
+        }
+        batch
     }
 
     /// `PendingWriter::try_tick`.
-    fn try_drain(&mut self) -> usize {
-        let mut n = 0;
-        while self.done_rx.try_recv().is_ok() {
-            n += 1;
-        }
-        self.ack(n);
-        n
+    fn try_tick(&mut self) -> Vec<Range<u64>> {
+        self.settle(Vec::new())
     }
 
     /// `PendingWriter::tick`: rebuilds a `recv()` listener per call.
-    async fn tick(&mut self) -> usize {
-        self.done_rx.recv().await.expect("completion channel");
-        self.ack(1);
-        1 + self.try_drain()
+    async fn tick(&mut self) -> Vec<Range<u64>> {
+        let first = self.done_rx.recv().await.expect("completion channel");
+        self.settle(vec![first])
     }
 
     /// The planned `PendingWriter::poll_completions`.
     #[inline]
-    fn poll_done(&mut self, cx: &mut Context<'_>) -> Poll<usize> {
+    fn poll_completions(&mut self, cx: &mut Context<'_>) -> Poll<Vec<Range<u64>>> {
         if self.in_flight == 0 {
             return Poll::Pending;
         }
-        ready!(self.done_rx.as_mut().poll_next(cx)).expect("completion channel");
-        self.ack(1);
-        Poll::Ready(1 + self.try_drain())
+        let first = ready!(self.done_rx.as_mut().poll_next(cx)).expect("completion channel");
+        Poll::Ready(self.settle(vec![first]))
     }
 
-    async fn finish(mut self) {
-        while self.in_flight > 0 {
-            self.tick().await;
+    /// Wait for every write; returns the bytes completed meanwhile and the number of
+    /// full-queue fallbacks.
+    async fn finish(mut self) -> (u64, u64) {
+        let mut written = 0;
+        while self.in_flight > 0 || self.pending_write.is_some() {
+            written += self
+                .tick()
+                .await
+                .iter()
+                .map(|r| r.end - r.start)
+                .sum::<u64>();
         }
         assert_eq!(
             self.completed, self.dispatched,
@@ -954,27 +1004,131 @@ impl LoopWriter {
         );
         assert!(self.done_rx.try_recv().is_err(), "duplicate completion");
         let Self {
-            commands, worker, ..
+            commands,
+            worker,
+            fallbacks,
+            ..
         } = self;
         drop(commands);
         worker.expect("worker").join().expect("worker panicked");
+        (written, fallbacks)
     }
 }
 
-type LifecycleGroup = StreamGroup<futures::stream::BoxStream<'static, (RunnerId, Lifecycle)>>;
-type DataGroup = StreamGroup<futures::stream::BoxStream<'static, (RunnerId, Bytes)>>;
+/// Mirrors `ChunkPlanner` (chunks in a `BTreeMap` keyed by start) and the
+/// per-runner `meters` of `RunnerManager`.
+struct Planner {
+    chunks: BTreeMap<u64, ChunkState>,
+    runner_to_chunk: HashMap<RunnerId, u64>,
+    meters: HashMap<RunnerId, usize>,
+}
+
+impl Planner {
+    fn new(ranges: &[Range<u64>]) -> Self {
+        let mut planner = Self {
+            chunks: BTreeMap::new(),
+            runner_to_chunk: HashMap::with_capacity(ranges.len()),
+            meters: HashMap::with_capacity(ranges.len()),
+        };
+        for (id, range) in ranges.iter().enumerate() {
+            planner.chunks.insert(
+                range.start,
+                ChunkState {
+                    allocated: range.clone(),
+                    downloaded: range.start..range.start,
+                    finished: false,
+                },
+            );
+            planner.runner_to_chunk.insert(id as RunnerId, range.start);
+        }
+        planner
+    }
+
+    /// `RunnerManager::handle_data_frame`: meter, then `ChunkPlanner::update_progress`.
+    #[inline]
+    fn update_progress(&mut self, runner_id: RunnerId, len: usize) -> Range<u64> {
+        *self.meters.entry(runner_id).or_insert(0) += len;
+        let start = self.runner_to_chunk[&runner_id];
+        let chunk = self.chunks.get_mut(&start).expect("chunk");
+        let remaining = chunk.allocated.end - chunk.downloaded.end;
+        let new_end = chunk.downloaded.end + (len as u64).min(remaining);
+        let previous_end = std::mem::replace(&mut chunk.downloaded.end, new_end);
+        if chunk.downloaded.end >= chunk.allocated.end {
+            chunk.finished = true;
+        }
+        previous_end..new_end
+    }
+
+    /// `ChunkPlanner::get_total_downloaded`: O(chunks).
+    fn total_downloaded(&self) -> u64 {
+        self.chunks
+            .values()
+            .map(|c| c.downloaded.end - c.downloaded.start)
+            .sum()
+    }
+
+    /// `take_meters_snapshot` + `get_downloaded_ranges` (collect, sort, merge).
+    fn sample(&mut self) -> (usize, u64) {
+        let speed = self.meters.values_mut().map(std::mem::take).sum::<usize>();
+        let ranges = self
+            .chunks
+            .values()
+            .filter(|c| c.downloaded.start < c.downloaded.end)
+            .map(|c| c.downloaded.clone())
+            .collect();
+        (speed, merged_len(ranges))
+    }
+}
+
+/// Mirrors the crate's aggregators: an empty group stays pending instead of ending.
+struct Group<S>(StreamGroup<S>);
+
+impl<S: Stream + Unpin> Stream for Group<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        if self.0.is_empty() {
+            return Poll::Pending;
+        }
+        self.0.poll_next_unpin(cx)
+    }
+}
+
+type LifecycleGroup = Group<futures::stream::BoxStream<'static, (RunnerId, Lifecycle)>>;
+type DataGroup = Group<futures::stream::BoxStream<'static, (RunnerId, Bytes)>>;
+
+/// A connected runner's channels, sent from its task like `RunnerBuilderOutput`.
+type Connected = (RunnerId, AsyncHeapCons<Lifecycle>, AsyncHeapCons<Bytes>);
+
+/// Mirrors `PendingRunnerGroup`: registers the waker on every poll and stays
+/// pending while empty.
+struct PendingGroup {
+    waker: futures::task::AtomicWaker,
+    group: Pin<Box<FutureGroup<oneshot::AsyncReceiver<Connected>>>>,
+}
+
+impl Stream for PendingGroup {
+    type Item = Result<Connected, oneshot::RecvError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.waker.register(cx.waker());
+        if self.group.is_empty() {
+            return Poll::Pending;
+        }
+        self.group.as_mut().poll_next(cx)
+    }
+}
 
 enum RunnerEvent {
     Lifecycle(Option<(RunnerId, Lifecycle)>),
-    /// The pending group never yields here: every runner starts connected.
-    Pending,
+    Pending(Option<Result<Connected, oneshot::RecvError>>),
     Data(Option<(RunnerId, Bytes)>),
 }
 
 enum LoopEvent {
     Cancelled,
     Deadline,
-    Written(usize),
+    Written(Vec<Range<u64>>),
     Strategy,
     Throughput,
     Runner(RunnerEvent),
@@ -984,7 +1138,7 @@ enum LoopEvent {
 #[inline]
 fn poll_runner(
     lifecycle: &mut LifecycleGroup,
-    pending: &mut futures::stream::Pending<()>,
+    pending: &mut PendingGroup,
     data: &mut DataGroup,
     data_enabled: bool,
     cx: &mut Context<'_>,
@@ -992,8 +1146,8 @@ fn poll_runner(
     if let Poll::Ready(event) = lifecycle.poll_next_unpin(cx) {
         return Poll::Ready(RunnerEvent::Lifecycle(event));
     }
-    if pending.poll_next_unpin(cx).is_ready() {
-        return Poll::Ready(RunnerEvent::Pending);
+    if let Poll::Ready(connected) = pending.poll_next_unpin(cx) {
+        return Poll::Ready(RunnerEvent::Pending(connected));
     }
     if data_enabled {
         data.poll_next_unpin(cx).map(RunnerEvent::Data)
@@ -1005,7 +1159,7 @@ fn poll_runner(
 /// Today's `RunnerManager::tick` / `tick_lifecycle_only`.
 async fn runner_tick_rebuilt(
     lifecycle: &mut LifecycleGroup,
-    pending: &mut futures::stream::Pending<()>,
+    pending: &mut PendingGroup,
     data: &mut DataGroup,
     data_enabled: bool,
 ) -> RunnerEvent {
@@ -1017,13 +1171,13 @@ async fn runner_tick_rebuilt(
         futures::pin_mut!(next_data);
         futures::select_biased! {
             event = next_lifecycle => RunnerEvent::Lifecycle(event),
-            _ = next_pending => RunnerEvent::Pending,
+            connected = next_pending => RunnerEvent::Pending(connected),
             frame = next_data => RunnerEvent::Data(frame),
         }
     } else {
         futures::select_biased! {
             event = next_lifecycle => RunnerEvent::Lifecycle(event),
-            _ = next_pending => RunnerEvent::Pending,
+            connected = next_pending => RunnerEvent::Pending(connected),
         }
     }
 }
@@ -1031,56 +1185,67 @@ async fn runner_tick_rebuilt(
 /// Result of one loop run.
 struct LoopOutcome {
     downloaded: u64,
+    written: u64,
     frames: u64,
     strategy_ticks: u64,
     throughput_ticks: u64,
+    fallbacks: u64,
     /// Time from the stop signal to the loop handling it.
     stop_latency: Option<Duration>,
 }
 
 struct LoopModel {
     cfg: LoopConfig,
-    state: State,
+    planner: Planner,
     writer: LoopWriter,
     lifecycle: LifecycleGroup,
-    pending: futures::stream::Pending<()>,
+    pending: PendingGroup,
     data: DataGroup,
-    data_done: bool,
     cancel_token: smol_cancellation_token::CancellationToken,
-    cancel: Fuse<Pin<Box<smol_cancellation_token::WaitForCancellationFutureOwned>>>,
+    /// The persistent cancel listener; `rebuilt_select` re-creates one per iteration.
+    cancel: Option<Fuse<Pin<Box<smol_cancellation_token::WaitForCancellationFutureOwned>>>>,
     cancelled_at: Arc<std::sync::Mutex<Option<Instant>>>,
     deadline: async_io::Timer,
+    no_progress: Duration,
+    last_accepted: u64,
     last_progress: Instant,
     strategy: LoopTimer,
     throughput: LoopTimer,
     producers: Vec<tokio::task::JoinHandle<()>>,
     finished: usize,
     frames: u64,
+    written: u64,
     strategy_ticks: u64,
     throughput_ticks: u64,
-    checksum: u64,
 }
 
 impl LoopModel {
     fn new(cfg: LoopConfig) -> Self {
-        let ranges = split_ranges(LOOP_TOTAL, cfg.runners);
+        let ranges = split_ranges(cfg.total, cfg.runners);
         let frame = Bytes::from(vec![0xABu8; cfg.frame_size]);
-        let mut lifecycle = StreamGroup::new();
-        let mut data = StreamGroup::new();
+        let mut connecting = Box::pin(FutureGroup::new());
         let mut producers = Vec::with_capacity(ranges.len());
         for (id, range) in ranges.iter().enumerate() {
-            let (mut lc_tx, lc_rx): (AsyncHeapProd<Lifecycle>, AsyncHeapCons<Lifecycle>) =
-                AsyncHeapRb::new(LIFECYCLE_CHANNEL_CAPACITY).split();
-            let (mut data_tx, data_rx): (AsyncHeapProd<Bytes>, AsyncHeapCons<Bytes>) =
-                AsyncHeapRb::new(DATA_FRAME_CHANNEL_CAPACITY).split();
-            lifecycle.insert(tag(id as RunnerId, lc_rx).boxed());
-            data.insert(tag(id as RunnerId, data_rx).boxed());
+            let (connected_tx, connected_rx) = oneshot::channel();
+            connecting.as_mut().insert(connected_rx.into_future());
             let mut src = FrameSource::new(&frame, range);
             if !matches!(cfg.stop, Stop::Complete) {
                 // Keep the loop busy until the stop signal; extra frames are clipped.
                 src.remaining = u64::MAX;
             }
+            let late = cfg.stagger_connect && id % 2 == 1;
             producers.push(tokio::spawn(async move {
+                // "Connect", then hand the channels to the loop.
+                if late {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+                let (mut lc_tx, lc_rx) = AsyncHeapRb::new(LIFECYCLE_CHANNEL_CAPACITY).split();
+                let (mut data_tx, data_rx) = AsyncHeapRb::new(DATA_FRAME_CHANNEL_CAPACITY).split();
+                if connected_tx.send((id as RunnerId, lc_rx, data_rx)).is_err() {
+                    return;
+                }
                 let _ = lc_tx.push(Lifecycle::Started).await;
                 while let Some(f) = src.next().await {
                     if data_tx.push(f).await.is_err() {
@@ -1092,55 +1257,61 @@ impl LoopModel {
             }));
         }
 
-        let now = Instant::now();
-        let no_progress = match cfg.stop {
-            Stop::DeadlineAfter(after) => after,
-            _ => LOOP_NO_PROGRESS,
-        };
         let cancel_token = smol_cancellation_token::CancellationToken::new();
         let persistent = cfg.shape != LoopShape::RebuiltSelect;
+        let now = Instant::now();
         Self {
             cfg,
-            state: State::new(&ranges),
-            writer: LoopWriter::new(cfg.write, cfg.queue, cfg.write_cost_ns),
-            lifecycle,
-            pending: futures::stream::pending(),
-            data,
-            data_done: false,
-            cancel: Box::pin(cancel_token.clone().cancelled_owned()).fuse(),
+            planner: Planner::new(&ranges),
+            writer: LoopWriter::new(&cfg),
+            lifecycle: Group(StreamGroup::new()),
+            pending: PendingGroup {
+                waker: futures::task::AtomicWaker::new(),
+                group: connecting,
+            },
+            data: Group(StreamGroup::new()),
+            cancel: persistent.then(|| Box::pin(cancel_token.clone().cancelled_owned()).fuse()),
             cancel_token,
             cancelled_at: Arc::default(),
-            deadline: async_io::Timer::at(now + no_progress),
+            deadline: async_io::Timer::at(now + LOOP_NO_PROGRESS),
+            no_progress: LOOP_NO_PROGRESS,
+            last_accepted: 0,
             last_progress: now,
             strategy: LoopTimer::new(cfg.timer, LOOP_STRATEGY_INTERVAL, persistent),
             throughput: LoopTimer::new(cfg.timer, LOOP_THROUGHPUT_INTERVAL, persistent),
             producers,
             finished: 0,
             frames: 0,
+            written: 0,
             strategy_ticks: 0,
             throughput_ticks: 0,
-            checksum: 0,
         }
-        .with_cancel_timer()
     }
 
-    /// Arm the cancel signal for `Stop::CancelAfter`.
-    fn with_cancel_timer(self) -> Self {
-        if let Stop::CancelAfter(after) = self.cfg.stop {
-            let token = self.cancel_token.clone();
-            let cancelled_at = self.cancelled_at.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(after);
-                *cancelled_at.lock().unwrap() = Some(Instant::now());
-                token.cancel();
-            });
+    /// Arm the stop signal once setup is done, right before the loop starts.
+    fn arm_stop(&mut self) {
+        match self.cfg.stop {
+            Stop::Complete => {}
+            Stop::CancelAfter(after) => {
+                let token = self.cancel_token.clone();
+                let cancelled_at = self.cancelled_at.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(after);
+                    *cancelled_at.lock().unwrap() = Some(Instant::now());
+                    token.cancel();
+                });
+            }
+            Stop::DeadlineAfter(after) => {
+                self.no_progress = after;
+                self.last_progress = Instant::now();
+                self.deadline.set_at(self.last_progress + after);
+            }
         }
-        self
     }
 
     #[inline]
     fn data_enabled(&self) -> bool {
-        self.writer.can_write() && !self.data_done
+        self.writer.can_write()
     }
 
     async fn next_rebuilt(&mut self) -> LoopEvent {
@@ -1156,7 +1327,7 @@ impl LoopModel {
             throughput,
             ..
         } = self;
-        let writer_fut = if writer.in_flight == 0 {
+        let writer_fut = if writer.in_flight == 0 && writer.pending_write.is_none() {
             futures::future::Either::Left(futures::future::pending())
         } else {
             futures::future::Either::Right(writer.tick())
@@ -1178,7 +1349,7 @@ impl LoopModel {
         futures::select_biased! {
             _ = cancelled => LoopEvent::Cancelled,
             _ = deadline => LoopEvent::Deadline,
-            n = writer_fut => LoopEvent::Written(n),
+            batch = writer_fut => LoopEvent::Written(batch),
             _ = strategy_tick => LoopEvent::Strategy,
             _ = throughput_tick => LoopEvent::Throughput,
             event = runner_fut => LoopEvent::Runner(event),
@@ -1198,9 +1369,9 @@ impl LoopModel {
             throughput,
             ..
         } = self;
-        let mut cancel = cancel;
+        let mut cancel = cancel.as_mut().expect("persistent cancel listener");
         let deadline = FutureExt::fuse(deadline);
-        let writer_fut = poll_fn(|cx| writer.poll_done(cx)).fuse();
+        let writer_fut = poll_fn(|cx| writer.poll_completions(cx)).fuse();
         let strategy_tick = poll_fn(|cx| strategy.poll_tick(cx)).fuse();
         let throughput_tick = poll_fn(|cx| throughput.poll_tick(cx)).fuse();
         let runner_fut =
@@ -1215,7 +1386,7 @@ impl LoopModel {
         futures::select_biased! {
             _ = cancel => LoopEvent::Cancelled,
             _ = deadline => LoopEvent::Deadline,
-            n = writer_fut => LoopEvent::Written(n),
+            batch = writer_fut => LoopEvent::Written(batch),
             _ = strategy_tick => LoopEvent::Strategy,
             _ = throughput_tick => LoopEvent::Throughput,
             event = runner_fut => LoopEvent::Runner(event),
@@ -1224,14 +1395,15 @@ impl LoopModel {
 
     /// Priority: cancel > deadline > writer > strategy > throughput > runner.
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<LoopEvent> {
-        if let Poll::Ready(()) = self.cancel.poll_unpin(cx) {
+        let cancel = self.cancel.as_mut().expect("persistent cancel listener");
+        if let Poll::Ready(()) = cancel.poll_unpin(cx) {
             return Poll::Ready(LoopEvent::Cancelled);
         }
         if Pin::new(&mut self.deadline).poll(cx).is_ready() {
             return Poll::Ready(LoopEvent::Deadline);
         }
-        if let Poll::Ready(n) = self.writer.poll_done(cx) {
-            return Poll::Ready(LoopEvent::Written(n));
+        if let Poll::Ready(batch) = self.writer.poll_completions(cx) {
+            return Poll::Ready(LoopEvent::Written(batch));
         }
         if let Poll::Ready(()) = self.strategy.poll_tick(cx) {
             return Poll::Ready(LoopEvent::Strategy);
@@ -1250,6 +1422,11 @@ impl LoopModel {
         .map(LoopEvent::Runner)
     }
 
+    /// `record_completions` + `check_completions`.
+    fn record_completions(&mut self, batch: Vec<Range<u64>>) {
+        self.written += batch.iter().map(|r| r.end - r.start).sum::<u64>();
+    }
+
     /// Returns the stop latency once the loop must end.
     fn handle(&mut self, event: LoopEvent) -> ControlFlow<Option<Duration>> {
         match event {
@@ -1258,27 +1435,26 @@ impl LoopModel {
                 return ControlFlow::Break(Some(at.elapsed()));
             }
             LoopEvent::Deadline => {
-                let due = self.last_progress
-                    + match self.cfg.stop {
-                        Stop::DeadlineAfter(after) => after,
-                        _ => LOOP_NO_PROGRESS,
-                    };
+                let due = self.last_progress + self.no_progress;
                 let now = Instant::now();
                 if now >= due {
                     return ControlFlow::Break(Some(now - due));
                 }
                 self.deadline.set_at(due);
             }
-            LoopEvent::Written(n) => {
-                black_box(n);
-            }
+            LoopEvent::Written(batch) => self.record_completions(batch),
             LoopEvent::Strategy => {
                 self.strategy_ticks += 1;
-                black_box(self.state.runner_to_chunk.len());
+                black_box(self.planner.runner_to_chunk.len());
             }
             LoopEvent::Throughput => {
                 self.throughput_ticks += 1;
-                black_box(self.state.sample());
+                black_box(self.planner.sample());
+            }
+            LoopEvent::Runner(RunnerEvent::Pending(connected)) => {
+                let (id, lc_rx, data_rx) = connected.expect("pending group").expect("connected");
+                self.lifecycle.0.insert(tag(id, lc_rx).boxed());
+                self.data.0.insert(tag(id, data_rx).boxed());
             }
             LoopEvent::Runner(RunnerEvent::Lifecycle(Some((_, Lifecycle::Finished)))) => {
                 self.finished += 1;
@@ -1286,17 +1462,21 @@ impl LoopModel {
                     return ControlFlow::Break(None);
                 }
             }
-            LoopEvent::Runner(RunnerEvent::Lifecycle(_) | RunnerEvent::Pending) => {}
-            LoopEvent::Runner(RunnerEvent::Data(None)) => self.data_done = true,
+            LoopEvent::Runner(RunnerEvent::Lifecycle(_)) => {}
+            // The last data stream ended; the now empty group stays pending.
+            LoopEvent::Runner(RunnerEvent::Data(None)) => {}
             LoopEvent::Runner(RunnerEvent::Data(Some((id, mut bytes)))) => {
                 self.frames += 1;
-                let range = self.state.on_frame(id, bytes.len());
+                let range = self.planner.update_progress(id, bytes.len());
                 bytes.truncate((range.end - range.start) as usize);
-                if !range.is_empty() && !matches!(self.cfg.stop, Stop::DeadlineAfter(_)) {
-                    self.last_progress = Instant::now();
+                self.writer.write_range(range, bytes);
+                // `policy.on_bytes_accepted(manager.get_total_downloaded(), Instant::now())`.
+                let total = self.planner.total_downloaded();
+                let now = Instant::now();
+                if total > self.last_accepted && !matches!(self.cfg.stop, Stop::DeadlineAfter(_)) {
+                    self.last_accepted = total;
+                    self.last_progress = now;
                 }
-                self.checksum = self.checksum.wrapping_add(range.start);
-                self.writer.dispatch(range, bytes);
             }
         }
         ControlFlow::Continue(())
@@ -1304,29 +1484,32 @@ impl LoopModel {
 
     async fn finish(self, stop_latency: Option<Duration>) -> LoopOutcome {
         let Self {
-            mut state,
+            mut planner,
             writer,
             lifecycle,
+            pending,
             data,
             producers,
             frames,
+            mut written,
             strategy_ticks,
             throughput_ticks,
-            checksum,
             ..
         } = self;
         // Dropping the consumers releases producers blocked on a full channel.
-        drop((lifecycle, data));
-        writer.finish().await;
+        drop((lifecycle, pending, data));
+        let (tail, fallbacks) = writer.finish().await;
+        written += tail;
         for producer in producers {
             producer.await.expect("producer");
         }
-        black_box(checksum);
         LoopOutcome {
-            downloaded: state.sample().1,
+            downloaded: planner.sample().1,
+            written,
             frames,
             strategy_ticks,
             throughput_ticks,
+            fallbacks,
             stop_latency,
         }
     }
@@ -1334,10 +1517,12 @@ impl LoopModel {
 
 async fn download_loop(cfg: LoopConfig) -> LoopOutcome {
     let mut model = LoopModel::new(cfg);
+    model.arm_stop();
     let stop_latency = loop {
         let event = match cfg.shape {
             LoopShape::RebuiltSelect => {
-                model.writer.try_drain();
+                let batch = model.writer.try_tick();
+                model.record_completions(batch);
                 model.next_rebuilt().await
             }
             LoopShape::PersistentSelect => model.next_persistent().await,
@@ -1348,8 +1533,17 @@ async fn download_loop(cfg: LoopConfig) -> LoopOutcome {
         }
     };
     let outcome = model.finish(stop_latency).await;
-    if matches!(cfg.stop, Stop::Complete) {
-        assert_eq!(outcome.downloaded, LOOP_TOTAL, "{cfg:?} lost bytes");
+    match cfg.stop {
+        Stop::Complete => {
+            assert_eq!(outcome.downloaded, cfg.total, "{cfg:?} lost bytes");
+            assert_eq!(outcome.written, cfg.total, "{cfg:?} lost writes");
+        }
+        Stop::CancelAfter(_) | Stop::DeadlineAfter(_) => {
+            assert!(outcome.frames > 0, "{cfg:?} stopped before any work");
+        }
+    }
+    if cfg.write == WriteMode::DirectCompletion && cfg.queue == 1 {
+        assert!(outcome.fallbacks > 0, "{cfg:?} never hit a full queue");
     }
     outcome
 }
@@ -1388,89 +1582,96 @@ fn meters_vec(runners: usize, frames: usize, sample_every: usize) -> usize {
     acc
 }
 
-/// Few active runners over many retained chunks: per-frame O(chunks) total vs a counter.
-fn retained_chunks_state(retained: usize, active: usize) -> State {
+/// `active` running chunks after `retained` finished ones that no runner owns.
+fn retained_chunks_planner(retained: usize, active: usize) -> Planner {
     let ranges = split_ranges(LOOP_TOTAL, retained + active);
-    let mut state = State::new(&ranges);
-    // Retained chunks are finished and no longer have a runner.
-    for id in active..retained + active {
-        let key = state
-            .runner_to_chunk
-            .remove(&(id as RunnerId))
-            .expect("chunk");
-        let chunk = state.chunks.get_mut(&key).expect("chunk");
-        chunk.downloaded.end = chunk.allocated.end;
-        chunk.finished = true;
+    // Runner ids 0..active own the last chunks; the earlier ones are finished.
+    let mut planner = Planner::new(&ranges[retained..]);
+    for range in &ranges[..retained] {
+        planner.chunks.insert(
+            range.start,
+            ChunkState {
+                allocated: range.clone(),
+                downloaded: range.clone(),
+                finished: true,
+            },
+        );
     }
-    state
+    planner
 }
 
-fn frames_with_sum(state: &mut State, active: usize, frames: usize) -> u64 {
-    (0..frames)
-        .map(|i| state.on_frame((i % active) as RunnerId, 1).end)
-        .fold(0, u64::wrapping_add)
-}
-
-fn frames_with_counter(state: &mut State, active: usize, frames: usize) -> u64 {
-    let mut accepted = 0u64;
-    let mut acc = 0u64;
+/// Today: every frame recomputes `get_total_downloaded()`.
+fn frames_with_sum(planner: &mut Planner, active: usize, frames: usize) -> u64 {
+    let mut last_accepted = 0;
     for i in 0..frames {
-        let range = state.on_frame_counted((i % active) as RunnerId, 1);
-        accepted += range.end - range.start;
-        acc = acc.wrapping_add(range.end);
+        planner.update_progress((i % active) as RunnerId, 1);
+        last_accepted = last_accepted.max(planner.total_downloaded());
     }
-    acc.wrapping_add(accepted)
+    last_accepted
 }
 
-impl State {
-    /// `on_frame` with the planned `accepted_bytes` counter instead of the O(chunks) sum.
-    fn on_frame_counted(&mut self, runner_id: RunnerId, len: usize) -> Range<u64> {
-        *self.meters.entry(runner_id).or_insert(0) += len;
-        let key = self.runner_to_chunk[&runner_id];
-        let chunk = self.chunks.get_mut(&key).expect("chunk");
-        let new_end = (chunk.downloaded.end + len as u64).min(chunk.allocated.end);
-        let prev = std::mem::replace(&mut chunk.downloaded.end, new_end);
-        if chunk.downloaded.end >= chunk.allocated.end {
-            chunk.finished = true;
-        }
-        prev..new_end
+/// Planned: `accepted_bytes` grows by each accepted range.
+fn frames_with_counter(planner: &mut Planner, active: usize, frames: usize) -> u64 {
+    let mut accepted = planner.total_downloaded();
+    for i in 0..frames {
+        let range = planner.update_progress((i % active) as RunnerId, 1);
+        accepted += range.end - range.start;
     }
+    accepted
 }
 
 // ───────────────────────────── allocation counter ─────────────────────────────
 
-/// Counts allocations while `COUNT_ALLOCS` is set (profile mode only).
-struct CountingAlloc;
+/// Counts allocations process-wide while `COUNT_ALLOCS` is set. Built only with
+/// `RUSTFLAGS="--cfg coord_alloc"`, so ordinary timing runs use the plain allocator.
+#[cfg(coord_alloc)]
+mod alloc_counter {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    };
 
-static COUNT_ALLOCS: AtomicBool = AtomicBool::new(false);
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static COUNT_ALLOCS: AtomicBool = AtomicBool::new(false);
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
-// SAFETY: forwards every call to `System` unchanged.
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    struct CountingAlloc;
+
+    #[inline]
+    fn count() {
         if COUNT_ALLOCS.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
-        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
-        unsafe { System.alloc(layout) }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNT_ALLOCS.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: forwards every call to `System` unchanged.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count();
+            // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
+            unsafe { System.alloc(layout) }
         }
-        // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
-        unsafe { System.realloc(ptr, layout, new_size) }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            count();
+            // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            count();
+            // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
     }
+
+    #[global_allocator]
+    static GLOBAL: CountingAlloc = CountingAlloc;
 }
-
-#[global_allocator]
-static GLOBAL: CountingAlloc = CountingAlloc;
 
 // ───────────────────────────── criterion ─────────────────────────────
 
@@ -1581,25 +1782,61 @@ fn bench_download_loop_shape(c: &mut Criterion) {
     group.finish();
 }
 
-/// Write path at equal backend work; `q1` forces the full-queue fallback.
+/// Write path at equal backend work; `q1` forces the full-queue fallback (asserted).
 fn bench_download_loop_writer(c: &mut Criterion) {
     let rt = Runtime::new().expect("Failed to create runtime");
     let mut group = loop_group(c, "download_loop_writer");
-    for (label, queue, write_cost_ns) in [("q2048", WRITER_QUEUE, 0), ("q1/cost5us", 1, 5_000)] {
+    for (label, queue_full) in [("q2048", false), ("q1/cost5us", true)] {
         for runners in [4usize, 16] {
             for write in [WriteMode::SpawnOneshot, WriteMode::DirectCompletion] {
                 let cfg = LoopConfig {
                     write,
-                    queue,
-                    write_cost_ns,
                     ..LoopConfig::new(LoopShape::DirectPoll, TimerKind::Tokio, runners, 32 * 1024)
                 };
+                let cfg = if queue_full { cfg.queue_full() } else { cfg };
                 group.bench_with_input(
                     BenchmarkId::new(write.name(), format!("{label}/n{runners}/c32k")),
                     &cfg,
                     |b, cfg| b.to_async(&rt).iter(|| download_loop(*cfg)),
                 );
             }
+        }
+    }
+    group.finish();
+}
+
+/// Longer runs with late connections: every shape must re-arm both timers repeatedly.
+fn bench_download_loop_sustained(c: &mut Criterion) {
+    const TOTAL: u64 = 8 * LOOP_TOTAL;
+    let rt = Runtime::new().expect("Failed to create runtime");
+    let mut group = loop_group(c, "download_loop_sustained");
+    group.throughput(Throughput::Bytes(TOTAL));
+    for timer in [TimerKind::Tokio, TimerKind::Custom] {
+        for shape in LoopShape::ALL {
+            let cfg = LoopConfig {
+                total: TOTAL,
+                stagger_connect: true,
+                ..LoopConfig::new(shape, timer, 16, 32 * 1024)
+            };
+            group.bench_with_input(
+                BenchmarkId::new(shape.name(), format!("{}/n16/c32k", timer.name())),
+                &cfg,
+                |b, cfg| {
+                    b.to_async(&rt).iter(|| async {
+                        let outcome = download_loop(*cfg).await;
+                        // The first tick of each timer is immediate.
+                        assert!(
+                            outcome.strategy_ticks >= 3,
+                            "{cfg:?}: strategy re-armed too rarely"
+                        );
+                        assert!(
+                            outcome.throughput_ticks >= 5,
+                            "{cfg:?}: throughput re-armed too rarely"
+                        );
+                        outcome
+                    })
+                },
+            );
         }
     }
     group.finish();
@@ -1660,13 +1897,26 @@ fn bench_frame_bookkeeping(c: &mut Criterion) {
     }
     const ACTIVE: usize = 4;
     for retained in [16usize, 256, 4096] {
+        assert_eq!(
+            frames_with_sum(
+                &mut retained_chunks_planner(retained, ACTIVE),
+                ACTIVE,
+                FRAMES
+            ),
+            frames_with_counter(
+                &mut retained_chunks_planner(retained, ACTIVE),
+                ACTIVE,
+                FRAMES
+            ),
+            "the counter must match the recomputed total"
+        );
         group.bench_with_input(
             BenchmarkId::new("progress_sum", format!("a{ACTIVE}/r{retained}")),
             &retained,
             |b, &r| {
                 b.iter_batched_ref(
-                    || retained_chunks_state(r, ACTIVE),
-                    |state| frames_with_sum(state, ACTIVE, FRAMES),
+                    || retained_chunks_planner(r, ACTIVE),
+                    |planner| frames_with_sum(planner, ACTIVE, FRAMES),
                     criterion::BatchSize::LargeInput,
                 )
             },
@@ -1676,8 +1926,8 @@ fn bench_frame_bookkeeping(c: &mut Criterion) {
             &retained,
             |b, &r| {
                 b.iter_batched_ref(
-                    || retained_chunks_state(r, ACTIVE),
-                    |state| frames_with_counter(state, ACTIVE, FRAMES),
+                    || retained_chunks_planner(r, ACTIVE),
+                    |planner| frames_with_counter(planner, ACTIVE, FRAMES),
                     criterion::BatchSize::LargeInput,
                 )
             },
@@ -1692,13 +1942,15 @@ criterion_group!(
     bench_coordination_costly_write,
     bench_download_loop_shape,
     bench_download_loop_writer,
+    bench_download_loop_sustained,
     bench_download_loop_latency,
     bench_frame_bookkeeping
 );
 
-/// `COORD_PROFILE=loop:shape:timer:write:runners:frame_size:iterations[:queue[:write_cost_ns]]`
-/// runs one download loop config outside criterion, printing allocations per frame
-/// and full-queue fallbacks.
+/// `COORD_PROFILE=loop:shape:timer:write:runners:frame_size:iterations[:queue_full]`
+/// runs one download loop config outside criterion, reporting ns/frame, timer ticks
+/// and full-queue fallbacks. Built with `RUSTFLAGS="--cfg coord_alloc"` it also reports
+/// process-wide allocations per frame (from a separate, untimed pass).
 fn profile_loop(parts: &[&str]) {
     let parse = |name: &str, s: &str| -> usize { s.parse().unwrap_or_else(|_| panic!("{name}")) };
     let shape = *LoopShape::ALL
@@ -1715,8 +1967,6 @@ fn profile_loop(parts: &[&str]) {
         .expect("unknown write mode");
     let cfg = LoopConfig {
         write,
-        queue: parts.get(6).map_or(WRITER_QUEUE, |s| parse("queue", s)),
-        write_cost_ns: parts.get(7).map_or(0, |s| parse("write_cost_ns", s) as u64),
         ..LoopConfig::new(
             shape,
             timer,
@@ -1724,30 +1974,45 @@ fn profile_loop(parts: &[&str]) {
             parse("frame_size", parts[4]),
         )
     };
+    let cfg = if parts.get(6) == Some(&"queue_full") {
+        cfg.queue_full()
+    } else {
+        cfg
+    };
     let iterations = parse("iterations", parts[5]);
     let rt = Runtime::new().expect("Failed to create runtime");
     let start = Instant::now();
-    COUNT_ALLOCS.store(true, Ordering::Relaxed);
-    let (mut frames, mut strategy_ticks, mut throughput_ticks) = (0, 0, 0);
+    let (mut frames, mut strategy_ticks, mut throughput_ticks, mut fallbacks) = (0, 0, 0, 0);
     for _ in 0..iterations {
         let outcome = rt.block_on(download_loop(cfg));
         frames += outcome.frames;
         strategy_ticks += outcome.strategy_ticks;
         throughput_ticks += outcome.throughput_ticks;
+        fallbacks += outcome.fallbacks;
     }
-    COUNT_ALLOCS.store(false, Ordering::Relaxed);
     let elapsed = start.elapsed();
-    let gib = (LOOP_TOTAL * iterations as u64) as f64 / (1u64 << 30) as f64;
+    let gib = (cfg.total * iterations as u64) as f64 / (1u64 << 30) as f64;
     println!(
-        "loop:{}: {gib:.2} GiB in {elapsed:?} -> {:.2} GiB/s wall, {:.1} ns/frame, {:.2} \
-         allocs/frame, {} fallbacks, {strategy_ticks} strategy + {throughput_ticks} throughput \
-         ticks",
+        "loop:{}: {gib:.2} GiB in {elapsed:?} -> {:.2} GiB/s wall, {:.1} ns/frame, {fallbacks} \
+         fallbacks, {strategy_ticks} strategy + {throughput_ticks} throughput ticks",
         parts.join(":"),
         gib / elapsed.as_secs_f64(),
         elapsed.as_nanos() as f64 / frames as f64,
-        ALLOCS.load(Ordering::Relaxed) as f64 / frames as f64,
-        WRITE_FALLBACKS.load(Ordering::Relaxed),
     );
+    #[cfg(coord_alloc)]
+    {
+        use alloc_counter::{ALLOCS, COUNT_ALLOCS};
+        let mut frames = 0;
+        COUNT_ALLOCS.store(true, Ordering::Relaxed);
+        for _ in 0..iterations {
+            frames += rt.block_on(download_loop(cfg)).frames;
+        }
+        COUNT_ALLOCS.store(false, Ordering::Relaxed);
+        println!(
+            "  {:.2} allocs/frame (process-wide, amortized)",
+            ALLOCS.load(Ordering::Relaxed) as f64 / frames as f64
+        );
+    }
 }
 
 /// `COORD_PROFILE=variant:runners:frame_size:iterations[:write_cost_ns]` runs one config

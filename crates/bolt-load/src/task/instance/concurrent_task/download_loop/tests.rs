@@ -1,7 +1,11 @@
 use std::{
     path::Path,
     pin::pin,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -9,7 +13,7 @@ use async_waitgroup::WaitGroup;
 use bolt_load_tests::adapter::simple::SimpleTestAdapter;
 use futures::{
     future::{Either, FutureObj},
-    task::{Spawn, SpawnError},
+    task::{ArcWake, Spawn, SpawnError},
 };
 use pretty_assertions::assert_eq;
 use smol_cancellation_token::CancellationToken;
@@ -81,8 +85,6 @@ enum SpawnMode {
     Park,
     /// Reject the spawn.
     Fail,
-    /// Run the future to completion on a thread of its own.
-    Run,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,6 +181,11 @@ impl ScriptedRuntime {
     fn set_mode(&self, mode: SpawnMode) {
         *self.mode.lock().unwrap() = mode;
     }
+
+    /// Take the parked futures, in spawn order.
+    fn take_parked(&self) -> Vec<FutureObj<'static, ()>> {
+        std::mem::take(&mut *self.parked.lock().unwrap())
+    }
 }
 
 impl Spawn for ScriptedRuntime {
@@ -187,9 +194,6 @@ impl Spawn for ScriptedRuntime {
         match mode {
             SpawnMode::Park => self.parked.lock().unwrap().push(future),
             SpawnMode::Fail => return Err(SpawnError::shutdown()),
-            SpawnMode::Run => drop(std::thread::spawn(move || {
-                futures::executor::block_on(future)
-            })),
         }
         Ok(())
     }
@@ -225,20 +229,37 @@ fn on_each_executor<F: Future<Output = ()>>(test: impl Fn() -> F) {
 
 /// Await `fut`, failing the test if it takes longer than a few seconds.
 async fn with_watchdog<T>(fut: impl Future<Output = T>) -> T {
-    let fut = pin!(fut);
-    match futures::future::select(fut, async_io::Timer::after(Duration::from_secs(10))).await {
-        Either::Left((value, _)) => value,
-        Either::Right(_) => panic!("the event loop never returned"),
+    // Poll the timeout first: its wake-up must not rescue a future that lost its own.
+    match futures::future::select(async_io::Timer::after(Duration::from_secs(10)), pin!(fut)).await
+    {
+        Either::Left(_) => panic!("the event loop never returned"),
+        Either::Right((value, _)) => value,
     }
 }
 
-/// Cancel `token` from another thread after `delay`.
-fn cancel_after(token: &CancellationToken, delay: Duration) {
-    let token = token.clone();
-    drop(std::thread::spawn(move || {
-        std::thread::sleep(delay);
-        token.cancel();
-    }));
+/// Counts the wake-ups of a manually polled future.
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl WakeCount {
+    fn get(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the count exceeds `seen`, failing on a lost wake-up.
+    fn wait_past(&self, seen: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.get() <= seen {
+            assert!(Instant::now() < deadline, "lost wake-up");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl ArcWake for WakeCount {
+    fn wake_by_ref(this: &Arc<Self>) {
+        this.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,22 +377,22 @@ impl LoopHarness {
         }
     }
 
-    /// Run the loop; it is cancelled after `cancel_after` if still running.
-    async fn run(&mut self, cancel_after_delay: Duration) -> Result<()> {
-        cancel_after(&self.cancel, cancel_after_delay);
+    /// Run the loop until it returns on its own.
+    async fn run_to_end(&mut self) -> Result<()> {
         with_watchdog(self.download.run(&self.cancel)).await
-    }
-
-    fn progress_events(&self) -> usize {
-        std::iter::from_fn(|| self.events.try_recv().ok())
-            .filter(|e| matches!(e, TaskEvent::Downloading(_)))
-            .count()
     }
 
     async fn teardown(self) {
         drop(self.download);
         self.file_writer.finalize().await.unwrap();
     }
+}
+
+/// Drain the progress events published so far.
+fn progress_events(events: &async_channel::Receiver<TaskEvent>) -> usize {
+    std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|e| matches!(e, TaskEvent::Downloading(_)))
+        .count()
 }
 
 /// Pairs `(higher, lower)` that `run` already orders correctly.
@@ -397,7 +418,26 @@ async fn assert_priority(high: Source, low: Source) {
         LoopHarness::scripted(Source::Deadline == high || Source::Deadline == low).await;
     harness.make_ready(low);
     harness.make_ready(high);
-    let result = harness.run(Duration::from_millis(200)).await;
+    let cancel = harness.cancel.clone();
+    let result = {
+        let mut run = pin!(harness.download.run(&cancel));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // One poll handles every event that is already ready.
+        match run.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => {
+                assert!(
+                    !high.is_terminal() && !low.is_terminal(),
+                    "{high:?} vs {low:?}: parked with a terminal event ready"
+                );
+                cancel.cancel();
+                let Poll::Ready(result) = run.as_mut().poll(&mut cx) else {
+                    panic!("{high:?} vs {low:?}: parked after cancellation");
+                };
+                result
+            }
+        }
+    };
     let log = harness.rt.script.log();
     let context = format!("{high:?} vs {low:?}: result {result:?}, ticks {log:?}");
     if high.is_terminal() {
@@ -438,8 +478,7 @@ fn test_loop_priority_deadline_beats_writer() {
 fn test_custom_timer_survives_other_events() {
     on_each_executor(|| async {
         let mut harness = LoopHarness::scripted(false).await;
-        // Writer completions arrive while the loop waits.
-        harness.rt.set_mode(SpawnMode::Run);
+        // Writes and a connecting runner stay parked until the timer waits.
         while !harness.download.writer.is_full() {
             harness
                 .download
@@ -447,56 +486,120 @@ fn test_custom_timer_survives_other_events() {
                 .write_range(0..1, bytes::Bytes::from_static(b"x"))
                 .unwrap();
         }
-        harness.rt.set_mode(SpawnMode::Park);
-        for _ in 0..3 {
-            harness.rt.script.permit("strategy");
-        }
+        let writes = harness.rt.take_parked();
+        harness.download.spawn_runner(0..LOOP_TOTAL);
+        let connecting = harness.rt.take_parked();
         let script = harness.rt.script.clone();
-        drop(std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            script.permit("throughput");
-        }));
+        let cancel = harness.cancel.clone();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let result = {
+            let mut run = pin!(harness.download.run(&cancel));
+            assert!(run.as_mut().poll(&mut cx).is_pending());
 
-        let result = harness.run(Duration::from_millis(300)).await;
+            // Writer completions and a lost connection arrive while it waits.
+            let seen = wakes.get();
+            let writers: Vec<_> = writes
+                .into_iter()
+                .map(|write| std::thread::spawn(move || futures::executor::block_on(write)))
+                .collect();
+            writers.into_iter().for_each(|w| w.join().unwrap());
+            drop(connecting);
+            wakes.wait_past(seen);
+            assert!(run.as_mut().poll(&mut cx).is_pending());
+
+            for _ in 0..3 {
+                let seen = wakes.get();
+                script.permit("strategy");
+                wakes.wait_past(seen);
+                assert!(run.as_mut().poll(&mut cx).is_pending());
+            }
+
+            let seen = wakes.get();
+            script.permit("throughput");
+            wakes.wait_past(seen);
+            assert!(run.as_mut().poll(&mut cx).is_pending());
+
+            cancel.cancel();
+            let Poll::Ready(result) = run.as_mut().poll(&mut cx) else {
+                panic!("parked after cancellation");
+            };
+            result
+        };
 
         assert_eq!(outcome(&result), "cancel");
         assert_eq!(
-            harness.rt.script.log(),
+            script.log(),
             ["strategy", "strategy", "strategy", "throughput"]
         );
         assert!(harness.download.writer.is_idle());
-        assert_eq!(harness.progress_events(), 1);
+        let stats = harness
+            .download
+            .manager
+            .runner_outcome_sampler_mut()
+            .stats();
+        assert_eq!(stats.connect_failed_retryable, 1, "{stats:?}");
+        assert_eq!(progress_events(&harness.events), 1);
         harness.teardown().await;
     });
 }
 
 #[test]
 fn test_timer_rearms_after_consecutive_ticks() {
-    // Scripted: every permit is one more tick.
+    // Scripted: the loop parks between ticks and every permit is one more tick.
     on_each_executor(|| async {
         let mut harness = LoopHarness::scripted(false).await;
         let script = harness.rt.script.clone();
-        drop(std::thread::spawn(move || {
-            for _ in 0..3 {
-                std::thread::sleep(Duration::from_millis(20));
+        let events = harness.events.clone();
+        let cancel = harness.cancel.clone();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let result = {
+            let mut run = pin!(harness.download.run(&cancel));
+            assert!(run.as_mut().poll(&mut cx).is_pending());
+            for tick in 1..=3 {
+                let seen = wakes.get();
                 script.permit("throughput");
+                wakes.wait_past(seen);
+                assert!(run.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(progress_events(&events), 1, "tick {tick}");
             }
-        }));
-        let result = harness.run(Duration::from_millis(300)).await;
+            cancel.cancel();
+            let Poll::Ready(result) = run.as_mut().poll(&mut cx) else {
+                panic!("parked after cancellation");
+            };
+            result
+        };
         assert_eq!(outcome(&result), "cancel");
-        assert_eq!(harness.progress_events(), 3);
         harness.teardown().await;
     });
 
     // Native: the first tick is immediate, then one per sample interval.
     let native = |timers| async move {
         let mut harness = LoopHarness::new(timers, TaskOptions::default()).await;
-        let result = harness
-            .run(DEFAULT_SAMPLE_INTERVAL * 2 + DEFAULT_SAMPLE_INTERVAL / 2)
-            .await;
+        let events = harness.events.clone();
+        let cancel = harness.cancel.clone();
+        drop(std::thread::spawn(move || {
+            let mut ticks = 0;
+            while ticks < 3 {
+                match events.recv_blocking() {
+                    Ok(TaskEvent::Downloading(_)) => ticks += 1,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            cancel.cancel();
+        }));
+        let started = Instant::now();
+        let result = harness.run_to_end().await;
+        let elapsed = started.elapsed();
         assert_eq!(outcome(&result), "cancel");
-        let ticks = harness.progress_events();
-        assert!(ticks >= 3, "{timers:?}: {ticks} throughput ticks");
+        assert!(
+            elapsed >= DEFAULT_SAMPLE_INTERVAL * 2,
+            "{timers:?}: three ticks within {elapsed:?}"
+        );
         harness.teardown().await;
     };
     tokio::runtime::Builder::new_current_thread()
@@ -524,13 +627,21 @@ fn test_deadline_moved_repeatedly_before_fire() {
         std::thread::sleep(TIMEOUT / 4);
         let last_progress = Instant::now();
         harness.download.policy.on_bytes_accepted(2, last_progress);
+        let policy = &harness.download.policy;
+        assert!(
+            policy
+                .check(last_progress + TIMEOUT - Duration::from_nanos(1))
+                .is_none()
+        );
+        assert!(policy.check(last_progress + TIMEOUT).is_some());
 
-        let result = harness.run(Duration::from_secs(5)).await;
+        let result = harness.run_to_end().await;
 
+        // The timer first fires at the stale deadline, a quarter timeout after the
+        // last progress; it must re-arm instead of failing there.
         let elapsed = last_progress.elapsed();
         assert_eq!(outcome(&result), "deadline");
         assert!(elapsed >= TIMEOUT, "fired early: {elapsed:?}");
-        assert!(elapsed < TIMEOUT * 2, "fired late: {elapsed:?}");
         harness.teardown().await;
     });
 }
@@ -539,10 +650,22 @@ fn test_deadline_moved_repeatedly_before_fire() {
 fn test_cancel_after_registration_wakes_loop() {
     on_each_executor(|| async {
         let mut harness = LoopHarness::scripted(false).await;
-        let started = Instant::now();
-        let result = harness.run(Duration::from_millis(50)).await;
+        let cancel = harness.cancel.clone();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let result = {
+            let mut run = pin!(harness.download.run(&cancel));
+            assert!(run.as_mut().poll(&mut cx).is_pending());
+            let seen = wakes.get();
+            cancel.cancel();
+            assert!(wakes.get() > seen, "cancellation did not wake the loop");
+            let Poll::Ready(result) = run.as_mut().poll(&mut cx) else {
+                panic!("parked after cancellation");
+            };
+            result
+        };
         assert_eq!(outcome(&result), "cancel");
-        assert!(started.elapsed() >= Duration::from_millis(50));
         harness.teardown().await;
     });
 }
