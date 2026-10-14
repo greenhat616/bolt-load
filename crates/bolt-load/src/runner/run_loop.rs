@@ -107,6 +107,7 @@ impl<'a> RunnerLoop<'a> {
         let phase = match runner.input {
             RunnerInput::Connected(_) => Phase::PublishingStarted,
             RunnerInput::Connecting(_) => Phase::Connecting,
+            RunnerInput::Abandoned => Phase::Stopped,
         };
         Self {
             runner,
@@ -207,6 +208,10 @@ impl<'a> RunnerLoop<'a> {
     /// Stop with `result`, draining the data channel first when the
     /// delivered bytes count.
     fn begin_stop(&mut self, result: RunResult) {
+        if matches!(self.phase, Phase::Connecting) {
+            // Release the connection before reporting the stop.
+            self.runner.input = RunnerInput::Abandoned;
+        }
         if TaskRunner::should_wait_data_drain(&result) {
             self.phase = Phase::Draining(DrainState::new(result));
         } else {

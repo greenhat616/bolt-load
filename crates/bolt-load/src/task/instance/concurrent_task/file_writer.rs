@@ -731,7 +731,7 @@ mod tests {
             let token = runners_cancel_token.clone();
 
             runner_manager
-                .allocate_pending_runner_with_chunk(range, |runner_id, limits| {
+                .spawn_runner_with_chunk(range, |runner_id, limits| {
                     RunnerSpawner::new(
                         rt.clone(),
                         adapter,

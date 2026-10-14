@@ -2151,9 +2151,9 @@ async fn test_cancel_while_connecting_drops_the_connection() {
         )))
     ));
     assert!(lifecycle_rx.try_pop().is_none());
-    // The pending connection is only dropped with the runner.
-    drop(runner);
+    // The pending connection was released before the stop was reported.
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    drop(runner);
 }
 
 #[tokio::test]
