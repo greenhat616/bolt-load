@@ -12,8 +12,8 @@ repository.workspace = true
 tracing = ["bolt-load-utils/tracing", "dep:tracing"]
 
 [dependencies]
-bolt-load-core = { path = "../bolt-load-core", version = "0.1" }
-bolt-load-utils = { path = "../bolt-load-utils", version = "0.1", features = [
+bolt-load-core = { path = "../bolt-load-core", version = "0.2" }
+bolt-load-utils = { path = "../bolt-load-utils", version = "0.2", features = [
     "tracing",
 ] }
 

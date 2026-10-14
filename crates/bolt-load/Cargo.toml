@@ -46,9 +46,9 @@ path = "src/lib.rs"
 
 
 [dependencies]
-bolt-load-core = { path = "../bolt-load-core", version = "0.1" }
-bolt-load-adapter = { path = "../bolt-load-adapter", version = "0.1" }
-bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
+bolt-load-core = { path = "../bolt-load-core", version = "0.2" }
+bolt-load-adapter = { path = "../bolt-load-adapter", version = "0.2" }
+bolt-load-utils = { path = "../bolt-load-utils", version = "0.2" }
 
 snafu = { workspace = true }
 dynosaur = "0.3" # for dyn-compatible async traits

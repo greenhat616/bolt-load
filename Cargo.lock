@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-load"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-load-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-lock",
  "async-once-cell",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-load-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dynosaur",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-load-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "bolt-load-utils"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blocking",
  "bytes",
