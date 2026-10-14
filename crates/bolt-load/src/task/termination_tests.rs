@@ -380,13 +380,14 @@ async fn test_singleton_never_hangs() {
     assert!(task_error(task.wait().await).is_cancelled());
     assert_cleaned_up(&adapter, &dest);
 
-    // Connection blocked past the no-progress deadline.
+    // Connection blocked past the connect timeout.
+    let gate = Gate::new();
     let adapter = range_adapter()
-        .full_connect_plan(FaultPlan::Block(Gate::new()))
+        .full_connect_plan(FaultPlan::Block(gate.clone()))
         .build()
         .unwrap();
     let dest = dir.path().join("t10-connect.bin");
-    let options = idle.clone().no_progress_timeout(Duration::from_millis(300));
+    let options = idle.clone().connect_timeout(Duration::from_millis(300));
     let mut task = start(
         &adapter,
         &dest,
@@ -395,9 +396,14 @@ async fn test_singleton_never_hangs() {
         DownloadMode::Singleton,
     )
     .await;
+    watchdog(gate.entered()).await;
+    assert!(
+        !tmp_path(&dest).exists(),
+        "the file is created once connected"
+    );
     assert!(matches!(
         task_error(watchdog(task.wait()).await),
-        TaskError::NoProgress { .. }
+        TaskError::Timeout
     ));
     assert_cleaned_up(&adapter, &dest);
 
@@ -440,6 +446,56 @@ async fn test_singleton_never_hangs() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_singleton_connect_failure_keeps_the_adapter_error() {
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("connect-failure.bin");
+    let adapter = range_adapter()
+        .full_connect_plan(FaultPlan::AlwaysFail(FaultKind::Unretryable))
+        .build()
+        .unwrap();
+    let mut task = start(
+        &adapter,
+        &dest,
+        &CancellationToken::new(),
+        TaskOptions::default(),
+        DownloadMode::Singleton,
+    )
+    .await;
+    assert!(matches!(
+        watchdog(task.wait()).await,
+        Err(TaskInstanceError::StreamFailed {
+            source: AdapterError::Unretryable { .. }
+        })
+    ));
+    assert_cleaned_up(&adapter, &dest);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_singleton_file_open_failure_stops_the_runner() {
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("file.bin");
+    // A directory in its place keeps the temporary file from being opened.
+    std::fs::create_dir(tmp_path(&dest)).unwrap();
+    let adapter = range_adapter().build().unwrap();
+    let mut task = start(
+        &adapter,
+        &dest,
+        &CancellationToken::new(),
+        TaskOptions::default(),
+        DownloadMode::Singleton,
+    )
+    .await;
+    assert!(matches!(
+        watchdog(task.wait()).await,
+        Err(TaskInstanceError::WriteChunkFailed { .. })
+    ));
+    assert_eq!(adapter.active_requests(), 0);
+    assert_eq!(adapter.active_streams(), 0);
+    assert!(!dest.exists());
+}
+
+// T11
 #[tokio::test(flavor = "multi_thread")]
 async fn test_singleton_success_keeps_caller_token() {
     let dir = TempDir::new().unwrap();
