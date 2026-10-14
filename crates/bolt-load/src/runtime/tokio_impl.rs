@@ -1,4 +1,9 @@
-use std::{rc::Rc, time::Duration};
+use std::{
+    future::poll_fn,
+    rc::Rc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
 
@@ -183,8 +188,16 @@ impl TokioDelayedTimer {
     }
 }
 
+impl TokioDelayedTimer {
+    /// Poll for the next tick.
+    #[inline]
+    pub(crate) fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.timer.poll_tick(cx).map(drop)
+    }
+}
+
 impl Timer for TokioDelayedTimer {
     async fn tick(&mut self) {
-        self.timer.tick().await;
+        poll_fn(|cx| self.poll_tick(cx)).await
     }
 }

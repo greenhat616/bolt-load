@@ -4,11 +4,16 @@ use std::{
     task::{Context, Poll},
 };
 
+use bolt_load_utils::telemetry::*;
+use bytes::Bytes;
 use futures::{Stream, task::AtomicWaker};
 use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
-use super::stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem};
+use super::{
+    DownloadedChunk, RunnerManager, RunnerTick,
+    stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem},
+};
 use crate::{
     runner::{DataFrame, DataFrameReceiver},
     task::RunnerId,
@@ -29,7 +34,6 @@ pin_project! {
         #[pin]
         group: StreamGroup<RunnerTaggedStream<DataFrameReceiver>>,
         map: HashMap<RunnerId, Key>,
-        is_closed: bool,
         waker: AtomicWaker,
     }
 }
@@ -49,7 +53,6 @@ impl DataAggregator {
         Self {
             group: StreamGroup::with_capacity(capacity),
             map: HashMap::with_capacity(capacity),
-            is_closed: false,
             waker: AtomicWaker::new(),
         }
     }
@@ -103,10 +106,8 @@ impl Stream for DataAggregator {
         let this = self.project();
         this.waker.register(cx.waker());
 
+        // Never ends: a runner may be registered at any time.
         if this.map.is_empty() {
-            if *this.is_closed {
-                return Poll::Ready(None);
-            }
             return Poll::Pending;
         }
 
@@ -118,14 +119,46 @@ impl Stream for DataAggregator {
                     Poll::Ready(Some(DataStreamEvent::Closed(runner_id)))
                 }
             },
-            Poll::Ready(None) => {
-                if *this.is_closed {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RunnerManager {
+    /// Poll the next data frame, returning the part of it the planner accepted.
+    #[inline]
+    pub(super) fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<RunnerTick> {
+        Pin::new(&mut self.data_aggregator)
+            .poll_next(cx)
+            .map(
+                |event| match event.expect("the data aggregator never ends") {
+                    DataStreamEvent::Data(item) => RunnerTick::with_chunk(
+                        self.handle_data_frame(item.runner_id, item.item.data),
+                    ),
+                    DataStreamEvent::Closed(runner_id) => {
+                        trace!("runner {runner_id} data stream closed");
+                        self.data_aggregator.unregister(runner_id);
+                        RunnerTick::downloading()
+                    }
+                },
+            )
+    }
+
+    /// Handle data frames from runners, returning the chunk ready for writing.
+    fn handle_data_frame(&mut self, runner_id: RunnerId, mut data_frame: Bytes) -> DownloadedChunk {
+        let bytes_len = data_frame.len();
+        *self.meters.entry(runner_id).or_insert(0) += bytes_len;
+
+        let fixed_downloaded_range = self
+            .chunk_planner
+            .update_progress(runner_id, bytes_len as u64)
+            .expect("chunk planner should not fail");
+        let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
+        data_frame.truncate(picked_size as usize);
+
+        DownloadedChunk {
+            range: fixed_downloaded_range,
+            bytes: data_frame,
         }
     }
 }
