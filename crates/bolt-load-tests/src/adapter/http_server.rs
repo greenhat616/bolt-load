@@ -33,12 +33,10 @@ struct FileHolder(Arc<tokio::sync::Mutex<tokio::fs::File>>);
 
 pub const DEFAULT_FILE_SIZE: usize = 1024 * 1024;
 
-#[allow(dead_code)]
 pub async fn create_http_server() -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
     create_http_server_with_file_size(DEFAULT_FILE_SIZE).await
 }
 
-#[allow(dead_code)]
 pub async fn create_http_server_with_file_size(
     file_size: usize,
 ) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {

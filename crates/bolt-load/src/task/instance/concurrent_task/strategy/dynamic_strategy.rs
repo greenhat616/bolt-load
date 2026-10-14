@@ -27,7 +27,7 @@ impl Default for DynamicStrategy {
 }
 
 impl DynamicStrategy {
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "the strategy is built with its defaults")]
     pub fn new(threashold1: f64, threashold2: f64) -> Self {
         Self {
             threashold1,

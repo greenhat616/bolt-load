@@ -4,5 +4,8 @@ use bolt_load_core::adapter::*;
 pub mod reqwest;
 
 #[cfg(feature = "ureq2")]
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "the module re-exports ureq's large error type"
+)]
 pub mod ureq2;

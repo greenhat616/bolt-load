@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![expect(dead_code, reason = "not every planner query is used by the task yet")]
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -767,7 +767,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::reversed_empty_ranges)]
+    #[expect(
+        clippy::reversed_empty_ranges,
+        reason = "tests that reversed ranges are rejected"
+    )]
     fn test_invalid_range_allocation() {
         let mut planner = ChunkPlanner::new(1000);
 
@@ -1280,7 +1283,7 @@ mod tests {
     // === Helper function tests ===
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
+    #[expect(clippy::single_range_in_vec_init, reason = "lists holding one range")]
     fn test_merge_adjacent_ranges() {
         // Empty vector
         assert_eq!(merge_adjacent_ranges(vec![]), vec![]);

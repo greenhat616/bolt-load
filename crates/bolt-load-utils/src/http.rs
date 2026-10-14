@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod content_disposition;
 pub mod extended;
 

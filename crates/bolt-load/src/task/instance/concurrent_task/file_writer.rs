@@ -96,7 +96,7 @@ where
     fn finalize(self) -> impl Future<Output = Result<(), FileWriterError>> + Send;
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "only used by tests"))]
 trait FileWriterCapability {
     fn is_supported(_file_size: u64) -> bool {
         true

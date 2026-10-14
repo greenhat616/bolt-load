@@ -73,7 +73,6 @@ impl<'a> From<&'a str> for DispositionType {
 /// Parameter in [`ContentDisposition`].
 ///
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
 pub enum DispositionParam {
     /// For [`DispositionType::FormData`] (i.e. *multipart/form-data*), the name of an field from
     /// the form.

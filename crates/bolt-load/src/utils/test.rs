@@ -1,4 +1,8 @@
-#![allow(dead_code, unused_imports)]
+#![expect(
+    dead_code,
+    unused_imports,
+    reason = "shared test helpers, not every test uses them"
+)]
 
 use tracing::{level_filters::LevelFilter, *};
 use tracing_subscriber::{

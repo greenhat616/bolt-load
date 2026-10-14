@@ -257,7 +257,7 @@ impl ConcurrencyControlStrategy {
     }
 
     /// Get the current state
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "debugging aid for the strategy state")]
     pub fn current_state(&self) -> &str {
         match self.state {
             StrategyState::Normal => "normal",
@@ -362,7 +362,7 @@ mod tests {
     use super::{super::runner_outcome_sampler::FailureKind, *};
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
+    #[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
     fn test_immediate_degradation_never_drops_to_zero() {
         let mut strategy = ConcurrencyControlStrategy::with_default_config(4);
         let mut sampler = RunnerOutcomeSampler::with_defaults();

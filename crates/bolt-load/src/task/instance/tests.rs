@@ -118,7 +118,8 @@ impl BoltLoadAdapter for MockAdapter {
 }
 
 // Test helper functions
-#[allow(unreachable_code)]
+// `needless_return` fires with one runtime feature, `unreachable_code` with both.
+#[allow(clippy::needless_return, unreachable_code)]
 fn create_test_runtime() -> ThreadedRuntimeImpl {
     #[cfg(feature = "tokio")]
     {

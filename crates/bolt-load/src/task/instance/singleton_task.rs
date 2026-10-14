@@ -395,7 +395,10 @@ impl Transfer for SingletonTaskInner {
         Progress {
             total: self.total,
             downloaded: self.downloaded,
-            #[allow(clippy::single_range_in_vec_init)]
+            #[expect(
+                clippy::single_range_in_vec_init,
+                reason = "a list holding one downloaded range"
+            )]
             downloaded_chunks: vec![0..self.downloaded],
         }
     }
