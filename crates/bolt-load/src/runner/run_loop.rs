@@ -5,6 +5,7 @@
 //!
 //! | Phase | Priority |
 //! |---|---|
+//! | `Connecting` | cancel > control > connection |
 //! | `PublishingStarted` | lifecycle vacancy |
 //! | `Streaming`, reading | cancel > control > idle timeout > stream |
 //! | `Streaming`, emitting | cancel > control > data vacancy |
@@ -26,9 +27,13 @@ use self::{
     emit::EmitResult,
     stream::StreamingState,
 };
-use super::{LifecycleEvent, TaskError, TaskRunError, TaskRunner};
-use crate::{adapter::AdapterError, task::ControlEvent};
+use super::{LifecycleEvent, RunnerInput, TaskError, TaskRunError, TaskRunner};
+use crate::{
+    adapter::{AdapterError, AnyBytesStream},
+    task::ControlEvent,
+};
 
+mod connect;
 pub(super) mod drain;
 mod emit;
 mod lifecycle;
@@ -38,6 +43,9 @@ type RunResult = Result<(), TaskRunError>;
 type Cancelled = Pin<Box<WaitForCancellationFutureOwned>>;
 
 enum Phase {
+    /// Limits received meanwhile apply once streaming; the range requested
+    /// from the server is already fixed.
+    Connecting,
     PublishingStarted,
     Streaming(StreamingState),
     Draining(DrainState),
@@ -58,6 +66,8 @@ enum Continuation {
 /// The event a phase selected.
 #[derive(derive_more::Debug)]
 pub(super) enum Step {
+    #[debug("Connected(..)")]
+    Connected(Result<AnyBytesStream, AdapterError>),
     Started(RunResult),
     Cancelled,
     Control(Result<ControlEvent, TaskRunError>),
@@ -94,9 +104,13 @@ impl TaskRunner {
 impl<'a> RunnerLoop<'a> {
     pub(super) fn new(runner: &'a mut TaskRunner) -> Self {
         let cancelled = Box::pin(runner.cancel_token.clone().cancelled_owned());
+        let phase = match runner.input {
+            RunnerInput::Connected(_) => Phase::PublishingStarted,
+            RunnerInput::Connecting(_) => Phase::Connecting,
+        };
         Self {
             runner,
-            phase: Phase::PublishingStarted,
+            phase,
             cancelled,
         }
     }
@@ -112,6 +126,15 @@ impl<'a> RunnerLoop<'a> {
     /// Poll the sources of the current phase, see the module docs.
     pub(super) fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
         match &self.phase {
+            Phase::Connecting => {
+                if let Poll::Ready(()) = self.poll_cancel(cx) {
+                    return Poll::Ready(Step::Cancelled);
+                }
+                if let Poll::Ready(event) = self.runner.poll_control(cx) {
+                    return Poll::Ready(Step::Control(event));
+                }
+                self.poll_connect(cx).map(Step::Connected)
+            }
             Phase::PublishingStarted => self.poll_started(cx).map(Step::Started),
             Phase::Streaming(state) if state.is_emitting() => self.poll_emit(cx).map(Step::Emitted),
             Phase::Streaming(_) => {
@@ -139,6 +162,14 @@ impl<'a> RunnerLoop<'a> {
 
     pub(super) fn handle_step(&mut self, step: Step) {
         match step {
+            Step::Connected(Ok(stream)) => {
+                self.on_connected(stream);
+                self.phase = Phase::PublishingStarted;
+            }
+            Step::Connected(Err(source)) => {
+                warn!("runner: failed to connect: {source}");
+                self.begin_stop(Err(TaskError::StreamError { source }.into()));
+            }
             Step::Started(Ok(())) => {
                 trace!("runner: started");
                 self.phase = Phase::Streaming(StreamingState::new(self.runner.idle_timeout));
