@@ -58,9 +58,24 @@ impl Timer for TimerImpl {
     }
 }
 
+/// A one-shot sleep created by [`TimerBuilder::sleep`].
+pub type Sleep = futures::future::BoxFuture<'static, ()>;
+
 pub trait TimerBuilder {
     /// A `Timer` that will be delayed if missed a tick in the interval.
     fn create_delayed_timer(&self, duration: std::time::Duration) -> TimerImpl;
+
+    /// Sleep for `duration` on this runtime's timer.
+    ///
+    /// The default waits for the second tick of [`Self::create_delayed_timer`],
+    /// assuming its first tick completes immediately like the built-in timers.
+    fn sleep(&self, duration: std::time::Duration) -> Sleep {
+        let mut timer = self.create_delayed_timer(duration);
+        Box::pin(async move {
+            timer.tick().await;
+            timer.tick().await;
+        })
+    }
 }
 
 /// ThreadedRuntime is a wrapper around the different multi-threaded runtime libraries.
@@ -82,6 +97,16 @@ impl TimerBuilder for ThreadedRuntimeImpl {
             #[cfg(feature = "smol")]
             ThreadedRuntimeImpl::Smol(rt) => rt.create_delayed_timer(duration),
             ThreadedRuntimeImpl::Other(rt) => rt.create_delayed_timer(duration),
+        }
+    }
+
+    fn sleep(&self, duration: std::time::Duration) -> Sleep {
+        match self {
+            #[cfg(feature = "tokio")]
+            ThreadedRuntimeImpl::Tokio(rt) => rt.sleep(duration),
+            #[cfg(feature = "smol")]
+            ThreadedRuntimeImpl::Smol(rt) => rt.sleep(duration),
+            ThreadedRuntimeImpl::Other(rt) => rt.sleep(duration),
         }
     }
 }
@@ -242,6 +267,16 @@ impl TimerBuilder for LocalRuntimeImpl {
             LocalRuntimeImpl::Other(rt) => rt.create_delayed_timer(duration),
         }
     }
+
+    fn sleep(&self, duration: std::time::Duration) -> Sleep {
+        match self {
+            #[cfg(feature = "tokio")]
+            LocalRuntimeImpl::Tokio(rt) => rt.sleep(duration),
+            #[cfg(feature = "smol")]
+            LocalRuntimeImpl::Smol(rt) => rt.sleep(duration),
+            LocalRuntimeImpl::Other(rt) => rt.sleep(duration),
+        }
+    }
 }
 
 impl LocalRuntimeBuilder for LocalRuntimeBuilderImpl {
@@ -332,5 +367,21 @@ mod tests {
         })
         .await;
         assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_default_sleep_waits_for_the_second_tick() {
+        struct TimerOnly;
+        impl TimerBuilder for TimerOnly {
+            fn create_delayed_timer(&self, duration: std::time::Duration) -> TimerImpl {
+                TimerImpl::Tokio(TokioDelayedTimer::new(duration))
+            }
+        }
+
+        let delay = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        TimerOnly.sleep(delay).await;
+        assert!(start.elapsed() >= delay);
     }
 }

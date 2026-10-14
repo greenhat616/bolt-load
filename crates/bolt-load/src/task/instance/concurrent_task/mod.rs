@@ -27,6 +27,7 @@ use crate::{
             ProgressWithSpeed, TaskControl, TaskEvent, TaskInstanceError,
             sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
         },
+        meta,
     },
 };
 
@@ -165,10 +166,7 @@ impl ConcurrentTaskInner {
     }
     /// Retrieve the meta data of the file
     async fn retrieve_meta(&mut self) -> Result<()> {
-        // TODO: use backon to retry
-        let meta = self
-            .adapter
-            .retrieve_meta()
+        let meta = meta::retrieve_meta(&self.adapter, &self.options.meta_retry, Some(&self.rt))
             .await
             .map_err(TaskInstanceError::new_retrieve_meta_failed)?;
         let total = if meta.content_size == 0 {

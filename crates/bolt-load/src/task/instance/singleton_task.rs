@@ -22,6 +22,7 @@ use crate::{
     task::{
         Progress, RunnerId, TaskOptions,
         instance::{ProgressWithSpeed, TaskControl, TaskEvent},
+        meta,
     },
 };
 
@@ -76,8 +77,8 @@ impl TaskInstance for SingletonTask {
             self.threaded_rt.clone(),
             self.local_runtime_builder.clone(),
             cancel_token.clone(),
-            move |_| {
-                let inner = SingletonTaskInner::new(adapter, path, event_tx.clone(), options);
+            move |rt| {
+                let inner = SingletonTaskInner::new(adapter, path, event_tx.clone(), rt, options);
                 let task = drive::drive(inner, event_tx, cancel_token);
                 #[cfg(feature = "tracing")]
                 let task = tracing::Instrument::instrument(
@@ -118,6 +119,7 @@ struct SingletonTaskInner {
     path: PathBuf,
     adapter: Arc<AnyAdapter>,
     event_tx: async_channel::Sender<TaskEvent>,
+    rt: ThreadedRuntimeImpl,
     options: TaskOptions,
 }
 
@@ -126,6 +128,7 @@ impl SingletonTaskInner {
         adapter: Arc<AnyAdapter>,
         path: PathBuf,
         event_tx: async_channel::Sender<TaskEvent>,
+        rt: ThreadedRuntimeImpl,
         options: TaskOptions,
     ) -> Self {
         Self {
@@ -134,6 +137,7 @@ impl SingletonTaskInner {
             path,
             adapter,
             event_tx,
+            rt,
             options,
         }
     }
@@ -142,10 +146,7 @@ impl SingletonTaskInner {
 impl SingletonTaskInner {
     /// Retrieve the meta data of the file
     async fn retrieve_meta(&mut self) -> Result<()> {
-        // TODO: use backon to retry
-        let meta = self
-            .adapter
-            .retrieve_meta()
+        let meta = meta::retrieve_meta(&self.adapter, &self.options.meta_retry, Some(&self.rt))
             .await
             .map_err(TaskInstanceError::new_retrieve_meta_failed)?;
         let total = if meta.content_size == 0 {

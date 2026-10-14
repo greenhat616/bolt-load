@@ -9,7 +9,9 @@ use bolt_load_utils::telemetry::*;
 use futures::FutureExt;
 use smol_cancellation_token::CancellationToken;
 
-use super::{AtomicTaskState, DownloadMode, Task, TaskInstanceImpl, TaskOptions, TaskState};
+use super::{
+    AtomicTaskState, DownloadMode, MetaRetry, Task, TaskInstanceImpl, TaskOptions, TaskState,
+};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
@@ -83,24 +85,37 @@ async fn until_cancelled<T>(
 async fn try_get_or_init_meta<'a>(
     meta: &'a OnceCell<BoltLoadAdapterMeta>,
     adapter: &'a AnyAdapter,
+    retry: &MetaRetry,
+    rt: Option<&ThreadedRuntimeImpl>,
 ) -> Result<&'a BoltLoadAdapterMeta, TaskManagerBuildError> {
     let meta = meta
-        .get_or_try_init(|| async { adapter.retrieve_meta().await })
+        .get_or_try_init(|| super::meta::retrieve_meta(adapter, retry, rt))
         .await?;
     Ok(meta)
 }
 
 impl TaskBuilder {
     /// You can call this method to get the meta before build the task manager
+    ///
+    /// Retryable errors are retried as [`TaskOptions::meta_retry`] allows,
+    /// sleeping on the threaded runtime's timer if one is set. The cancel token
+    /// is not observed here; only [`Self::build`] stops on cancellation.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub async fn retrieve_meta(&mut self) -> Result<&BoltLoadAdapterMeta, TaskManagerBuildError> {
+        self.options.validate()?;
         if self.adapter.is_none() {
             return Err(TaskManagerBuildError::FieldValidationFailed {
                 message: "adapter is not set".to_string(),
             });
         }
         let adapter = self.adapter.as_ref().unwrap();
-        let meta = try_get_or_init_meta(&self.meta, adapter).await?;
+        let meta = try_get_or_init_meta(
+            &self.meta,
+            adapter,
+            &self.options.meta_retry,
+            self.threaded_runtime.as_ref(),
+        )
+        .await?;
 
         if self.save_path.is_none()
             && let Some(ref filename) = meta.filename
