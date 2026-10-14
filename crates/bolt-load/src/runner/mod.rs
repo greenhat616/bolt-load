@@ -114,7 +114,7 @@ pub struct TaskRunner {
     stream: AnyBytesStream,
     /// the receiver of the manager messages (point-to-point channel)
     #[debug(skip)]
-    control_signal: ControlSignalReceiver,
+    control_signal: std::pin::Pin<Box<ControlSignalReceiver>>,
     /// the sender of the lifecycle events
     #[debug(skip)]
     lifecycle_tx: LifecycleSender,

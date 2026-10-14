@@ -1,28 +1,80 @@
-use std::cmp::Ordering;
+//! The runner's event loop: a state machine polled in place.
+//!
+//! Every event source lives as long as the loop, so no future is rebuilt per
+//! event. Each phase polls its own sources in priority order:
+//!
+//! | Phase | Priority |
+//! |---|---|
+//! | `PublishingStarted` | lifecycle vacancy |
+//! | `Streaming`, reading | cancel > control > idle timeout > stream |
+//! | `Streaming`, emitting | cancel > control > data vacancy |
+//! | `Draining` | cancel > drained or consumer closed > drain timeout |
+//! | `PublishingStopped` | lifecycle vacancy |
 
-use async_ringbuf::traits::*;
+use std::{
+    future::{Future, poll_fn},
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
+
 use bolt_load_utils::telemetry::*;
-use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, StreamExt};
+use bytes::Bytes;
+use smol_cancellation_token::WaitForCancellationFutureOwned;
 
-use self::drain::DataDrainOutcome;
-use super::{BUFFER_SIZE, LifecycleEvent, TaskError, TaskRunError, TaskRunner};
+use self::{
+    drain::{DataDrainOutcome, DrainState},
+    emit::EmitResult,
+    stream::StreamingState,
+};
+use super::{LifecycleEvent, TaskError, TaskRunError, TaskRunner};
 use crate::{adapter::AdapterError, task::ControlEvent};
 
 pub(super) mod drain;
 mod emit;
+mod lifecycle;
 mod stream;
 
-/// The step of the event loop
-enum EventLoopStep {
-    /// The task is cancelled
-    Cancelled,
-    /// The stream yielded no non-empty data within the idle timeout
+type RunResult = Result<(), TaskRunError>;
+type Cancelled = Pin<Box<WaitForCancellationFutureOwned>>;
+
+enum Phase {
+    PublishingStarted,
+    Streaming(StreamingState),
+    Draining(DrainState),
+    PublishingStopped(Option<LifecycleEvent>),
+    Stopped,
+}
+
+/// Why a buffer is being emitted, deciding what follows a successful push.
+enum Continuation {
+    /// Buffer the rest of the current item.
+    ResumeItem,
+    /// The stream ended or the size limit was reached.
+    Validate,
     IdleTimeout,
-    /// The control signal is received (point-to-point, no need for RunnerId filtering)
-    Control(Result<ControlEvent, async_channel::RecvError>),
-    /// The download event is received
+    StreamError(AdapterError),
+}
+
+/// The event a phase selected.
+#[derive(derive_more::Debug)]
+pub(super) enum Step {
+    Started(RunResult),
+    Cancelled,
+    Control(Result<ControlEvent, TaskRunError>),
+    IdleTimeout,
+    #[debug("Download(..)")]
     Download(Option<Result<Bytes, AdapterError>>),
+    Emitted(EmitResult),
+    Drained(DataDrainOutcome),
+    StoppedPublished,
+}
+
+/// The state of one [`TaskRunner::run`] call.
+pub(super) struct RunnerLoop<'a> {
+    runner: &'a mut TaskRunner,
+    phase: Phase,
+    /// Allocated once per run.
+    cancelled: Cancelled,
 }
 
 impl TaskRunner {
@@ -34,142 +86,123 @@ impl TaskRunner {
         tracing::instrument(skip(self), name = "TaskRunner::run", fields(runner_id = self.id))
     )]
     pub async fn run(&mut self) {
-        let mut result = self.run_inner().await;
-        if Self::should_wait_data_drain(&result) {
-            match self.wait_data_drained().await {
-                DataDrainOutcome::Drained => {}
-                DataDrainOutcome::Cancelled => result = Err(TaskRunError::Cancelled),
-                DataDrainOutcome::TimedOut => {
-                    warn!(
-                        "data drain timed out; reporting as timeout so undrained bytes are retried"
-                    );
-                    result = Err(TaskRunError::Failed(TaskError::Timeout));
-                }
-            }
-        }
+        let mut run = RunnerLoop::new(self);
+        poll_fn(|cx| run.poll_run(cx)).await;
+    }
+}
 
-        match result {
-            Ok(_) => {
-                let _ = self.lifecycle_tx.push(LifecycleEvent::finished()).await;
-            }
-            Err(err) => match err {
-                TaskRunError::Cancelled => {
-                    let _ = self
-                        .lifecycle_tx
-                        .push(LifecycleEvent::failed(TaskError::Cancelled))
-                        .await;
-                }
-                TaskRunError::Failed(task_err) => {
-                    let _ = self
-                        .lifecycle_tx
-                        .push(LifecycleEvent::failed(task_err))
-                        .await;
-                }
-            },
+impl<'a> RunnerLoop<'a> {
+    pub(super) fn new(runner: &'a mut TaskRunner) -> Self {
+        let cancelled = Box::pin(runner.cancel_token.clone().cancelled_owned());
+        Self {
+            runner,
+            phase: Phase::PublishingStarted,
+            cancelled,
         }
-        self.data_tx.take();
     }
 
-    /// The inner logic of the task runner
-    /// Just wrap a Result<(), TaskFailedKind> to return the error kind
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip(self), name = "TaskRunner::run_inner", fields(runner_id = self.id))
-    )]
-    pub(super) async fn run_inner(&mut self) -> Result<(), TaskRunError> {
-        trace!("runner: started");
-        self.lifecycle_tx
-            .push(LifecycleEvent::Started)
-            .await
-            .map_err(|_| TaskRunError::Failed(TaskError::ChannelClosed))?;
+    fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        while !matches!(self.phase, Phase::Stopped) {
+            let step = ready!(self.poll_step(cx));
+            self.handle_step(step);
+        }
+        Poll::Ready(())
+    }
 
-        let mut buff = BytesMut::with_capacity(BUFFER_SIZE);
-        let idle_timeout = self.idle_timeout;
-        let mut idle_timer = async_io::Timer::after(idle_timeout);
-        loop {
-            let step = {
-                let cancelled = self.cancel_token.cancelled().fuse();
-                let control_signal = self.control_signal.recv().fuse();
-                let download = self.stream.next().fuse();
-                let idle = FutureExt::fuse(&mut idle_timer);
-                futures::pin_mut!(cancelled, control_signal, download, idle);
-                futures::select_biased! {
-                    _ = cancelled => EventLoopStep::Cancelled,
-                    signal = control_signal => EventLoopStep::Control(signal),
-                    _ = idle => EventLoopStep::IdleTimeout,
-                    result = download => EventLoopStep::Download(result),
+    /// Poll the sources of the current phase, see the module docs.
+    pub(super) fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Step> {
+        match &self.phase {
+            Phase::PublishingStarted => self.poll_started(cx).map(Step::Started),
+            Phase::Streaming(state) if state.is_emitting() => self.poll_emit(cx).map(Step::Emitted),
+            Phase::Streaming(_) => {
+                if let Poll::Ready(()) = self.poll_cancel(cx) {
+                    return Poll::Ready(Step::Cancelled);
                 }
-            };
+                if let Poll::Ready(event) = self.runner.poll_control(cx) {
+                    return Poll::Ready(Step::Control(event));
+                }
+                if let Poll::Ready(()) = self.poll_idle(cx) {
+                    return Poll::Ready(Step::IdleTimeout);
+                }
+                self.poll_read(cx).map(Step::Download)
+            }
+            Phase::Draining(_) => self.poll_drain(cx).map(Step::Drained),
+            Phase::PublishingStopped(_) => self.poll_stopped(cx).map(|()| Step::StoppedPublished),
+            Phase::Stopped => unreachable!("a stopped runner is not polled"),
+        }
+    }
 
-            match step {
-                EventLoopStep::Cancelled => {
-                    trace!("runner: cancelled");
-                    return Err(TaskRunError::Cancelled);
-                }
-                EventLoopStep::Control(Ok(signal)) => {
-                    trace!("runner: control signal: {signal:?}");
-                    Self::apply_control(&mut self.total, &signal)?;
-                }
-                EventLoopStep::Control(Err(_)) => {
-                    // Control channel closed - manager has released this runner
-                    trace!("runner: control signal channel closed");
-                    return Err(TaskError::ChannelClosed.into());
-                }
-                EventLoopStep::IdleTimeout => {
-                    warn!("runner: no data received in the last {idle_timeout:?}");
-                    self.flush_checked(&mut buff).await?;
-                    return Err(TaskError::Timeout.into());
-                }
-                EventLoopStep::Download(None) => {
-                    self.flush_checked(&mut buff).await?;
-                    break;
-                }
-                EventLoopStep::Download(Some(Err(source))) => {
-                    // The upstream error wins over a control error deferred by the push.
-                    let _ = self.flush(&mut buff).await?;
-                    return Err(TaskError::StreamError { source }.into());
-                }
-                EventLoopStep::Download(Some(Ok(item))) => {
-                    if !item.is_empty() {
-                        idle_timer.set_after(idle_timeout);
-                    }
-                    if self
-                        .buffer_item(item, &mut buff, &mut idle_timer)
-                        .await?
-                        .is_break()
-                    {
-                        break;
-                    }
+    #[inline]
+    fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.cancelled.as_mut().poll(cx)
+    }
+
+    pub(super) fn handle_step(&mut self, step: Step) {
+        match step {
+            Step::Started(Ok(())) => {
+                trace!("runner: started");
+                self.phase = Phase::Streaming(StreamingState::new(self.runner.idle_timeout));
+            }
+            Step::Started(Err(error)) => self.begin_stop(Err(error)),
+            Step::Cancelled => {
+                trace!("runner: cancelled");
+                self.begin_stop(Err(TaskRunError::Cancelled));
+            }
+            Step::Control(event) => {
+                trace!("runner: control signal: {event:?}");
+                if let Err(error) = event.and_then(|event| self.runner.apply_limit(&event)) {
+                    self.begin_stop(Err(error));
                 }
             }
-        }
-
-        // TODO: handle the error
-        match self.total {
-            Some(total) => match total.cmp(&self.downloaded) {
-                Ordering::Equal => {}
-                Ordering::Greater => {
-                    warn!(
-                        "runner: downloaded content is smaller than the total size, total: {}, \
-                         downloaded: {}",
-                        total, self.downloaded
-                    );
-                    return Err(TaskError::SmallerThanTotalSize.into());
-                }
-                Ordering::Less => {
-                    warn!(
-                        "runner: downloaded content is larger than the total size, total: {}, \
-                         downloaded: {}",
-                        total, self.downloaded
-                    );
-                    return Err(TaskError::ExceededTotalSize.into());
-                }
-            },
-            None if self.downloaded > 0 => {}
-            None => {
-                return Err(TaskError::Empty.into());
+            Step::IdleTimeout => {
+                warn!(
+                    "runner: no data received in the last {:?}",
+                    self.runner.idle_timeout
+                );
+                self.flush(Continuation::IdleTimeout);
+            }
+            Step::Download(None) => self.flush(Continuation::Validate),
+            Step::Download(Some(Err(source))) => self.flush(Continuation::StreamError(source)),
+            Step::Download(Some(Ok(item))) => self.on_item(item),
+            Step::Emitted(result) => self.on_emitted(result),
+            Step::Drained(outcome) => self.finish_drain(outcome),
+            Step::StoppedPublished => {
+                self.runner.data_tx.take();
+                self.phase = Phase::Stopped;
             }
         }
-        Ok(())
+    }
+
+    /// Stop with `result`, draining the data channel first when the
+    /// delivered bytes count.
+    fn begin_stop(&mut self, result: RunResult) {
+        if TaskRunner::should_wait_data_drain(&result) {
+            self.phase = Phase::Draining(DrainState::new(result));
+        } else {
+            self.publish_stopped(result);
+        }
+    }
+
+    /// Continue after an emitted buffer.
+    ///
+    /// Cancellation and a failed push win over everything; an upstream error
+    /// wins over a control error deferred by the push.
+    fn resume_after_emit(&mut self, then: Continuation, result: EmitResult) {
+        let deferred = match result {
+            Ok(deferred) => deferred,
+            Err(error) => return self.begin_stop(Err(error)),
+        };
+        match (then, deferred) {
+            (Continuation::StreamError(source), _) => {
+                self.begin_stop(Err(TaskError::StreamError { source }.into()));
+            }
+            (_, Some(error)) => self.begin_stop(Err(error)),
+            (Continuation::ResumeItem, None) => self.resume_item(),
+            (Continuation::Validate, None) => {
+                let result = self.runner.validate_size();
+                self.begin_stop(result);
+            }
+            (Continuation::IdleTimeout, None) => self.begin_stop(Err(TaskError::Timeout.into())),
+        }
     }
 }

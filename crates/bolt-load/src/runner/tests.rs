@@ -94,6 +94,51 @@ async fn run_runner_and_collect(
 }
 
 #[tokio::test]
+async fn test_last_item_outlives_the_final_push() {
+    /// Cancels the runner when the item's bytes are released.
+    struct CancelOnDrop(CancellationToken);
+
+    impl AsRef<[u8]> for CancelOnDrop {
+        fn as_ref(&self) -> &[u8] {
+            b"*"
+        }
+    }
+
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+
+    let token = CancellationToken::new();
+    let item = Bytes::from_owner(CancelOnDrop(token.clone()));
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let (mut runner, mut lifecycle_rx, mut data_rx) = TaskRunner::builder()
+        .runner_id(1)
+        .total(1)
+        .stream(Box::pin(futures::stream::iter([Ok(item)])))
+        .control_signal(control_rx)
+        .cancel_token(token)
+        .build()
+        .unwrap();
+    timeout(Duration::from_secs(5), runner.run()).await.unwrap();
+
+    // The byte was pushed before the item was released; the cancellation
+    // then wins while draining.
+    assert_eq!(&data_rx.try_pop().unwrap().data[..], b"*");
+    assert!(matches!(
+        lifecycle_rx.try_pop(),
+        Some(LifecycleEvent::Started)
+    ));
+    assert!(matches!(
+        lifecycle_rx.try_pop(),
+        Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+            TaskError::Cancelled
+        )))
+    ));
+}
+
+#[tokio::test]
 async fn test_drain_zero_timeout_empty_channel_returns_drained() {
     let (_control_tx, control_rx) = async_channel::bounded(1);
     let token = CancellationToken::new();
@@ -1766,11 +1811,12 @@ struct Ready {
     stream: bool,
 }
 
-/// What a runner whose sources are ready as given selected first: the
-/// result of its streaming loop, and whether the control and the stream
-/// were consumed.
-async fn first_selected(ready: Ready) -> (Result<(), TaskRunError>, bool, bool) {
+/// The first event a streaming runner whose sources are ready as given
+/// selects, and whether the control and the stream were consumed.
+async fn first_selected(ready: Ready) -> (&'static str, bool, bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::run_loop::{RunnerLoop, Step};
 
     const TOTAL: u64 = 10;
     let polled = Arc::new(AtomicBool::new(false));
@@ -1813,10 +1859,23 @@ async fn first_selected(ready: Ready) -> (Result<(), TaskRunError>, bool, bool) 
         .idle_timeout(idle_timeout)
         .build()
         .unwrap();
-    // Not `run`: draining may replace the result with `Cancelled`.
-    let result = runner.run_inner().await;
-    let control_consumed = control_tx.is_empty();
-    (result, control_consumed, polled.load(Ordering::Relaxed))
+    let mut run = RunnerLoop::new(&mut runner);
+    let started = std::future::poll_fn(|cx| run.poll_step(cx)).await;
+    assert!(matches!(started, Step::Started(Ok(()))), "{started:?}");
+    run.handle_step(started);
+    let selected = match std::future::poll_fn(|cx| run.poll_step(cx)).await {
+        Step::Cancelled => "cancelled",
+        Step::Control(Ok(_)) => "control",
+        Step::Control(Err(_)) => "closed",
+        Step::IdleTimeout => "timeout",
+        Step::Download(Some(Ok(_))) => "stream",
+        other => panic!("{ready:?}: unexpected {other:?}"),
+    };
+    (
+        selected,
+        control_tx.is_empty(),
+        polled.load(Ordering::Relaxed),
+    )
 }
 
 #[test]
@@ -1839,7 +1898,7 @@ fn test_streaming_priority_cancel_control_idle_stream() {
                 idle: true,
                 stream: true,
             },
-            "exceeded",
+            "control",
         ),
         (
             Ready {
@@ -1866,25 +1925,17 @@ fn test_streaming_priority_cancel_control_idle_stream() {
                 idle: false,
                 stream: true,
             },
-            "finished",
+            "stream",
         ),
     ];
     on_each_executor(|| async move {
         for (ready, expected) in cases {
-            let (result, control_consumed, stream_polled) = first_selected(ready).await;
-            let got = match result {
-                Err(TaskRunError::Cancelled) => "cancelled",
-                Err(TaskRunError::Failed(TaskError::ExceededTotalSize)) => "exceeded",
-                Err(TaskRunError::Failed(TaskError::ChannelClosed)) => "closed",
-                Err(TaskRunError::Failed(TaskError::Timeout)) => "timeout",
-                Ok(()) => "finished",
-                other => panic!("{ready:?}: unexpected {other:?}"),
-            };
-            assert_eq!(got, expected, "{ready:?}");
+            let (selected, control_consumed, stream_polled) = first_selected(ready).await;
+            assert_eq!(selected, expected, "{ready:?}");
             if expected == "cancelled" {
                 assert!(!control_consumed, "{ready:?}: control consumed");
             }
-            assert_eq!(stream_polled, expected == "finished", "{ready:?}");
+            assert_eq!(stream_polled, expected == "stream", "{ready:?}");
         }
     });
 }
