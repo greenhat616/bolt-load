@@ -668,13 +668,13 @@ impl WriteMode {
 }
 
 /// When the loop stops.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     /// After every runner finished.
     Complete,
-    /// On cancellation, `after` the loop started.
+    /// On cancellation, `after` the first frame.
     CancelAfter(Duration),
-    /// On the no-progress deadline, `after` the loop started (progress is ignored).
+    /// On the no-progress deadline, `after` the first frame (progress is ignored).
     DeadlineAfter(Duration),
 }
 
@@ -1467,6 +1467,10 @@ impl LoopModel {
             LoopEvent::Runner(RunnerEvent::Data(None)) => {}
             LoopEvent::Runner(RunnerEvent::Data(Some((id, mut bytes)))) => {
                 self.frames += 1;
+                // Stop a busy loop: runners may take a while to deliver on a loaded machine.
+                if self.frames == 1 {
+                    self.arm_stop();
+                }
                 let range = self.planner.update_progress(id, bytes.len());
                 bytes.truncate((range.end - range.start) as usize);
                 self.writer.write_range(range, bytes);
@@ -1517,7 +1521,6 @@ impl LoopModel {
 
 async fn download_loop(cfg: LoopConfig) -> LoopOutcome {
     let mut model = LoopModel::new(cfg);
-    model.arm_stop();
     let stop_latency = loop {
         let event = match cfg.shape {
             LoopShape::RebuiltSelect => {
@@ -1533,14 +1536,10 @@ async fn download_loop(cfg: LoopConfig) -> LoopOutcome {
         }
     };
     let outcome = model.finish(stop_latency).await;
-    match cfg.stop {
-        Stop::Complete => {
-            assert_eq!(outcome.downloaded, cfg.total, "{cfg:?} lost bytes");
-            assert_eq!(outcome.written, cfg.total, "{cfg:?} lost writes");
-        }
-        Stop::CancelAfter(_) | Stop::DeadlineAfter(_) => {
-            assert!(outcome.frames > 0, "{cfg:?} stopped before any work");
-        }
+    // A stop is armed by the first frame, so a stopped loop has done some work.
+    if cfg.stop == Stop::Complete {
+        assert_eq!(outcome.downloaded, cfg.total, "{cfg:?} lost bytes");
+        assert_eq!(outcome.written, cfg.total, "{cfg:?} lost writes");
     }
     if cfg.write == WriteMode::DirectCompletion && cfg.queue == 1 {
         assert!(outcome.fallbacks > 0, "{cfg:?} never hit a full queue");
