@@ -100,7 +100,7 @@ tokio = { version = "1", features = [
     "tracing",
 ], optional = true }
 smol = { version = "2", optional = true }
-compio = { version = "0.18", optional = true, default-features = false, features = [
+compio = { version = "0.19", optional = true, default-features = false, features = [
     "io-uring",
     "runtime",
     "io",
@@ -131,17 +131,17 @@ tokio-util = { workspace = true, features = ["full"] }
 async-stream = "0.3"
 
 # Tracing and bench
-tracing-tracy = "0.11"
+tracing-tracy = "0.12"
 console-subscriber = "0.5.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = { version = "0.32", features = ["metrics"] }
-opentelemetry = { version = "0.31", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
-opentelemetry-semantic-conventions = { version = "0.31", features = [
+tracing-opentelemetry = { version = "0.34", features = ["metrics"] }
+opentelemetry = { version = "0.33", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["metrics", "grpc-tonic"] }
+opentelemetry-semantic-conventions = { version = "0.33", features = [
     "semconv_experimental",
 ] }
-opentelemetry-stdout = { version = "0.31", features = ["trace", "metrics"] }
+opentelemetry-stdout = { version = "0.33", features = ["trace", "metrics"] }
 
 # for benchmarks
 criterion = { version = "0.8", features = ["async_tokio"] }

@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use rand::Rng;
+use rand::RngExt;
 use tempfile::tempfile;
 use tokio::net::TcpListener;
 
