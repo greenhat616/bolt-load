@@ -25,6 +25,8 @@ mod event_contract_tests;
 
 #[cfg(test)]
 mod integration_test;
+#[cfg(all(test, bolt_load_probe_send))]
+mod probe_send;
 
 #[allow(ambiguous_glob_reexports)]
 pub use concurrent_task::*;

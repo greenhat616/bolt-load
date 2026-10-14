@@ -82,6 +82,25 @@ impl ConcurrentTask {
     }
 }
 
+/// One download attempt, run on a local runtime by [`drive::spawn_on_local`].
+pub(super) fn concurrent_attempt(
+    adapter: Arc<AnyAdapter>,
+    path: PathBuf,
+    event_tx: async_channel::Sender<TaskEvent>,
+    cancel_token: CancellationToken,
+    rt: ThreadedRuntimeImpl,
+    options: TaskOptions,
+) -> impl Future<Output = ()> + 'static {
+    let inner = ConcurrentTaskInner::new(adapter, path, event_tx.clone(), rt, options);
+    let task = drive::drive(inner, event_tx, cancel_token);
+    #[cfg(feature = "tracing")]
+    let task = tracing::Instrument::instrument(
+        task,
+        tracing::trace_span!(parent: None, "ConcurrentTask::background_task"),
+    );
+    task
+}
+
 impl TaskInstance for ConcurrentTask {
     #[cfg_attr(
         feature = "tracing",
@@ -99,16 +118,8 @@ impl TaskInstance for ConcurrentTask {
             self.threaded_rt.clone(),
             self.local_runtime_builder.clone(),
             cancel_token.clone(),
-            move |rt| {
-                let inner = ConcurrentTaskInner::new(adapter, path, event_tx.clone(), rt, options);
-                let task = drive::drive(inner, event_tx, cancel_token);
-                #[cfg(feature = "tracing")]
-                let task = tracing::Instrument::instrument(
-                    task,
-                    tracing::trace_span!(parent: None, "ConcurrentTask::background_task"),
-                );
-                task
-            },
+            // Built on the local runtime's thread, so it does not need to be `Send`.
+            move |rt| concurrent_attempt(adapter, path, event_tx, cancel_token, rt, options),
         );
         self.task = Some(task);
         Ok(())
