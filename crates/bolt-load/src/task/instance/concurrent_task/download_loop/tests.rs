@@ -335,13 +335,20 @@ impl LoopHarness {
         );
         let (event_tx, events) = async_channel::unbounded();
         let cancel = CancellationToken::new();
-        let download = DownloadLoop::new(
+        let mut download = DownloadLoop::new(
             LOOP_TOTAL,
             spawner,
             &file_writer,
             event_tx,
             &options,
             cancel.clone(),
+        );
+        // This harness scripts spawn rejection and parked write tasks.
+        // Direct submission is covered separately by the writer tests.
+        download.writer = PendingWriter::new(
+            Arc::new(file_writer.clone()),
+            download.spawner.rt.clone(),
+            download.max_concurrency,
         );
         Self {
             download,

@@ -82,7 +82,7 @@ impl DownloadLoop {
         let manager = RunnerManager::new(total, max_concurrency);
         let strategy = StrategyControl::new(max_concurrency);
         let policy = FailurePolicy::new(options, Instant::now());
-        let writer = PendingWriter::new(
+        let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),
             spawner.rt.clone(),
             max_concurrency,
