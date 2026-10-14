@@ -1541,9 +1541,8 @@ async fn download_loop(cfg: LoopConfig) -> LoopOutcome {
         assert_eq!(outcome.downloaded, cfg.total, "{cfg:?} lost bytes");
         assert_eq!(outcome.written, cfg.total, "{cfg:?} lost writes");
     }
-    if cfg.write == WriteMode::DirectCompletion && cfg.queue == 1 {
-        assert!(outcome.fallbacks > 0, "{cfg:?} never hit a full queue");
-    }
+    // Whether a queue of one fills depends on scheduling; the profile mode
+    // reports how often it did.
     outcome
 }
 

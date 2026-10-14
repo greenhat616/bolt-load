@@ -584,6 +584,8 @@ fn test_timer_rearms_after_consecutive_ticks() {
 
     // Native: the first tick is immediate, then one per sample interval.
     let native = |timers| async move {
+        // Before the harness creates the timers the ticks are counted from.
+        let started = Instant::now();
         let mut harness = LoopHarness::new(timers, TaskOptions::default()).await;
         let events = harness.events.clone();
         let cancel = harness.cancel.clone();
@@ -598,7 +600,6 @@ fn test_timer_rearms_after_consecutive_ticks() {
             }
             cancel.cancel();
         }));
-        let started = Instant::now();
         let result = harness.run_to_end().await;
         let elapsed = started.elapsed();
         assert_eq!(outcome(&result), "cancel");

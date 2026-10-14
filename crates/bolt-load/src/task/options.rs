@@ -101,9 +101,10 @@ pub struct TaskOptions {
     /// A runner reports a retryable `Timeout` when its upstream yields no
     /// non-empty data for this long. Must be non-zero.
     pub stream_idle_timeout: Duration,
-    /// A range runner reports a retryable `Timeout` when it is not connected
-    /// this long after it started connecting, however much other runners
-    /// progress meanwhile. Must be non-zero.
+    /// A runner reports a retryable `Timeout` when it is not connected this
+    /// long after it started connecting, however much other runners progress
+    /// meanwhile; it also bounds the singleton task's connection, which
+    /// `no_progress_timeout` used to. Must be non-zero.
     pub connect_timeout: Duration,
     /// Retry policy of the metadata request, see [`MetaRetry`].
     pub meta_retry: MetaRetry,
