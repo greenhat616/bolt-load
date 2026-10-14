@@ -136,10 +136,10 @@ pub async fn init_tracing(opentelemetry_ptr: &mut *mut OtelGuard) {
 
     let subscriber = tracing_subscriber::registry().with(filter_layer);
     // .with(fmt_layer);
-    let tokio_console_layer = console_subscriber::spawn();
-    let subscriber = subscriber
-        .with(tracing_tracy::TracyLayer::default())
-        .with(tokio_console_layer);
+    let subscriber = subscriber.with(tracing_tracy::TracyLayer::default());
+    // tokio-console needs tokio's unstable instrumentation, see the README.
+    #[cfg(tokio_unstable)]
+    let subscriber = subscriber.with(console_subscriber::spawn());
 
     if has_arg_opentelemetry {
         let (subscriber, telemetry_guard) = {
