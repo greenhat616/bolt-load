@@ -624,10 +624,10 @@ fn test_deadline_moved_repeatedly_before_fire() {
         // The deadline timer stays armed at the first deadline; each
         // progress report moves the policy deadline past it.
         std::thread::sleep(TIMEOUT / 2);
-        harness.download.policy.on_bytes_accepted(1, Instant::now());
+        harness.download.policy.on_progress(Instant::now());
         std::thread::sleep(TIMEOUT / 4);
         let last_progress = Instant::now();
-        harness.download.policy.on_bytes_accepted(2, last_progress);
+        harness.download.policy.on_progress(last_progress);
         let policy = &harness.download.policy;
         assert!(
             policy
@@ -645,6 +645,45 @@ fn test_deadline_moved_repeatedly_before_fire() {
         assert!(elapsed >= TIMEOUT, "fired early: {elapsed:?}");
         harness.teardown().await;
     });
+}
+
+#[tokio::test]
+async fn test_clipped_frame_does_not_count_as_progress() {
+    use super::super::runner_manager::{DownloadedChunk, TaskState};
+
+    fn frame(range: std::ops::Range<u64>) -> RunnerTick {
+        RunnerTick {
+            state: TaskState::Downloading,
+            downloaded: Some(DownloadedChunk {
+                bytes: bytes::Bytes::from(vec![0; (range.end - range.start) as usize]),
+                range,
+            }),
+            failure: None,
+        }
+    }
+
+    let mut harness = LoopHarness::scripted(false).await;
+    // Fail the writes synchronously, so no write task outlives the loop.
+    harness.rt.set_mode(SpawnMode::Fail);
+    let initial = harness.download.policy.deadline();
+    std::thread::sleep(Duration::from_millis(1));
+    assert!(
+        harness
+            .download
+            .on_runner(frame(5..5))
+            .unwrap()
+            .is_continue()
+    );
+    assert_eq!(harness.download.policy.deadline(), initial);
+    assert!(
+        harness
+            .download
+            .on_runner(frame(0..5))
+            .unwrap()
+            .is_continue()
+    );
+    assert!(harness.download.policy.deadline() > initial);
+    harness.teardown().await;
 }
 
 #[test]
