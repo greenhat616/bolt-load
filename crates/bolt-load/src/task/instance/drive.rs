@@ -36,9 +36,8 @@ pub(super) async fn drive<T: Transfer>(
     let _ = event_tx.send(TaskEvent::Initializing).await;
     let result = async {
         {
-            let prepare = transfer.prepare().fuse();
-            let cancelled = cancel_token.cancelled().fuse();
-            futures::pin_mut!(prepare, cancelled);
+            let mut prepare = std::pin::pin!(transfer.prepare().fuse());
+            let mut cancelled = std::pin::pin!(cancel_token.cancelled().fuse());
             futures::select_biased! {
                 _ = cancelled => Err(TaskInstanceError::new_failed(TaskError::Cancelled)),
                 res = prepare => res,

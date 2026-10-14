@@ -73,9 +73,8 @@ async fn until_cancelled<T>(
     if token.is_cancelled() {
         return Err(TaskManagerBuildError::Cancelled);
     }
-    let fut = fut.fuse();
-    let cancelled = token.cancelled().fuse();
-    futures::pin_mut!(fut, cancelled);
+    let mut fut = std::pin::pin!(fut.fuse());
+    let mut cancelled = std::pin::pin!(token.cancelled().fuse());
     futures::select_biased! {
         _ = cancelled => Err(TaskManagerBuildError::Cancelled),
         res = fut => res,

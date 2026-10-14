@@ -106,6 +106,8 @@ enum RunnerInput {
     Connected(AnyBytesStream),
     /// Connected by the runner itself before it starts.
     Connecting(BoxFuture<'static, Result<AnyBytesStream, AdapterError>>),
+    /// The connection was abandoned before it yielded a stream.
+    Abandoned,
 }
 
 /// runner for each chunk, or single file, responsible for downloading each chunk
