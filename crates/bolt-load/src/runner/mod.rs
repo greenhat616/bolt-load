@@ -1,9 +1,13 @@
 #![doc = include_str!("../../docs/runner.md")]
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd};
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use smol_cancellation_token::CancellationToken;
 
-use crate::{adapter::AnyBytesStream, task::RunnerId};
+use crate::{
+    adapter::{AdapterError, AnyBytesStream},
+    task::RunnerId,
+};
 
 mod builder;
 mod connector;
@@ -40,7 +44,7 @@ pub type LifecycleReceiver = AsyncHeapCons<LifecycleEvent>;
 
 #[derive(Debug)]
 pub enum LifecycleEvent {
-    /// The task is started
+    /// The runner is connected; its data frames follow
     Started,
     /// Stopped with message
     Stopped(StoppedReason),
@@ -97,6 +101,13 @@ impl From<TaskError> for TaskRunError {
     }
 }
 
+/// Where a runner reads its bytes from.
+enum RunnerInput {
+    Connected(AnyBytesStream),
+    /// Connected by the runner itself before it starts.
+    Connecting(BoxFuture<'static, Result<AnyBytesStream, AdapterError>>),
+}
+
 /// runner for each chunk, or single file, responsible for downloading each chunk
 #[derive(derive_more::Debug)]
 pub struct TaskRunner {
@@ -111,9 +122,9 @@ pub struct TaskRunner {
     total: Option<u64>,
     /// the downloaded size
     downloaded: u64,
-    /// the adapter of the task
+    /// the stream of the task, or how to connect it
     #[debug(skip)]
-    stream: AnyBytesStream,
+    input: RunnerInput,
     /// the control signals from the manager
     #[debug(skip)]
     control: ControlSource,

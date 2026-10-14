@@ -16,8 +16,8 @@ AnyBytesStream ──► TaskRunner ──► DataFrameSender ──► FileWrit
 Each runner operates on a dedicated async task and communicates through
 two ring-buffer channels:
 
-- **Lifecycle channel** (capacity 2) — reports [`Started`] and
-  [`Stopped`] events to the runner manager.
+- **Lifecycle channel** (capacity 2) — reports [`Started`] (connected)
+  and [`Stopped`] events to the runner manager.
 - **Data channel** (capacity 32) — emits [`DataFrame`] chunks for
   the file writer to consume.
 
@@ -53,7 +53,10 @@ a runner that is still connecting.
 - [`TaskRunner`] — the stream consumer itself.
 - [`TaskRunnerBuilder`] — fluent builder with validation.
   A runner is stopped by cancelling the token passed to its builder.
-- [`StreamConnector`] — lazy or pre-connected stream source.
+- [`StreamConnector`] — lazy or pre-connected stream source. A runner given
+  one through [`TaskRunnerBuilder::connector`] connects it itself: it reports
+  [`Started`] once connected, and a failed or cancelled connection reports
+  only [`Stopped`].
 - [`TaskError`] — comprehensive error enum with retryability classification.
 
 # Constants

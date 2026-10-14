@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     adapter::AdapterError,
-    runner::{BUFFER_SIZE, TaskError, TaskRunner},
+    runner::{BUFFER_SIZE, RunnerInput, TaskError, TaskRunner},
 };
 
 /// Reading the stream into the buffer, or emitting the buffer.
@@ -110,7 +110,10 @@ impl RunnerLoop<'_> {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, AdapterError>>> {
-        self.runner.stream.as_mut().poll_next(cx)
+        let RunnerInput::Connected(stream) = &mut self.runner.input else {
+            unreachable!("streaming before connecting");
+        };
+        stream.as_mut().poll_next(cx)
     }
 
     pub(super) fn on_item(&mut self, item: Bytes) {

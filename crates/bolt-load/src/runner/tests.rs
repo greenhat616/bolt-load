@@ -2041,3 +2041,176 @@ fn test_drain_priority() {
         assert_eq!(runner.wait_data_drained().await, DataDrainOutcome::Drained);
     });
 }
+
+// ── Connecting ──
+
+/// A runner connecting through `connect`, with a pending stream afterwards
+/// unless `connect` yields one.
+fn connecting_runner(
+    connect: impl Future<Output = Result<AnyBytesStream, AdapterError>> + Send + 'static,
+    total: u64,
+    limits: crate::runner::LimitReceiver,
+    token: CancellationToken,
+) -> (TaskRunner, LifecycleReceiver, DataFrameReceiver) {
+    TaskRunner::builder()
+        .total(total)
+        .connector(StreamConnector::from(connect))
+        .runner_id(1)
+        .limit_receiver(limits)
+        .cancel_token(token)
+        .build()
+        .unwrap()
+}
+
+fn frames(count: usize) -> AnyBytesStream {
+    Box::pin(futures::stream::iter(
+        (0..count).map(|_| Ok(Bytes::from(vec![1; BUFFER_SIZE]))),
+    ))
+}
+
+#[tokio::test]
+async fn test_connector_success_starts_then_streams() {
+    let (_limit_tx, limits) = limit_mailbox();
+    let total = 3 * BUFFER_SIZE as u64;
+    let (mut runner, mut lifecycle_rx, mut data_rx) = connecting_runner(
+        async { Ok(frames(3)) },
+        total,
+        limits,
+        CancellationToken::new(),
+    );
+    let handle = tokio::spawn(async move { runner.run().await });
+    let started = timeout(Duration::from_secs(5), lifecycle_rx.next())
+        .await
+        .unwrap();
+    assert!(matches!(started, Some(LifecycleEvent::Started)));
+    let (received, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+    handle.await.unwrap();
+    assert!(matches!(reason, StoppedReason::Finished), "got {reason:?}");
+    assert_eq!(received, total as usize);
+}
+
+#[tokio::test]
+async fn test_connector_failure_stops_without_starting() {
+    let (_limit_tx, limits) = limit_mailbox();
+    let (mut runner, mut lifecycle_rx, _data_rx) = connecting_runner(
+        async { Err(stream_io_error("refused")) },
+        10,
+        limits,
+        CancellationToken::new(),
+    );
+    timeout(Duration::from_secs(5), runner.run()).await.unwrap();
+    let stopped = lifecycle_rx.try_pop();
+    assert!(
+        matches!(
+            &stopped,
+            Some(LifecycleEvent::Stopped(StoppedReason::Failed(e))) if e.is_stream_error()
+        ),
+        "got {stopped:?}"
+    );
+    assert!(lifecycle_rx.try_pop().is_none());
+}
+
+#[tokio::test]
+async fn test_cancel_while_connecting_drops_the_connection() {
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = SetOnDrop(dropped.clone());
+    let (polled_tx, polled_rx) = async_channel::bounded(1);
+    let (_limit_tx, limits) = limit_mailbox();
+    let token = CancellationToken::new();
+    let (mut runner, mut lifecycle_rx, _data_rx) = connecting_runner(
+        async move {
+            let _guard = guard;
+            polled_tx.try_send(()).unwrap();
+            futures::future::pending().await
+        },
+        10,
+        limits,
+        token.clone(),
+    );
+    let handle = tokio::spawn(async move {
+        runner.run().await;
+        runner
+    });
+    polled_rx.recv().await.unwrap();
+    token.cancel();
+    let runner = timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        lifecycle_rx.try_pop(),
+        Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+            TaskError::Cancelled
+        )))
+    ));
+    assert!(lifecycle_rx.try_pop().is_none());
+    // The pending connection is only dropped with the runner.
+    drop(runner);
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_limit_received_while_connecting_bounds_the_delivery() {
+    let (limit_tx, limits) = limit_mailbox();
+    let (connect_tx, connect_rx) = async_channel::bounded::<()>(1);
+    let (mut runner, mut lifecycle_rx, mut data_rx) = connecting_runner(
+        async move {
+            connect_rx.recv().await.unwrap();
+            Ok(frames(10))
+        },
+        10 * BUFFER_SIZE as u64,
+        limits,
+        CancellationToken::new(),
+    );
+    let handle = tokio::spawn(async move { runner.run().await });
+    // The range was requested in full; the limit only shortens the delivery.
+    assert!(limit_tx.send(4 * BUFFER_SIZE as u64));
+    tokio::task::yield_now().await;
+    assert!(limit_tx.send(2 * BUFFER_SIZE as u64));
+    connect_tx.send(()).await.unwrap();
+    let (received, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+    handle.await.unwrap();
+    drop(limit_tx);
+    assert!(matches!(reason, StoppedReason::Finished), "got {reason:?}");
+    assert_eq!(received, 2 * BUFFER_SIZE);
+}
+
+#[test]
+fn test_connecting_priority_cancel_control_connection() {
+    use super::run_loop::{RunnerLoop, Step};
+
+    /// The first event of a connecting runner whose connection, and control
+    /// and cancellation as given, are ready.
+    async fn first(cancel: bool, control: bool) -> &'static str {
+        let (limit_tx, limits) = limit_mailbox();
+        if control {
+            assert!(limit_tx.send(5));
+        }
+        let token = CancellationToken::new();
+        if cancel {
+            token.cancel();
+        }
+        let (mut runner, _lifecycle_rx, _data_rx) =
+            connecting_runner(async { Ok(frames(1)) }, 10, limits, token);
+        let mut run = RunnerLoop::new(&mut runner);
+        match std::future::poll_fn(|cx| run.poll_step(cx)).await {
+            Step::Cancelled => "cancelled",
+            Step::Control(Ok(_)) => "control",
+            Step::Connected(Ok(_)) => "connected",
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    on_each_executor(|| async {
+        assert_eq!(first(true, true).await, "cancelled");
+        assert_eq!(first(false, true).await, "control");
+        assert_eq!(first(false, false).await, "connected");
+    });
+}
