@@ -51,7 +51,7 @@ bolt-load-adapter = { path = "../bolt-load-adapter", version = "0.1" }
 bolt-load-utils = { path = "../bolt-load-utils", version = "0.1" }
 
 snafu = { workspace = true }
-async-trait = "0.1"
+dynosaur = "0.3" # for dyn-compatible async traits
 futures = { workspace = true }
 futures-concurrency = "7"
 pin-project-lite = "0.2"
@@ -116,6 +116,7 @@ windows-sys = { version = "0.61", features = [
 
 
 [dev-dependencies]
+async-trait = "0.1"
 bolt-load-tests = { path = "../bolt-load-tests" }
 
 pretty_assertions = { workspace = true }

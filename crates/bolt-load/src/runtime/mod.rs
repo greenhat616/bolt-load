@@ -14,19 +14,14 @@ pub use smol_impl::*;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::*;
 
-pub trait Timer {
-    fn tick(&mut self) -> impl std::future::Future<Output = ()>;
-}
-
-#[async_trait::async_trait]
-pub trait ObjectSafeTimer: Send + Sync + 'static {
-    async fn tick(&mut self);
-}
-
-impl<T: ObjectSafeTimer> Timer for T {
-    fn tick(&mut self) -> impl std::future::Future<Output = ()> {
-        self.tick()
-    }
+/// A periodic timer.
+///
+/// Implement it with `async fn tick(&mut self)`; the returned future must be
+/// `Send`. Wrap a custom timer with [`DynTimer::new_box`] to pass it as
+/// [`TimerImpl::Custom`].
+#[dynosaur::dynosaur(pub DynTimer = dyn(box) Timer, bridge(none))]
+pub trait Timer: Send + Sync {
+    fn tick(&mut self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 pub enum TimerImpl {
@@ -34,12 +29,12 @@ pub enum TimerImpl {
     Tokio(tokio_impl::TokioDelayedTimer),
     #[cfg(feature = "smol")]
     Smol(smol_impl::SmolDelayedTimer),
-    Custom(Box<dyn ObjectSafeTimer + Send + Sync + 'static>),
+    Custom(Box<DynTimer<'static>>),
 }
 
 impl Timer for TimerImpl {
     #[allow(clippy::manual_async_fn)]
-    fn tick(&mut self) -> impl std::future::Future<Output = ()> {
+    fn tick(&mut self) -> impl std::future::Future<Output = ()> + Send {
         async move {
             match self {
                 #[cfg(feature = "tokio")]
@@ -353,6 +348,24 @@ impl std::future::Future for YieldNow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send_sync<T: ?Sized + Send + Sync>() {}
+    fn assert_send<T: Send>(_: &T) {}
+
+    #[test]
+    fn test_timers_and_their_ticks_are_send() {
+        assert_send_sync::<TimerImpl>();
+        assert_send_sync::<DynTimer<'static>>();
+
+        struct NoopTimer;
+        impl Timer for NoopTimer {
+            async fn tick(&mut self) {}
+        }
+        let mut timer = TimerImpl::Custom(DynTimer::new_box(NoopTimer));
+        assert_send(&timer.tick());
+        let mut boxed = DynTimer::new_box(NoopTimer);
+        assert_send(&boxed.tick());
+    }
 
     #[tokio::test]
     async fn test_timeout() {

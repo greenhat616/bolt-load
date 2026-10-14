@@ -14,10 +14,13 @@ The module defines a trait hierarchy for async execution:
   Used internally by state machines that require `!Send` futures.
 - [`DowncastLocalRuntime`] — Bridges threaded and local runtimes by
   downcasting a [`ThreadedRuntime`] into a [`LocalRuntime`].
-- [`Timer`] / [`ObjectSafeTimer`] — Periodic tick interface for speed
-  sampling and strategy evaluation.
+- [`Timer`] — Periodic tick interface for speed sampling and strategy
+  evaluation. Implement it with `async fn tick(&mut self)` (the future
+  must be `Send`) and wrap a custom timer with [`DynTimer::new_box`] to
+  pass it as [`TimerImpl::Custom`].
 - [`TimerBuilder`] — Factory for creating [`Timer`] instances with a
-  configurable interval.
+  configurable interval, and for one-shot [`TimerBuilder::sleep`]s such
+  as the metadata retry backoff.
 
 # Enum Dispatch
 

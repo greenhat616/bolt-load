@@ -377,7 +377,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::{
-        DowncastLocalRuntime, ObjectSafeTimer, ThreadedRuntime, TimerBuilder, TimerImpl,
+        DowncastLocalRuntime, DynTimer, ThreadedRuntime, Timer, TimerBuilder, TimerImpl,
     };
 
     #[derive(Debug, Default)]
@@ -446,7 +446,7 @@ mod tests {
 
     impl TimerBuilder for FailingRuntime {
         fn create_delayed_timer(&self, _duration: Duration) -> TimerImpl {
-            TimerImpl::Custom(Box::new(NoopTimer))
+            TimerImpl::Custom(DynTimer::new_box(NoopTimer))
         }
     }
 
@@ -471,8 +471,7 @@ mod tests {
 
     struct NoopTimer;
 
-    #[async_trait::async_trait]
-    impl ObjectSafeTimer for NoopTimer {
+    impl Timer for NoopTimer {
         async fn tick(&mut self) {}
     }
 

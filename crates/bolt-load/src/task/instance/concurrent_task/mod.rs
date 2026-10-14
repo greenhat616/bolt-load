@@ -791,7 +791,7 @@ mod tests {
         adapter::BoltLoadAdapter,
         runner::{LifecycleEvent, StoppedReason},
         runtime::{
-            DowncastLocalRuntime, ObjectSafeTimer, ThreadedRuntime, ThreadedRuntimeImpl,
+            DowncastLocalRuntime, DynTimer, ThreadedRuntime, ThreadedRuntimeImpl, Timer,
             TimerBuilder, TimerImpl,
         },
         task::ControlEvent,
@@ -828,7 +828,7 @@ mod tests {
 
     impl TimerBuilder for FailOnSpawnRuntime {
         fn create_delayed_timer(&self, _duration: Duration) -> TimerImpl {
-            TimerImpl::Custom(Box::new(NoopTimer))
+            TimerImpl::Custom(DynTimer::new_box(NoopTimer))
         }
     }
 
@@ -836,8 +836,7 @@ mod tests {
 
     struct NoopTimer;
 
-    #[async_trait::async_trait]
-    impl ObjectSafeTimer for NoopTimer {
+    impl Timer for NoopTimer {
         async fn tick(&mut self) {}
     }
 
