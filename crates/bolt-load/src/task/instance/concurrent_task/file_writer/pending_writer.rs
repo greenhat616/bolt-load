@@ -6,12 +6,19 @@
 //! a slot opens. Callers should check [`is_full`] / [`has_pending_write`] to
 //! decide whether to submit more writes.
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    future::poll_fn,
+    ops::Range,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, ready},
+};
 
 use async_channel::{Receiver, Sender};
 use async_waitgroup::WaitGroup;
 use bytes::Bytes;
-use futures::task::SpawnExt;
+use futures::{Stream, task::SpawnExt};
 
 use super::{Chunk, CommandError, FileRangeWriter, FileWriterError};
 use crate::runtime::ThreadedRuntimeImpl;
@@ -103,8 +110,9 @@ pub struct PendingWriter<F> {
     /// Channel for receiving write completions.
     #[debug(skip)]
     completion_tx: Sender<WriteCompletion>,
+    /// Boxed: polled in place, yet `finish` takes `self` apart.
     #[debug(skip)]
-    completion_rx: Receiver<WriteCompletion>,
+    completion_rx: Pin<Box<Receiver<WriteCompletion>>>,
 
     /// At most one write can be buffered when the backlog is full.
     pending_write: Option<PendingWrite>,
@@ -133,7 +141,7 @@ where
             capacity,
             in_flight: 0,
             completion_tx: tx,
-            completion_rx: rx,
+            completion_rx: Box::pin(rx),
             pending_write: None,
             saw_error: false,
             write_wg: WaitGroup::new(),
@@ -203,68 +211,52 @@ where
     /// Returns an empty `Vec` if nothing has completed yet.
     /// Skips auto-flush once any write error has been observed.
     pub fn try_tick(&mut self) -> Vec<WriteCompletion> {
-        let completions = self.drain_completions();
-        self.saw_error |= Self::completions_have_error(&completions);
-        if !self.saw_error {
-            self.try_flush_pending();
-        }
-        completions
+        let mut completions = Vec::new();
+        self.drain_ready_into(&mut completions);
+        self.settle(completions)
     }
 
-    /// Async: wait for **at least one** completion, then drain any others
-    /// that are immediately available. Auto-flushes the pending write
-    /// if a slot opens, unless an error has been observed.
+    /// Poll for **at least one** completion, then take any others that are
+    /// already available. Auto-flushes the pending write if a slot opens,
+    /// unless an error has been observed.
     ///
-    /// Returns `None` only if all senders have been dropped (should not
-    /// happen while `self` is alive).
+    /// `Pending` while no write is in flight; `Ready(None)` only if all
+    /// senders have been dropped (should not happen while `self` is alive).
+    pub fn poll_completions(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<WriteCompletion>>> {
+        // A pending write implies a write in flight, see `settle`; the count
+        // only grows from zero within `self`, so the caller polls again.
+        if self.in_flight_count() == 0 {
+            return Poll::Pending;
+        }
+        let Some(first) = ready!(self.completion_rx.as_mut().poll_next(cx)) else {
+            return Poll::Ready(None);
+        };
+        let mut completions = vec![first];
+        self.drain_ready_into(&mut completions);
+        Poll::Ready(Some(self.settle(completions)))
+    }
+
+    /// Async: wait for **at least one** completion, see [`Self::poll_completions`].
+    ///
+    /// Returns an empty `Vec` at once while no write is in flight.
     pub async fn tick(&mut self) -> Option<Vec<WriteCompletion>> {
         if self.in_flight_count() == 0 {
             return Some(Vec::new());
         }
-
-        let first = self.completion_rx.recv().await.ok()?;
-        let mut completions = vec![first];
-        while let Ok(c) = self.completion_rx.try_recv() {
-            completions.push(c);
-        }
-        self.ack_completions(completions.len());
-        self.saw_error |= Self::completions_have_error(&completions);
-        if !self.saw_error {
-            self.try_flush_pending();
-        }
-        Some(completions)
+        poll_fn(|cx| self.poll_completions(cx)).await
     }
 
     /// Async: wait until **all** in-flight writes have completed.
     /// Returns every completion in order received.
     /// Stops dispatching the pending write once an error is observed.
     pub async fn flush(&mut self) -> Vec<WriteCompletion> {
-        let mut completions = Vec::new();
-
-        loop {
-            let drained = self.drain_completions();
-            self.saw_error |= Self::completions_have_error(&drained);
-            completions.extend(drained);
-
-            if !self.saw_error {
-                self.try_flush_pending();
-            }
-
-            if self.in_flight_count() == 0 {
-                break;
-            }
-
-            match self.completion_rx.recv().await {
-                Ok(c) => {
-                    self.ack_completions(1);
-                    self.saw_error |= c.result.is_err();
-                    completions.push(c);
-                }
-                Err(_) => break,
+        let mut completions = self.try_tick();
+        while self.in_flight_count() > 0 {
+            match poll_fn(|cx| self.poll_completions(cx)).await {
+                Some(batch) => completions.extend(batch),
+                None => break,
             }
         }
-
-        completions.extend(self.drain_completions());
         completions
     }
 
@@ -284,6 +276,25 @@ where
 
     fn completions_have_error(completions: &[WriteCompletion]) -> bool {
         completions.iter().any(|c| c.result.is_err())
+    }
+
+    /// Account for `completions`: free their slots, note any error, and
+    /// dispatch the pending write into a freed slot unless an error was seen.
+    ///
+    /// Every public operation ends here or leaves the counts untouched, so on
+    /// return a pending write that may still be dispatched has a write in
+    /// flight ahead of it, which `poll_completions` relies on.
+    fn settle(&mut self, completions: Vec<WriteCompletion>) -> Vec<WriteCompletion> {
+        self.ack_completions(completions.len());
+        self.saw_error |= Self::completions_have_error(&completions);
+        if !self.saw_error {
+            self.try_flush_pending();
+        }
+        debug_assert!(
+            self.pending_write.is_none() || self.saw_error || self.in_flight > 0,
+            "a pending write must wait behind a write in flight"
+        );
+        completions
     }
 
     fn ack_completions(&mut self, count: usize) {
@@ -351,13 +362,11 @@ where
         }
     }
 
-    fn drain_completions(&mut self) -> Vec<WriteCompletion> {
-        let mut completions = Vec::new();
+    /// Take the completions already available, without accounting for them.
+    fn drain_ready_into(&mut self, completions: &mut Vec<WriteCompletion>) {
         while let Ok(c) = self.completion_rx.try_recv() {
             completions.push(c);
         }
-        self.ack_completions(completions.len());
-        completions
     }
 }
 
@@ -576,6 +585,75 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].0, 0..1);
         assert_eq!(writes[1].0, 1..2);
+    }
+
+    /// Poll `poll_completions` once with a no-op waker.
+    fn poll_once<F: FileRangeWriter + 'static>(
+        pending: &mut PendingWriter<F>,
+    ) -> Poll<Option<Vec<WriteCompletion>>> {
+        let waker = futures::task::noop_waker();
+        pending.poll_completions(&mut Context::from_waker(&waker))
+    }
+
+    #[tokio::test]
+    async fn poll_completions_alone_flushes_the_pending_write() {
+        let (release_tx, release_rx) = async_channel::unbounded();
+        let writer = Arc::new(ControlledWriter::new(release_rx));
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+        assert!(poll_once(&mut pending).is_pending(), "nothing is in flight");
+        pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
+        pending.write_range(1..2, Bytes::from_static(b"b")).unwrap();
+
+        for range in [0..1, 1..2] {
+            release_tx.send(()).await.unwrap();
+            let batch = poll_fn(|cx| pending.poll_completions(cx)).await.unwrap();
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].range, range);
+        }
+        assert!(pending.is_idle());
+        assert!(poll_once(&mut pending).is_pending());
+        assert_eq!(writer.writes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn try_tick_and_poll_completions_account_each_completion_once() {
+        let writer = Arc::new(RecordingWriter::default());
+        let mut pending =
+            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+        pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
+        pending.write_range(1..2, Bytes::from_static(b"b")).unwrap();
+
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            seen.extend(pending.try_tick());
+            if seen.len() < 2 {
+                seen.extend(poll_fn(|cx| pending.poll_completions(cx)).await.unwrap());
+            }
+        }
+        assert_eq!(seen.len(), 2);
+        assert!(pending.is_idle());
+        assert!(pending.try_tick().is_empty());
+        assert!(poll_once(&mut pending).is_pending());
+    }
+
+    #[tokio::test]
+    async fn poll_completions_reports_a_rejected_spawn_at_once() {
+        let writer = Arc::new(RecordingWriter::default());
+        let rt = ThreadedRuntimeImpl::new_other_rt(FailingRuntime);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), rt, 1);
+        pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
+        // Buffered behind the rejected write; never dispatched after its error.
+        pending.write_range(1..2, Bytes::from_static(b"b")).unwrap();
+
+        let Poll::Ready(Some(batch)) = poll_once(&mut pending) else {
+            panic!("the rejected write completes synchronously");
+        };
+        assert_eq!(batch.len(), 1);
+        assert!(batch[0].result.is_err());
+        assert_eq!(pending.in_flight_count(), 0);
+        assert!(pending.has_pending_write());
+        assert!(poll_once(&mut pending).is_pending());
     }
 
     #[tokio::test]

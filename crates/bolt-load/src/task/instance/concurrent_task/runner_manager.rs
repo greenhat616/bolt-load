@@ -8,14 +8,13 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    future::poll_fn,
     ops::Range,
-    pin::pin,
+    task::{Context, Poll},
 };
 
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
-use futures::{FutureExt, StreamExt};
-use stream::RunnerTaggedStreamItem;
 
 /// A chunk of data downloaded by a runner, ready to be written to disk.
 #[derive(Debug)]
@@ -105,8 +104,7 @@ use super::{
 };
 use crate::{
     runner::{
-        DataFrameReceiver, LifecycleEvent, LifecycleReceiver, LimitReceiver, LimitSender,
-        StoppedReason, TaskError, limit_mailbox,
+        DataFrameReceiver, LifecycleReceiver, LimitReceiver, LimitSender, TaskError, limit_mailbox,
     },
     task::{
         RunnerId,
@@ -118,8 +116,8 @@ mod data;
 mod lifecycle;
 mod stream;
 
-pub use data::{DataAggregator, DataStreamEvent};
-pub use lifecycle::{LifecycleAggregator, LifecycleStreamEvent};
+use data::DataAggregator;
+use lifecycle::LifecycleAggregator;
 
 /// The receiving ends of a spawned runner.
 pub(super) struct RunnerChannels {
@@ -531,213 +529,44 @@ impl RunnerManager {
             .is_some_and(|state| state.status == ChunkStatus::Pending)
     }
 
-    fn handle_lifecycle(&mut self, event: RunnerTaggedStreamItem<LifecycleEvent>) -> RunnerTick {
-        let runner_id = event.runner_id;
-        let connecting = self.is_connecting(runner_id);
-        let reason = match event.item {
-            LifecycleEvent::Started => {
-                trace!("runner {runner_id} started");
-                debug_assert!(connecting, "runner {runner_id} started twice");
-                self.chunk_planner
-                    .mark_running(runner_id)
-                    .expect("chunk planner should not fail");
-                let data_rx = self
-                    .connecting_data
-                    .remove(&runner_id)
-                    .expect("a connecting runner has a data receiver");
-                self.data_aggregator.register(runner_id, data_rx);
-                return RunnerTick::downloading();
-            }
-            LifecycleEvent::Stopped(reason) => reason,
-        };
-        self.meters.remove(&runner_id);
-        // Remove control channel when runner stops
-        self.release_runner(runner_id);
-        if connecting {
-            let error = match reason {
-                StoppedReason::Failed(error) => error,
-                StoppedReason::Finished => {
-                    debug_assert!(false, "runner {runner_id} finished before starting");
-                    TaskError::ChannelClosed
-                }
-            };
-            return self.handle_connect_failed(runner_id, error);
+    /// Poll the runners: lifecycle first, so a runner starting or stopping
+    /// is never starved by data, then data when `data_enabled`.
+    #[inline]
+    pub(super) fn poll_tick(
+        &mut self,
+        cx: &mut Context<'_>,
+        data_enabled: bool,
+    ) -> Poll<RunnerTick> {
+        if let Poll::Ready(tick) = self.poll_lifecycle(cx) {
+            return Poll::Ready(tick);
         }
-        let kind = match reason {
-            StoppedReason::Finished | StoppedReason::Failed(TaskError::ExceededTotalSize) => {
-                trace!("runner {runner_id} finished");
-                return if self.mark_runner_completed(runner_id) {
-                    RunnerTick::finished()
-                } else {
-                    RunnerTick::downloading()
-                };
-            }
-            StoppedReason::Failed(kind) => kind,
-        };
-        error!("runner {runner_id} failed: {kind:?}");
-        let unfinished_range = self
-            .chunk_planner
-            .mark_failed(runner_id)
-            .expect("chunk planner should not fail");
-        trace!("runner {runner_id} failed, released range: {unfinished_range:?}");
-        if kind.is_cancelled() {
-            return RunnerTick::downloading();
-        }
-        self.runner_outcome_sampler
-            .record_stream_closed(if kind.is_retryable() {
-                RunnerFailureKind::Retryable
-            } else {
-                RunnerFailureKind::Unretryable
-            });
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            retryable: is_attempt_retryable(&kind),
-            error: kind,
-        })
-    }
-
-    /// Handle a runner that stopped before it connected; its range is
-    /// released and it never counts as finished.
-    fn handle_connect_failed(&mut self, runner_id: RunnerId, error: TaskError) -> RunnerTick {
-        self.chunk_planner
-            .mark_failed(runner_id)
-            .expect("chunk planner should not fail");
-        if error.is_cancelled() {
-            trace!("runner {runner_id} cancelled while connecting");
-            return RunnerTick::downloading();
-        }
-        error!("runner {runner_id} failed to connect: {error:?}");
-        let retryable = is_attempt_retryable(&error);
-        self.runner_outcome_sampler
-            .record_connect_failed(if retryable {
-                RunnerFailureKind::Retryable
-            } else {
-                RunnerFailureKind::Unretryable
-            });
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            error,
-            retryable,
-        })
-    }
-
-    /// Handle a runner whose spawn was rejected.
-    #[cold]
-    fn handle_spawn_failed(&mut self, runner_id: RunnerId, failed: SpawnFailed) -> RunnerTick {
-        error!("failed to spawn runner {runner_id}: {}", failed.message);
-        self.release_runner(runner_id);
-        self.handle_connect_failed(
-            runner_id,
-            TaskError::Other {
-                message: failed.message,
-            },
-        )
-    }
-
-    /// Handle a runner whose stream closed without sending `Stopped`.
-    fn handle_runner_lost(&mut self, runner_id: RunnerId) -> RunnerTick {
-        warn!("runner {runner_id} lifecycle stream closed unexpectedly");
-        let connecting = self.is_connecting(runner_id);
-        self.meters.remove(&runner_id);
-        let unfinished_range = self
-            .chunk_planner
-            .mark_failed(runner_id)
-            .expect("chunk planner should not fail");
-        if connecting {
-            self.runner_outcome_sampler
-                .record_connect_failed(RunnerFailureKind::Retryable);
+        if data_enabled {
+            self.poll_data(cx)
         } else {
-            self.runner_outcome_sampler
-                .record_stream_closed(RunnerFailureKind::Retryable);
-        }
-        self.release_runner(runner_id);
-        trace!("runner {runner_id} lost, released range: {unfinished_range:?}");
-        if self.chunk_planner.is_complete() {
-            return RunnerTick::finished();
-        }
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            error: TaskError::ChannelClosed,
-            retryable: true,
-        })
-    }
-
-    fn handle_lifecycle_stream_event(&mut self, event: Option<LifecycleStreamEvent>) -> RunnerTick {
-        match event {
-            Some(LifecycleStreamEvent::Event(tagged)) => self.handle_lifecycle(tagged),
-            Some(LifecycleStreamEvent::Closed(runner_id)) => self.handle_runner_lost(runner_id),
-            None => RunnerTick::downloading(),
-        }
-    }
-
-    /// The next rejected spawn, which the lifecycle reports before anything else.
-    fn take_spawn_failure(&mut self) -> Option<RunnerTick> {
-        let (runner_id, failed) = self.spawn_failures.pop_front()?;
-        Some(self.handle_spawn_failed(runner_id, failed))
-    }
-
-    /// Handle data frames from runners, returning the chunk ready for writing.
-    fn handle_data_frame(&mut self, runner_id: RunnerId, mut data_frame: Bytes) -> DownloadedChunk {
-        let bytes_len = data_frame.len();
-        *self.meters.entry(runner_id).or_insert(0) += bytes_len;
-
-        let fixed_downloaded_range = self
-            .chunk_planner
-            .update_progress(runner_id, bytes_len as u64)
-            .expect("chunk planner should not fail");
-        let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
-        data_frame.truncate(picked_size as usize);
-
-        DownloadedChunk {
-            range: fixed_downloaded_range,
-            bytes: data_frame,
+            Poll::Pending
         }
     }
 
     pub async fn tick(&mut self) -> RunnerTick {
-        if let Some(tick) = self.take_spawn_failure() {
-            return tick;
-        }
-        let mut next_lifecycle = pin!(self.lifecycle_aggregator.next().fuse());
-        let mut next_data = pin!(self.data_aggregator.next().fuse());
-        // Priority: lifecycle > data (lifecycle is control-plane, must not be starved)
-        futures::select_biased! {
-            event = next_lifecycle => self.handle_lifecycle_stream_event(event),
-            data = next_data => {
-                if let Some(event) = data {
-                    match event {
-                        DataStreamEvent::Data(item) => {
-                            let chunk = self.handle_data_frame(item.runner_id, item.item.data);
-                            return RunnerTick::with_chunk(chunk);
-                        }
-                        DataStreamEvent::Closed(runner_id) => {
-                            trace!("runner {runner_id} data stream closed");
-                            self.data_aggregator.unregister(runner_id);
-                        }
-                    }
-                }
-                RunnerTick::downloading()
-            }
-        }
+        poll_fn(|cx| self.poll_tick(cx, true)).await
     }
 
     pub async fn tick_lifecycle_only(&mut self) -> RunnerTick {
-        if let Some(tick) = self.take_spawn_failure() {
-            return tick;
-        }
-        let event = self.lifecycle_aggregator.next().await;
-        self.handle_lifecycle_stream_event(event)
+        poll_fn(|cx| self.poll_tick(cx, false)).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{pin::pin, time::Duration};
 
     use async_ringbuf::traits::Producer;
+    use futures::StreamExt;
 
     use super::*;
-    use crate::runner::{DATA_FRAME_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY};
+    use crate::runner::{
+        DATA_FRAME_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, StoppedReason,
+    };
 
     #[test]
     fn test_runner_manager_creation() {
@@ -1010,6 +839,31 @@ mod tests {
             ChunkStatus::Running
         );
         assert_eq!(manager.tick().await.downloaded.unwrap().range, 0..3);
+    }
+
+    #[test]
+    fn test_poll_tick_parks_once_every_source_is_exhausted() {
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut manager = RunnerManager::new(1000, 2);
+        assert!(manager.poll_tick(&mut cx, true).is_pending());
+
+        let (lifecycle_tx, data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        drop((lifecycle_tx, data_tx));
+        let Poll::Ready(tick) = manager.poll_tick(&mut cx, true) else {
+            panic!("the closed lifecycle is reported");
+        };
+        assert!(matches!(
+            tick.failure,
+            Some(AttemptFailure {
+                error: TaskError::ChannelClosed,
+                ..
+            })
+        ));
+        // Nothing is left: no source keeps reporting it ended.
+        for data_enabled in [true, false, true] {
+            assert!(manager.poll_tick(&mut cx, data_enabled).is_pending());
+        }
     }
 
     #[tokio::test]
