@@ -16,3 +16,14 @@ event-listener = "5"
 [dev-dependencies]
 futures = { workspace = true }
 pretty_assertions = { workspace = true }
+
+# Model checking: `RUSTFLAGS="--cfg loom" cargo test -p bolt-load-sync --release --test loom`
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+event-listener = { version = "5", features = ["loom"] }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = { version = "0.7", features = ["futures"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

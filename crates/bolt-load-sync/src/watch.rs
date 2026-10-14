@@ -31,16 +31,11 @@
 //! assert_eq!(reader.join().unwrap(), 100);
 //! ```
 
-use std::{
-    error::Error,
-    fmt,
-    sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{error::Error, fmt, sync::PoisonError};
 
 use event_listener::{Event, Listener, listener};
+
+use crate::sync::{Arc, AtomicU64, Mutex, MutexGuard, Ordering};
 
 /// Set in [`Shared::state`] once the sender is dropped.
 const CLOSED: u64 = 1;
@@ -274,7 +269,8 @@ impl<T> fmt::Debug for Receiver<T> {
     }
 }
 
-#[cfg(test)]
+// Uses std threads, which loom's primitives reject; see `tests/loom.rs`.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use std::{
         pin::pin,

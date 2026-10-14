@@ -56,7 +56,8 @@ notifying, so the argument covers both.
 can see the new version while the sender still holds the lock. Any read of
 the value takes the same lock and therefore cannot return the old pointer;
 `borrow_and_update` reads the version and the value under that lock, so
-they always match. No `SeqCst` is needed.
+they always match. `state` needs no `SeqCst`; `event-listener` itself uses
+a `SeqCst` fence inside `notify`.
 
 ## Differences from `tokio::sync::watch`
 
@@ -77,6 +78,18 @@ they always match. No `SeqCst` is needed.
 | 2026-10-15 | `Mutex<Arc<T>>`, not `arc-swap` | No extra dependency; the lock is held for a pointer operation only. |
 | 2026-10-15 | `listener!` instead of `Event::listen` | `listen()` boxes the listener on every wait; the boxed variant was 2-4x slower in fan-out. |
 
+## Testing
+
+```sh
+cargo test -p bolt-load-sync
+RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
+  cargo test -p bolt-load-sync --release --test loom
+```
+
+Under `cfg(loom)`, `src/sync.rs` swaps `Arc`, `Mutex` and `AtomicU64` for
+loom's, and `event-listener` is built with its `loom` feature; the unit tests,
+which use std threads, are compiled out.
+
 ## Measurements
 
 From `benches/progress.rs` on the `bench/progress-reporting` branch, a
@@ -92,8 +105,14 @@ single run):
 
 ## Known limits
 
-- The memory-ordering argument is covered by stress tests, not by a model
-  checker (`loom`).
+- `tests/loom.rs` model-checks small cases (one sender, up to two
+  receivers, up to two sends): wakeup of async and blocking waiters, the
+  last value before `Closed`, the version recorded by `borrow_and_update`,
+  and fan-out to two parked receivers. The fan-out model has three threads
+  and is bounded to two preemptions; the others are exhaustive. Two injected
+  bugs were caught as deadlocks: dropping the re-check after registration in
+  `changed`, and `notify(1)` instead of `notify(usize::MAX)`. Larger runs are
+  covered by the stress test only.
 - The version wraps after 2^63 publications. A receiver that has not looked
   for exactly that many publications would miss the newest value; at one
   publication per nanosecond that takes about 292 years.
