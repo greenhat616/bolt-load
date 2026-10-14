@@ -101,6 +101,22 @@ impl TaskRunner {
         let mut run = RunnerLoop::new(self);
         poll_fn(|cx| run.poll_run(cx)).await;
     }
+
+    /// Like [`Self::run`], but once `Started` is published, wait for `ready`
+    /// before streaming, so a consumer can prepare for the data without the
+    /// idle and drain timeouts running.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, name = "TaskRunner::run", fields(runner_id = self.id))
+    )]
+    pub(crate) async fn run_after_started(&mut self, ready: impl Future<Output = ()>) {
+        let mut run = RunnerLoop::new(self);
+        if poll_fn(|cx| run.poll_until_started(cx)).await {
+            ready.await;
+            run.handle_step(Step::Started(Ok(())));
+            poll_fn(|cx| run.poll_run(cx)).await;
+        }
+    }
 }
 
 impl<'a> RunnerLoop<'a> {
@@ -119,6 +135,19 @@ impl<'a> RunnerLoop<'a> {
             phase,
             cancelled,
         }
+    }
+
+    /// Run until `Started` is published, without handling it; `false` when
+    /// the runner stopped before.
+    fn poll_until_started(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        while !matches!(self.phase, Phase::Stopped) {
+            let step = ready!(self.poll_step(cx));
+            if matches!(step, Step::Started(Ok(()))) {
+                return Poll::Ready(true);
+            }
+            self.handle_step(step);
+        }
+        Poll::Ready(false)
     }
 
     fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<()> {
