@@ -23,7 +23,7 @@
 //! Run with: `cargo bench -p bolt-load --bench runner_loop`
 //!
 //! Profiling mode (bypasses criterion): `RUNNER_PROFILE=<case>:<iterations>` prints
-//! ns/frame; built with `RUSTFLAGS="--cfg coord_alloc"` it also prints allocations per
+//! ns/frame (ns/iteration for `tokio_runners_8`, `setup` and `cancel_latency`); built with `RUSTFLAGS="--cfg coord_alloc"` it also prints allocations per
 //! frame from a separate pass.
 
 use std::{
@@ -380,12 +380,41 @@ mod alloc_counter {
     static GLOBAL: CountingAlloc = CountingAlloc;
 }
 
-/// `RUNNER_PROFILE=<case>:<iterations>` runs one case outside criterion.
+/// `RUNNER_PROFILE=<case>:<iterations>` runs one case outside criterion; besides
+/// [`CASES`], `tokio_runners_8`, `setup` and `cancel_latency` report per iteration.
 fn profile(spec: &str) {
     let (name, iterations) = spec.split_once(':').expect("<case>:<iterations>");
     let iterations: usize = iterations.parse().expect("iterations");
-    let case = *CASES.iter().find(|c| c.name == name).expect("unknown case");
     let rt = Runtime::new().expect("tokio runtime");
+    let per_iteration = |run: &dyn Fn() -> Duration| {
+        let elapsed: Duration = (0..iterations).map(|_| run()).sum();
+        println!(
+            "{name}: {iterations} iterations in {elapsed:?} -> {:.1} ns/iteration",
+            elapsed.as_nanos() as f64 / iterations as f64
+        );
+    };
+    let timed = |run: &dyn Fn() -> u64| {
+        let start = Instant::now();
+        black_box(run());
+        start.elapsed()
+    };
+    match name {
+        "tokio_runners_8" => {
+            return per_iteration(&|| timed(&|| rt.block_on(run_many(8, tokio_spawn(&rt)))));
+        }
+        "setup" => {
+            let case = Case {
+                item: 1,
+                ..CASES[1]
+            };
+            return per_iteration(&|| timed(&|| rt.block_on(run_case(case, 1, tokio_spawn(&rt)))));
+        }
+        "cancel_latency" => {
+            return per_iteration(&|| rt.block_on(cancel_latency(tokio_spawn(&rt))));
+        }
+        _ => {}
+    }
+    let case = *CASES.iter().find(|c| c.name == name).expect("unknown case");
     let start = Instant::now();
     let mut frames = 0;
     for _ in 0..iterations {
