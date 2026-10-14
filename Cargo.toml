@@ -5,6 +5,7 @@ members = [
     'crates/bolt-load-adapter',
     'crates/bolt-load-tests',
     "crates/bolt-load-utils",
+    "crates/bolt-load-sync",
 ]
 resolver = "3"
 

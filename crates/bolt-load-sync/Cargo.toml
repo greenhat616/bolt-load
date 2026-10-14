@@ -1,0 +1,18 @@
+[package]
+name = "bolt-load-sync"
+description = "Runtime-agnostic synchronization primitives for bolt-load: a latest-value watch channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+event-listener = "5"
+
+[dev-dependencies]
+futures = { workspace = true }
+pretty_assertions = { workspace = true }
