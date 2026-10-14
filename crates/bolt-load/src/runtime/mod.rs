@@ -59,13 +59,16 @@ impl Timer for TimerImpl {
 pub type Sleep = futures::future::BoxFuture<'static, ()>;
 
 pub trait TimerBuilder {
-    /// A `Timer` that will be delayed if missed a tick in the interval.
+    /// A `Timer` that ticks every `duration` and is delayed if it missed a tick.
+    ///
+    /// Like `tokio::time::interval`, the first tick completes immediately.
     fn create_delayed_timer(&self, duration: std::time::Duration) -> TimerImpl;
 
     /// Sleep for `duration` on this runtime's timer.
     ///
     /// The default waits for the second tick of [`Self::create_delayed_timer`],
-    /// assuming its first tick completes immediately like the built-in timers.
+    /// so it only sleeps for `duration` when the first tick is immediate.
+    /// Custom runtimes should override it with their own one-shot sleep.
     fn sleep(&self, duration: std::time::Duration) -> Sleep {
         let mut timer = self.create_delayed_timer(duration);
         Box::pin(async move {

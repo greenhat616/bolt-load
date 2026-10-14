@@ -24,6 +24,7 @@ handles the rest.
 use bolt_load::task::TaskBuilder;
 use bolt_load::adapter::reqwest::IntoReqwestAdapter;
 use bolt_load::runtime::ThreadedRuntimeImpl;
+use smol_cancellation_token::CancellationToken;
 
 let client = reqwest::Client::new();
 let adapter = client.into_reqwest_adapter((
@@ -37,6 +38,7 @@ let mut task = TaskBuilder::default()
     .adapter(adapter)
     .save_path("large-file.bin".into())
     .threaded_runtime(runtime)
+    .cancel_token(CancellationToken::new())
     .build()
     .await?;
 

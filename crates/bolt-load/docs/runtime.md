@@ -19,8 +19,10 @@ The module defines a trait hierarchy for async execution:
   must be `Send`) and wrap a custom timer with [`DynTimer::new_box`] to
   pass it as [`TimerImpl::Custom`].
 - [`TimerBuilder`] — Factory for creating [`Timer`] instances with a
-  configurable interval, and for one-shot [`TimerBuilder::sleep`]s such
-  as the metadata retry backoff.
+  configurable interval, whose first tick completes immediately, and for
+  one-shot [`TimerBuilder::sleep`]s such as the metadata retry backoff.
+  The default `sleep` waits for the second tick of a delayed timer;
+  custom runtimes should override it with their own sleep.
 
 # Enum Dispatch
 
