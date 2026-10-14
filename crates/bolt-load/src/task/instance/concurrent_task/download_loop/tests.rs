@@ -702,13 +702,12 @@ async fn connecting_loop(total: u64, max_concurrency: usize) -> (DownloadLoop, F
 }
 
 #[tokio::test]
-#[ignore = "fixed in Phase C: a connecting runner does not drain its control channel"]
-async fn test_split_connecting_runner_repeatedly() {
+async fn test_split_connecting_runner_beyond_its_control_channel() {
     const TOTAL: u64 = 1 << 20;
     let (mut download, file_writer) = connecting_loop(TOTAL, 64).await;
     download.spawn_runner(0..TOTAL);
-    // One more split than the control channel holds; each one queues a
-    // `LimitTotal` for the connecting runner 0.
+    // Each split queues a `LimitTotal` for the connecting runner 0; the ninth
+    // finds its control channel full and is skipped.
     for _ in 0..9 {
         let incomplete = download
             .manager
@@ -719,8 +718,9 @@ async fn test_split_connecting_runner_repeatedly() {
     }
     assert_eq!(
         download.manager.get_runner_state(0).unwrap().allocated,
-        0..TOTAL >> 9
+        0..TOTAL >> 8
     );
+    assert_eq!(download.manager.allocated_runner_count(), 9);
     drop(download);
     file_writer.finalize().await.unwrap();
 }
@@ -792,7 +792,6 @@ async fn test_strategy_split_rounds_fit_connecting_control_channel() {
 }
 
 #[tokio::test]
-#[ignore = "fixed in Phase C: a connecting runner does not drain its control channel"]
 async fn test_strategy_split_rounds_beyond_control_channel() {
     assert!(!strategy_overflows_connecting_runner(1025, 64).await);
 }
