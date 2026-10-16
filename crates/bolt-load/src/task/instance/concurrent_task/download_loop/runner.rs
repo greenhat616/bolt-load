@@ -1,11 +1,15 @@
-use std::{ops::ControlFlow, time::Instant};
+use std::{
+    ops::ControlFlow,
+    task::{Context, Poll},
+    time::Instant,
+};
 
 use super::{
     super::{
         file_writer::WriterFullError,
         runner_manager::{DownloadedChunk, TaskState},
     },
-    DownloadLoop, RunnerTick,
+    DownloadLoop, LoopEvent, RunnerTick,
 };
 use crate::{
     runner::TaskError,
@@ -13,6 +17,16 @@ use crate::{
 };
 
 impl DownloadLoop {
+    /// Runner data is only polled while the writer can take it; their
+    /// lifecycle always is, so failures are noticed under backpressure.
+    #[inline]
+    pub(super) fn poll_runner(&mut self, cx: &mut Context<'_>) -> Poll<LoopEvent> {
+        let data_enabled = self.writer.can_write();
+        self.manager
+            .poll_tick(cx, data_enabled)
+            .map(LoopEvent::Runner)
+    }
+
     pub(super) fn on_runner(&mut self, tick: RunnerTick) -> Result<ControlFlow<()>> {
         if let Some(chunk) = tick.downloaded {
             self.accept_chunk(chunk)?;

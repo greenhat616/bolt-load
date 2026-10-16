@@ -253,8 +253,9 @@ impl ConcurrentTaskInner {
             &file_writer,
             self.event_tx.clone(),
             &self.options,
+            cancel_token.clone(),
         );
-        let transfer_result = download.run(cancel_token).await;
+        let transfer_result = download.run().await;
         let transfer_result = download.finish(transfer_result, &mut self.progress).await;
         // Always join the writer workers, so the file handle is released before
         // the temporary file is renamed or removed.
