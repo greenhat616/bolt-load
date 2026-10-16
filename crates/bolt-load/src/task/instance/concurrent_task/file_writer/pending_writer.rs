@@ -9,7 +9,6 @@
 use std::{
     future::poll_fn,
     ops::Range,
-    path::PathBuf,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
@@ -17,10 +16,14 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use async_waitgroup::WaitGroup;
+use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use futures::{Stream, task::SpawnExt};
 
-use super::{Chunk, CommandError, FileRangeWriter, FileWriterError};
+use super::{
+    Chunk, FileRangeWriter, FileWriter, FileWriterError,
+    command::{CompletionGuard, SubmitError, SubmitWrite, queue_closed},
+};
 use crate::runtime::ThreadedRuntimeImpl;
 
 /// A single write request: range + data.
@@ -37,48 +40,6 @@ pub struct PendingWrite {
 pub struct WriteCompletion {
     pub range: Range<u64>,
     pub result: Result<(), FileWriterError>,
-}
-
-struct WriteCompletionGuard {
-    tx: Sender<WriteCompletion>,
-    range: Range<u64>,
-    chunk: Option<Chunk>,
-    armed: bool,
-}
-
-impl WriteCompletionGuard {
-    fn new(tx: Sender<WriteCompletion>, range: Range<u64>, chunk: Chunk) -> Self {
-        Self {
-            tx,
-            range,
-            chunk: Some(chunk),
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-        self.chunk = None;
-    }
-}
-
-impl Drop for WriteCompletionGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-
-        let _ = self.tx.try_send(WriteCompletion {
-            range: self.range.clone(),
-            result: Err(FileWriterError::WriteRange {
-                source: CommandError::Io {
-                    source: std::io::Error::other("write task panicked"),
-                },
-                chunk: self.chunk.take(),
-                path: PathBuf::new(),
-            }),
-        });
-    }
 }
 
 /// Indicates what happened when [`PendingWriter::write_range`] was called.
@@ -104,6 +65,8 @@ pub struct PendingWriter<F> {
     #[debug(skip)]
     threaded_rt: ThreadedRuntimeImpl,
     capacity: usize,
+    #[debug(skip)]
+    dispatch: fn(&mut Self, Chunk),
 
     in_flight: usize,
 
@@ -139,6 +102,7 @@ where
             writer,
             threaded_rt,
             capacity,
+            dispatch: Self::dispatch_spawned,
             in_flight: 0,
             completion_tx: tx,
             completion_rx: Box::pin(rx),
@@ -306,50 +270,15 @@ where
 
     fn dispatch_write(&mut self, range: Range<u64>, data: Bytes) {
         self.in_flight += 1;
+        (self.dispatch)(self, Chunk { range, data });
+    }
 
-        let writer = Arc::clone(&self.writer);
-        let tx = self.completion_tx.clone();
-        let wg_guard = self.write_wg.clone();
-        let task_range = range.clone();
-        let completion_range = range.clone();
-        let guard_range = range.clone();
-        let guard_chunk = Chunk {
-            range: range.clone(),
-            data: data.clone(),
-        };
-        let completion_chunk = Chunk {
-            range,
-            data: data.clone(),
-        };
-
-        if let Err(spawn_error) = self.threaded_rt.spawn(async move {
-            let mut guard = WriteCompletionGuard::new(tx.clone(), guard_range, guard_chunk);
-            let result = writer.write_range(task_range.clone(), data).await;
-            let _ = tx
-                .send(WriteCompletion {
-                    range: task_range,
-                    result,
-                })
-                .await;
-            guard.disarm();
-            drop(guard);
-            drop(writer);
-            drop(wg_guard);
-        }) {
-            self.completion_tx
-                .try_send(WriteCompletion {
-                    range: completion_range,
-                    result: Err(FileWriterError::WriteRange {
-                        source: CommandError::Io {
-                            source: std::io::Error::other(format!(
-                                "failed to spawn write task: {spawn_error}"
-                            )),
-                        },
-                        chunk: Some(completion_chunk),
-                        path: PathBuf::new(),
-                    }),
-                })
-                .expect("completion channel should have capacity for spawn-failure completion");
+    /// Write through [`FileRangeWriter::write_range`] in a spawned task.
+    fn dispatch_spawned(&mut self, chunk: Chunk) {
+        let task = WriteTask::new(self, chunk);
+        // A rejected task is dropped with its completion, which reports it.
+        if let Err(e) = self.threaded_rt.spawn(task.write()) {
+            error!("failed to spawn write task: {e}");
         }
     }
 
@@ -370,9 +299,98 @@ where
     }
 }
 
+/// A spawned write, owning its completion before it is first polled: a
+/// rejected or dropped task still completes the write, once.
+///
+/// Fields drop in declaration order: the writer is released before the
+/// completion is reported and before the wait group membership.
+struct WriteTask<F> {
+    writer: Arc<F>,
+    done: Option<CompletionGuard>,
+    chunk: Option<Chunk>,
+    _wait_group: WaitGroup,
+}
+
+impl<F: FileRangeWriter + 'static> WriteTask<F> {
+    fn new(pending: &PendingWriter<F>, chunk: Chunk) -> Self {
+        let done = CompletionGuard::new(pending.completion_tx.clone(), chunk.clone());
+        Self::guarded(pending, chunk, done)
+    }
+
+    fn guarded(pending: &PendingWriter<F>, chunk: Chunk, done: CompletionGuard) -> Self {
+        Self {
+            writer: Arc::clone(&pending.writer),
+            done: Some(done),
+            chunk: Some(chunk),
+            _wait_group: pending.write_wg.clone(),
+        }
+    }
+
+    async fn write(mut self) {
+        let chunk = self.chunk.take().expect("one write");
+        let result = self.writer.write_range(chunk.range, chunk.data).await;
+        self.done
+            .take()
+            .expect("one completion")
+            .complete_result(result);
+    }
+}
+
+impl WriteTask<FileWriter> {
+    /// Queue the write once the backend has room; the backend completes it.
+    async fn submit(mut self) {
+        let chunk = self.chunk.take().expect("one write");
+        let done = self.done.take().expect("one completion");
+        self.writer.submit(chunk, done).await;
+    }
+}
+
+impl PendingWriter<FileWriter> {
+    /// Like [`Self::new`], but writes are queued straight to the backend's
+    /// workers, which report the completion: no task per write.
+    pub(crate) fn new_direct(
+        writer: Arc<FileWriter>,
+        threaded_rt: ThreadedRuntimeImpl,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            dispatch: Self::dispatch_direct,
+            ..Self::new(writer, threaded_rt, capacity)
+        }
+    }
+
+    fn dispatch_direct(&mut self, chunk: Chunk) {
+        if self.writer.submission().is_none() {
+            return self.dispatch_spawned(chunk);
+        }
+        let done = CompletionGuard::new(self.completion_tx.clone(), chunk.clone());
+        match self.writer.try_submit(chunk, done) {
+            Ok(()) => {}
+            Err(SubmitError::Full(chunk, done)) => self.spawn_submit(chunk, done),
+            Err(SubmitError::Closed(done)) => {
+                let (_, path) = self.writer.submission().expect("direct backend");
+                done.complete(Err(queue_closed()), path);
+            }
+        }
+    }
+
+    /// The backend's queue is full: queue the write from a task instead.
+    fn spawn_submit(&mut self, chunk: Chunk, done: CompletionGuard) {
+        let task = WriteTask::guarded(self, chunk, done);
+        // A rejected or dropped task reports the write through its completion.
+        if let Err(e) = self.threaded_rt.spawn(task.submit()) {
+            error!("failed to spawn write submission task: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_tests;
+
 #[cfg(test)]
 mod tests {
     use std::{
+        path::PathBuf,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -384,7 +402,7 @@ mod tests {
         task::{Spawn, SpawnError},
     };
 
-    use super::*;
+    use super::{super::CommandError, *};
     use crate::runtime::{
         DowncastLocalRuntime, DynTimer, ThreadedRuntime, Timer, TimerBuilder, TimerImpl,
     };

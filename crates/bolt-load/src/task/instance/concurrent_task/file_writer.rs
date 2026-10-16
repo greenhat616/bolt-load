@@ -3,6 +3,7 @@
 //! Use memmap to write random access file,
 //! and use seek write to write the file in large file.
 
+mod command;
 #[cfg(feature = "compio")]
 mod compio_writer;
 #[cfg(feature = "mmap")]
@@ -40,15 +41,8 @@ use crate::runtime::yield_now;
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
 
-#[derive(Debug, Snafu)]
-pub enum CommandError {
-    #[snafu(transparent)]
-    Io { source: std::io::Error },
-    #[snafu(display("failed to receive command: channel closed"))]
-    Recv,
-    #[snafu(display("failed to send command: channel closed"))]
-    Send,
-}
+pub use self::command::CommandError;
+use self::command::{CloseOnExit, Command, CommandAck, WriteReply};
 
 #[derive(Debug, Snafu)]
 pub enum FileWriterBuilderError {
@@ -232,8 +226,6 @@ async fn open_file(path: PathBuf, size: u64) -> Result<File, FileWriterError> {
     .await?;
     Ok(file)
 }
-
-type CommandAck = oneshot::Sender<Result<(), std::io::Error>>;
 
 /// Ask a channel-driven backend to finalize, then wait until all of its
 /// workers have exited and released their file and mapping handles.
