@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    pin::pin,
     sync::Arc,
 };
 
@@ -17,7 +18,7 @@ use super::{
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter},
-    runner::{LifecycleEvent, StoppedReason, TaskError, TaskRunner},
+    runner::{LifecycleEvent, StoppedReason, StreamConnector, TaskError, TaskRunner},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     task::{
         Progress, RunnerId, TaskOptions,
@@ -170,6 +171,23 @@ impl SingletonTaskInner {
         Ok(())
     }
 
+    /// Create the temporary file, sized to the total when it is known.
+    async fn create_file(&self, tmp_path: &Path) -> Result<File> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(tmp_path)
+            .await
+            .map_err(TaskInstanceError::new_write_chunk_failed)?;
+        if let Some(total) = self.total {
+            file.set_len(total)
+                .await
+                .map_err(TaskInstanceError::new_write_chunk_failed)?;
+        }
+        Ok(file)
+    }
+
     async fn handle_lifecycle_event(
         &mut self,
         event: LifecycleEvent,
@@ -236,62 +254,30 @@ impl SingletonTaskInner {
         let runner_token = cancel_token.child_token();
         let _runner_cancel_guard = runner_token.clone().drop_guard();
 
-        let stream = {
-            let adapter = self.adapter.clone();
-            let connect = async move { adapter.full_stream().await }.fuse();
-            let cancelled = runner_token.cancelled().fuse();
-            let timeout = FutureExt::fuse(Timer::after(self.options.no_progress_timeout));
-            futures::pin_mut!(connect, cancelled, timeout);
-            futures::select_biased! {
-                _ = cancelled => {
-                    return Err(TaskInstanceError::new_failed(TaskError::Cancelled));
-                }
-                _ = timeout => {
-                    return Err(TaskInstanceError::new_failed(TaskError::NoProgress {
-                        timeout: self.options.no_progress_timeout,
-                    }));
-                }
-                res = connect => res.map_err(TaskInstanceError::new_stream_failed)?,
-            }
-        };
-        trace!("[SINGLETON TASK] stream obtained successfully");
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(tmp_path)
-            .await
-            .map_err(TaskInstanceError::new_write_chunk_failed)?;
-
-        if let Some(total) = self.total {
-            file.set_len(total)
-                .await
-                .map_err(TaskInstanceError::new_write_chunk_failed)?;
-        }
-
         // The runner fails with `ChannelClosed` once every control sender is
         // gone, so the sender must outlive it.
         let (control_tx, control_rx) = async_channel::bounded(CONTROL_CHANNEL_CAPACITY);
-
-        // Use builder pattern to create runner with split channels
+        let adapter = self.adapter.clone();
         let mut builder = TaskRunner::builder()
-            .stream(stream)
+            .connector(StreamConnector::from(
+                async move { adapter.full_stream().await },
+            ))
             .runner_id(STATIC_RUNNER_ID)
             .control_signal(control_rx)
             .cancel_token(runner_token.clone())
-            .idle_timeout(self.options.stream_idle_timeout);
-
+            .idle_timeout(self.options.stream_idle_timeout)
+            .connect_timeout(self.options.connect_timeout);
         if let Some(total) = self.total {
             builder = builder.total(total);
         }
-
         let (mut runner, lifecycle_rx, data_rx) =
             builder.build().expect("failed to build task runner");
 
         let mut meter = 0;
         let mut sampler = SpeedSampler::new();
         let mut timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
+        // Opened once the runner is connected; data is consumed only then.
+        let mut file = None;
 
         // The runner is driven inline; leaving this block drops it, which stops
         // it and releases the upstream stream.
@@ -300,12 +286,20 @@ impl SingletonTaskInner {
             let mut runner_stopped = false;
             let mut data_done = false;
             let mut lifecycle_done = false;
-            let fut = runner.run().fuse();
-            futures::pin_mut!(fut);
-            futures::pin_mut!(lifecycle_rx);
-            futures::pin_mut!(data_rx);
+            // Streaming starts once the file is ready.
+            let (file_ready_tx, file_ready_rx) = oneshot::channel::<()>();
+            let mut file_ready_tx = Some(file_ready_tx);
+            let mut fut = pin!(
+                runner
+                    .run_after_started(async move {
+                        let _ = file_ready_rx.await;
+                    })
+                    .fuse()
+            );
+            let mut lifecycle_rx = pin!(lifecycle_rx);
+            let mut data_rx = pin!(data_rx);
             loop {
-                let data_next = if data_done {
+                let data_next = if data_done || file.is_none() {
                     futures::future::Either::Left(futures::future::pending())
                 } else {
                     futures::future::Either::Right(data_rx.next())
@@ -317,15 +311,21 @@ impl SingletonTaskInner {
                     futures::future::Either::Right(lifecycle_rx.next())
                 }
                 .fuse();
-                futures::pin_mut!(data_next, lifecycle_next);
+                let mut data_next = pin!(data_next);
+                let mut lifecycle_next = pin!(lifecycle_next);
 
                 futures::select_biased! {
-                    _ = timer.next().fuse() => self.handle_timer_tick(&mut sampler, &mut meter),
+                    _ = timer.next().fuse() => {
+                        if file.is_some() {
+                            self.handle_timer_tick(&mut sampler, &mut meter);
+                        }
+                    }
                     _ = fut => (),
                     frame = data_next => {
                         match frame {
                             Some(frame) => {
-                                self.handle_data_frame(frame.data, &mut file, &mut meter).await?;
+                                let file = file.as_mut().expect("data is consumed once connected");
+                                self.handle_data_frame(frame.data, file, &mut meter).await?;
                             }
                             None => {
                                 data_done = true;
@@ -337,18 +337,25 @@ impl SingletonTaskInner {
                     }
                     event = lifecycle_next => {
                         match event {
+                            Some(LifecycleEvent::Started) => {
+                                trace!("[SINGLETON TASK] stream obtained successfully");
+                                file = Some(self.create_file(tmp_path).await?);
+                                // Measure the speed from the first byte on.
+                                sampler = SpeedSampler::new();
+                                timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
+                                if let Some(file_ready_tx) = file_ready_tx.take() {
+                                    let _ = file_ready_tx.send(());
+                                }
+                            }
+                            Some(LifecycleEvent::Stopped(reason)) if file.is_none() => {
+                                return Err(connect_error(reason));
+                            }
                             Some(event) => {
-                                match self.handle_lifecycle_event(event, &mut is_finished).await {
-                                    Ok(()) => {
-                                        if is_finished {
-                                            runner_stopped = true;
-                                            if data_done {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        return Err(e);
+                                self.handle_lifecycle_event(event, &mut is_finished).await?;
+                                if is_finished {
+                                    runner_stopped = true;
+                                    if data_done {
+                                        break;
                                     }
                                 }
                             }
@@ -376,10 +383,13 @@ impl SingletonTaskInner {
         runner_token.cancel();
         drop(runner);
         drop(control_tx);
-        let flush = file
-            .flush()
-            .await
-            .map_err(TaskInstanceError::new_write_chunk_failed);
+        let flush = match file.as_mut() {
+            Some(file) => file
+                .flush()
+                .await
+                .map_err(TaskInstanceError::new_write_chunk_failed),
+            None => Ok(()),
+        };
         drop(file);
 
         result.and(flush)
@@ -413,5 +423,20 @@ impl Transfer for SingletonTaskInner {
 
     async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
         SingletonTaskInner::download(self, cancel_token).await
+    }
+}
+
+/// The error of a runner that stopped before it connected; a failed
+/// connection keeps the adapter's error.
+#[cold]
+fn connect_error(reason: StoppedReason) -> TaskInstanceError {
+    match reason {
+        StoppedReason::Failed(TaskError::StreamError { source }) => {
+            TaskInstanceError::new_stream_failed(source)
+        }
+        StoppedReason::Failed(error) => TaskInstanceError::new_failed(error),
+        StoppedReason::Finished => TaskInstanceError::new_failed(TaskError::Other {
+            message: "the runner finished before it connected".to_string(),
+        }),
     }
 }

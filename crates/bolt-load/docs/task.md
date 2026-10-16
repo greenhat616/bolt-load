@@ -48,8 +48,13 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 - **Idle streams**: a runner whose upstream yields no non-empty data
   for [`TaskOptions::stream_idle_timeout`] fails with the retryable
   `TaskError::Timeout`. In singleton mode there is no retry, so this
-  ends the task; there `no_progress_timeout` bounds establishing the
-  connection.
+  ends the task.
+- **Slow connects**: a runner that is not connected
+  [`TaskOptions::connect_timeout`] after it started connecting fails with
+  the retryable `TaskError::Timeout`, however much other runners progress
+  meanwhile. A concurrent task retries its range; runners still connecting
+  are never split. A singleton task fails, and creates its temporary file
+  only once connected; a failed connection keeps the adapter's error.
 - **Metadata request**: [`TaskBuilder::build`],
   [`TaskBuilder::retrieve_meta`] and both task modes retry retryable
   metadata errors as [`TaskOptions::meta_retry`] allows, with jittered
@@ -61,6 +66,7 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 | `no_progress_timeout` | 60 s |
 | `max_consecutive_failures` | `max(8, 2 × CPU count)` |
 | `stream_idle_timeout` | 30 s |
+| `connect_timeout` | 30 s |
 | `meta_retry` | 3 retries, 200 ms – 2 s per wait |
 
 Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a

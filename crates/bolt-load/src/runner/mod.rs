@@ -27,6 +27,9 @@ const BUFFER_SIZE: usize = 32 * 1024; // 32KB
 /// The default period without non-empty upstream data after which a runner
 /// fails with a retryable [`TaskError::Timeout`]
 pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The default period a runner may take to connect before it fails with a
+/// retryable [`TaskError::Timeout`]
+pub const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DATA_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub const LIFECYCLE_CHANNEL_CAPACITY: usize = 2;
@@ -140,6 +143,10 @@ pub struct TaskRunner {
     data_drain_timeout: std::time::Duration,
     /// How long the upstream may yield no non-empty data before failing with `Timeout`.
     idle_timeout: std::time::Duration,
+    /// How long connecting may take before failing with `Timeout`.
+    connect_timeout: std::time::Duration,
+    /// When the runner was built, to tell scheduling from connecting delays.
+    built_at: std::time::Instant,
     /// the cancel token
     cancel_token: CancellationToken,
 }

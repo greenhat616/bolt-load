@@ -42,6 +42,11 @@ a runner that is still connecting.
   runner fails with the retryable [`TaskError::Timeout`]. Empty frames do
   not reset the timer; waiting for the consumer (backpressure) does not
   count as idle.
+- **Connect timeout**: a runner given a [`TaskRunnerBuilder::connector`]
+  that is not connected within the connect timeout (default 30 s, see
+  [`TaskRunnerBuilder::connect_timeout`]) fails with the retryable
+  [`TaskError::Timeout`] without reporting `Started`. Control signals do not
+  extend it.
 - **Data drain timeout**: when the stream ends, waits up to 5 seconds
   for the consumer to accept remaining buffered data.
 - **Size validation**: checks that downloaded bytes match the declared
@@ -65,6 +70,7 @@ a runner that is still connecting.
 |------|-------|---------|
 | `BUFFER_SIZE` | 32 KB | Internal read buffer |
 | `DEFAULT_IDLE_TIMEOUT` | 30 s | No-data threshold before `Timeout` |
+| `DEFAULT_CONNECT_TIMEOUT` | 30 s | Connect threshold before `Timeout` |
 | `DATA_DRAIN_TIMEOUT` | 5 s | Backpressure wait on stream end |
 | `LIFECYCLE_CHANNEL_CAPACITY` | 2 | Lifecycle ring-buffer slots |
 | `DATA_FRAME_CHANNEL_CAPACITY` | 32 | Data frame ring-buffer slots |

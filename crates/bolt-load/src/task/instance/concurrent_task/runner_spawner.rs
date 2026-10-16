@@ -22,6 +22,7 @@ pub(super) struct RunnerSpawner {
     pub(super) wg: WaitGroup,
     pub(super) cancel_token: CancellationToken,
     idle_timeout: Duration,
+    connect_timeout: Duration,
 }
 
 impl RunnerSpawner {
@@ -38,7 +39,14 @@ impl RunnerSpawner {
             wg,
             cancel_token,
             idle_timeout,
+            connect_timeout: crate::runner::DEFAULT_CONNECT_TIMEOUT,
         }
+    }
+
+    /// How long each runner may take to connect.
+    pub(super) fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
     }
 
     /// Spawn a runner that connects `range` and downloads it.
@@ -66,6 +74,7 @@ impl RunnerSpawner {
             .limit_receiver(limits)
             .cancel_token(self.cancel_token.clone())
             .idle_timeout(self.idle_timeout)
+            .connect_timeout(self.connect_timeout)
             .build()
             .expect("every runner input is set");
         let worker = RunnerWorker {

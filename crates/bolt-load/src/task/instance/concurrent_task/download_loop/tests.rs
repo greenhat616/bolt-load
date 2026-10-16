@@ -856,8 +856,7 @@ async fn test_split_handshaking_runner_keeps_the_latest_limit() {
 /// spawns stays connecting; returns the runners each `SplitAllTask` targeted,
 /// per round.
 ///
-/// Every target must be split, and every connecting runner must be left with
-/// its latest limit: the length of its chunk.
+/// Every target must be split, and no connecting runner may be sent a limit.
 async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::task::RunnerId>> {
     use async_ringbuf::{
         AsyncHeapRb,
@@ -926,14 +925,11 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
         // The running runner reads its limits.
         limits.try_recv();
         for runner_id in 1..max_concurrency {
-            if let Some(limit) = download.manager.unread_limit(runner_id) {
-                let allocated = &download
-                    .manager
-                    .get_runner_state(runner_id)
-                    .unwrap()
-                    .allocated;
-                assert_eq!(limit, allocated.end - allocated.start, "runner {runner_id}");
-            }
+            assert_eq!(
+                download.manager.unread_limit(runner_id),
+                None,
+                "connecting runner {runner_id} was split"
+            );
         }
     }
     drop(download);
@@ -941,19 +937,18 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
     rounds
 }
 
-/// Each quick start round splits every runner, connecting ones included, and
-/// doubles the concurrency, so the runner spawned by the first round is sent
-/// one limit per later round while it connects.
+/// Each quick start round splits every running runner: only runner 0 runs,
+/// so the runners it spawns are left to connect with their whole range.
 #[tokio::test]
-async fn test_strategy_split_rounds_leave_connecting_runners_their_latest_limit() {
-    for (max_concurrency, expected) in [(4, 1), (16, 3), (64, 5), (1024, 9), (1025, 10)] {
+async fn test_strategy_splits_only_running_runners() {
+    for max_concurrency in [4, 16, 64, 1024] {
         let rounds = probe_strategy(max_concurrency, 64).await;
-        assert_eq!(rounds.len(), expected, "max_concurrency {max_concurrency}");
-        for (round, targets) in rounds.iter().enumerate() {
-            assert_eq!(
-                targets.len(),
-                1 << round,
-                "max_concurrency {max_concurrency}"
+        assert_eq!(rounds[0], [0], "max_concurrency {max_concurrency}");
+        // Until runner 0 is too small to split.
+        for targets in &rounds {
+            assert!(
+                targets.is_empty() || targets == &[0],
+                "max_concurrency {max_concurrency}: {targets:?}"
             );
         }
     }
