@@ -32,7 +32,6 @@ pub struct FailurePolicy {
     no_progress: Duration,
     consecutive: usize,
     last_progress_at: Instant,
-    last_accepted: u64,
 }
 
 impl FailurePolicy {
@@ -42,16 +41,13 @@ impl FailurePolicy {
             no_progress: options.no_progress_timeout,
             consecutive: 0,
             last_progress_at: now,
-            last_accepted: 0,
         }
     }
 
-    /// Record the total number of unique bytes accepted so far.
-    pub fn on_bytes_accepted(&mut self, total_unique: u64, now: Instant) {
-        if total_unique > self.last_accepted {
-            self.last_accepted = total_unique;
-            self.last_progress_at = now;
-        }
+    /// Record that new bytes were accepted at `now`.
+    #[inline]
+    pub fn on_progress(&mut self, now: Instant) {
+        self.last_progress_at = now;
     }
 
     /// A successful non-empty write resets the consecutive failure count.
@@ -206,11 +202,7 @@ mod tests {
         assert_eq!(p.deadline(), start + timeout);
         assert!(p.check(start + Duration::from_secs(9)).is_none());
 
-        // Same total does not count as progress.
-        p.on_bytes_accepted(0, start + Duration::from_secs(5));
-        assert_eq!(p.deadline(), start + timeout);
-
-        p.on_bytes_accepted(100, start + Duration::from_secs(5));
+        p.on_progress(start + Duration::from_secs(5));
         assert_eq!(p.deadline(), start + Duration::from_secs(15));
         assert!(p.check(start + Duration::from_secs(12)).is_none());
         assert!(matches!(
