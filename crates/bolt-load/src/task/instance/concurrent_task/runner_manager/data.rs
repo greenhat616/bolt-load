@@ -71,33 +71,19 @@ impl DataAggregator {
         }
     }
 
+    #[cfg(test)]
     /// Check if a runner is registered.
     pub fn contains(&self, runner_id: RunnerId) -> bool {
         self.map.contains_key(&runner_id)
     }
 
-    /// Check if the aggregator is closed.
-    pub fn is_closed(&self) -> bool {
-        self.is_closed
-    }
-
-    /// Close the aggregator, signaling no more data will be received.
-    pub fn close(&mut self) {
-        self.is_closed = true;
-        self.waker.wake();
-    }
-
-    /// Reopen the aggregator for receiving data.
-    pub fn reopen(&mut self) {
-        self.is_closed = false;
-        self.waker.wake();
-    }
-
+    #[cfg(test)]
     /// Get the number of runners registered.
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    #[cfg(test)]
     /// Check if there are no runners registered.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()

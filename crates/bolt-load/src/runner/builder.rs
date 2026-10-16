@@ -3,9 +3,9 @@ use bolt_load_core::adapter::AnyBytesStream;
 use smol_cancellation_token::CancellationToken;
 
 use super::{
-    ControlSignalReceiver, DATA_DRAIN_TIMEOUT, DATA_FRAME_CHANNEL_CAPACITY, DEFAULT_IDLE_TIMEOUT,
-    DataFrame, DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver,
-    TaskRunner,
+    ControlSignalReceiver, ControlSource, DATA_DRAIN_TIMEOUT, DATA_FRAME_CHANNEL_CAPACITY,
+    DEFAULT_IDLE_TIMEOUT, DataFrame, DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent,
+    LifecycleReceiver, LimitReceiver, TaskRunner,
 };
 use crate::task::RunnerId;
 
@@ -24,20 +24,21 @@ pub enum TaskRunnerBuilderError {
 #[derive(derive_more::Debug, Default)]
 pub struct TaskRunnerBuilder {
     /// the total size of the task
-    pub total: Option<u64>,
+    total: Option<u64>,
     /// the stream of the task
     #[debug("stream is set: {}", stream.is_some())]
-    pub stream: Option<AnyBytesStream>,
+    stream: Option<AnyBytesStream>,
     /// the runner id of the task
-    pub runner_id: Option<RunnerId>,
-    /// the receiver of the control signal
-    pub control_signal: Option<ControlSignalReceiver>,
+    runner_id: Option<RunnerId>,
+    /// where the control signals come from
+    #[debug(skip)]
+    control: Option<ControlSource>,
     /// the cancel token of the task
-    pub cancel_token: Option<CancellationToken>,
+    cancel_token: Option<CancellationToken>,
     /// optional override for tests that need to exercise drain timeout paths quickly
-    pub data_drain_timeout: Option<std::time::Duration>,
+    data_drain_timeout: Option<std::time::Duration>,
     /// how long the stream may yield no non-empty data before the runner fails with `Timeout`
-    pub idle_timeout: Option<std::time::Duration>,
+    idle_timeout: Option<std::time::Duration>,
 }
 
 impl TaskRunnerBuilder {
@@ -60,8 +61,19 @@ impl TaskRunnerBuilder {
     }
 
     /// set the receiver of the control signal
+    ///
+    /// Every signal is applied in order; a limit that does not lower a known
+    /// total fails the runner with
+    /// [`TaskError::ExceededTotalSize`](super::TaskError::ExceededTotalSize).
     pub fn control_signal(mut self, control_signal: ControlSignalReceiver) -> Self {
-        self.control_signal = Some(control_signal);
+        self.control = Some(ControlSource::Channel(Box::pin(control_signal)));
+        self
+    }
+
+    /// Receive only the latest limit from `limits`, replacing
+    /// [`Self::control_signal`].
+    pub(crate) fn limit_receiver(mut self, limits: LimitReceiver) -> Self {
+        self.control = Some(ControlSource::Latest(limits));
         self
     }
 
@@ -101,10 +113,9 @@ impl TaskRunnerBuilder {
             downloaded: 0,
             stream: self.stream.ok_or(TaskRunnerBuilderError::StreamNotSet)?,
 
-            control_signal: Box::pin(
-                self.control_signal
-                    .ok_or(TaskRunnerBuilderError::ControlSignalNotSet)?,
-            ),
+            control: self
+                .control
+                .ok_or(TaskRunnerBuilderError::ControlSignalNotSet)?,
             lifecycle_tx: lifecycle_prod,
             data_tx: Some(data_prod),
             data_drain_timeout: self.data_drain_timeout.unwrap_or(DATA_DRAIN_TIMEOUT),

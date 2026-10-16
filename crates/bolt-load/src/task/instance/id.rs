@@ -116,12 +116,14 @@ impl Generator {
         self.bitvec.len()
     }
 
+    #[cfg(test)]
     /// Check if the generator is full
     #[inline]
     pub fn is_full(&self) -> bool {
         self.allocated_count >= self.bitvec.len()
     }
 
+    #[cfg(test)]
     /// Check if the generator is empty (no IDs allocated)
     #[inline]
     pub fn is_empty(&self) -> bool {
