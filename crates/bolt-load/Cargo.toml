@@ -153,3 +153,7 @@ harness = false
 [[bench]]
 name = "coordination"
 harness = false
+
+[[bench]]
+name = "runner_loop"
+harness = false

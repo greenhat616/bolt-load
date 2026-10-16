@@ -43,9 +43,8 @@ use runner_spawner::RunnerSpawner;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
 
-/// Default capacity for control channels
-#[cfg_attr(not(test), expect(dead_code, reason = "only used by tests"))]
-const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
+#[cfg(test)]
+use runner_manager::DEFAULT_CONTROL_CHANNEL_CAPACITY;
 
 #[expect(
     dead_code,
