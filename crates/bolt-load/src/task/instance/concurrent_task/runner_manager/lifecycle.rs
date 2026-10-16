@@ -17,10 +17,9 @@ use crate::{
 pin_project! {
     /// Aggregates lifecycle events from multiple runners into a single stream.
     ///
-    /// Similar to `RunnerNotification` but specifically for the new lifecycle channel
-    /// architecture. Each runner has its own lifecycle receiver that emits events
-    /// (Connecting, Ready, Started, Stopped). This aggregator multiplexes all of
-    /// them into a single stream for the RunnerManager to consume.
+    /// Each runner has its own lifecycle receiver that emits `Started` once it
+    /// is connected and `Stopped` when it ends. This aggregator multiplexes all
+    /// of them into a single stream for the RunnerManager to consume.
     pub struct LifecycleAggregator {
         #[pin]
         group: StreamGroup<RunnerTaggedStream<LifecycleReceiver>>,

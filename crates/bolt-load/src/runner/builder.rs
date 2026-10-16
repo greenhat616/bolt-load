@@ -5,13 +5,13 @@ use smol_cancellation_token::CancellationToken;
 use super::{
     ControlSignalReceiver, ControlSource, DATA_DRAIN_TIMEOUT, DATA_FRAME_CHANNEL_CAPACITY,
     DEFAULT_IDLE_TIMEOUT, DataFrame, DataFrameReceiver, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent,
-    LifecycleReceiver, LimitReceiver, TaskRunner,
+    LifecycleReceiver, LimitReceiver, RunnerInput, StreamConnector, TaskRunner,
 };
 use crate::task::RunnerId;
 
 #[derive(Debug, snafu::Snafu)]
 pub enum TaskRunnerBuilderError {
-    #[snafu(display("stream is not set"))]
+    #[snafu(display("neither a stream nor a connector is set"))]
     StreamNotSet,
     #[snafu(display("runner id is not set"))]
     RunnerIdNotSet,
@@ -25,9 +25,9 @@ pub enum TaskRunnerBuilderError {
 pub struct TaskRunnerBuilder {
     /// the total size of the task
     total: Option<u64>,
-    /// the stream of the task
-    #[debug("stream is set: {}", stream.is_some())]
-    stream: Option<AnyBytesStream>,
+    /// the stream of the task, or how to connect it
+    #[debug("input is set: {}", input.is_some())]
+    input: Option<RunnerInput>,
     /// the runner id of the task
     runner_id: Option<RunnerId>,
     /// where the control signals come from
@@ -50,7 +50,21 @@ impl TaskRunnerBuilder {
 
     /// set the stream of the task
     pub fn stream(mut self, stream: AnyBytesStream) -> Self {
-        self.stream = Some(stream);
+        self.input = Some(RunnerInput::Connected(stream));
+        self
+    }
+
+    /// set how to connect the stream of the task, replacing [`Self::stream`]
+    ///
+    /// The runner connects it before reporting
+    /// [`Started`](super::LifecycleEvent::Started); a failed connection stops
+    /// the runner with [`TaskError::StreamError`](super::TaskError::StreamError)
+    /// without reporting `Started`.
+    pub fn connector(mut self, connector: StreamConnector) -> Self {
+        self.input = Some(match connector {
+            StreamConnector::DirectStream(stream) => RunnerInput::Connected(stream),
+            StreamConnector::StreamConnector(connect) => RunnerInput::Connecting(connect),
+        });
         self
     }
 
@@ -111,7 +125,7 @@ impl TaskRunnerBuilder {
             id: runner_id,
             total: self.total,
             downloaded: 0,
-            stream: self.stream.ok_or(TaskRunnerBuilderError::StreamNotSet)?,
+            input: self.input.ok_or(TaskRunnerBuilderError::StreamNotSet)?,
 
             control: self
                 .control

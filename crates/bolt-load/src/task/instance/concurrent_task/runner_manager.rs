@@ -6,12 +6,15 @@
 //! - Aggregated reception of runner messages (RunnerNotification)
 //! - Channels for sending control messages to specific runners
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    pin::pin,
+};
 
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
-use pending::{PendingRunnerContext, PendingRunnerError, PendingRunnerGroup, PendingRunnerOutput};
 use stream::RunnerTaggedStreamItem;
 
 /// A chunk of data downloaded by a runner, ready to be written to disk.
@@ -97,7 +100,7 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 
 use super::{
     ChunkPlanner, PlannerGuard,
-    chunk_planner::{ChunkState, Resize},
+    chunk_planner::{ChunkState, ChunkStatus, Resize},
     strategy::RunnerOutcomeSampler,
 };
 use crate::{
@@ -113,12 +116,22 @@ use crate::{
 
 mod data;
 mod lifecycle;
-pub mod pending;
 mod stream;
 
 pub use data::{DataAggregator, DataStreamEvent};
 pub use lifecycle::{LifecycleAggregator, LifecycleStreamEvent};
-pub use pending::PendingRunnerReceiver;
+
+/// The receiving ends of a spawned runner.
+pub(super) struct RunnerChannels {
+    pub lifecycle_rx: LifecycleReceiver,
+    pub data_rx: DataFrameReceiver,
+}
+
+/// A runner that could not be spawned.
+#[derive(Debug)]
+pub(super) struct SpawnFailed {
+    pub message: String,
+}
 
 /// Errors that may occur when sending messages
 #[derive(Debug, snafu::Snafu)]
@@ -166,12 +179,16 @@ pub struct RunnerManager {
 
     /// Where to send each runner its limits
     limit_senders: HashMap<RunnerId, LimitSender>,
-    /// Pending runners for creating runners
-    pending_runners: PendingRunnerGroup,
+    /// Runners whose spawn was rejected, reported by the next tick
+    spawn_failures: VecDeque<(RunnerId, SpawnFailed)>,
     /// Sampler for tracking the outcome of the runners
     runner_outcome_sampler: RunnerOutcomeSampler,
     /// Lifecycle aggregator for runners' lifecycle events
     lifecycle_aggregator: LifecycleAggregator,
+    /// Data receivers of connecting runners, polled only once their runner
+    /// reported `Started`: polling it with the lifecycle is not atomic, so
+    /// data could otherwise be seen first.
+    connecting_data: HashMap<RunnerId, DataFrameReceiver>,
     /// Data aggregator for runners' data frames
     data_aggregator: DataAggregator,
     /// Bytes received per runner since the last meter snapshot.
@@ -192,9 +209,10 @@ impl RunnerManager {
             id_generator: Generator::new(max_concurrency),
             chunk_planner: ChunkPlanner::new(total),
             limit_senders: HashMap::with_capacity(max_concurrency),
-            pending_runners: PendingRunnerGroup::new(),
+            spawn_failures: VecDeque::new(),
             runner_outcome_sampler: RunnerOutcomeSampler::with_defaults(),
             lifecycle_aggregator: LifecycleAggregator::with_capacity(max_concurrency),
+            connecting_data: HashMap::with_capacity(max_concurrency),
             data_aggregator: DataAggregator::with_capacity(max_concurrency),
             meters: HashMap::with_capacity(max_concurrency),
         }
@@ -236,6 +254,7 @@ impl RunnerManager {
         // The runner sees its limits closed once the sender is dropped
         self.limit_senders.remove(&runner_id);
         self.lifecycle_aggregator.remove(runner_id);
+        self.connecting_data.remove(&runner_id);
         self.data_aggregator.unregister(runner_id);
         self.id_generator.release(runner_id);
     }
@@ -285,26 +304,8 @@ impl RunnerManager {
 
     // ==================== Runner Notification Related Methods ====================
 
-    /// Registers a lifecycle receiver for a runner
-    #[expect(
-        dead_code,
-        reason = "registration without a pending runner is not used yet"
-    )]
-    fn register_lifecycle(&mut self, runner_id: RunnerId, receiver: LifecycleReceiver) {
-        self.lifecycle_aggregator.add(runner_id, receiver);
-    }
-
-    /// Registers a data receiver for a runner
-    /// Called when the runner is successfully created
-    #[expect(
-        dead_code,
-        reason = "registration without a pending runner is not used yet"
-    )]
-    fn register_data(&mut self, runner_id: RunnerId, receiver: DataFrameReceiver) {
-        self.data_aggregator.register(runner_id, receiver);
-    }
-
-    /// Registers both lifecycle and data receivers for a runner.
+    /// Registers both lifecycle and data receivers for a runner; the data of
+    /// a connecting runner is polled once it reported `Started`.
     pub fn register_runner_channels(
         &mut self,
         runner_id: RunnerId,
@@ -312,7 +313,11 @@ impl RunnerManager {
         data_rx: DataFrameReceiver,
     ) {
         self.lifecycle_aggregator.add(runner_id, lifecycle_rx);
-        self.data_aggregator.register(runner_id, data_rx);
+        if self.is_connecting(runner_id) {
+            self.connecting_data.insert(runner_id, data_rx);
+        } else {
+            self.data_aggregator.register(runner_id, data_rx);
+        }
     }
 
     /// Gets the total file size
@@ -411,42 +416,46 @@ impl RunnerManager {
     // ==================== Combined Operations ====================
 
     #[cfg(test)]
-    /// Allocates a new runner and assigns a chunk
-    ///
-    /// This is a convenience method that combines `allocate_runner` and `allocate_chunk`
-    ///
-    /// # Arguments
-    /// * `range` - The chunk range to allocate
+    /// Allocates a runner that has already started on `range`.
     ///
     /// # Returns
-    /// * `Some((RunnerRegistration, bool))` - Runner registration info and whether chunk was successfully allocated
-    /// * `None` - If unable to allocate a runner ID
+    /// * `None` - If unable to allocate a runner ID or the range
     pub fn allocate_runner_with_chunk(&mut self, range: Range<u64>) -> Option<RunnerRegistration> {
         let registration = self.allocate_runner()?;
         if !self.allocate_chunk(range, registration.runner_id) {
             self.release_runner(registration.runner_id);
             return None;
         }
+        self.chunk_planner
+            .mark_running(registration.runner_id)
+            .expect("the chunk was just allocated");
         Some(registration)
     }
 
-    /// Allocates a pending runner with chunk using legacy architecture
-    pub fn allocate_pending_runner_with_chunk(
+    /// Allocate a runner for `range` and spawn it with `spawn`.
+    ///
+    /// The chunk stays pending until the runner reports `Started`. A rejected
+    /// spawn is reported by the next tick, once.
+    ///
+    /// # Returns
+    /// * `None` - If unable to allocate a runner ID or the range
+    pub fn spawn_runner_with_chunk(
         &mut self,
         range: Range<u64>,
-        f: impl FnOnce(RunnerId, LimitReceiver) -> PendingRunnerReceiver,
+        spawn: impl FnOnce(RunnerId, LimitReceiver) -> Result<RunnerChannels, SpawnFailed>,
     ) -> Option<()> {
         let registration = self.allocate_runner()?;
-        if !self
-            .chunk_planner
-            .allocate_pending_chunk(range.clone(), registration.runner_id)
-        {
-            self.release_runner(registration.runner_id);
+        let runner_id = registration.runner_id;
+        if !self.chunk_planner.allocate_pending_chunk(range, runner_id) {
+            self.release_runner(runner_id);
             return None;
         }
-        let rx = f(registration.runner_id, registration.limits);
-        let context = PendingRunnerContext::new(registration.runner_id, range);
-        self.pending_runners.insert(context, rx);
+        match spawn(runner_id, registration.limits) {
+            Ok(channels) => {
+                self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx)
+            }
+            Err(failed) => self.spawn_failures.push_back((runner_id, failed)),
+        }
         Some(())
     }
 
@@ -515,11 +524,28 @@ impl RunnerManager {
         false
     }
 
+    /// Whether the runner has not reported `Started` yet.
+    fn is_connecting(&self, runner_id: RunnerId) -> bool {
+        self.chunk_planner
+            .get_runner_state(runner_id)
+            .is_some_and(|state| state.status == ChunkStatus::Pending)
+    }
+
     fn handle_lifecycle(&mut self, event: RunnerTaggedStreamItem<LifecycleEvent>) -> RunnerTick {
         let runner_id = event.runner_id;
+        let connecting = self.is_connecting(runner_id);
         let reason = match event.item {
             LifecycleEvent::Started => {
                 trace!("runner {runner_id} started");
+                debug_assert!(connecting, "runner {runner_id} started twice");
+                self.chunk_planner
+                    .mark_running(runner_id)
+                    .expect("chunk planner should not fail");
+                let data_rx = self
+                    .connecting_data
+                    .remove(&runner_id)
+                    .expect("a connecting runner has a data receiver");
+                self.data_aggregator.register(runner_id, data_rx);
                 return RunnerTick::downloading();
             }
             LifecycleEvent::Stopped(reason) => reason,
@@ -527,6 +553,16 @@ impl RunnerManager {
         self.meters.remove(&runner_id);
         // Remove control channel when runner stops
         self.release_runner(runner_id);
+        if connecting {
+            let error = match reason {
+                StoppedReason::Failed(error) => error,
+                StoppedReason::Finished => {
+                    debug_assert!(false, "runner {runner_id} finished before starting");
+                    TaskError::ChannelClosed
+                }
+            };
+            return self.handle_connect_failed(runner_id, error);
+        }
         let kind = match reason {
             StoppedReason::Finished | StoppedReason::Failed(TaskError::ExceededTotalSize) => {
                 trace!("runner {runner_id} finished");
@@ -560,40 +596,18 @@ impl RunnerManager {
         })
     }
 
-    /// Handle pending runners
-    fn handle_pending(&mut self, pending: PendingRunnerOutput) -> RunnerTick {
-        let runner_id = pending.context.runner_id;
-        let error = match pending.result {
-            Ok(output) => {
-                self.chunk_planner
-                    .mark_running(runner_id)
-                    .expect("chunk planner should not fail");
-                self.register_runner_channels(runner_id, output.lifecycle_rx, output.data_rx);
-                return RunnerTick::downloading();
-            }
-            Err(error) => error,
-        };
-        error!("failed to create runner: {error:?}");
-        // Update planner state first for stronger atomicity
+    /// Handle a runner that stopped before it connected; its range is
+    /// released and it never counts as finished.
+    fn handle_connect_failed(&mut self, runner_id: RunnerId, error: TaskError) -> RunnerTick {
         self.chunk_planner
             .mark_failed(runner_id)
             .expect("chunk planner should not fail");
-        // Release runner slot after planner state transition
-        // Note: release_runner() is no-op for unregistered runners (safe)
-        self.release_runner(runner_id);
-        let (error, retryable) = match error {
-            PendingRunnerError::ReceiverClosed => (TaskError::ChannelClosed, true),
-            PendingRunnerError::Connection { source } => {
-                let retryable = source.is_retryable();
-                (
-                    TaskError::StreamError {
-                        source: source.source,
-                    },
-                    retryable,
-                )
-            }
-            PendingRunnerError::Spawn { message } => (TaskError::Other { message }, false),
-        };
+        if error.is_cancelled() {
+            trace!("runner {runner_id} cancelled while connecting");
+            return RunnerTick::downloading();
+        }
+        error!("runner {runner_id} failed to connect: {error:?}");
+        let retryable = is_attempt_retryable(&error);
         self.runner_outcome_sampler
             .record_connect_failed(if retryable {
                 RunnerFailureKind::Retryable
@@ -607,16 +621,35 @@ impl RunnerManager {
         })
     }
 
+    /// Handle a runner whose spawn was rejected.
+    #[cold]
+    fn handle_spawn_failed(&mut self, runner_id: RunnerId, failed: SpawnFailed) -> RunnerTick {
+        error!("failed to spawn runner {runner_id}: {}", failed.message);
+        self.release_runner(runner_id);
+        self.handle_connect_failed(
+            runner_id,
+            TaskError::Other {
+                message: failed.message,
+            },
+        )
+    }
+
     /// Handle a runner whose stream closed without sending `Stopped`.
     fn handle_runner_lost(&mut self, runner_id: RunnerId) -> RunnerTick {
         warn!("runner {runner_id} lifecycle stream closed unexpectedly");
+        let connecting = self.is_connecting(runner_id);
         self.meters.remove(&runner_id);
         let unfinished_range = self
             .chunk_planner
             .mark_failed(runner_id)
             .expect("chunk planner should not fail");
-        self.runner_outcome_sampler
-            .record_stream_closed(RunnerFailureKind::Retryable);
+        if connecting {
+            self.runner_outcome_sampler
+                .record_connect_failed(RunnerFailureKind::Retryable);
+        } else {
+            self.runner_outcome_sampler
+                .record_stream_closed(RunnerFailureKind::Retryable);
+        }
         self.release_runner(runner_id);
         trace!("runner {runner_id} lost, released range: {unfinished_range:?}");
         if self.chunk_planner.is_complete() {
@@ -637,12 +670,10 @@ impl RunnerManager {
         }
     }
 
-    fn handle_pending_stream_event(&mut self, pending: Option<PendingRunnerOutput>) -> RunnerTick {
-        match pending {
-            Some(pending) => self.handle_pending(pending),
-            None if self.chunk_planner.is_complete() => RunnerTick::finished(),
-            None => RunnerTick::downloading(),
-        }
+    /// The next rejected spawn, which the lifecycle reports before anything else.
+    fn take_spawn_failure(&mut self) -> Option<RunnerTick> {
+        let (runner_id, failed) = self.spawn_failures.pop_front()?;
+        Some(self.handle_spawn_failed(runner_id, failed))
     }
 
     /// Handle data frames from runners, returning the chunk ready for writing.
@@ -664,14 +695,14 @@ impl RunnerManager {
     }
 
     pub async fn tick(&mut self) -> RunnerTick {
-        let next_lifecycle = self.lifecycle_aggregator.next().fuse();
-        let next_data = self.data_aggregator.next().fuse();
-        let pending = self.pending_runners.next().fuse();
-        futures::pin_mut!(next_lifecycle, next_data, pending);
-        // Priority: lifecycle > pending > data (lifecycle is control-plane, must not be starved)
+        if let Some(tick) = self.take_spawn_failure() {
+            return tick;
+        }
+        let mut next_lifecycle = pin!(self.lifecycle_aggregator.next().fuse());
+        let mut next_data = pin!(self.data_aggregator.next().fuse());
+        // Priority: lifecycle > data (lifecycle is control-plane, must not be starved)
         futures::select_biased! {
             event = next_lifecycle => self.handle_lifecycle_stream_event(event),
-            pending = pending => self.handle_pending_stream_event(pending),
             data = next_data => {
                 if let Some(event) = data {
                     match event {
@@ -691,13 +722,11 @@ impl RunnerManager {
     }
 
     pub async fn tick_lifecycle_only(&mut self) -> RunnerTick {
-        let next_lifecycle = self.lifecycle_aggregator.next().fuse();
-        let pending = self.pending_runners.next().fuse();
-        futures::pin_mut!(next_lifecycle, pending);
-        futures::select_biased! {
-            event = next_lifecycle => self.handle_lifecycle_stream_event(event),
-            pending = pending => self.handle_pending_stream_event(pending),
+        if let Some(tick) = self.take_spawn_failure() {
+            return tick;
         }
+        let event = self.lifecycle_aggregator.next().await;
+        self.handle_lifecycle_stream_event(event)
     }
 }
 
@@ -705,8 +734,10 @@ impl RunnerManager {
 mod tests {
     use std::time::Duration;
 
-    use super::{super::chunk_planner::ChunkStatus, *};
-    use crate::runner::{ConnectionError, DATA_FRAME_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY};
+    use async_ringbuf::traits::Producer;
+
+    use super::*;
+    use crate::runner::{DATA_FRAME_CHANNEL_CAPACITY, LIFECYCLE_CHANNEL_CAPACITY};
 
     #[test]
     fn test_runner_manager_creation() {
@@ -864,145 +895,218 @@ mod tests {
         assert!(manager.is_empty());
     }
 
-    #[test]
-    fn test_allocate_pending_runner_with_chunk() {
-        use pending::{PendingRunnerError, RunnerBuilderOutput};
-
-        let mut manager = RunnerManager::new(1000, 2);
-
-        // Allocate pending runner with chunk
-        let result = manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _limits| {
-            assert_eq!(runner_id, 0);
-            // Return a receiver that will resolve later
-            let (_, rx) = oneshot::channel::<Result<RunnerBuilderOutput, PendingRunnerError>>();
-            rx
-        });
-
-        assert!(result.is_some());
-        assert_eq!(manager.allocated_runner_count(), 1);
-
-        // Verify chunk is allocated with pending status
-        let state = manager.get_runner_state(0).unwrap();
-        assert_eq!(state.allocated, 0..500);
-        assert_eq!(state.status, ChunkStatus::Pending);
-    }
-
-    #[test]
-    fn test_multiple_pending_runners() {
-        use pending::{PendingRunnerError, RunnerBuilderOutput};
-
-        let mut manager = RunnerManager::new(1000, 4);
-
-        // Allocate multiple pending runners
-        for i in 0..4 {
-            let start = (i * 250) as u64;
-            let end = ((i + 1) * 250) as u64;
-            let result = manager.allocate_pending_runner_with_chunk(start..end, |_runner_id, _| {
-                let (_, rx) = oneshot::channel::<Result<RunnerBuilderOutput, PendingRunnerError>>();
-                rx
-            });
-            assert!(result.is_some());
-        }
-
-        assert_eq!(manager.allocated_runner_count(), 4);
-        assert!(manager.is_full());
-
-        // Cannot allocate more
-        let result = manager.allocate_pending_runner_with_chunk(0..100, |_, _| {
-            let (_, rx) = oneshot::channel();
-            rx
-        });
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_pending_to_running_via_tick() {
+    /// Channels for a runner, and their sending ends.
+    fn test_channels() -> (
+        RunnerChannels,
+        crate::runner::LifecycleSender,
+        crate::runner::DataFrameSender,
+    ) {
         use async_ringbuf::{AsyncHeapRb, traits::Split};
 
         use crate::runner::{DataFrame, LifecycleEvent};
 
-        let mut manager = RunnerManager::new(1000, 2);
+        let (lifecycle_tx, lifecycle_rx) =
+            AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY).split();
+        let (data_tx, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
+        let channels = RunnerChannels {
+            lifecycle_rx,
+            data_rx,
+        };
+        (channels, lifecycle_tx, data_tx)
+    }
 
-        // Create a channel to send the builder output
-        let (tx, rx) = oneshot::channel();
+    /// Spawn a runner on `range` whose channels the test drives.
+    fn spawn_test_runner(
+        manager: &mut RunnerManager,
+        range: Range<u64>,
+    ) -> Option<(
+        crate::runner::LifecycleSender,
+        crate::runner::DataFrameSender,
+    )> {
+        let mut senders = None;
+        manager.spawn_runner_with_chunk(range, |_, _limits| {
+            let (channels, lifecycle_tx, data_tx) = test_channels();
+            senders = Some((lifecycle_tx, data_tx));
+            Ok(channels)
+        })?;
+        senders
+    }
 
-        // Allocate pending runner
-        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _limits| {
-            assert_eq!(runner_id, 0);
-            rx
-        });
+    fn unretryable_stream_error() -> TaskError {
+        TaskError::StreamError {
+            source: bolt_load_core::adapter::AdapterError::Unretryable {
+                source: crate::adapter::UnretryableError::Whatever {
+                    message: "test connection error".to_string(),
+                    source: None,
+                },
+            },
+        }
+    }
 
-        // Verify initial state is pending
-        let state = manager.get_runner_state(0).unwrap();
-        assert_eq!(state.status, ChunkStatus::Pending);
-
-        // Create mock channels for the new architecture
-        let data_rb = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY);
-        let (_data_prod, data_cons) = data_rb.split();
-
-        let lifecycle_rb = AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY);
-        let (_lifecycle_prod, lifecycle_cons) = lifecycle_rb.split();
-
-        // Send the channels through the pending receiver
-        tx.send(Ok(pending::RunnerBuilderOutput {
-            data_rx: data_cons,
-            lifecycle_rx: lifecycle_cons,
-        }))
-        .unwrap();
-
-        // Tick to process the pending runner
-        let tick = manager.tick().await;
-
-        assert_eq!(tick.state, TaskState::Downloading);
-        assert!(tick.downloaded.is_none());
-
-        // Verify state is now running
-        let chunk_state = manager.get_runner_state(0).unwrap();
-        assert_eq!(chunk_state.status, ChunkStatus::Running);
+    #[test]
+    fn test_spawned_runner_is_pending_until_started() {
+        let mut manager = RunnerManager::new(1000, 4);
+        for i in 0..4 {
+            assert!(spawn_test_runner(&mut manager, i * 250..(i + 1) * 250).is_some());
+        }
+        assert_eq!(manager.allocated_runner_count(), 4);
+        assert!(manager.is_full());
+        for id in 0..4 {
+            assert_eq!(
+                manager.get_runner_state(id).unwrap().status,
+                ChunkStatus::Pending
+            );
+        }
+        // Cannot allocate more
+        assert!(
+            manager
+                .spawn_runner_with_chunk(0..100, |_, _| unreachable!("no runner id is left"))
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn test_pending_connection_failure_via_tick() {
-        use bolt_load_core::adapter::AdapterError;
-
-        use crate::adapter::UnretryableError;
-
+    async fn test_started_marks_the_chunk_running() {
         let mut manager = RunnerManager::new(1000, 2);
+        let (mut lifecycle_tx, mut data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        data_tx
+            .try_push(crate::runner::DataFrame {
+                data: Bytes::from_static(b"abc"),
+            })
+            .unwrap();
 
-        // Create a channel to send the error
-        let (tx, rx) = oneshot::channel();
-
-        // Allocate pending runner
-        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _limits| {
-            assert_eq!(runner_id, 0);
-            rx
-        });
-
-        // Verify initial state is pending
-        let state = manager.get_runner_state(0).unwrap();
-        assert_eq!(state.status, ChunkStatus::Pending);
-
-        // Send connection error
-        tx.send(Err(pending::PendingRunnerError::Connection {
-            source: ConnectionError {
-                source: AdapterError::Unretryable {
-                    source: UnretryableError::Whatever {
-                        message: "test connection error".to_string(),
-                        source: None,
-                    },
-                },
-            },
-        }))
-        .unwrap();
-
-        // Tick to process the pending runner
+        // The lifecycle comes first, so the chunk runs before its data arrives.
         let tick = manager.tick().await;
-
         assert_eq!(tick.state, TaskState::Downloading);
         assert!(tick.downloaded.is_none());
+        assert_eq!(
+            manager.get_runner_state(0).unwrap().status,
+            ChunkStatus::Running
+        );
+        assert_eq!(manager.tick().await.downloaded.unwrap().range, 0..3);
+    }
 
-        // Verify runner state is removed (failed)
+    #[tokio::test]
+    async fn test_data_cannot_overtake_started_between_source_polls() {
+        let mut manager = RunnerManager::new(3, 1);
+        let (mut lifecycle_tx, mut data_tx) = spawn_test_runner(&mut manager, 0..3).unwrap();
+
+        // Both arrive between a tick's lifecycle poll and its data poll.
+        assert!(futures::poll!(pin!(manager.lifecycle_aggregator.next())).is_pending());
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        data_tx
+            .try_push(crate::runner::DataFrame {
+                data: Bytes::from_static(b"abc"),
+            })
+            .unwrap();
+        assert!(futures::poll!(pin!(manager.data_aggregator.next())).is_pending());
+        assert_eq!(manager.get_total_downloaded(), 0);
+
+        // Started is handled under writer backpressure too.
+        assert!(manager.tick_lifecycle_only().await.downloaded.is_none());
+        assert_eq!(
+            manager.get_runner_state(0).unwrap().status,
+            ChunkStatus::Running
+        );
+        assert_eq!(manager.tick().await.downloaded.unwrap().range, 0..3);
+    }
+
+    #[tokio::test]
+    async fn test_stopped_before_started_is_a_connect_failure() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        lifecycle_tx
+            .try_push(LifecycleEvent::failed(unretryable_stream_error()))
+            .unwrap();
+
+        let failure = manager.tick().await.failure.unwrap();
+        assert!(failure.error.is_stream_error());
+        assert!(!failure.retryable);
         assert!(manager.get_runner_state(0).is_none());
+        assert_eq!(manager.get_available_ranges(), vec![0..1000]);
+        assert!(manager.is_empty());
+        let stats = manager.runner_outcome_sampler_mut().stats();
+        assert_eq!(stats.connect_failed_unretryable, 1);
+        assert_eq!(stats.stream_closed_unretryable, 0);
+    }
+
+    #[tokio::test]
+    async fn test_exceeded_total_size_before_started_does_not_finish_the_chunk() {
+        let mut manager = RunnerManager::new(500, 1);
+        let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        lifecycle_tx
+            .try_push(LifecycleEvent::failed(TaskError::ExceededTotalSize))
+            .unwrap();
+
+        let tick = manager.tick().await;
+        assert_eq!(tick.state, TaskState::Downloading);
+        assert!(matches!(
+            tick.failure,
+            Some(AttemptFailure {
+                error: TaskError::ExceededTotalSize,
+                ..
+            })
+        ));
+        assert_eq!(manager.get_available_ranges(), vec![0..500]);
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_while_connecting_is_not_a_failure() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        lifecycle_tx
+            .try_push(LifecycleEvent::failed(TaskError::Cancelled))
+            .unwrap();
+
+        assert!(manager.tick().await.failure.is_none());
+        assert_eq!(manager.get_available_ranges(), vec![0..1000]);
+        assert_eq!(manager.runner_outcome_sampler_mut().stats().total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_closed_before_started_is_a_lost_connect() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let (lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        drop(lifecycle_tx);
+
+        let failure = manager.tick_lifecycle_only().await.failure.unwrap();
+        assert!(matches!(failure.error, TaskError::ChannelClosed));
+        assert!(failure.retryable);
+        let stats = manager.runner_outcome_sampler_mut().stats();
+        assert_eq!(stats.connect_failed_retryable, 1);
+        assert_eq!(stats.stream_closed_retryable, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rejected_spawn_is_reported_once() {
+        let mut manager = RunnerManager::new(1000, 2);
+        manager
+            .spawn_runner_with_chunk(0..500, |_, _| {
+                Err(SpawnFailed {
+                    message: "runtime is shut down".to_string(),
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            manager.get_runner_state(0).unwrap().status,
+            ChunkStatus::Pending
+        );
+
+        let failure = manager.tick_lifecycle_only().await.failure.unwrap();
+        assert!(matches!(failure.error, TaskError::Other { .. }));
+        assert!(!failure.retryable);
+        assert!(manager.is_empty());
+        assert_eq!(manager.get_available_ranges(), vec![0..1000]);
+        assert_eq!(
+            manager
+                .runner_outcome_sampler_mut()
+                .stats()
+                .connect_failed_unretryable,
+            1
+        );
+        // Nothing else is left to report.
+        assert!(futures::poll!(std::pin::pin!(manager.tick())).is_pending());
     }
 
     // ==================== New Two-Channel Architecture Tests ====================
@@ -1257,24 +1361,30 @@ mod tests {
         use crate::runner::TaskRunner;
 
         let mut manager = RunnerManager::new(64, 1);
-        let registration = manager.allocate_runner_with_chunk(0..64).unwrap();
-        let runner_id = registration.runner_id;
-        let cancel_token = CancellationToken::new();
+        let runner_id = 0;
         let test_stream = stream! {
             yield Ok(Bytes::from(vec![7; 64]));
         };
-
-        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
-            .total(64)
-            .stream(Box::pin(test_stream))
-            .runner_id(runner_id)
-            .limit_receiver(registration.limits)
-            .cancel_token(cancel_token)
-            .data_drain_timeout(Duration::from_millis(50))
-            .build()
+        let mut runner = None;
+        manager
+            .spawn_runner_with_chunk(0..64, |id, limits| {
+                let (built, lifecycle_rx, data_rx) = TaskRunner::builder()
+                    .total(64)
+                    .stream(Box::pin(test_stream))
+                    .runner_id(id)
+                    .limit_receiver(limits)
+                    .cancel_token(CancellationToken::new())
+                    .data_drain_timeout(Duration::from_millis(50))
+                    .build()
+                    .unwrap();
+                runner = Some(built);
+                Ok(RunnerChannels {
+                    lifecycle_rx,
+                    data_rx,
+                })
+            })
             .unwrap();
-
-        manager.register_runner_channels(runner_id, lifecycle_rx, data_rx);
+        let mut runner = runner.unwrap();
 
         let runner_handle = tokio::spawn(async move {
             runner.run().await;
