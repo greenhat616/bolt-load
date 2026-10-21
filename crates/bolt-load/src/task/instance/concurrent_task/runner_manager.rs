@@ -153,6 +153,18 @@ impl ManagerControlMapExt for HashMap<RunnerId, ControlSender> {
     }
 }
 
+/// Errors that may occur when resizing a runner's chunk.
+#[derive(Debug, snafu::Snafu)]
+pub enum ResizeError {
+    #[snafu(transparent)]
+    Planner { source: super::chunk_planner::Error },
+    #[snafu(display("Failed to limit runner {runner_id}: {source}"))]
+    Limit {
+        runner_id: RunnerId,
+        source: SendError,
+    },
+}
+
 impl<T> From<TrySendError<T>> for SendError {
     fn from(err: TrySendError<T>) -> Self {
         match err {
@@ -499,13 +511,10 @@ impl RunnerManager {
     /// Shrink the runner's chunk to end `new_size` bytes after its downloaded
     /// part, and limit the runner to match.
     ///
-    /// On error nothing changes and no control message is sent.
+    /// On error nothing changes: the planner is rolled back when the runner
+    /// cannot be sent the limit.
     #[inline]
-    pub fn resize_runner(
-        &mut self,
-        runner_id: RunnerId,
-        new_size: u64,
-    ) -> Result<(), super::chunk_planner::Error> {
+    pub fn resize_runner(&mut self, runner_id: RunnerId, new_size: u64) -> Result<(), ResizeError> {
         let Self {
             chunk_planner,
             control_channels,
@@ -520,7 +529,7 @@ impl RunnerManager {
         // Limit the total size of the runner
         control_channels
             .send_message(runner_id, ControlEvent::LimitTotal(limit))
-            .expect("Manager control channel should never full or closed");
+            .map_err(|source| ResizeError::Limit { runner_id, source })?;
 
         guard.commit();
         Ok(())
@@ -842,7 +851,9 @@ mod tests {
         // Growing is rejected, keeping the chunk.
         assert!(matches!(
             manager.resize_runner(reg.runner_id, 600),
-            Err(super::super::chunk_planner::Error::InvalidResize { .. })
+            Err(ResizeError::Planner {
+                source: super::super::chunk_planner::Error::InvalidResize { .. }
+            })
         ));
         // The same end is a no-op.
         manager.resize_runner(reg.runner_id, 400).unwrap();
@@ -852,6 +863,35 @@ mod tests {
             0..500
         );
         assert!(reg.control_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_resize_runner_rolls_back_when_the_limit_cannot_be_sent() {
+        let mut manager = RunnerManager::new(1000, 2);
+        let reg = manager.allocate_runner_with_chunk(0..512).unwrap();
+        for _ in 0..DEFAULT_CONTROL_CHANNEL_CAPACITY {
+            let incomplete = manager.get_runner_state(0).unwrap().incomplete_range();
+            manager.resize_runner(0, incomplete.end / 2).unwrap();
+        }
+        let full = manager.get_runner_state(0).unwrap().allocated.clone();
+        assert!(matches!(
+            manager.resize_runner(0, full.end / 2),
+            Err(ResizeError::Limit {
+                runner_id: 0,
+                source: SendError::ChannelFull
+            })
+        ));
+        assert_eq!(manager.get_runner_state(0).unwrap().allocated, full);
+
+        drop(reg.control_rx);
+        assert!(matches!(
+            manager.resize_runner(0, full.end / 2),
+            Err(ResizeError::Limit {
+                runner_id: 0,
+                source: SendError::ChannelClosed
+            })
+        ));
+        assert_eq!(manager.get_runner_state(0).unwrap().allocated, full);
     }
 
     #[test]
