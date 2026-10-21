@@ -41,7 +41,7 @@ tracing = ["dep:tracing", "bolt-load-utils/tracing"]
 
 [lints.rust]
 # `bolt_load_probe_send` enables the nightly `Send` probe, see `task/instance/probe_send.rs`.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bolt_load_probe_send)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bolt_load_probe_send)', 'cfg(coord_alloc)'] }
 
 [lib]
 doctest = false
@@ -148,4 +148,8 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]
 name = "file_writer"
+harness = false
+
+[[bench]]
+name = "coordination"
 harness = false
