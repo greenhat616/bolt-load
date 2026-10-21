@@ -2,10 +2,10 @@ use std::{ops::Range, sync::Arc, time::Duration};
 
 use async_waitgroup::WaitGroup;
 use bolt_load_utils::telemetry::*;
-use futures::{FutureExt, task::SpawnExt};
+use futures::task::SpawnExt;
 use smol_cancellation_token::CancellationToken;
 
-use super::runner_manager;
+use super::runner_manager::{RunnerChannels, SpawnFailed};
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter},
     runner::{LimitReceiver, StreamConnector, TaskRunner},
@@ -41,8 +41,10 @@ impl RunnerSpawner {
         }
     }
 
-    /// Connect `range` and run a runner on it in one spawned task; the receiver
-    /// yields the runner's channels.
+    /// Spawn a runner that connects `range` and downloads it.
+    ///
+    /// Returns the runner's receivers; nothing is left running when the
+    /// spawn is rejected.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, fields(runner_id, range))
@@ -52,95 +54,59 @@ impl RunnerSpawner {
         range: Range<u64>,
         runner_id: RunnerId,
         limits: LimitReceiver,
-    ) -> runner_manager::PendingRunnerReceiver {
-        use runner_manager::pending::{PendingRunnerError, RunnerBuilderOutput};
-
-        let (tx, rx) = oneshot::channel();
+    ) -> Result<RunnerChannels, SpawnFailed> {
         let (start, end) = (range.start, range.end);
-        let wg = self.wg.clone();
         let adapter = self.adapter.clone();
-        let cancel_token = self.cancel_token.clone();
-        let idle_timeout = self.idle_timeout;
-        let worker = async move {
-            // Declared first, so the runner and its upstream stream drop before
-            // the wait group is released.
-            let _wg = wg;
-            trace!("[TASK] background range runner: id: {runner_id}, range: {range:?}");
-
-            // Connect the stream, abandoning the request on cancellation
-            let connector =
-                StreamConnector::from(async move { adapter.range_stream(start, end).await });
-            let connected = {
-                let connect = connector.connect().fuse();
-                let cancelled = cancel_token.cancelled().fuse();
-                futures::pin_mut!(connect, cancelled);
-                futures::select_biased! {
-                    _ = cancelled => return,
-                    res = connect => res,
-                }
-            };
-            if cancel_token.is_cancelled() {
-                return;
-            }
-            let stream = match connected {
-                Ok(stream) => stream,
-                Err(e) => {
-                    error!("failed to connect background range runner: {e:?}");
-                    let _ = tx.send(Err(PendingRunnerError::Connection { source: e }));
-                    return;
-                }
-            };
-
-            let built = TaskRunner::builder()
-                .total(end - start)
-                .stream(stream)
-                .runner_id(runner_id)
-                .limit_receiver(limits)
-                .cancel_token(cancel_token)
-                .idle_timeout(idle_timeout)
-                .build();
-            let (mut runner, lifecycle_rx, data_rx) = match built {
-                Ok(built) => built,
-                Err(e) => {
-                    // Build error - should not happen with proper setup
-                    error!("failed to build task runner: {e:?}");
-                    let _ = tx.send(Err(PendingRunnerError::ReceiverClosed));
-                    return;
-                }
-            };
-            if let Err(e) = tx.send(Ok(RunnerBuilderOutput {
-                data_rx,
-                lifecycle_rx,
-            })) {
-                error!("failed to send channels to pending receiver: {e:?}");
-                return;
-            }
-
-            let run = runner.run();
-            #[cfg(feature = "tracing")]
-            let run = tracing::Instrument::instrument(
-                run,
-                tracing::trace_span!("background_task::runner"),
-            );
-            run.await;
-        };
+        let (runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .total(end - start)
+            .connector(StreamConnector::from(async move {
+                adapter.range_stream(start, end).await
+            }))
+            .runner_id(runner_id)
+            .limit_receiver(limits)
+            .cancel_token(self.cancel_token.clone())
+            .idle_timeout(self.idle_timeout)
+            .build()
+            .expect("every runner input is set");
+        let worker = RunnerWorker {
+            runner,
+            _wait_group: self.wg.clone(),
+        }
+        .run();
         #[cfg(feature = "tracing")]
         let worker = tracing::Instrument::instrument(
             worker,
             tracing::trace_span!(
                 parent: None,
-                "background_task::runner_connector",
+                "background_task::runner",
                 runner_id = runner_id,
                 range = ?start..end,
             ),
         );
         if let Err(e) = self.rt.spawn(worker) {
             error!("failed to spawn background range runner: {e}");
-            return runner_manager::pending::failed_receiver(PendingRunnerError::Spawn {
+            return Err(SpawnFailed {
                 message: e.to_string(),
             });
         }
-        rx
+        Ok(RunnerChannels {
+            lifecycle_rx,
+            data_rx,
+        })
+    }
+}
+
+/// A spawned runner, holding the wait group until the runner and its
+/// connection are dropped.
+struct RunnerWorker {
+    // Dropped first: fields drop in declaration order.
+    runner: TaskRunner,
+    _wait_group: WaitGroup,
+}
+
+impl RunnerWorker {
+    async fn run(mut self) {
+        self.runner.run().await;
     }
 }
 
@@ -152,7 +118,6 @@ mod tests {
     use bolt_load_tests::adapter::simple::{SimpleTestAdapter, calculate_blake3};
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
-    use runner_manager::pending::PendingRunnerError;
     use smol_cancellation_token::CancellationToken;
 
     use super::{super::test_support::FailOnSpawnRuntime, *};
@@ -181,9 +146,7 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range.clone(), runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = receiver.expect("runner should spawn");
         let data_rx = output.data_rx;
         let lifecycle_rx = output.lifecycle_rx;
 
@@ -263,16 +226,15 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range, runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
+        let mut lifecycle_rx = receiver.expect("runner should spawn").lifecycle_rx;
         wg.wait().await;
 
-        // Connection should fail because range_stream fails
-        assert!(result.is_err());
-        match result {
-            Ok(_) => panic!("Expected Connection error, got channels"),
-            Err(PendingRunnerError::Connection { .. }) => {}
-            Err(e) => panic!("Expected Connection error, got: {:?}", e),
+        // The connection fails because range_stream fails; the runner never starts
+        match lifecycle_rx.next().await {
+            Some(LifecycleEvent::Stopped(StoppedReason::Failed(e))) if e.is_stream_error() => {}
+            other => panic!("Expected a stream error, got: {other:?}"),
         }
+        assert!(lifecycle_rx.next().await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -295,12 +257,14 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range, runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
-
-        match result {
-            Err(PendingRunnerError::Spawn { message }) => assert!(!message.is_empty()),
-            other => panic!("expected Spawn error, got: {other:?}"),
+        match receiver {
+            Err(SpawnFailed { message }) => assert!(!message.is_empty()),
+            Ok(_) => panic!("expected the spawn to fail"),
         }
+        // Nothing is left holding the wait group.
+        tokio::time::timeout(Duration::from_secs(1), wg.wait())
+            .await
+            .expect("the rejected runner was dropped");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -323,11 +287,7 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(0..500, 9, limits);
-        let output = tokio::time::timeout(Duration::from_secs(1), receiver)
-            .await
-            .expect("timed out waiting for runner channels")
-            .expect("receiver closed")
-            .expect("runner should start");
+        let output = receiver.expect("runner should spawn");
 
         let mut data_rx = pin!(output.data_rx);
         let mut lifecycle_rx = pin!(output.lifecycle_rx);
@@ -366,9 +326,7 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range, runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = receiver.expect("runner should spawn");
         let _data_rx = output.data_rx;
         let lifecycle_rx = output.lifecycle_rx;
 
@@ -417,9 +375,7 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range.clone(), runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = receiver.expect("runner should spawn");
         let data_rx = output.data_rx;
         let lifecycle_rx = output.lifecycle_rx;
 
@@ -482,9 +438,7 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range.clone(), runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = receiver.expect("runner should spawn");
         let data_rx = output.data_rx;
         let lifecycle_rx = output.lifecycle_rx;
 
@@ -557,9 +511,7 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range, runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = receiver.expect("runner should spawn");
         let _data_rx = output.data_rx;
         let lifecycle_rx = output.lifecycle_rx;
 
@@ -613,8 +565,7 @@ mod tests {
                     crate::runner::DEFAULT_IDLE_TIMEOUT,
                 )
                 .spawn(range.clone(), runner_id, limits);
-                let result = receiver.await.expect("receiver closed");
-                let output = result.expect("connection failed");
+                let output = receiver.expect("runner should spawn");
                 let data_rx = output.data_rx;
                 let lifecycle_rx = output.lifecycle_rx;
 
@@ -713,9 +664,7 @@ mod tests {
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         )
         .spawn(range.clone(), runner_id, limits);
-        let result = receiver.await.expect("receiver closed");
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = receiver.expect("runner should spawn");
         let data_rx = output.data_rx;
         let lifecycle_rx = output.lifecycle_rx;
 

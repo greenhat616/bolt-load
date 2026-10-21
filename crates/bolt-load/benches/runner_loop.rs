@@ -17,8 +17,9 @@
 //! - `smol_item_32k`: `item_32k` on smol.
 //! - `{tokio,smol}_runners_8`: eight runners at once, 4 MiB in total.
 //! - `setup`: build, start and stop a runner on a one-byte stream.
-//! - `cancel_latency`: time from cancelling a runner waiting on its stream until it
-//!   reports `Stopped`.
+//! - `connect_32k`: `item_32k` with the stream handed over through a connector.
+//! - `cancel_latency`, `connect_cancel_latency`: time from cancelling a runner waiting
+//!   on its stream, or on its connection, until it reports `Stopped`.
 //!
 //! Run with: `cargo bench -p bolt-load --bench runner_loop`
 //!
@@ -36,7 +37,7 @@ use bolt_load::{
     adapter::{AdapterError, AnyBytesStream},
     runner::{
         DATA_FRAME_CHANNEL_CAPACITY, DataFrameReceiver, LifecycleEvent, LifecycleReceiver,
-        StoppedReason, TaskError, TaskRunner,
+        StoppedReason, StreamConnector, TaskError, TaskRunner,
     },
     task::ControlEvent,
 };
@@ -66,6 +67,8 @@ struct Case {
     item: usize,
     known_total: bool,
     consume: Consume,
+    /// Hand the stream over through a connector the runner awaits.
+    connect: bool,
 }
 
 const CASES: &[Case] = &[
@@ -74,36 +77,49 @@ const CASES: &[Case] = &[
         item: 8 * 1024,
         known_total: true,
         consume: Consume::Fast,
+        connect: false,
     },
     Case {
         name: "item_32k",
         item: 32 * 1024,
         known_total: true,
         consume: Consume::Fast,
+        connect: false,
     },
     Case {
         name: "item_128k",
         item: 128 * 1024,
         known_total: true,
         consume: Consume::Fast,
+        connect: false,
     },
     Case {
         name: "unknown_total",
         item: 32 * 1024,
         known_total: false,
         consume: Consume::Fast,
+        connect: false,
     },
     Case {
         name: "backpressure",
         item: 32 * 1024,
         known_total: true,
         consume: Consume::Batched,
+        connect: false,
     },
     Case {
         name: "limit_every_64",
         item: 32 * 1024,
         known_total: true,
         consume: Consume::Limit(64),
+        connect: false,
+    },
+    Case {
+        name: "connect_32k",
+        item: 32 * 1024,
+        known_total: true,
+        consume: Consume::Fast,
+        connect: true,
     },
 ];
 
@@ -123,11 +139,11 @@ struct Built {
     cancel_token: CancellationToken,
 }
 
-fn build(stream: AnyBytesStream, total: Option<u64>) -> Built {
+fn build(input: StreamConnector, total: Option<u64>) -> Built {
     let (control_tx, control_rx) = async_channel::bounded(8);
     let cancel_token = CancellationToken::new();
     let mut builder = TaskRunner::builder()
-        .stream(stream)
+        .connector(input)
         .runner_id(0)
         .control_signal(control_rx)
         .cancel_token(cancel_token.clone());
@@ -210,7 +226,12 @@ async fn run_case(case: Case, total: u64, spawn: impl FnOnce(TaskRunner)) -> u64
         control_tx,
         cancel_token: _,
     } = build(
-        stream_of(total, case.item),
+        if case.connect {
+            let stream = stream_of(total, case.item);
+            StreamConnector::from(async move { Ok(stream) })
+        } else {
+            StreamConnector::DirectStream(stream_of(total, case.item))
+        },
         case.known_total.then_some(total),
     );
     spawn(runner);
@@ -236,21 +257,29 @@ async fn run_many(runners: usize, spawn: impl Fn(TaskRunner)) -> u64 {
     futures::future::join_all(consumers).await.into_iter().sum()
 }
 
-/// Time from cancelling a runner waiting on its stream until it reports `Stopped`.
-async fn cancel_latency(spawn: impl FnOnce(TaskRunner)) -> Duration {
+/// Time from cancelling a runner waiting on its stream, or on its connection
+/// when `connecting`, until it reports `Stopped`.
+async fn cancel_latency(spawn: impl FnOnce(TaskRunner), connecting: bool) -> Duration {
     let (waiting_tx, waiting_rx) = async_channel::bounded(1);
-    // The runner polls its stream after its cancellation.
-    let stream = Box::pin(futures::stream::poll_fn(move |_| {
-        let _ = waiting_tx.try_send(());
-        std::task::Poll::Pending
-    }));
+    // The runner polls its stream or connection after its cancellation.
+    let input = if connecting {
+        StreamConnector::from(async move {
+            let _ = waiting_tx.try_send(());
+            futures::future::pending().await
+        })
+    } else {
+        StreamConnector::DirectStream(Box::pin(futures::stream::poll_fn(move |_| {
+            let _ = waiting_tx.try_send(());
+            std::task::Poll::Pending
+        })))
+    };
     let Built {
         runner,
         mut lifecycle_rx,
         data_rx,
         control_tx,
         cancel_token,
-    } = build(stream, Some(1));
+    } = build(input, Some(1));
     spawn(runner);
     waiting_rx
         .recv()
@@ -317,15 +346,17 @@ fn bench_runner_loop(c: &mut Criterion) {
         b.to_async(&rt).iter(|| run_case(case, 1, tokio_spawn(&rt)));
     });
     let rt_ref = &rt;
-    group.bench_function("cancel_latency", |b| {
-        b.to_async(rt_ref).iter_custom(|iters| async move {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += cancel_latency(tokio_spawn(rt_ref)).await;
-            }
-            total
+    for (name, connecting) in [("cancel_latency", false), ("connect_cancel_latency", true)] {
+        group.bench_function(name, |b| {
+            b.to_async(rt_ref).iter_custom(|iters| async move {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += cancel_latency(tokio_spawn(rt_ref), connecting).await;
+                }
+                total
+            });
         });
-    });
+    }
     group.finish();
 }
 
@@ -409,8 +440,9 @@ fn profile(spec: &str) {
             };
             return per_iteration(&|| timed(&|| rt.block_on(run_case(case, 1, tokio_spawn(&rt)))));
         }
-        "cancel_latency" => {
-            return per_iteration(&|| rt.block_on(cancel_latency(tokio_spawn(&rt))));
+        "cancel_latency" | "connect_cancel_latency" => {
+            let connecting = name == "connect_cancel_latency";
+            return per_iteration(&|| rt.block_on(cancel_latency(tokio_spawn(&rt), connecting)));
         }
         _ => {}
     }

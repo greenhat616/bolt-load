@@ -784,9 +784,9 @@ impl crate::adapter::BoltLoadAdapter for HandshakeAdapter {
     }
 }
 
-/// Split runner 0 more often than any bounded queue of limits would hold,
-/// and check that it is left with the latest limit.
-fn split_connecting_runner_repeatedly(download: &mut DownloadLoop) {
+/// Split runner 0 more often than any bounded queue of limits would hold;
+/// returns its latest limit.
+fn split_connecting_runner_repeatedly(download: &mut DownloadLoop) -> u64 {
     const SPLITS: u32 = 12;
     let total = download.manager.total();
     for _ in 0..SPLITS {
@@ -801,11 +801,11 @@ fn split_connecting_runner_repeatedly(download: &mut DownloadLoop) {
         download.manager.get_runner_state(0).unwrap().allocated,
         0..total >> SPLITS
     );
-    assert_eq!(download.manager.unread_limit(0), Some(total >> SPLITS));
     assert_eq!(
         download.manager.allocated_runner_count(),
         SPLITS as usize + 1
     );
+    total >> SPLITS
 }
 
 #[tokio::test]
@@ -813,7 +813,9 @@ async fn test_split_parked_runner_keeps_the_latest_limit() {
     const TOTAL: u64 = 1 << 30;
     let (mut download, file_writer) = parked_loop(TOTAL, 64).await;
     download.spawn_runner(0..TOTAL);
-    split_connecting_runner_repeatedly(&mut download);
+    let limit = split_connecting_runner_repeatedly(&mut download);
+    // Never polled, so the runner is left the latest limit to read.
+    assert_eq!(download.manager.unread_limit(0), Some(limit));
     drop(download);
     file_writer.finalize().await.unwrap();
 }
@@ -832,6 +834,13 @@ async fn test_split_handshaking_runner_keeps_the_latest_limit() {
     download.spawn_runner(0..TOTAL);
     assert_eq!(with_watchdog(connects.recv()).await.unwrap(), 0);
     split_connecting_runner_repeatedly(&mut download);
+    // The connecting runner reads its limits.
+    with_watchdog(async {
+        while download.manager.unread_limit(0).is_some() {
+            async_io::Timer::after(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
 
     let (cancel, wg) = (
         download.spawner.cancel_token.clone(),
@@ -850,33 +859,34 @@ async fn test_split_handshaking_runner_keeps_the_latest_limit() {
 /// Every target must be split, and every connecting runner must be left with
 /// its latest limit: the length of its chunk.
 async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::task::RunnerId>> {
-    use async_ringbuf::{AsyncHeapRb, traits::Split};
+    use async_ringbuf::{
+        AsyncHeapRb,
+        traits::{Producer, Split},
+    };
 
-    use super::super::{runner_manager::pending::RunnerBuilderOutput, strategy::StrategyAction};
+    use super::super::{runner_manager::RunnerChannels, strategy::StrategyAction};
     use crate::runner::{
         DATA_FRAME_CHANNEL_CAPACITY, DataFrame, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent,
     };
 
     const TOTAL: u64 = 1 << 34;
     let (mut download, file_writer) = parked_loop(TOTAL, max_concurrency).await;
-    let (tx, rx) = oneshot::channel();
+    let (_data_tx, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
+    let (mut lifecycle_tx, lifecycle_rx) =
+        AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY).split();
     let mut limits = None;
     download
         .manager
-        .allocate_pending_runner_with_chunk(0..TOTAL, |_, runner_limits| {
+        .spawn_runner_with_chunk(0..TOTAL, |_, runner_limits| {
             limits = Some(runner_limits);
-            rx
+            Ok(RunnerChannels {
+                lifecycle_rx,
+                data_rx,
+            })
         })
         .unwrap();
     let mut limits = limits.unwrap();
-    let (_data_tx, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
-    let (_lifecycle_tx, lifecycle_rx) =
-        AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY).split();
-    tx.send(Ok(RunnerBuilderOutput {
-        data_rx,
-        lifecycle_rx,
-    }))
-    .unwrap();
+    lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
     download.manager.tick().await;
     assert_eq!(
         download.manager.get_runner_state(0).unwrap().status,
