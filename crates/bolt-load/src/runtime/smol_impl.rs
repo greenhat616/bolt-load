@@ -1,4 +1,11 @@
-use std::{pin::Pin, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    future::{Future, poll_fn},
+    pin::Pin,
+    rc::Rc,
+    sync::Arc,
+    task::{Context, Poll, ready},
+    time::Duration,
+};
 
 use bolt_load_utils::telemetry::*;
 use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
@@ -183,39 +190,20 @@ impl SmolDelayedTimer {
     }
 }
 
-pin_project_lite::pin_project! {
-    pub struct SmolDelayedTick<'a> {
-        #[pin]
-        timer: Pin<&'a mut smol::Timer>,
-        duration: Duration,
-    }
-}
-
-impl<'a> Future for SmolDelayedTick<'a> {
-    type Output = ();
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let mut this = self.project();
-
-        match this.timer.as_mut().poll(cx) {
-            std::task::Poll::Ready(_) => {
-                this.timer.set_after(*this.duration);
-                std::task::Poll::Ready(())
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+impl SmolDelayedTimer {
+    /// Poll for the next tick; the one after is due a period after this one
+    /// was observed.
+    #[inline]
+    pub(crate) fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        ready!(Pin::new(&mut self.timer).poll(cx));
+        self.timer.set_after(self.duration);
+        Poll::Ready(())
     }
 }
 
 impl Timer for SmolDelayedTimer {
     async fn tick(&mut self) {
-        let fut = SmolDelayedTick {
-            timer: Pin::new(&mut self.timer),
-            duration: self.duration,
-        };
-        fut.await
+        poll_fn(|cx| self.poll_tick(cx)).await
     }
 }
 

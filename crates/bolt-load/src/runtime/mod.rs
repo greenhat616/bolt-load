@@ -3,11 +3,13 @@ use std::{rc::Rc, sync::Arc};
 
 use futures::task::{LocalSpawn, Spawn, SpawnError};
 
+mod event_timer;
 #[cfg(feature = "smol")]
 mod smol_impl;
 #[cfg(feature = "tokio")]
 mod tokio_impl;
 
+pub(crate) use event_timer::EventTimer;
 #[cfg(feature = "smol")]
 pub use smol_impl::*;
 #[cfg(feature = "tokio")]

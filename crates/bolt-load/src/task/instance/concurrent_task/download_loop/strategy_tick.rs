@@ -1,9 +1,28 @@
-use std::ops::Range;
+use std::{
+    ops::Range,
+    task::{Context, Poll},
+};
 
 use bolt_load_utils::telemetry::*;
 
-use super::{super::strategy::StrategyAction, DownloadLoop};
-use crate::task::RunnerId;
+use super::{super::strategy::StrategyAction, DownloadLoop, LoopEvent};
+use crate::{runtime::EventTimer, task::RunnerId};
+
+/// The strategy's periodic tick.
+pub(super) struct StrategyTick {
+    timer: EventTimer,
+}
+
+impl StrategyTick {
+    pub(super) fn new(timer: EventTimer) -> Self {
+        Self { timer }
+    }
+
+    #[inline]
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<LoopEvent> {
+        self.timer.poll_tick(cx).map(|()| LoopEvent::StrategyTimer)
+    }
+}
 
 impl DownloadLoop {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]

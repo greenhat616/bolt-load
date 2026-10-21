@@ -4,13 +4,18 @@ use std::{
     task::{Context, Poll},
 };
 
+use bolt_load_utils::telemetry::*;
 use futures::{Stream, task::AtomicWaker};
 use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
-use super::stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem};
+use super::{
+    AttemptFailure, RunnerFailureKind, RunnerManager, RunnerTick, SpawnFailed,
+    is_attempt_retryable,
+    stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem},
+};
 use crate::{
-    runner::{LifecycleEvent, LifecycleReceiver},
+    runner::{LifecycleEvent, LifecycleReceiver, StoppedReason, TaskError},
     task::RunnerId,
 };
 
@@ -24,7 +29,6 @@ pin_project! {
         #[pin]
         group: StreamGroup<RunnerTaggedStream<LifecycleReceiver>>,
         map: HashMap<RunnerId, Key>,
-        is_closed: bool,
         waker: AtomicWaker,
     }
 }
@@ -44,7 +48,6 @@ impl LifecycleAggregator {
         Self {
             group: StreamGroup::with_capacity(capacity),
             map: HashMap::with_capacity(capacity),
-            is_closed: false,
             waker: AtomicWaker::new(),
         }
     }
@@ -65,34 +68,14 @@ impl LifecycleAggregator {
         }
     }
 
-    /// Check if the aggregator is closed.
-    #[allow(dead_code)]
-    pub fn is_closed(&self) -> bool {
-        self.is_closed
-    }
-
-    /// Close the aggregator, signaling no more events will be received.
-    #[allow(dead_code)]
-    pub fn close(&mut self) {
-        self.is_closed = true;
-        self.waker.wake();
-    }
-
-    /// Reopen the aggregator for receiving events.
-    #[allow(dead_code)]
-    pub fn reopen(&mut self) {
-        self.is_closed = false;
-        self.waker.wake();
-    }
-
     /// Get the number of runners being tracked.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
     /// Check if there are no runners being tracked.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -110,10 +93,8 @@ impl Stream for LifecycleAggregator {
         let this = self.project();
         this.waker.register(cx.waker());
 
+        // Never ends: a runner may be added at any time.
         if this.map.is_empty() {
-            if *this.is_closed {
-                return Poll::Ready(None);
-            }
             return Poll::Pending;
         }
 
@@ -127,15 +108,168 @@ impl Stream for LifecycleAggregator {
                     Poll::Ready(Some(LifecycleStreamEvent::Closed(runner_id)))
                 }
             },
-            Poll::Ready(None) => {
-                if *this.is_closed {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl RunnerManager {
+    /// Poll the next runner lifecycle event; a rejected spawn comes first.
+    #[inline]
+    pub(super) fn poll_lifecycle(&mut self, cx: &mut Context<'_>) -> Poll<RunnerTick> {
+        if let Some(tick) = self.take_spawn_failure() {
+            return Poll::Ready(tick);
+        }
+        Pin::new(&mut self.lifecycle_aggregator)
+            .poll_next(cx)
+            .map(|event| {
+                let event = event.expect("the lifecycle aggregator never ends");
+                self.handle_lifecycle_stream_event(event)
+            })
+    }
+
+    fn handle_lifecycle(&mut self, event: RunnerTaggedStreamItem<LifecycleEvent>) -> RunnerTick {
+        let runner_id = event.runner_id;
+        let connecting = self.is_connecting(runner_id);
+        let reason = match event.item {
+            LifecycleEvent::Started => {
+                trace!("runner {runner_id} started");
+                debug_assert!(connecting, "runner {runner_id} started twice");
+                self.chunk_planner
+                    .mark_running(runner_id)
+                    .expect("chunk planner should not fail");
+                let data_rx = self
+                    .connecting_data
+                    .remove(&runner_id)
+                    .expect("a connecting runner has a data receiver");
+                self.data_aggregator.register(runner_id, data_rx);
+                return RunnerTick::downloading();
+            }
+            LifecycleEvent::Stopped(reason) => reason,
+        };
+        self.meters.remove(&runner_id);
+        // Remove control channel when runner stops
+        self.release_runner(runner_id);
+        if connecting {
+            let error = match reason {
+                StoppedReason::Failed(error) => error,
+                StoppedReason::Finished => {
+                    debug_assert!(false, "runner {runner_id} finished before starting");
+                    TaskError::ChannelClosed
+                }
+            };
+            return self.handle_connect_failed(runner_id, error);
+        }
+        let kind = match reason {
+            StoppedReason::Finished | StoppedReason::Failed(TaskError::ExceededTotalSize) => {
+                trace!("runner {runner_id} finished");
+                return if self.mark_runner_completed(runner_id) {
+                    RunnerTick::finished()
+                } else {
+                    RunnerTick::downloading()
+                };
+            }
+            StoppedReason::Failed(kind) => kind,
+        };
+        error!("runner {runner_id} failed: {kind:?}");
+        let unfinished_range = self
+            .chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        trace!("runner {runner_id} failed, released range: {unfinished_range:?}");
+        if kind.is_cancelled() {
+            return RunnerTick::downloading();
+        }
+        self.runner_outcome_sampler
+            .record_stream_closed(if kind.is_retryable() {
+                RunnerFailureKind::Retryable
+            } else {
+                RunnerFailureKind::Unretryable
+            });
+        RunnerTick::with_failure(AttemptFailure {
+            runner_id,
+            retryable: is_attempt_retryable(&kind),
+            error: kind,
+        })
+    }
+
+    /// Handle a runner that stopped before it connected; its range is
+    /// released and it never counts as finished.
+    fn handle_connect_failed(&mut self, runner_id: RunnerId, error: TaskError) -> RunnerTick {
+        self.chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        if error.is_cancelled() {
+            trace!("runner {runner_id} cancelled while connecting");
+            return RunnerTick::downloading();
+        }
+        error!("runner {runner_id} failed to connect: {error:?}");
+        let retryable = is_attempt_retryable(&error);
+        self.runner_outcome_sampler
+            .record_connect_failed(if retryable {
+                RunnerFailureKind::Retryable
+            } else {
+                RunnerFailureKind::Unretryable
+            });
+        RunnerTick::with_failure(AttemptFailure {
+            runner_id,
+            error,
+            retryable,
+        })
+    }
+
+    /// Handle a runner whose spawn was rejected.
+    #[cold]
+    fn handle_spawn_failed(&mut self, runner_id: RunnerId, failed: SpawnFailed) -> RunnerTick {
+        error!("failed to spawn runner {runner_id}: {}", failed.message);
+        self.release_runner(runner_id);
+        self.handle_connect_failed(
+            runner_id,
+            TaskError::Other {
+                message: failed.message,
+            },
+        )
+    }
+
+    /// Handle a runner whose stream closed without sending `Stopped`.
+    fn handle_runner_lost(&mut self, runner_id: RunnerId) -> RunnerTick {
+        warn!("runner {runner_id} lifecycle stream closed unexpectedly");
+        let connecting = self.is_connecting(runner_id);
+        self.meters.remove(&runner_id);
+        let unfinished_range = self
+            .chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        if connecting {
+            self.runner_outcome_sampler
+                .record_connect_failed(RunnerFailureKind::Retryable);
+        } else {
+            self.runner_outcome_sampler
+                .record_stream_closed(RunnerFailureKind::Retryable);
+        }
+        self.release_runner(runner_id);
+        trace!("runner {runner_id} lost, released range: {unfinished_range:?}");
+        if self.chunk_planner.is_complete() {
+            return RunnerTick::finished();
+        }
+        RunnerTick::with_failure(AttemptFailure {
+            runner_id,
+            error: TaskError::ChannelClosed,
+            retryable: true,
+        })
+    }
+
+    fn handle_lifecycle_stream_event(&mut self, event: LifecycleStreamEvent) -> RunnerTick {
+        match event {
+            LifecycleStreamEvent::Event(tagged) => self.handle_lifecycle(tagged),
+            LifecycleStreamEvent::Closed(runner_id) => self.handle_runner_lost(runner_id),
+        }
+    }
+
+    /// The next rejected spawn, which the lifecycle reports before anything else.
+    fn take_spawn_failure(&mut self) -> Option<RunnerTick> {
+        let (runner_id, failed) = self.spawn_failures.pop_front()?;
+        Some(self.handle_spawn_failed(runner_id, failed))
     }
 }
 
@@ -265,17 +399,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecycle_aggregator_closed_empty_returns_none() {
+    fn test_lifecycle_aggregator_never_ends() {
         let mut aggregator = LifecycleAggregator::new();
         let waker = Arc::new(CountWaker::default());
         let waker_ref = waker_ref(&waker);
         let mut cx = Context::from_waker(&waker_ref);
 
-        aggregator.close();
-
-        assert!(matches!(
-            Pin::new(&mut aggregator).poll_next(&mut cx),
-            Poll::Ready(None)
-        ));
+        assert!(Pin::new(&mut aggregator).poll_next(&mut cx).is_pending());
     }
 }

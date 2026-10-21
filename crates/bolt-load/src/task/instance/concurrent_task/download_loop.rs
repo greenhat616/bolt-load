@@ -1,5 +1,6 @@
 //! The event loop of one concurrent download attempt.
 
+mod cancel;
 mod completion;
 mod deadline;
 mod runner;
@@ -8,12 +9,20 @@ mod strategy_tick;
 mod tests;
 mod throughput;
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    future::poll_fn,
+    ops::ControlFlow,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Instant,
+};
 
-use futures::{FutureExt, future::Either};
 use smol_cancellation_token::CancellationToken;
 
-use self::{completion::check_completions, throughput::Throughput};
+use self::{
+    cancel::CancelSource, completion::check_completions, deadline::DeadlineSource,
+    strategy_tick::StrategyTick, throughput::ThroughputSampler,
+};
 use super::{
     DEFAULT_MAX_CONCURRENCY, RunnerManager, RunnerSpawner,
     file_writer::{FileWriter, PendingWriter, WriteCompletion},
@@ -22,7 +31,7 @@ use super::{
 };
 use crate::{
     runner::TaskError,
-    runtime::{Timer, TimerBuilder, TimerImpl},
+    runtime::TimerBuilder,
     task::{
         Progress, TaskOptions,
         instance::{Result, TaskEvent, TaskInstanceError, sampler::DEFAULT_SAMPLE_INTERVAL},
@@ -39,19 +48,21 @@ enum LoopEvent {
 }
 
 /// The event loop of one concurrent download attempt.
+///
+/// Every event source lives as long as the loop and is polled in place, in
+/// priority order, see [`Self::poll_event`].
 pub(super) struct DownloadLoop {
     spawner: RunnerSpawner,
     manager: RunnerManager,
     strategy: StrategyControl,
     policy: FailurePolicy,
     max_concurrency: usize,
-    throughput: Throughput,
     writer: PendingWriter<FileWriter>,
     event_tx: async_channel::Sender<TaskEvent>,
-    throughput_timer: TimerImpl,
-    strategy_timer: TimerImpl,
-    /// Woken at the no-progress deadline; re-armed lazily when progress moved it.
-    deadline_timer: async_io::Timer,
+    cancel: CancelSource,
+    deadline: DeadlineSource,
+    strategy_tick: StrategyTick,
+    throughput: ThroughputSampler,
 }
 
 impl DownloadLoop {
@@ -61,6 +72,7 @@ impl DownloadLoop {
         file_writer: &FileWriter,
         event_tx: async_channel::Sender<TaskEvent>,
         options: &TaskOptions,
+        cancel_token: CancellationToken,
     ) -> Self {
         let max_concurrency = std::thread::available_parallelism()
             .map(|t| t.get())
@@ -79,95 +91,75 @@ impl DownloadLoop {
         let strategy_timer = spawner
             .rt
             .create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
-        let deadline_timer = async_io::Timer::at(policy.deadline());
+        let deadline = DeadlineSource::new(policy.deadline());
         Self {
             spawner,
             manager,
             strategy,
             policy,
             max_concurrency,
-            throughput: Throughput::new(),
             writer,
             event_tx,
-            throughput_timer,
-            strategy_timer,
-            deadline_timer,
+            cancel: CancelSource::new(cancel_token),
+            deadline,
+            strategy_tick: StrategyTick::new(strategy_timer.into()),
+            throughput: ThroughputSampler::new(throughput_timer.into()),
         }
     }
 
-    pub(super) async fn run(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+    pub(super) async fn run(&mut self) -> Result<()> {
         loop {
-            let completions = self.writer.try_tick();
-            self.record_completions(completions)?;
-
-            match self.next_event(cancel_token).await {
-                LoopEvent::Cancelled => {
-                    return Err(TaskInstanceError::new_failed(TaskError::Cancelled));
-                }
-                LoopEvent::Deadline => self.on_deadline()?,
-                LoopEvent::WriterCompleted(Some(completions)) => {
-                    self.record_completions(completions)?;
-                }
-                LoopEvent::WriterCompleted(None) => {
-                    return Err(TaskInstanceError::new_failed(TaskError::Other {
-                        message: "writer completion channel closed unexpectedly".into(),
-                    }));
-                }
-                LoopEvent::StrategyTimer => self.on_strategy_tick(),
-                LoopEvent::ThroughputTimer => self.on_throughput_tick(),
-                LoopEvent::Runner(tick) => {
-                    if self.on_runner(tick)?.is_break() {
-                        return Ok(());
-                    }
-                }
+            let event = poll_fn(|cx| self.poll_event(cx)).await;
+            if self.handle_event(event)?.is_break() {
+                return Ok(());
             }
         }
     }
 
     /// Priority: cancel > deadline > writer > strategy > throughput > runner.
-    async fn next_event(&mut self, cancel_token: &CancellationToken) -> LoopEvent {
-        let Self {
-            manager,
-            writer,
-            throughput_timer,
-            strategy_timer,
-            deadline_timer,
-            ..
-        } = self;
-        let can_write = writer.can_write();
-        let writer_fut = if writer.is_idle() {
-            Either::Left(futures::future::pending::<Option<Vec<WriteCompletion>>>())
-        } else {
-            Either::Right(writer.tick())
+    ///
+    /// Every source is polled before `Pending` is returned, so each has
+    /// registered for its wake-up.
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<LoopEvent> {
+        if let Poll::Ready(event) = self.cancel.poll(cx) {
+            return Poll::Ready(event);
         }
-        .fuse();
-        let runner_fut = if can_write {
-            Either::Left(manager.tick())
-        } else {
-            Either::Right(manager.tick_lifecycle_only())
+        if let Poll::Ready(event) = self.deadline.poll(cx) {
+            return Poll::Ready(event);
         }
-        .fuse();
-        let cancelled = cancel_token.cancelled().fuse();
-        let deadline = FutureExt::fuse(deadline_timer);
-        let strategy_tick = strategy_timer.tick().fuse();
-        let throughput_tick = throughput_timer.tick().fuse();
+        if let Poll::Ready(event) = self.poll_writer(cx) {
+            return Poll::Ready(event);
+        }
+        if let Poll::Ready(event) = self.strategy_tick.poll(cx) {
+            return Poll::Ready(event);
+        }
+        if let Poll::Ready(event) = self.throughput.poll(cx) {
+            return Poll::Ready(event);
+        }
+        self.poll_runner(cx)
+    }
 
-        futures::pin_mut!(
-            cancelled,
-            deadline,
-            writer_fut,
-            runner_fut,
-            strategy_tick,
-            throughput_tick
-        );
-
-        futures::select_biased! {
-            _ = cancelled => LoopEvent::Cancelled,
-            _ = deadline => LoopEvent::Deadline,
-            completions = writer_fut => LoopEvent::WriterCompleted(completions),
-            _ = strategy_tick => LoopEvent::StrategyTimer,
-            _ = throughput_tick => LoopEvent::ThroughputTimer,
-            tick = runner_fut => LoopEvent::Runner(tick),
+    fn handle_event(&mut self, event: LoopEvent) -> Result<ControlFlow<()>> {
+        match event {
+            LoopEvent::Cancelled => Err(TaskInstanceError::new_failed(TaskError::Cancelled)),
+            LoopEvent::Deadline => self.on_deadline().map(ControlFlow::Continue),
+            LoopEvent::WriterCompleted(Some(completions)) => self
+                .record_completions(completions)
+                .map(ControlFlow::Continue),
+            LoopEvent::WriterCompleted(None) => {
+                Err(TaskInstanceError::new_failed(TaskError::Other {
+                    message: "writer completion channel closed unexpectedly".into(),
+                }))
+            }
+            LoopEvent::StrategyTimer => {
+                self.on_strategy_tick();
+                Ok(ControlFlow::Continue(()))
+            }
+            LoopEvent::ThroughputTimer => {
+                self.on_throughput_tick();
+                Ok(ControlFlow::Continue(()))
+            }
+            LoopEvent::Runner(tick) => self.on_runner(tick),
         }
     }
 
