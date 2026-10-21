@@ -133,14 +133,12 @@ jobs:
             target/
           key: ${{ runner.os }}-hra-probe-${{ hashFiles('**/Cargo.lock') }}
 
-      # RUSTFLAGS replaces `build.rustflags` from .cargo/config.toml, so
-      # `--cfg tokio_unstable` is repeated here.
       - name: Probe without the flag (control)
         id: control
         continue-on-error: true
         run: |
           set +e
-          RUSTFLAGS="--cfg tokio_unstable --cfg bolt_load_probe_send" \
+          RUSTFLAGS="--cfg bolt_load_probe_send" \
             cargo +nightly check -p bolt-load --tests 2>&1 | tee probe-control.log
           echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
@@ -149,7 +147,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          RUSTFLAGS="--cfg tokio_unstable --cfg bolt_load_probe_send -Zhigher-ranked-assumptions" \
+          RUSTFLAGS="--cfg bolt_load_probe_send -Zhigher-ranked-assumptions" \
             cargo +nightly check -p bolt-load --tests 2>&1 | tee probe-hra.log
           echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 

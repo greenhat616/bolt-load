@@ -41,24 +41,23 @@ impl Throughput {
 }
 
 impl DownloadLoop {
-    /// Sample the throughput and publish a periodic progress event; the event
-    /// is dropped when the channel is full.
+    /// Sample the throughput and publish a periodic progress event.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(super) fn on_throughput_tick(&mut self) {
         let meters = self.manager.take_meters_snapshot();
         let (speed, write_speed) = self.throughput.sample(meters);
-        let downloaded_chunks = self.manager.get_downloaded_ranges();
-        let downloaded = downloaded_chunks
-            .iter()
-            .map(|r| r.end - r.start)
-            .sum::<u64>();
+        self.publish_progress(speed, write_speed);
+    }
+
+    /// Publish the progress; the event is dropped when the channel is full.
+    fn publish_progress(&self, speed: f64, write_speed: f64) {
         let _ = self
             .event_tx
             .try_send(TaskEvent::Downloading(ProgressWithSpeed::new(
                 Progress {
                     total: Some(self.manager.total()),
-                    downloaded,
-                    downloaded_chunks,
+                    downloaded: self.manager.get_total_downloaded(),
+                    downloaded_chunks: self.manager.get_downloaded_ranges(),
                 },
                 speed,
                 write_speed,

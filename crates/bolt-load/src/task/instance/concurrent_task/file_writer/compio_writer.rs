@@ -3,7 +3,7 @@ use std::{ops::Range, path::PathBuf};
 use async_channel::{Receiver, Sender};
 use async_waitgroup::WaitGroup;
 use bytes::Bytes;
-use compio::{BufResult, fs::OpenOptions, io::AsyncWriteAt, runtime::Runtime};
+use compio::{BufResult, fs::OpenOptions, io::AsyncWriteAtExt, runtime::Runtime};
 use snafu::prelude::*;
 
 use super::{
@@ -104,11 +104,8 @@ fn compio_file_writer_task(
                     rt.spawn(async move {
                         let _wg = wg;
                         let BufResult(result, _) =
-                            file.write_at(chunk.data, chunk.range.start).await;
-                        let _ = match result {
-                            Ok(_) => tx.send(Ok(())),
-                            Err(e) => tx.send(Err(e)),
-                        };
+                            file.write_all_at(chunk.data, chunk.range.start).await;
+                        let _ = tx.send(result);
                     })
                     .detach();
                 }

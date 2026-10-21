@@ -187,6 +187,13 @@ fix: handle zero-length range responses
 refactor: migrate error types to snafu
 ```
 
+The examples can report to [tokio-console](https://github.com/tokio-rs/console),
+which needs tokio's unstable instrumentation:
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" cargo run --example test_performance
+```
+
 ### Thread Control Algorithm
 
 The concurrent download engine uses a two-phase approach to find optimal parallelism:

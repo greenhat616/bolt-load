@@ -131,6 +131,8 @@ pub struct ChunkPlanner {
     chunks: BTreeMap<u64, ChunkState>,
     /// Runner ID to chunk start mapping for quick lookup
     runner_to_chunk: HashMap<RunnerId, u64>,
+    /// Bytes accepted into all chunks; no operation ever drops accepted bytes.
+    accepted_bytes: u64,
 }
 
 impl ChunkPlanner {
@@ -141,6 +143,7 @@ impl ChunkPlanner {
             max_chunk_count: None,
             chunks: BTreeMap::new(),
             runner_to_chunk: HashMap::new(),
+            accepted_bytes: 0,
         }
     }
 
@@ -237,6 +240,7 @@ impl ChunkPlanner {
         // Update downloaded range, adding at most the remaining length
         let new_end = chunk.downloaded.end + bytes_downloaded.min(chunk.remaining());
         let previous_end = std::mem::replace(&mut chunk.downloaded.end, new_end);
+        self.accepted_bytes += new_end - previous_end;
 
         // Check if complete
         if chunk.is_complete() {
@@ -383,17 +387,19 @@ impl ChunkPlanner {
             .map(|c| c.downloaded.clone())
             .collect();
         ranges.sort_by_key(|r| r.start);
+        debug_assert_eq!(
+            self.accepted_bytes,
+            ranges.iter().map(|r| r.end - r.start).sum::<u64>()
+        );
 
         // Merge adjacent ranges
         merge_adjacent_ranges(ranges)
     }
 
     /// Get total downloaded bytes
+    #[inline]
     pub fn get_total_downloaded(&self) -> u64 {
-        self.chunks
-            .values()
-            .map(|c| c.downloaded.end - c.downloaded.start)
-            .sum()
+        self.accepted_bytes
     }
 
     /// Get incomplete states from occupied ranges
@@ -596,6 +602,72 @@ mod tests {
     use super::*;
 
     // === Basic functionality tests ===
+
+    // === Accepted bytes ===
+
+    fn summed_downloaded(planner: &ChunkPlanner) -> u64 {
+        planner
+            .chunks
+            .values()
+            .map(|c| c.downloaded.end - c.downloaded.start)
+            .sum()
+    }
+
+    /// A planner with runner 1 on `0..600` and runner 2 on `600..1000`,
+    /// each part way through.
+    fn planner_in_progress() -> ChunkPlanner {
+        let mut planner = ChunkPlanner::new(1000);
+        assert!(planner.allocate_chunk(0..600, Some(1)));
+        assert!(planner.allocate_chunk(600..1000, Some(2)));
+        planner.mark_running(1).unwrap();
+        planner.mark_running(2).unwrap();
+        planner.update_progress(1, 200).unwrap();
+        planner.update_progress(2, 50).unwrap();
+        assert_eq!(planner.get_total_downloaded(), 250);
+        planner
+    }
+
+    #[test]
+    fn test_accepted_bytes_matches_sum_after_split() {
+        let mut planner = planner_in_progress();
+        planner.split_chunk(1, 400, 3).unwrap();
+        planner.update_progress(3, 10).unwrap();
+        assert_eq!(planner.get_total_downloaded(), 260);
+        assert_eq!(planner.get_total_downloaded(), summed_downloaded(&planner));
+    }
+
+    #[test]
+    fn test_accepted_bytes_matches_sum_after_fail() {
+        let mut planner = planner_in_progress();
+        planner.mark_failed(1).unwrap();
+        assert!(planner.allocate_chunk(200..600, Some(3)));
+        planner.mark_failed(3).unwrap();
+        assert_eq!(planner.get_total_downloaded(), 250);
+        assert_eq!(planner.get_total_downloaded(), summed_downloaded(&planner));
+    }
+
+    #[test]
+    fn test_accepted_bytes_matches_sum_after_resize() {
+        let mut planner = planner_in_progress();
+        planner.resize_runner_state(1, 100).unwrap();
+        // Progress beyond the new end is clipped.
+        assert_eq!(planner.update_progress(1, 500).unwrap(), 200..300);
+        assert_eq!(planner.get_total_downloaded(), 350);
+        assert_eq!(planner.get_total_downloaded(), summed_downloaded(&planner));
+    }
+
+    #[test]
+    fn test_accepted_bytes_matches_sum_after_rollback() {
+        let mut planner = planner_in_progress();
+        {
+            let mut guard = PlannerGuard::new(&mut planner);
+            guard.planner().update_progress(2, 100).unwrap();
+            guard.planner().mark_failed(1).unwrap();
+        }
+        assert_eq!(planner.get_total_downloaded(), 250);
+        assert_eq!(planner.get_total_downloaded(), summed_downloaded(&planner));
+        assert_eq!(planner.get_downloaded_ranges(), vec![0..200, 600..650]);
+    }
 
     #[test]
     fn test_chunk_planner_creation() {
