@@ -97,6 +97,8 @@ pub enum FaultPlan {
     AlwaysFail(FaultKind),
     /// Block every attempt at the gate until it is released.
     Block(Gate),
+    /// Never complete the `n`-th (0-based) attempt; connect the others normally.
+    HangAt(usize),
 }
 
 impl FaultPlan {
@@ -111,6 +113,8 @@ impl FaultPlan {
                 gate.pass().await;
                 Ok(())
             }
+            FaultPlan::HangAt(n) if attempt == *n => std::future::pending().await,
+            FaultPlan::HangAt(_) => Ok(()),
         }
     }
 }

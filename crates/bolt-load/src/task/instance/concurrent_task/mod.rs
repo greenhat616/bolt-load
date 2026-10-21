@@ -244,7 +244,8 @@ impl ConcurrentTaskInner {
             WaitGroup::new(),
             runners_cancel_token,
             self.options.stream_idle_timeout,
-        );
+        )
+        .connect_timeout(self.options.connect_timeout);
 
         let mut download = DownloadLoop::new(
             total,

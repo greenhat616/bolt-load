@@ -1032,6 +1032,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_congestion_while_connecting_is_still_recognised() {
+        use std::time::Instant;
+
+        use super::super::strategy::FailurePolicy;
+        use crate::{adapter::UnretryableError, task::TaskOptions};
+
+        let mut manager = RunnerManager::new(1000, 2);
+        let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        let _other = spawn_test_runner(&mut manager, 500..1000).unwrap();
+        lifecycle_tx
+            .try_push(LifecycleEvent::failed(TaskError::StreamError {
+                source: bolt_load_core::adapter::AdapterError::Unretryable {
+                    source: UnretryableError::ServiceUnavailable {
+                        status: "429".into(),
+                        description: "Too Many Requests".into(),
+                    },
+                },
+            }))
+            .unwrap();
+
+        let failure = manager.tick().await.failure.unwrap();
+        let mut policy = FailurePolicy::new(&TaskOptions::default(), Instant::now());
+        // Left to the concurrency strategy while the other runner is in flight.
+        assert!(
+            policy
+                .on_failure(&failure, manager.allocated_runner_count())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_exceeded_total_size_before_started_does_not_finish_the_chunk() {
         let mut manager = RunnerManager::new(500, 1);
         let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();

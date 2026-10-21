@@ -2214,3 +2214,143 @@ fn test_connecting_priority_cancel_control_connection() {
         assert_eq!(first(false, false).await, "connected");
     });
 }
+
+#[tokio::test]
+async fn test_connect_timeout_is_not_extended_by_limits() {
+    use super::run_loop::{RunnerLoop, Step};
+
+    let (limit_tx, limits) = limit_mailbox();
+    let (mut runner, mut lifecycle_rx, _data_rx) = TaskRunner::builder()
+        .total(1000)
+        .connector(StreamConnector::from(futures::future::pending()))
+        .runner_id(1)
+        .limit_receiver(limits)
+        .cancel_token(CancellationToken::new())
+        .connect_timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let mut run = RunnerLoop::new(&mut runner);
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(run.poll_step(&mut cx).is_pending());
+
+    // Limits win over the expired timeout, but do not extend it.
+    sleep(Duration::from_millis(200)).await;
+    for limit in (990..1000).rev() {
+        assert!(limit_tx.send(limit));
+        let std::task::Poll::Ready(step @ Step::Control(Ok(_))) = run.poll_step(&mut cx) else {
+            panic!("a waiting limit wins over the expired timeout");
+        };
+        run.handle_step(step);
+    }
+    let std::task::Poll::Ready(step @ Step::ConnectTimeout) = run.poll_step(&mut cx) else {
+        panic!("the timeout was extended");
+    };
+    run.handle_step(step);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let step = std::future::poll_fn(|cx| run.poll_step(cx)).await;
+            let published = matches!(step, Step::StoppedPublished);
+            run.handle_step(step);
+            if published {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        lifecycle_rx.try_pop(),
+        Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+            TaskError::Timeout
+        )))
+    ));
+    assert!(lifecycle_rx.try_pop().is_none());
+    drop(limit_tx);
+}
+
+#[test]
+fn test_connecting_priority_control_timeout_connection() {
+    use super::run_loop::{RunnerLoop, Step};
+
+    /// The first event of a connecting runner whose connect timeout and
+    /// connection, and its control as given, are ready.
+    async fn first(control: bool) -> &'static str {
+        let (limit_tx, limits) = limit_mailbox();
+        if control {
+            assert!(limit_tx.send(5));
+        }
+        let (mut runner, _lifecycle_rx, _data_rx) = TaskRunner::builder()
+            .total(10)
+            .connector(StreamConnector::from(async { Ok(frames(1)) }))
+            .runner_id(1)
+            .limit_receiver(limits)
+            .cancel_token(CancellationToken::new())
+            .connect_timeout(Duration::ZERO)
+            .build()
+            .unwrap();
+        let mut run = RunnerLoop::new(&mut runner);
+        match std::future::poll_fn(|cx| run.poll_step(cx)).await {
+            Step::Control(Ok(_)) => "control",
+            Step::ConnectTimeout => "timeout",
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    on_each_executor(|| async {
+        assert_eq!(first(true).await, "control");
+        assert_eq!(first(false).await, "timeout");
+    });
+}
+
+#[tokio::test]
+async fn test_run_after_started_holds_the_timeouts_until_ready() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for total in [Some(10), None] {
+        let polled = Arc::new(AtomicBool::new(false));
+        let stream_polled = polled.clone();
+        let mut item = Some(Ok(Bytes::from_static(&[1; 10])));
+        let stream = Box::pin(futures::stream::poll_fn(move |_| {
+            stream_polled.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(item.take())
+        }));
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let mut builder = TaskRunner::builder()
+            .stream(stream)
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(CancellationToken::new())
+            .idle_timeout(Duration::from_millis(50))
+            .data_drain_timeout(Duration::from_millis(50));
+        if let Some(total) = total {
+            builder = builder.total(total);
+        }
+        let (mut runner, mut lifecycle_rx, mut data_rx) = builder.build().unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            runner
+                .run_after_started(async move {
+                    let _ = ready_rx.await;
+                })
+                .await;
+        });
+
+        let started = timeout(Duration::from_secs(5), lifecycle_rx.next())
+            .await
+            .unwrap();
+        assert!(matches!(started, Some(LifecycleEvent::Started)));
+        // Longer than both timeouts; nothing runs until ready.
+        sleep(Duration::from_millis(200)).await;
+        assert!(!polled.load(Ordering::SeqCst), "{total:?}");
+        ready_tx.send(()).unwrap();
+
+        let (received, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+        handle.await.unwrap();
+        assert!(
+            matches!(reason, StoppedReason::Finished),
+            "{total:?}: {reason:?}"
+        );
+        assert_eq!(received, 10);
+    }
+}
