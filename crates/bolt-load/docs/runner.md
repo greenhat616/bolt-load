@@ -27,6 +27,12 @@ Runners accept [`ControlSignal`] messages for dynamic adjustments:
 
 - `LimitTotal(u64)` — cap the maximum bytes this runner should download.
 
+A runner built with [`TaskRunnerBuilder::control_signal`] applies every
+signal in order and fails with [`ExceededTotalSize`] on one that does not
+lower a known total. The runners of a concurrent task instead read only the
+latest limit the runner manager sent, so any number of limits can be sent to
+a runner that is still connecting.
+
 # Timeout & Error Handling
 
 - **Idle stream detection**: if no non-empty data arrives within the

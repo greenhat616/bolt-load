@@ -8,7 +8,6 @@
 
 use std::{collections::HashMap, ops::Range};
 
-use async_channel::{Receiver, Sender, TrySendError};
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
@@ -102,9 +101,12 @@ use super::{
     strategy::RunnerOutcomeSampler,
 };
 use crate::{
-    runner::{DataFrameReceiver, LifecycleEvent, LifecycleReceiver, StoppedReason, TaskError},
+    runner::{
+        DataFrameReceiver, LifecycleEvent, LifecycleReceiver, LimitReceiver, LimitSender,
+        StoppedReason, TaskError, limit_mailbox,
+    },
     task::{
-        ControlEvent, RunnerId,
+        RunnerId,
         instance::{Generator, concurrent_task::strategy::RunnerFailureKind},
     },
 };
@@ -118,39 +120,13 @@ pub use data::{DataAggregator, DataStreamEvent};
 pub use lifecycle::{LifecycleAggregator, LifecycleStreamEvent};
 pub use pending::PendingRunnerReceiver;
 
-/// Default capacity for control channels
-pub(super) const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 8;
-
-/// Type alias for control message sender
-pub type ControlSender = Sender<ControlEvent>;
-
-/// Type alias for control message receiver
-pub type ControlReceiver = Receiver<ControlEvent>;
-
 /// Errors that may occur when sending messages
 #[derive(Debug, snafu::Snafu)]
 pub enum SendError {
     #[snafu(display("Runner {runner_id} not found"))]
     RunnerNotFound { runner_id: RunnerId },
-    #[snafu(display("Control channel is full"))]
-    ChannelFull,
-    #[snafu(display("Control channel is closed"))]
-    ChannelClosed,
-}
-
-trait ManagerControlMapExt {
-    fn send_message(&self, runner_id: RunnerId, message: ControlEvent) -> Result<(), SendError>;
-}
-
-impl ManagerControlMapExt for HashMap<RunnerId, ControlSender> {
-    fn send_message(&self, runner_id: RunnerId, message: ControlEvent) -> Result<(), SendError> {
-        if let Some(tx) = self.get(&runner_id) {
-            tx.try_send(message)?;
-            Ok(())
-        } else {
-            Err(SendError::RunnerNotFound { runner_id })
-        }
-    }
+    #[snafu(display("Runner {runner_id} no longer receives limits"))]
+    ReceiverGone { runner_id: RunnerId },
 }
 
 /// Errors that may occur when resizing a runner's chunk.
@@ -158,28 +134,16 @@ impl ManagerControlMapExt for HashMap<RunnerId, ControlSender> {
 pub enum ResizeError {
     #[snafu(transparent)]
     Planner { source: super::chunk_planner::Error },
-    #[snafu(display("Failed to limit runner {runner_id}: {source}"))]
-    Limit {
-        runner_id: RunnerId,
-        source: SendError,
-    },
-}
-
-impl<T> From<TrySendError<T>> for SendError {
-    fn from(err: TrySendError<T>) -> Self {
-        match err {
-            TrySendError::Full(_) => SendError::ChannelFull,
-            TrySendError::Closed(_) => SendError::ChannelClosed,
-        }
-    }
+    #[snafu(transparent)]
+    Limit { source: SendError },
 }
 
 /// Runner registration information
 pub struct RunnerRegistration {
     /// Runner ID
     pub runner_id: RunnerId,
-    /// Control message receiver
-    pub control_rx: ControlReceiver,
+    /// The limits the manager sends to the runner
+    pub limits: LimitReceiver,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,8 +164,8 @@ pub struct RunnerManager {
     /// Chunk planner for managing chunk allocation and progress
     chunk_planner: ChunkPlanner,
 
-    /// Control channel mapping for sending messages to specific runners
-    control_channels: HashMap<RunnerId, ControlSender>,
+    /// Where to send each runner its limits
+    limit_senders: HashMap<RunnerId, LimitSender>,
     /// Pending runners for creating runners
     pending_runners: PendingRunnerGroup,
     /// Sampler for tracking the outcome of the runners
@@ -227,7 +191,7 @@ impl RunnerManager {
         Self {
             id_generator: Generator::new(max_concurrency),
             chunk_planner: ChunkPlanner::new(total),
-            control_channels: HashMap::with_capacity(max_concurrency),
+            limit_senders: HashMap::with_capacity(max_concurrency),
             pending_runners: PendingRunnerGroup::new(),
             runner_outcome_sampler: RunnerOutcomeSampler::with_defaults(),
             lifecycle_aggregator: LifecycleAggregator::with_capacity(max_concurrency),
@@ -250,30 +214,27 @@ impl RunnerManager {
 
     // ==================== ID Generator Related Methods ====================
 
-    /// Allocates a new runner ID and corresponding control channel
+    /// Allocates a new runner ID and the mailbox for its limits
     ///
     /// # Returns
     /// * `Some(RunnerRegistration)` - If allocation is successful
     /// * `None` - If maximum concurrency has been reached
     pub fn allocate_runner(&mut self) -> Option<RunnerRegistration> {
         let runner_id = self.id_generator.next()?;
-        let (tx, rx) = async_channel::bounded(DEFAULT_CONTROL_CHANNEL_CAPACITY);
-        self.control_channels.insert(runner_id, tx);
-        Some(RunnerRegistration {
-            runner_id,
-            control_rx: rx,
-        })
+        let (sender, limits) = limit_mailbox();
+        self.limit_senders.insert(runner_id, sender);
+        Some(RunnerRegistration { runner_id, limits })
     }
 
     /// Releases a runner ID and its associated resources
     ///
     /// This will:
-    /// - Close and remove the control channel
+    /// - Close and remove the limit mailbox
     /// - Remove from RunnerNotification (legacy) and aggregators (new)
     /// - Recycle the runner ID
     pub fn release_runner(&mut self, runner_id: RunnerId) {
-        // Close control channel (receiver will get closed signal after sender is dropped)
-        self.control_channels.remove(&runner_id);
+        // The runner sees its limits closed once the sender is dropped
+        self.limit_senders.remove(&runner_id);
         self.lifecycle_aggregator.remove(runner_id);
         self.data_aggregator.unregister(runner_id);
         self.id_generator.release(runner_id);
@@ -285,41 +246,41 @@ impl RunnerManager {
         self.id_generator.allocated_count()
     }
 
+    #[cfg(test)]
     /// Checks if maximum concurrency has been reached
     #[inline]
     pub fn is_full(&self) -> bool {
         self.id_generator.is_full()
     }
 
+    #[cfg(test)]
     /// Checks if there are no runners
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.id_generator.is_empty()
     }
 
-    // ==================== Control Channel Related Methods ====================
+    // ==================== Control Related Methods ====================
 
-    /// Sends a control message to the specified runner
-    ///
-    /// # Arguments
-    /// * `runner_id` - ID of the target runner
-    /// * `message` - Message to send
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the message is sent successfully
-    /// * `Err(SendError)` - If sending fails
-    pub fn send_message(
-        &self,
-        runner_id: RunnerId,
-        message: ControlEvent,
-    ) -> Result<(), SendError> {
-        self.control_channels.send_message(runner_id, message)
+    #[cfg(test)]
+    /// Lower the runner's size limit to `limit`, replacing any limit it has
+    /// not read yet.
+    pub fn limit_runner(&self, runner_id: RunnerId, limit: u64) -> Result<(), SendError> {
+        let sender = self
+            .limit_senders
+            .get(&runner_id)
+            .ok_or(SendError::RunnerNotFound { runner_id })?;
+        if sender.send(limit) {
+            Ok(())
+        } else {
+            Err(SendError::ReceiverGone { runner_id })
+        }
     }
 
-    /// Control messages waiting for the runner to receive them.
+    /// The limit the runner has not read yet.
     #[cfg(test)]
-    pub(super) fn queued_controls(&self, runner_id: RunnerId) -> usize {
-        self.control_channels.get(&runner_id).map_or(0, Sender::len)
+    pub(super) fn unread_limit(&self, runner_id: RunnerId) -> Option<u64> {
+        self.limit_senders.get(&runner_id)?.unread()
     }
 
     // ==================== Runner Notification Related Methods ====================
@@ -354,23 +315,20 @@ impl RunnerManager {
         self.data_aggregator.register(runner_id, data_rx);
     }
 
-    /// Returns a reference to the data aggregator for consuming data
-    pub fn data_aggregator(&mut self) -> &mut DataAggregator {
-        &mut self.data_aggregator
-    }
-
     /// Gets the total file size
     #[inline]
     pub fn total(&self) -> u64 {
         self.chunk_planner.total
     }
 
+    #[cfg(test)]
     /// Allocates a chunk to the specified runner
     #[inline]
     pub fn allocate_chunk(&mut self, range: Range<u64>, runner_id: RunnerId) -> bool {
         self.chunk_planner.allocate_chunk(range, Some(runner_id))
     }
 
+    #[cfg(test)]
     /// Updates the download progress of a runner
     #[inline]
     pub fn update_progress(
@@ -382,6 +340,7 @@ impl RunnerManager {
             .update_progress(runner_id, bytes_downloaded)
     }
 
+    #[cfg(test)]
     /// Marks a runner as finished
     #[inline]
     pub fn mark_finished(
@@ -391,6 +350,7 @@ impl RunnerManager {
         self.chunk_planner.mark_finished(runner_id)
     }
 
+    #[cfg(test)]
     /// Marks a runner as failed
     #[inline]
     pub fn mark_failed(
@@ -450,6 +410,7 @@ impl RunnerManager {
 
     // ==================== Combined Operations ====================
 
+    #[cfg(test)]
     /// Allocates a new runner and assigns a chunk
     ///
     /// This is a convenience method that combines `allocate_runner` and `allocate_chunk`
@@ -473,7 +434,7 @@ impl RunnerManager {
     pub fn allocate_pending_runner_with_chunk(
         &mut self,
         range: Range<u64>,
-        f: impl FnOnce(RunnerId, ControlReceiver) -> PendingRunnerReceiver,
+        f: impl FnOnce(RunnerId, LimitReceiver) -> PendingRunnerReceiver,
     ) -> Option<()> {
         let registration = self.allocate_runner()?;
         if !self
@@ -483,12 +444,13 @@ impl RunnerManager {
             self.release_runner(registration.runner_id);
             return None;
         }
-        let rx = f(registration.runner_id, registration.control_rx);
+        let rx = f(registration.runner_id, registration.limits);
         let context = PendingRunnerContext::new(registration.runner_id, range);
         self.pending_runners.insert(context, rx);
         Some(())
     }
 
+    #[cfg(test)]
     /// Fully releases a runner (including marking chunk as complete)
     ///
     /// # Arguments
@@ -518,25 +480,22 @@ impl RunnerManager {
     /// part, and limit the runner to match.
     ///
     /// On error nothing changes: the planner is rolled back when the runner
-    /// cannot be sent the limit.
+    /// no longer receives limits.
     #[inline]
     pub fn resize_runner(&mut self, runner_id: RunnerId, new_size: u64) -> Result<(), ResizeError> {
-        let Self {
-            chunk_planner,
-            control_channels,
-            ..
-        } = self;
-        let mut guard = PlannerGuard::new(chunk_planner);
+        let mut guard = PlannerGuard::new(&mut self.chunk_planner);
         let limit = match guard.planner().resize_runner_state(runner_id, new_size)? {
             Resize::Unchanged => return Ok(()),
             Resize::Shrunk { limit } => limit,
         };
-
-        // Limit the total size of the runner
-        control_channels
-            .send_message(runner_id, ControlEvent::LimitTotal(limit))
-            .map_err(|source| ResizeError::Limit { runner_id, source })?;
-
+        // The chunk only shrinks, so the new limit may replace an unread one.
+        let sender = self
+            .limit_senders
+            .get(&runner_id)
+            .ok_or(SendError::RunnerNotFound { runner_id })?;
+        if !sender.send(limit) {
+            return Err(SendError::ReceiverGone { runner_id }.into());
+        }
         guard.commit();
         Ok(())
     }
@@ -704,10 +663,6 @@ impl RunnerManager {
         }
     }
 
-    #[expect(
-        private_interfaces,
-        reason = "`RunnerTick` is internal to the concurrent task"
-    )]
     pub async fn tick(&mut self) -> RunnerTick {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
         let next_data = self.data_aggregator.next().fuse();
@@ -735,10 +690,6 @@ impl RunnerManager {
         }
     }
 
-    #[expect(
-        private_interfaces,
-        reason = "`RunnerTick` is internal to the concurrent task"
-    )]
     pub async fn tick_lifecycle_only(&mut self) -> RunnerTick {
         let next_lifecycle = self.lifecycle_aggregator.next().fuse();
         let pending = self.pending_runners.next().fuse();
@@ -795,25 +746,21 @@ mod tests {
     }
 
     #[test]
-    fn test_send_message() {
+    fn test_limit_runner() {
         let mut manager = RunnerManager::new(1000, 2);
+        let mut reg = manager.allocate_runner().unwrap();
 
-        // Allocate runner
-        let reg = manager.allocate_runner().unwrap();
+        manager.limit_runner(reg.runner_id, 500).unwrap();
+        assert_eq!(reg.limits.try_recv(), Some(500));
 
-        // Send message
-        let result = manager.send_message(reg.runner_id, ControlEvent::LimitTotal(500));
-        assert!(result.is_ok());
-
-        // Receive message
-        let msg = reg.control_rx.try_recv().unwrap();
-        assert!(matches!(msg, ControlEvent::LimitTotal(500)));
-
-        // Send message to non-existent runner
-        let result = manager.send_message(999, ControlEvent::LimitTotal(500));
         assert!(matches!(
-            result,
+            manager.limit_runner(999, 500),
             Err(SendError::RunnerNotFound { runner_id: 999 })
+        ));
+        drop(reg.limits);
+        assert!(matches!(
+            manager.limit_runner(reg.runner_id, 400),
+            Err(SendError::ReceiverGone { runner_id: 0 })
         ));
     }
 
@@ -834,7 +781,7 @@ mod tests {
     #[test]
     fn test_resize_runner_shrinks_and_limits_the_runner() {
         let mut manager = RunnerManager::new(1000, 2);
-        let reg = manager.allocate_runner_with_chunk(0..500).unwrap();
+        let mut reg = manager.allocate_runner_with_chunk(0..500).unwrap();
         manager.update_progress(reg.runner_id, 100).unwrap();
 
         manager.resize_runner(reg.runner_id, 150).unwrap();
@@ -842,16 +789,13 @@ mod tests {
             manager.get_runner_state(reg.runner_id).unwrap().allocated,
             0..250
         );
-        assert!(matches!(
-            reg.control_rx.try_recv(),
-            Ok(ControlEvent::LimitTotal(250))
-        ));
+        assert_eq!(reg.limits.try_recv(), Some(250));
     }
 
     #[test]
     fn test_resize_runner_rejected_or_unchanged_sends_nothing() {
         let mut manager = RunnerManager::new(1000, 2);
-        let reg = manager.allocate_runner_with_chunk(0..500).unwrap();
+        let mut reg = manager.allocate_runner_with_chunk(0..500).unwrap();
         manager.update_progress(reg.runner_id, 100).unwrap();
 
         // Growing is rejected, keeping the chunk.
@@ -868,36 +812,38 @@ mod tests {
             manager.get_runner_state(reg.runner_id).unwrap().allocated,
             0..500
         );
-        assert!(reg.control_rx.try_recv().is_err());
+        assert_eq!(reg.limits.try_recv(), None);
     }
 
     #[test]
-    fn test_resize_runner_rolls_back_when_the_limit_cannot_be_sent() {
+    fn test_resize_unread_runner_keeps_the_latest_limit() {
+        let mut manager = RunnerManager::new(1 << 40, 2);
+        let mut reg = manager.allocate_runner_with_chunk(0..1 << 40).unwrap();
+        // Far more reductions than any queue would hold, none read.
+        for _ in 0..4096 {
+            let incomplete = manager.get_runner_state(0).unwrap().incomplete_range();
+            manager.resize_runner(0, incomplete.end - 1).unwrap();
+        }
+        assert_eq!(
+            manager.get_runner_state(0).unwrap().allocated,
+            0..(1 << 40) - 4096
+        );
+        assert_eq!(reg.limits.try_recv(), Some((1 << 40) - 4096));
+        assert_eq!(reg.limits.try_recv(), None);
+    }
+
+    #[test]
+    fn test_resize_runner_rolls_back_when_the_runner_is_gone() {
         let mut manager = RunnerManager::new(1000, 2);
         let reg = manager.allocate_runner_with_chunk(0..512).unwrap();
-        for _ in 0..DEFAULT_CONTROL_CHANNEL_CAPACITY {
-            let incomplete = manager.get_runner_state(0).unwrap().incomplete_range();
-            manager.resize_runner(0, incomplete.end / 2).unwrap();
-        }
-        let full = manager.get_runner_state(0).unwrap().allocated.clone();
+        drop(reg.limits);
         assert!(matches!(
-            manager.resize_runner(0, full.end / 2),
+            manager.resize_runner(0, 256),
             Err(ResizeError::Limit {
-                runner_id: 0,
-                source: SendError::ChannelFull
+                source: SendError::ReceiverGone { runner_id: 0 }
             })
         ));
-        assert_eq!(manager.get_runner_state(0).unwrap().allocated, full);
-
-        drop(reg.control_rx);
-        assert!(matches!(
-            manager.resize_runner(0, full.end / 2),
-            Err(ResizeError::Limit {
-                runner_id: 0,
-                source: SendError::ChannelClosed
-            })
-        ));
-        assert_eq!(manager.get_runner_state(0).unwrap().allocated, full);
+        assert_eq!(manager.get_runner_state(0).unwrap().allocated, 0..512);
     }
 
     #[test]
@@ -925,13 +871,12 @@ mod tests {
         let mut manager = RunnerManager::new(1000, 2);
 
         // Allocate pending runner with chunk
-        let result =
-            manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _control_rx| {
-                assert_eq!(runner_id, 0);
-                // Return a receiver that will resolve later
-                let (_, rx) = oneshot::channel::<Result<RunnerBuilderOutput, PendingRunnerError>>();
-                rx
-            });
+        let result = manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _limits| {
+            assert_eq!(runner_id, 0);
+            // Return a receiver that will resolve later
+            let (_, rx) = oneshot::channel::<Result<RunnerBuilderOutput, PendingRunnerError>>();
+            rx
+        });
 
         assert!(result.is_some());
         assert_eq!(manager.allocated_runner_count(), 1);
@@ -982,7 +927,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
 
         // Allocate pending runner
-        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _control_rx| {
+        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _limits| {
             assert_eq!(runner_id, 0);
             rx
         });
@@ -1028,7 +973,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
 
         // Allocate pending runner
-        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _control_rx| {
+        manager.allocate_pending_runner_with_chunk(0..500, |runner_id, _limits| {
             assert_eq!(runner_id, 0);
             rx
         });
@@ -1323,7 +1268,7 @@ mod tests {
             .total(64)
             .stream(Box::pin(test_stream))
             .runner_id(runner_id)
-            .control_signal(registration.control_rx)
+            .limit_receiver(registration.limits)
             .cancel_token(cancel_token)
             .data_drain_timeout(Duration::from_millis(50))
             .build()

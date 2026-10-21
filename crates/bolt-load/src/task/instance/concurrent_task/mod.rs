@@ -38,13 +38,10 @@ mod test_support;
 use chunk_planner::*;
 use download_loop::DownloadLoop;
 use file_writer::*;
-pub use runner_manager::{ControlReceiver, ControlSender, RunnerManager, RunnerRegistration};
+use runner_manager::RunnerManager;
 use runner_spawner::RunnerSpawner;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
-
-#[cfg(test)]
-use runner_manager::DEFAULT_CONTROL_CHANNEL_CAPACITY;
 
 #[expect(
     dead_code,
