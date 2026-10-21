@@ -1,87 +1,123 @@
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
+
 use async_ringbuf::traits::*;
 use bolt_load_utils::telemetry::*;
-use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, future::Either};
+use bytes::Bytes;
 
-use super::super::{DataFrame, TaskError, TaskRunError, TaskRunner};
+use super::{Cancelled, Phase, RunnerLoop};
+use crate::{
+    runner::{DataFrame, TaskError, TaskRunError, TaskRunner},
+    task::ControlEvent,
+};
 
-impl TaskRunner {
-    /// Push `data` downstream, applying the control signals that arrive meanwhile.
-    ///
-    /// Returns `Err` when the push fails or the runner is cancelled, and
-    /// `Ok(Some(_))` when the push succeeded but a control signal failed
-    /// meanwhile; only the first such error is kept. The stream is not polled
-    /// while pushing, so waiting for the consumer does not count as idle.
-    pub(in crate::runner) async fn emit(
+/// `Err` when the push failed or the runner was cancelled, `Ok(Some(_))`
+/// when the push succeeded but a control signal failed meanwhile.
+pub(super) type EmitResult = Result<Option<TaskRunError>, TaskRunError>;
+
+/// A frame being pushed downstream while the control signals that arrive
+/// meanwhile are applied.
+///
+/// Only the first control error is kept. The stream is not polled while
+/// pushing, so waiting for the consumer does not count as idle.
+pub(super) struct Emission {
+    frame: Option<DataFrame>,
+    deferred: Option<TaskRunError>,
+    control_open: bool,
+}
+
+impl Emission {
+    pub(super) fn new(data: Bytes) -> Self {
+        Self {
+            frame: Some(DataFrame { data }),
+            deferred: None,
+            control_open: true,
+        }
+    }
+
+    /// Priority: cancel > control > data vacancy.
+    pub(super) fn poll(
         &mut self,
-        data: Bytes,
-    ) -> Result<Option<TaskRunError>, TaskRunError> {
-        let len = data.len() as u64;
-        let Self {
-            total,
-            downloaded,
-            control_signal,
-            data_tx,
-            cancel_token,
-            ..
-        } = self;
-        let data_tx = data_tx.as_mut().ok_or(TaskError::ChannelClosed)?;
-        let push = data_tx.push(DataFrame { data });
-        let cancelled = cancel_token.cancelled().fuse();
-        futures::pin_mut!(push, cancelled);
-        let mut deferred = None;
-        let mut control_open = true;
+        runner: &mut TaskRunner,
+        cancelled: &mut Cancelled,
+        cx: &mut Context<'_>,
+    ) -> Poll<EmitResult> {
+        if runner.data_tx.is_none() {
+            return Poll::Ready(Err(TaskError::ChannelClosed.into()));
+        }
         loop {
-            let control = if control_open {
-                Either::Left(control_signal.recv())
-            } else {
-                Either::Right(futures::future::pending())
+            if let Poll::Ready(()) = cancelled.as_mut().poll(cx) {
+                return Poll::Ready(Err(TaskRunError::Cancelled));
             }
-            .fuse();
-            futures::pin_mut!(control);
-            futures::select_biased! {
-                _ = cancelled => return Err(TaskRunError::Cancelled),
-                signal = control => {
-                    let err = match signal {
-                        Ok(signal) => Self::apply_control(total, &signal).err().map(Into::into),
-                        Err(_) => {
-                            // The manager has released this runner
-                            control_open = false;
-                            Some(TaskError::ChannelClosed.into())
-                        }
-                    };
-                    match err {
-                        Some(err) if deferred.is_some() => {
-                            warn!("discarding control error during push: {err:?}");
-                        }
-                        err => deferred = deferred.or(err),
-                    }
-                }
-                res = push => {
-                    res.map_err(|_| TaskError::ChannelClosed)?;
-                    *downloaded += len;
-                    return Ok(deferred);
-                }
+            if self.control_open
+                && let Poll::Ready(event) = runner.poll_control(cx)
+            {
+                self.on_control(runner, event);
+                continue;
             }
+            return self
+                .poll_push(runner, cx)
+                .map(|pushed| pushed.map(|()| self.deferred.take()));
         }
     }
 
-    /// Push the buffered bytes, if any. See [`Self::emit`] for the result.
-    pub(super) async fn flush(
+    fn on_control(&mut self, runner: &mut TaskRunner, event: Result<ControlEvent, TaskRunError>) {
+        let error = match event {
+            Ok(event) => runner.apply_limit(&event).err(),
+            Err(error) => {
+                // The manager has released this runner
+                self.control_open = false;
+                Some(error)
+            }
+        };
+        match error {
+            Some(error) if self.deferred.is_some() => {
+                warn!("discarding control error during push: {error:?}");
+            }
+            error => self.deferred = self.deferred.take().or(error),
+        }
+    }
+
+    fn poll_push(
         &mut self,
-        buff: &mut BytesMut,
-    ) -> Result<Option<TaskRunError>, TaskRunError> {
-        if buff.is_empty() {
-            return Ok(None);
+        runner: &mut TaskRunner,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), TaskRunError>> {
+        let data_tx = runner.data_tx.as_mut().expect("checked by `poll`");
+        if !ready!(Pin::new(&mut *data_tx).poll_ready(cx)) {
+            return Poll::Ready(Err(TaskError::ChannelClosed.into()));
         }
-        self.emit(buff.split().freeze()).await
+        let frame = self.frame.take().expect("a frame is pushed once");
+        let len = frame.data.len() as u64;
+        // The only producer saw a vacant slot.
+        if data_tx.try_push(frame).is_err() {
+            unreachable!("a vacant slot was filled by another producer");
+        }
+        runner.downloaded += len;
+        Poll::Ready(Ok(()))
     }
+}
 
-    /// Push the buffered bytes, failing with a control error deferred by the push.
-    pub(super) async fn flush_checked(&mut self, buff: &mut BytesMut) -> Result<(), TaskRunError> {
-        match self.flush(buff).await? {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+impl RunnerLoop<'_> {
+    #[inline]
+    pub(super) fn poll_emit(&mut self, cx: &mut Context<'_>) -> Poll<EmitResult> {
+        let Phase::Streaming(state) = &mut self.phase else {
+            unreachable!("not streaming");
+        };
+        let emission = state.staged_mut().expect("a buffer was staged");
+        emission.poll(self.runner, &mut self.cancelled, cx)
+    }
+}
+
+#[cfg(test)]
+impl TaskRunner {
+    /// Push `data` the way a running runner does.
+    pub(in crate::runner) async fn emit(&mut self, data: Bytes) -> EmitResult {
+        let mut cancelled = Box::pin(self.cancel_token.clone().cancelled_owned());
+        let mut emission = Emission::new(data);
+        std::future::poll_fn(|cx| emission.poll(self, &mut cancelled, cx)).await
     }
 }

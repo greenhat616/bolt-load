@@ -101,9 +101,10 @@ impl TaskRunnerBuilder {
             downloaded: 0,
             stream: self.stream.ok_or(TaskRunnerBuilderError::StreamNotSet)?,
 
-            control_signal: self
-                .control_signal
-                .ok_or(TaskRunnerBuilderError::ControlSignalNotSet)?,
+            control_signal: Box::pin(
+                self.control_signal
+                    .ok_or(TaskRunnerBuilderError::ControlSignalNotSet)?,
+            ),
             lifecycle_tx: lifecycle_prod,
             data_tx: Some(data_prod),
             data_drain_timeout: self.data_drain_timeout.unwrap_or(DATA_DRAIN_TIMEOUT),
