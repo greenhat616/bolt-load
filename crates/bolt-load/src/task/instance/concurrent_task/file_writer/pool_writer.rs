@@ -8,19 +8,15 @@ use fs_err as fs;
 use snafu::prelude::*;
 
 use super::{
-    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu, finalize_and_join,
+    Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
+    FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu,
+    WriteRangeSnafu, WriteReply, finalize_and_join,
 };
 
 pub struct PoolWriter {
     pub file: File,
-    tx: Sender<Command>,
+    pub(super) tx: Sender<Command>,
     worker_wg: WaitGroup,
-}
-
-enum Command {
-    Write(Chunk, oneshot::Sender<Result<(), std::io::Error>>),
-    Finalize(oneshot::Sender<Result<(), std::io::Error>>),
 }
 
 impl FileRangeWriter for PoolWriter {
@@ -31,15 +27,21 @@ impl FileRangeWriter for PoolWriter {
             worker_wg,
         } = self;
         let path = file.path().to_path_buf();
-        drop(file);
-        finalize_and_join(tx, worker_wg, path, Command::Finalize).await
+        let joined = finalize_and_join(tx, worker_wg, path.clone(), Command::Finalize).await;
+        // Sync once every worker is gone: one may still have been writing
+        // when another took the finalize command.
+        let synced = blocking::unblock(move || file.sync_all())
+            .await
+            .map_err(CommandError::from)
+            .context(FinalizeSnafu { path });
+        joined.and(synced)
     }
 
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
         let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(chunk.clone(), tx))
+            .send(Command::Write(chunk.clone(), WriteReply::Awaited(tx)))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
@@ -113,16 +115,20 @@ fn write_all_at(file: &impl WriteAt, mut buf: &[u8], mut offset: u64) -> io::Res
     Ok(())
 }
 
+fn execute_write(file: &File, chunk: Chunk) -> io::Result<()> {
+    write_all_at(file, &chunk.data, chunk.range.start)
+}
+
 fn file_writer_task(file: &File, command_rx: &Receiver<Command>) {
+    let _close_on_exit = CloseOnExit(command_rx);
     while let Ok(command) = command_rx.recv_blocking() {
         match command {
-            Command::Write(chunk, tx) => {
-                let _ = tx.send(write_all_at(file, &chunk.data, chunk.range.start));
+            Command::Write(chunk, reply) => {
+                reply.complete(execute_write(file, chunk), file.path());
             }
             Command::Finalize(tx) => {
-                // The `flush` on unix and windows is a no-op,
-                // and we can just use `sync_all` for synchronizing all data to disk.
-                let _ = tx.send(file.sync_all());
+                // The owner syncs the file once all workers exited.
+                let _ = tx.send(Ok(()));
                 break;
             }
         }

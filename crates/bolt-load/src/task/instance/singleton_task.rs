@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter},
-    runner::{LifecycleEvent, StoppedReason, StreamConnector, TaskError, TaskRunner},
+    runner::{LifecycleEvent, StoppedReason, TaskError, TaskRunner},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
     task::{
         Progress, RunnerId, TaskOptions,
@@ -259,9 +259,7 @@ impl SingletonTaskInner {
         let (control_tx, control_rx) = async_channel::bounded(CONTROL_CHANNEL_CAPACITY);
         let adapter = self.adapter.clone();
         let mut builder = TaskRunner::builder()
-            .connector(StreamConnector::from(
-                async move { adapter.full_stream().await },
-            ))
+            .connector(async move { adapter.full_stream().await })
             .runner_id(STATIC_RUNNER_ID)
             .control_signal(control_rx)
             .cancel_token(runner_token.clone())

@@ -7,18 +7,14 @@ use compio::{BufResult, fs::OpenOptions, io::AsyncWriteAtExt, runtime::Runtime};
 use snafu::prelude::*;
 
 use super::{
-    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu, finalize_and_join,
+    Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
+    FileWriterCapability, FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
+    WriteReply, finalize_and_join,
 };
 
-enum Command {
-    Write(Chunk, oneshot::Sender<Result<(), std::io::Error>>),
-    Finalize(oneshot::Sender<Result<(), std::io::Error>>),
-}
-
 pub struct CompioWriter {
-    path: PathBuf,
-    tx: Sender<Command>,
+    pub(super) path: PathBuf,
+    pub(super) tx: Sender<Command>,
     worker_wg: WaitGroup,
 }
 
@@ -27,7 +23,7 @@ impl FileRangeWriter for CompioWriter {
         let (tx, rx) = oneshot::channel();
         let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(chunk.clone(), tx))
+            .send(Command::Write(chunk.clone(), WriteReply::Awaited(tx)))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
@@ -70,18 +66,25 @@ impl core::fmt::Debug for CompioWriter {
     }
 }
 
+async fn execute_write(file: &mut compio::fs::File, chunk: Chunk) -> std::io::Result<()> {
+    let BufResult(result, _) = file.write_all_at(chunk.data, chunk.range.start).await;
+    result
+}
+
 fn compio_file_writer_task(
     path: PathBuf,
     ready_tx: oneshot::Sender<Result<(), std::io::Error>>,
     command_rx: &Receiver<Command>,
 ) {
+    let _close_on_exit = CloseOnExit(command_rx);
+    let path = std::sync::Arc::new(path);
     let rt = Runtime::new().expect("failed to create runtime");
     rt.block_on(async {
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(path)
+            .open(path.as_path())
             .await
         {
             Ok(file) => {
@@ -98,14 +101,14 @@ fn compio_file_writer_task(
         let wg = WaitGroup::new();
         while let Ok(command) = command_rx.recv().await {
             match command {
-                Command::Write(chunk, tx) => {
+                Command::Write(chunk, reply) => {
                     let mut file = file.clone();
                     let wg = wg.clone();
+                    let path = path.clone();
                     rt.spawn(async move {
                         let _wg = wg;
-                        let BufResult(result, _) =
-                            file.write_all_at(chunk.data, chunk.range.start).await;
-                        let _ = tx.send(result);
+                        let result = execute_write(&mut file, chunk).await;
+                        reply.complete(result, path.as_path());
                     })
                     .detach();
                 }
@@ -294,7 +297,7 @@ mod tests {
             data: Bytes::from_static(b"test"),
         };
         let (tx, _rx) = oneshot::channel();
-        let _cmd = Command::Write(chunk, tx);
+        let _cmd = Command::Write(chunk, WriteReply::Awaited(tx));
 
         // Test Finalize variant
         let (tx2, _rx2) = oneshot::channel();

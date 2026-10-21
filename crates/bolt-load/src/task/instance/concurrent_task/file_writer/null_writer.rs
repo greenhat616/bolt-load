@@ -12,32 +12,28 @@ use bytes::Bytes;
 use snafu::prelude::*;
 
 use super::{
-    Chunk, CommandError, FileRangeWriter, FileWriterBuilderError, FileWriterCapability,
-    FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, WriteRangeSnafu,
+    Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
+    FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, WriteRangeSnafu,
+    WriteReply,
 };
-
-enum Command {
-    Write(Chunk, oneshot::Sender<Result<(), std::io::Error>>),
-    Finalize(oneshot::Sender<Result<(), std::io::Error>>),
-}
 
 /// A null writer that discards all data.
 ///
 /// This implementation uses the same channel-based architecture as other
 /// writers to ensure fair comparison in benchmarks.
 pub struct NullWriter {
-    tx: Sender<Command>,
+    pub(super) tx: Sender<Command>,
 }
 
 /// A sentinel path used for NullWriter since it doesn't have an actual file.
-const NULL_PATH: &str = "<null>";
+pub(super) const NULL_PATH: &str = "<null>";
 
 impl FileRangeWriter for NullWriter {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
         let chunk = Chunk { range, data };
         self.tx
-            .send(Command::Write(chunk.clone(), tx))
+            .send(Command::Write(chunk.clone(), WriteReply::Awaited(tx)))
             .await
             .map_err(|e| {
                 let Command::Write(chunk, _) = e.into_inner() else {
@@ -91,16 +87,20 @@ impl core::fmt::Debug for NullWriter {
     }
 }
 
+fn execute_write(_chunk: Chunk) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn null_writer_task(
     ready_tx: oneshot::Sender<Result<(), std::io::Error>>,
     command_rx: &Receiver<Command>,
 ) {
+    let _close_on_exit = CloseOnExit(command_rx);
     let _ = ready_tx.send(Ok(()));
     while let Ok(command) = command_rx.recv_blocking() {
         match command {
-            Command::Write(_chunk, tx) => {
-                // Discard the data immediately - simulate /dev/null
-                let _ = tx.send(Ok(()));
+            Command::Write(chunk, reply) => {
+                reply.complete(execute_write(chunk), std::path::Path::new(NULL_PATH));
             }
             Command::Finalize(tx) => {
                 let _ = tx.send(Ok(()));
