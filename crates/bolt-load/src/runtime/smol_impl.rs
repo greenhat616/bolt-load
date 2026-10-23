@@ -9,7 +9,6 @@ use std::{
 
 use bolt_load_utils::telemetry::*;
 use futures::task::{LocalFutureObj, LocalSpawn, Spawn, SpawnError};
-use smol::future::FutureExt;
 
 use super::{DowncastLocalRuntime, LocalRuntimeImpl, Sleep, Timer, TimerBuilder, TimerImpl};
 
@@ -54,18 +53,13 @@ impl SmolThreadedRuntime {
             debug!("spawn thread {} for smol runtime executor", i);
             let executor = executor.clone();
             let mut shutdown_signal = shutdown_rx.clone();
+            // Stay inside one `run` until shutdown, so the thread keeps its
+            // runner and local queue instead of re-entering after every task.
+            // `recv` also ends once the sender is dropped.
             std::thread::spawn(move || {
-                loop {
-                    if shutdown_signal.try_recv().is_ok() {
-                        break;
-                    }
-
-                    let timer = async move {
-                        smol::Timer::after(Duration::from_millis(100)).await;
-                    };
-
-                    smol::future::block_on(executor.run(executor.tick().or(timer)));
-                }
+                smol::future::block_on(executor.run(async move {
+                    let _ = shutdown_signal.recv().await;
+                }));
             });
         }
         Self {
@@ -279,10 +273,20 @@ mod tests {
     fn test_dropping_a_clone_keeps_the_executor_running() {
         let rt = SmolThreadedRuntime::build_with_threads(2);
         drop(rt.clone());
-        // Executor threads poll for shutdown every 100 ms.
+        // Give the executor threads time to exit if the drop shut them down.
         std::thread::sleep(Duration::from_millis(300));
         let (tx, rx) = oneshot::channel();
         rt.spawn(async move { tx.send(()).unwrap() }).detach();
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+    }
+
+    #[test]
+    fn test_shutdown_stops_the_executor_threads() {
+        let rt = SmolThreadedRuntime::build_with_threads(2);
+        rt.shutdown();
+        std::thread::sleep(Duration::from_millis(300));
+        let (tx, rx) = oneshot::channel();
+        rt.spawn(async move { tx.send(()).unwrap() }).detach();
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 }
