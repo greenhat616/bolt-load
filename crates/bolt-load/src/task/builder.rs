@@ -102,12 +102,11 @@ impl TaskBuilder {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub async fn retrieve_meta(&mut self) -> Result<&BoltLoadAdapterMeta, TaskManagerBuildError> {
         self.options.validate()?;
-        if self.adapter.is_none() {
+        let Some(adapter) = self.adapter.as_ref() else {
             return Err(TaskManagerBuildError::FieldValidationFailed {
                 message: "adapter is not set".to_string(),
             });
-        }
-        let adapter = self.adapter.as_ref().unwrap();
+        };
         let meta = try_get_or_init_meta(
             &self.meta,
             adapter,
@@ -236,21 +235,20 @@ impl TaskBuilder {
         )
     ))]
     pub async fn build(mut self) -> Result<Task, TaskManagerBuildError> {
-        if self.cancel_token.is_none() {
+        let Some(cancel_token) = self.cancel_token.take() else {
             return Err(TaskManagerBuildError::FieldValidationFailed {
                 message: "cancel token is not set".to_string(),
             });
-        }
+        };
         self.options.validate()?;
-        let cancel_token = self.cancel_token.take().unwrap();
         until_cancelled(&cancel_token, async {
             self.retrieve_meta().await.map(drop)
         })
         .await?;
         self.validate()?;
 
-        let adapter = self.adapter.take().unwrap();
-        let runtime = self.threaded_runtime.take().unwrap();
+        let adapter = self.adapter.take().expect("checked by `validate`");
+        let runtime = self.threaded_runtime.take().expect("checked by `validate`");
 
         // TODO: support dynamic check while manager support resumable or persistent
         let mode = if self
@@ -269,7 +267,7 @@ impl TaskBuilder {
         };
 
         // prepare the file handle
-        let save_path = self.save_path.unwrap();
+        let save_path = self.save_path.expect("checked by `validate`");
 
         // Check if the parent directory exists
         let parent_dir =
@@ -299,7 +297,7 @@ impl TaskBuilder {
             adapter,
             mode,
             save_path,
-            meta: self.meta.take().unwrap(),
+            meta: self.meta.take().expect("set by `retrieve_meta`"),
             threaded_rt: runtime.clone(),
             local_runtime_builder: self.local_runtime_builder.clone(),
             task: TaskInstanceImpl::with_options(
