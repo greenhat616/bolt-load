@@ -202,7 +202,7 @@ impl RunnerOutcomeSampler {
         if let Some(last) = self.last_unretryable_at
             && now.duration_since(last) <= within
         {
-            // 清除标记，避免重复触发
+            // Clear the mark so one failure triggers degradation only once.
             self.last_unretryable_at = None;
             return true;
         }
