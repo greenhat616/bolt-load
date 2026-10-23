@@ -36,3 +36,11 @@ tokio-util = "0.7"
 pretty_assertions = "1"
 n0-tracing-test = { version = "0.3.0", features = ["pretty-log-printing"] }
 
+
+# loom 0.7.2 lets an RMW read a value older than the latest store
+# (tokio-rs/loom#254), which fails the `bolt-load-sync` slot models
+# spuriously. Pinned to the unmerged fix (tokio-rs/loom#391) until a release
+# carries it; loom only builds under `--cfg loom`, and `[patch]` is not
+# published.
+[patch.crates-io]
+loom = { git = "https://github.com/ZobyTwo/loom", rev = "c673a8d" }

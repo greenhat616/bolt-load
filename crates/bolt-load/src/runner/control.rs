@@ -3,14 +3,16 @@ use std::{
     task::{Context, Poll},
 };
 
+/// The manager only ever lowers a runner's limit, so a newer limit may
+/// replace one the runner has not read yet; see [`bolt_load_sync::slot`].
+pub(crate) use bolt_load_sync::slot::{
+    Receiver as LimitReceiver, Sender as LimitSender, channel as limit_mailbox,
+};
 use bolt_load_utils::telemetry::*;
 use futures::Stream;
 
-pub(crate) use self::mailbox::{LimitReceiver, LimitSender, limit_mailbox};
 use super::{TaskError, TaskRunError, TaskRunner};
 use crate::task::ControlEvent;
-
-mod mailbox;
 
 /// Type alias for the control signal sender (point-to-point channel)
 pub type ControlSignalSender = async_channel::Sender<ControlEvent>;

@@ -4,6 +4,8 @@
 
 - Latest-value state sync from one owner to many subscribers (task
   progress first), without a tokio dependency.
+- A lock-free latest-value slot from one owner to one poller (runner
+  limits), model-checked.
 - Publishing must never wait for a subscriber to consume a value, fail
   because of one, or allocate per subscriber. It may wait for the value lock,
   which is only ever held for a pointer clone or swap.
@@ -59,6 +61,40 @@ the value takes the same lock and therefore cannot return the old pointer;
 they always match. `state` needs no `SeqCst`; `event-listener` itself uses
 a `SeqCst` fence inside `notify`.
 
+## `slot` protocol
+
+```
+Shared
+├── value:  AtomicU64     latest unread value, u64::MAX when empty
+├── closed: AtomicBool    set when the sender drops
+└── waker:  AtomicWaker   the receiver's waker
+```
+
+- `send`: fail if the receiver is gone (`Arc::strong_count == 1`); store the
+  value (`Release`), then wake.
+- `try_recv`: a `Relaxed` load skips the write when the slot is empty;
+  otherwise `swap(EMPTY, Acquire)` takes the value, so each is read once.
+- `poll_recv`: take; else register the waker, read `closed`, take again.
+  `closed` is read before the second take: the sender stores its last value
+  before setting `closed`, so a receiver that sees `closed` also sees that
+  value. Reading it after the take loses the last value (the
+  `slot_last_value_arrives_before_closed` model catches this).
+- Close: `Drop for Sender` sets `closed` (`Release`) and wakes.
+
+A send either precedes the registration, and the second take sees it, or
+follows it, and wakes the registered waker: `AtomicWaker` orders the two.
+Dropping the second take loses that send (caught by the two-send models).
+
+`AtomicWaker` is the algorithm of `futures::task::AtomicWaker` on
+`src/sync.rs` primitives, so loom models it with the slot instead of
+treating it as opaque. When `register` races a `wake`, it wakes the new
+waker itself and yields: the caller polls again at once, and under loom a
+spin without a yield never lets the `wake` finish.
+
+The slot is specific to `u64` so the value fits one atomic. A generic slot
+would need `Mutex<Option<T>>` or an allocation per send, which is what
+`watch` already offers.
+
 ## Differences from `tokio::sync::watch`
 
 | | tokio | here |
@@ -77,6 +113,9 @@ a `SeqCst` fence inside `notify`.
 | 2026-10-15 | `std::sync::Mutex`, not `parking_lot` | Uncontended cost is equal (publish 34.8 vs 38.0 ns, read 6.8 vs 5.2 ns on macOS). Under artificial contention neither wins, and `parking_lot`'s barging starved the writer (80 ns vs 1.2 µs per publish with one spinning reader). |
 | 2026-10-15 | `Mutex<Arc<T>>`, not `arc-swap` | No extra dependency; the lock is held for a pointer operation only. |
 | 2026-10-15 | `listener!` instead of `Event::listen` | `listen()` boxes the listener on every wait; the boxed variant was 2-4x slower in fan-out. |
+| 2026-10-24 | `slot` beside `watch`, not `watch` for runner limits | The runner polls its limits in place; `watch` has no poll API, allocates per send and registers an `event-listener` node on every pending poll. The slot moved here from `bolt-load` to get loom coverage. |
+| 2026-10-24 | Own `AtomicWaker` | `futures`' and `atomic-waker`'s use std atomics, which loom cannot model. |
+| 2026-10-24 | loom pinned to tokio-rs/loom#391 (`c673a8d`) | loom 0.7.2 lets an RMW read a value older than the latest store (tokio-rs/loom#254). A standalone repro (`swap` reads the initial value, a store is published, a second `swap` still reads 0) fails on 0.7.2 and passes on `c673a8d`; the two-send slot models deadlock spuriously on 0.7.2. Remove the `[patch]` once a release carries the fix. |
 
 ## Testing
 
@@ -86,9 +125,12 @@ RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
   cargo test -p bolt-load-sync --release --test loom
 ```
 
-Under `cfg(loom)`, `src/sync.rs` swaps `Arc`, `Mutex` and `AtomicU64` for
-loom's, and `event-listener` is built with its `loom` feature; the unit tests,
-which use std threads, are compiled out.
+Under `cfg(loom)`, `src/sync.rs` swaps `Arc`, `Mutex`, the atomics,
+`UnsafeCell` and `yield_now` for loom's, and `event-listener` is built with
+its `loom` feature; the unit tests, which use std threads, are compiled out.
+The workspace `[patch.crates-io]` pins loom to a fork with the fix for
+tokio-rs/loom#254 (see Decisions); it reaches `event-listener`'s loom too,
+so both share one runtime.
 
 ## Measurements
 
@@ -105,7 +147,13 @@ single run):
 
 ## Known limits
 
-- `tests/loom.rs` model-checks small cases (one sender, up to two
+- `tests/loom.rs` model-checks small cases. For `slot` (one sender, up to
+  two sends): wakeup by a send and by close, the last value before `None`,
+  reading the last of two racing sends in order, re-registering between
+  sends, and failed sends once the receiver is gone; all exhaustive. Two
+  injected bugs were caught: dropping the take after registration
+  (deadlock) and reading `closed` after the take (lost last value). For
+  `watch` (one sender, up to two
   receivers, up to two sends): wakeup of async and blocking waiters, the
   last value before `Closed`, the version recorded by `borrow_and_update`,
   and fan-out to two parked receivers. The fan-out model has three threads

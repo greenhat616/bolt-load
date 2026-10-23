@@ -1,6 +1,6 @@
 [package]
 name = "bolt-load-sync"
-description = "Runtime-agnostic synchronization primitives for bolt-load: a latest-value watch channel"
+description = "Runtime-agnostic synchronization primitives for bolt-load: latest-value watch channel and slot"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

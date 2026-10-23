@@ -1,10 +1,13 @@
-//! Model checks of the `watch` protocol.
+//! Model checks of the `watch` and `slot` protocols.
 //!
 //! Run with `RUSTFLAGS="--cfg loom" cargo test -p bolt-load-sync --release --test loom`.
 //! Each model stays small: loom explores every interleaving of it.
 #![cfg(loom)]
 
-use bolt_load_sync::watch::{self, Closed};
+use bolt_load_sync::{
+    slot,
+    watch::{self, Closed},
+};
 use loom::{future::block_on, thread};
 
 /// A send racing an async waiter is never lost.
@@ -98,5 +101,103 @@ fn a_send_wakes_every_receiver() {
         }
         // Kept alive until here, so a close cannot stand in for a lost wakeup.
         drop(tx);
+    });
+}
+
+/// A send racing a waiting receiver is never lost: a lost wake deadlocks the
+/// model, since the sender stays alive until the receiver returns.
+#[test]
+fn slot_send_wakes_the_receiver() {
+    loom::model(|| {
+        let (tx, mut rx) = slot::channel();
+        let sender = thread::spawn(move || {
+            assert!(tx.send(5));
+            tx
+        });
+        assert_eq!(block_on(rx.recv()), Some(5));
+        drop(sender.join().unwrap());
+    });
+}
+
+/// Closing right after the last send still delivers that value first.
+#[test]
+fn slot_last_value_arrives_before_closed() {
+    loom::model(|| {
+        let (tx, mut rx) = slot::channel();
+        let sender = thread::spawn(move || {
+            assert!(tx.send(7));
+            drop(tx);
+        });
+        assert_eq!(block_on(rx.recv()), Some(7));
+        assert_eq!(block_on(rx.recv()), None);
+        sender.join().unwrap();
+    });
+}
+
+/// Dropping the sender wakes a waiting receiver.
+#[test]
+fn slot_close_wakes_the_receiver() {
+    loom::model(|| {
+        let (tx, mut rx) = slot::channel();
+        let sender = thread::spawn(move || drop(tx));
+        assert_eq!(block_on(rx.recv()), None);
+        sender.join().unwrap();
+    });
+}
+
+/// Racing two sends, the receiver reads each value at most once, in send
+/// order, and always reads the last one.
+#[test]
+fn slot_receiver_reads_the_last_of_racing_sends() {
+    loom::model(|| {
+        let (tx, mut rx) = slot::channel();
+        let sender = thread::spawn(move || {
+            assert!(tx.send(2));
+            assert!(tx.send(1));
+            tx
+        });
+        let first = block_on(rx.recv()).unwrap();
+        if first == 2 {
+            assert_eq!(block_on(rx.recv()), Some(1));
+        } else {
+            assert_eq!(first, 1);
+        }
+        let tx = sender.join().unwrap();
+        assert_eq!(rx.try_recv(), None);
+        assert_eq!(tx.unread(), None);
+    });
+}
+
+/// A receiver dropped on another thread makes later sends fail.
+#[test]
+fn slot_send_fails_once_the_receiver_is_gone() {
+    loom::model(|| {
+        let (tx, rx) = slot::channel();
+        let receiver = thread::spawn(move || drop(rx));
+        // Racing the drop, the send may still succeed.
+        let _ = tx.send(1);
+        receiver.join().unwrap();
+        assert!(!tx.send(2));
+    });
+}
+
+/// A receiver that re-registers between two sends still sees the second:
+/// this reaches the `register` path that wakes on behalf of a racing wake.
+#[test]
+fn slot_reregistering_receiver_misses_no_send() {
+    loom::model(|| {
+        let (tx, mut rx) = slot::channel();
+        let sender = thread::spawn(move || {
+            assert!(tx.send(2));
+            assert!(tx.send(1));
+            tx
+        });
+        let mut last = u64::MAX;
+        while last != 1 {
+            let value = block_on(rx.recv()).unwrap();
+            assert!(value < last, "{value} after {last}");
+            last = value;
+        }
+        drop(sender.join().unwrap());
     });
 }
