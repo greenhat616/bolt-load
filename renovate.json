@@ -2,5 +2,23 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Batch semver-compatible Cargo updates into one PR",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "cargo non-major"
+    },
+    {
+      "description": "`ureq2` is the ureq 2.x adapter; ureq 3.x is covered by `ureq3`",
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["ureq2"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    }
   ]
 }
