@@ -126,6 +126,7 @@ The engine monitors runner failure rates over a sliding window:
 | [**bolt-load**](crates/bolt-load) | Main download engine |
 | [**bolt-load-core**](crates/bolt-load-core) | `BoltLoadAdapter` trait and error types |
 | [**bolt-load-adapter**](crates/bolt-load-adapter) | HTTP adapters: reqwest, ureq |
+| [**bolt-load-sync**](crates/bolt-load-sync) | Runtime-agnostic sync primitives: watch channel, slot |
 | [**bolt-load-utils**](crates/bolt-load-utils) | HTTP parsing, cross-runtime streams, telemetry |
 | [**bolt-load-tests**](crates/bolt-load-tests) | Test adapters and HTTP server fixtures |
 
@@ -163,6 +164,10 @@ or share a type-erased one built by `DynBoltLoadAdapter::new_arc` with
 `TaskBuilder::adapter_arc`.
 
 ## Development
+
+Read the [code guide](docs/code-guide.md) before contributing; it covers
+style, API design, error handling, async and unsafe code, tests, and commit
+messages. Coding agents start from [AGENTS.md](AGENTS.md).
 
 Install [Lefthook](https://lefthook.dev/) and [Deno](https://deno.com/) before
 working on this repository.
