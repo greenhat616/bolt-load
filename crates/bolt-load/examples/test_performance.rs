@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use bolt_load::{
     runtime::ThreadedRuntimeImpl,
-    task::{DownloadMode, TaskBuilder},
+    task::{DownloadMode, Task},
 };
 use bolt_load_tests::adapter::simple::{SimpleTestAdapterBuilder, calculate_blake3};
 use opentelemetry::{KeyValue, global};
@@ -16,7 +16,6 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{SERVICE_NAME, SERVICE_VERSION},
 };
-use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 use tracing::{level_filters::LevelFilter, *};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -189,14 +188,11 @@ async fn main() {
     let expected_hash = adapter.expected_hash().to_string();
     let save_path = temp_dir.path().join("concurrent_performance_test.bin");
 
-    let mut concurrent_task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
+    let concurrent_task = Task::builder(adapter)
+        .save_to(&save_path)
         .prefer_mode(DownloadMode::Concurrent)
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await
+        .runtime(runtime.clone())
+        .spawn()
         .unwrap();
 
     info!(
@@ -206,9 +202,7 @@ async fn main() {
 
     // Run the download and measure time
     let start_time = Instant::now();
-    concurrent_task.run().await.unwrap();
     concurrent_task
-        .wait()
         .await
         .expect("concurrent task should succeed");
     let concurrent_duration = start_time.elapsed();

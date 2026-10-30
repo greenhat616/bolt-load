@@ -1,6 +1,6 @@
 //! Coordination-strategy benchmark for the concurrent download hot path.
 //!
-//! Compares the single-owner "event loop" design used by `ConcurrentTask::download_to`
+//! Compares the single-owner "event loop" design used by `ConcurrentTaskInner::download_to`
 //! against shared-state alternatives. The model is self-contained: it reimplements the
 //! per-frame bookkeeping of `RunnerManager::handle_data_frame` / `ChunkPlanner` and the
 //! periodic sampler (`throughout_meter_tick`) instead of depending on private internals.

@@ -1,42 +1,31 @@
 #![doc = include_str!("../../docs/task.md")]
-use std::{
-    fmt::Debug,
-    ops::Range,
-    path::PathBuf,
-    sync::{Arc, Mutex, atomic::Ordering},
-};
-
-use async_channel::Sender;
-use bolt_load_utils::telemetry::*;
-use futures::{future::RemoteHandle, task::SpawnExt};
-use smol_cancellation_token::CancellationToken;
-#[cfg(feature = "tracing")]
-use tracing::Instrument;
-
-use crate::{
-    adapter::{AnyAdapter, BoltLoadAdapterMeta},
-    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
-};
+use std::ops::Range;
 
 mod builder;
 #[cfg(test)]
 mod comprehensive_tests;
+mod destination;
+mod error;
+mod handle;
 /// Task instance implementations (singleton and concurrent).
 pub mod instance;
 mod meta;
 #[cfg(test)]
 mod meta_retry_tests;
 mod options;
+mod status;
 #[cfg(test)]
 mod termination_tests;
+#[cfg(test)]
+mod test_support;
 
 pub use builder::*;
-use instance::*;
+pub use error::*;
+pub use handle::*;
 pub use options::*;
+pub use status::{Speed, StatusReceiver, TaskInfo, TaskState, TaskStatus};
 
 pub type RunnerId = usize;
-
-pub type TaskStateChangedCallback = Box<dyn Fn(TaskEvent) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone)]
 pub enum ControlEvent {
@@ -49,8 +38,9 @@ pub enum ControlEvent {
 pub type DownloadedChunks = Vec<Range<u64>>;
 
 /// the progress of the download task
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct Progress {
     /// the total size of the content
     /// possible None if the total size is unknown
@@ -66,7 +56,18 @@ pub struct Progress {
     pub downloaded_chunks: DownloadedChunks,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+impl Progress {
+    pub fn new(total: Option<u64>, downloaded: u64, downloaded_chunks: DownloadedChunks) -> Self {
+        Self {
+            total,
+            downloaded,
+            downloaded_chunks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DownloadMode {
     /// the download mode of single-thread download,
     /// Just use one runner task to fetch the content.
@@ -78,269 +79,4 @@ pub enum DownloadMode {
     /// Because possible some runtime support single-thread async mode.
     #[default]
     Concurrent,
-}
-
-#[atomic_enum::atomic_enum]
-#[derive(Default, PartialEq)]
-pub enum TaskState {
-    #[default]
-    /// the task is idle, the initial state
-    Idle,
-    /// the task is spawning the task,
-    /// Spawn the task and wait for the task to be initialized
-    Spawning,
-    /// the task is initializing the task
-    Initializing,
-    /// the task is downloading the content
-    Downloading,
-    /// the task is finished
-    Finished,
-    /// the task is failed with the error
-    Failed,
-}
-
-#[derive(Debug, Clone, snafu::Snafu)]
-pub enum TaskFailedError {
-    /// the task is cancelled
-    #[snafu(display("the task is cancelled"))]
-    Cancelled,
-    /// the task is stopped
-    #[snafu(display("the task is stopped: {source:?}"))]
-    Stopped { source: TaskInstanceError },
-}
-
-#[derive(Debug, Clone, snafu::Snafu)]
-pub enum TaskCommandError {}
-
-type CommandResult<T> = Result<T, TaskCommandError>;
-type CommandResponse<T> = oneshot::Sender<CommandResult<T>>;
-
-pub enum TaskCommand {
-    Cancel(CommandResponse<()>),
-    // Pause(CommandResponse<()>),
-    // Resume(CommandResponse<()>),
-}
-
-#[derive(Default)]
-#[expect(dead_code, reason = "state control is not wired up yet")]
-struct TaskStateControl(Option<(TaskState, async_channel::Sender<TaskState>)>);
-
-#[expect(dead_code, reason = "state control is not wired up yet")]
-impl TaskStateControl {
-    pub fn new(state: TaskState, sender: Sender<TaskState>) -> Self {
-        Self(Some((state, sender)))
-    }
-
-    pub async fn dispatch(
-        &mut self,
-        state: TaskState,
-    ) -> Result<(), async_channel::SendError<TaskState>> {
-        let Some((manager_state, sender)) = self.0.as_mut() else {
-            unreachable!("we should init the state control first");
-        };
-        *manager_state = state;
-        sender.send(state).await?;
-        Ok(())
-    }
-}
-
-#[non_exhaustive]
-#[derive(derive_more::Debug)]
-#[expect(dead_code, reason = "some fields are kept for restarting the task")]
-pub struct Task {
-    /// the async runtime passed from the client
-    #[debug(ignore)]
-    threaded_rt: ThreadedRuntimeImpl,
-    #[debug(ignore)]
-    local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-    /// the inner adapter of this task
-    // TODO: support persistent adapter
-    #[debug(ignore)]
-    adapter: Arc<AnyAdapter>,
-    /// the current mode of this task
-    // TODO: maybe we should introduce a `prefer_mode` to indicate the preferred mode of this task.
-    // TODO: support resumable download
-    mode: DownloadMode,
-    /// the save path of this task
-    save_path: PathBuf,
-    /// the meta of this task
-    meta: BoltLoadAdapterMeta,
-    /// the cancel token of this task
-    cancel_token: CancellationToken,
-    #[debug(ignore)]
-    on_task_state_changed: Arc<Vec<TaskStateChangedCallback>>,
-    #[debug(ignore)]
-    task: TaskInstanceImpl,
-    #[debug(ignore)]
-    event_handler_handle: Option<RemoteHandle<()>>,
-    task_state: Arc<AtomicTaskState>,
-    last_error: Arc<Mutex<Option<TaskInstanceError>>>,
-}
-
-impl Task {
-    pub fn builder() -> TaskBuilder {
-        TaskBuilder::default()
-    }
-
-    /// check if the task is finished or failed
-    pub fn is_finished(&self) -> bool {
-        matches!(
-            self.task_state.load(Ordering::Acquire),
-            TaskState::Finished | TaskState::Failed
-        )
-    }
-
-    /// check if the task is initialized
-    pub fn is_initialized(&self) -> bool {
-        self.task_state.load(Ordering::Acquire) != TaskState::Idle
-    }
-
-    #[cfg(feature = "progressbar")]
-    pub fn with_progress_bar(&mut self) {
-        let cb = std::mem::take(&mut self.on_task_state_changed);
-        let mut cb =
-            Arc::into_inner(cb).expect("we should init the callback first before running the task");
-        let (tx, rx) = async_channel::bounded::<TaskEvent>(32);
-        cb.push(Box::new(move |event| {
-            tx.send_blocking(event).unwrap();
-        }));
-
-        std::thread::spawn(move || {
-            let mut pb = None;
-            while let Ok(event) = rx.recv_blocking() {
-                match &event {
-                    TaskEvent::Downloading(progress) => match &mut pb {
-                        None => {
-                            let content_size = progress.progress().total.unwrap_or(0);
-                            let p = indicatif::ProgressBar::new(content_size);
-                            p.set_style(
-                                indicatif::ProgressStyle::with_template(
-                                    "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
-                                     {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                                )
-                                .unwrap()
-                                .progress_chars("#>-"),
-                            );
-                            pb = Some(p);
-                        }
-                        Some(pb) => {
-                            pb.set_position(progress.progress().downloaded);
-                        }
-                    },
-                    TaskEvent::Finished(_) => {
-                        if let Some(pb) = pb.take() {
-                            pb.finish();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-        self.on_task_state_changed = Arc::new(cb);
-    }
-
-    /// Cancel the task and wait until all of its owned work has exited
-    /// and the temporary file has been cleaned up.
-    ///
-    /// Use [`Task::wait`] to retrieve the terminal error.
-    pub async fn stop(&mut self) {
-        self.cancel_token.cancel();
-        let _ = self.task.stop().await;
-        let _ = self.wait().await;
-    }
-
-    /// Wait until the task and its event handler have exited, then return the
-    /// terminal error, if any.
-    ///
-    /// It is safe to call repeatedly, before [`Task::run`], or again after a
-    /// previous `wait` future was dropped.
-    #[cfg_attr(feature = "tracing", tracing::instrument)]
-    pub async fn wait(&mut self) -> Result<(), TaskInstanceError> {
-        let joined = self.task.wait().await;
-        // Join the event handler even if joining the instance failed.
-        if let Some(handle) = self.event_handler_handle.as_mut() {
-            handle.await;
-            self.event_handler_handle = None;
-        }
-        joined?;
-        trace!(
-            "[TASK] Task::wait, current_state: {:?}",
-            self.task_state.load(Ordering::Acquire)
-        );
-        match self.last_error.lock().unwrap().clone() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    #[cfg_attr(feature = "tracing", tracing::instrument)]
-    pub async fn run(&mut self) -> Result<(), TaskInstanceError> {
-        let (event_tx, event_rx) = async_channel::bounded::<TaskEvent>(32);
-        let cancel_token = self.cancel_token.clone();
-        let on_task_state_changed = self.on_task_state_changed.clone();
-        let task_state = self.task_state.clone();
-        let last_error = self.last_error.clone();
-        // A new run must not report the error of a previous one.
-        last_error.lock().unwrap().take();
-        task_state.store(TaskState::Spawning, Ordering::Release);
-
-        let fut = async move {
-            while let Ok(event) = event_rx.recv().await {
-                match &event {
-                    TaskEvent::Finished(_) => {
-                        #[cfg(test)]
-                        trace!("[TASK] TaskEvent::Finished");
-                        task_state.store(TaskState::Finished, Ordering::Release);
-                    }
-                    TaskEvent::Initializing => {
-                        #[cfg(test)]
-                        trace!("[TASK] TaskEvent::Initializing");
-                        task_state.store(TaskState::Initializing, Ordering::Release);
-                    }
-                    TaskEvent::Downloading(_) => {
-                        // trace!("[TASK] TaskEvent::Downloading, progress: {progress:?}");
-                        task_state.store(TaskState::Downloading, Ordering::Release);
-                    }
-                    TaskEvent::Failed(error) => {
-                        #[cfg(test)]
-                        trace!("[TASK] TaskEvent::Failed");
-                        last_error.lock().unwrap().replace(error.clone());
-                        task_state.store(TaskState::Failed, Ordering::Release);
-                    }
-                }
-                for callback in on_task_state_changed.iter() {
-                    callback(event.clone());
-                }
-            }
-        };
-
-        #[cfg(feature = "tracing")]
-        let fut = fut.instrument(tracing::trace_span!(
-            parent: None,
-            "Task::event_loop",
-        ));
-
-        let handle = self.threaded_rt.spawn_with_handle(fut).map_err(|e| {
-            error!("failed to spawn the task: {e:?}");
-            TaskInstanceError::new_failed(crate::runner::TaskError::Other {
-                message: "failed to spawn the task".to_string(),
-            })
-        })?;
-        self.event_handler_handle = Some(handle);
-
-        trace!("[TASK] Calling TaskInstance::run(), mode: {:?}", self.mode);
-        match &self.task {
-            TaskInstanceImpl::Singleton(_) => trace!("[TASK] Using SingletonTask"),
-            TaskInstanceImpl::Concurrent(_) => trace!("[TASK] Using ConcurrentTask"),
-        }
-
-        self.task.run(
-            self.adapter.clone(),
-            self.save_path.clone(),
-            event_tx,
-            cancel_token,
-        )?;
-        trace!("[TASK] TaskInstance::run() completed");
-        Ok(())
-    }
 }

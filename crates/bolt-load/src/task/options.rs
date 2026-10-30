@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::TaskManagerBuildError;
+use super::BuildError;
 
 /// Default for [`TaskOptions::no_progress_timeout`].
 pub const DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -153,8 +153,8 @@ impl TaskOptions {
         self
     }
 
-    pub(crate) fn validate(&self) -> Result<(), TaskManagerBuildError> {
-        let message = if self.no_progress_timeout.is_zero() {
+    pub(crate) fn validate(&self) -> Result<(), BuildError> {
+        let reason = if self.no_progress_timeout.is_zero() {
             "no_progress_timeout must be greater than zero"
         } else if self.max_consecutive_failures == 0 {
             "max_consecutive_failures must be at least 1"
@@ -162,14 +162,12 @@ impl TaskOptions {
             "stream_idle_timeout must be greater than zero"
         } else if self.connect_timeout.is_zero() {
             "connect_timeout must be greater than zero"
-        } else if let Some(message) = self.meta_retry.validate() {
-            message
+        } else if let Some(reason) = self.meta_retry.validate() {
+            reason
         } else {
             return Ok(());
         };
-        Err(TaskManagerBuildError::FieldValidationFailed {
-            message: message.to_string(),
-        })
+        Err(BuildError::InvalidOptions { reason })
     }
 }
 
@@ -205,7 +203,7 @@ mod tests {
         ] {
             assert!(matches!(
                 options.validate(),
-                Err(TaskManagerBuildError::FieldValidationFailed { .. })
+                Err(BuildError::InvalidOptions { .. })
             ));
         }
     }

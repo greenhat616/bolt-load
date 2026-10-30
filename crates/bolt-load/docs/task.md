@@ -1,30 +1,52 @@
 High-level download task orchestration.
 
-A [`Task`] is the primary user-facing type — it coordinates metadata
-retrieval, file allocation, runner spawning, progress tracking, and
-state transitions for a single download.
+A [`TaskBuilder`] configures a download synchronously and without network
+I/O; [`TaskBuilder::spawn`] starts it and returns a [`Task`], an awaitable,
+cancel-on-drop handle whose output is a [`TaskOutput`] or a
+[`DownloadError`]. [`Task::status`] is a latest-value
+[`watch`](bolt_load_sync::watch) receiver of [`TaskStatus`] snapshots.
+
+```rust,ignore
+let task = Task::builder(adapter)
+    .runtime(rt)
+    .save_to("large-file.bin")
+    .spawn()?;
+
+let mut status = task.status();
+while status.changed().await.is_ok() {
+    let s = status.borrow_and_update();
+    println!("{:?} {}/{:?}", s.state, s.progress.downloaded, s.progress.total);
+}
+let output = task.await?;
+```
+
+The full contract, with numbered requirements, is in
+`docs/task-api-spec.md`.
 
 # Download Modes
 
-| Mode | Implementation | Description |
-|------|---------------|-------------|
-| [`Singleton`](DownloadMode::Singleton) | [`SingletonTask`] | Single runner, sequential download |
-| [`Concurrent`](DownloadMode::Concurrent) | [`ConcurrentTask`] | Multiple runners, parallel range-based download |
+| Mode | Description |
+|------|-------------|
+| [`Singleton`](DownloadMode::Singleton) | Single runner, sequential download |
+| [`Concurrent`](DownloadMode::Concurrent) | Multiple runners, parallel range-based download |
 
-Mode selection is automatic when the adapter reports range stream
-support, or can be forced via [`TaskBuilder`].
+The mode is selected while the task is `Initializing`: `Singleton` when
+it is preferred via [`TaskBuilder::prefer_mode`] or the size is unknown
+(zero), otherwise `Concurrent` when the adapter reports range stream
+support. [`TaskInfo::mode`] reports the choice.
 
 # Task Lifecycle
 
 ```text
-Idle ──► Spawning ──► Initializing ──► Downloading ──► Finished
-                                            │
-                                            ▼
-                                          Failed
+Pending ──► Initializing ──► Downloading ──► Finished
+                 │                │
+                 └────────────────┴──► Failed | Cancelled
 ```
 
-[`TaskState`] is stored as an atomic enum for lock-free reads from
-any thread.
+A terminal [`TaskState`] never changes. Status is level-triggered: a
+receiver is guaranteed the newest value only, so intermediate states and
+samples may be coalesced. `progress` is kept in every state, and the
+channel closes right after the terminal status.
 
 # Termination
 
@@ -55,11 +77,12 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   meanwhile. A concurrent task retries its range; runners still connecting
   are never split. A singleton task fails, and creates its temporary file
   only once connected; a failed connection keeps the adapter's error.
-- **Metadata request**: [`TaskBuilder::build`],
-  [`TaskBuilder::retrieve_meta`] and both task modes retry retryable
-  metadata errors as [`TaskOptions::meta_retry`] allows, with jittered
-  exponential backoff on the runtime's timer, then report the last error.
-  Unretryable errors are reported at once.
+- **Metadata request**: [`TaskBuilder::retrieve_meta`] and the task's
+  initialization retry retryable metadata errors as
+  [`TaskOptions::meta_retry`] allows, with jittered exponential backoff
+  on the runtime's timer, then report the last error. Unretryable errors
+  are reported at once. Metadata retrieved by the builder, or injected
+  with [`TaskBuilder::meta`], is not requested again.
 
 | Option | Default |
 |--------|---------|
@@ -75,45 +98,59 @@ out and be retried.
 
 # Cancellation and Cleanup
 
-The cancel token passed to [`TaskBuilder`] is owned by the caller: the
-task only ever cancels child tokens, so finishing or failing never
-cancels it. Cancelling it aborts [`TaskBuilder::build`] (metadata and
-range probe requests) with `TaskManagerBuildError::Cancelled`, and a
-running task with `TaskError::Cancelled`.
+The optional cancel token passed to [`TaskBuilder::cancel_token`] is
+owned by the caller: each task runs on a child token of it, so finishing,
+failing or dropping a task never cancels it. Cancelling it, or the task's
+own token ([`Task::cancel`], [`Task::cancel_token`]), ends the task in
+`Cancelled`, during initialization (metadata and range probe requests,
+retry backoff) as well as while downloading.
 
 Success, failure and cancellation share one teardown path: cancel the
-runners, wait for connectors, runners, progress senders, write tasks and
-writer workers to exit, then publish or discard the temporary file.
-`TaskEvent::Failed` is emitted only after this teardown.
+runners, wait for connectors, runners, progress publishers, write tasks
+and writer workers to exit, then commit or discard the temporary file.
+The terminal status is published only after this teardown; when the
+temporary file cannot be removed, [`TaskStatus::leftover_temp_file`]
+names it.
 
-- [`Task::stop`] is a join barrier: it cancels and returns once all
-  work owned by bolt-load has exited. Work an adapter detaches on its
-  own, or a write blocked forever by the OS, cannot be bounded.
-- [`Task::wait`] joins the same way and returns the terminal error. Both
-  are safe to call repeatedly, before [`Task::run`], or after a dropped
-  `wait` future.
+- Awaiting the [`Task`] joins: it returns once all work owned by
+  bolt-load has exited. Work an adapter detaches on its own, or a write
+  blocked forever by the OS, cannot be bounded. `(&mut task).await` may
+  be repeated, and a dropped await does not cancel the task.
+- [`Task::stop`] cancels, then joins the same way.
+- Dropping the [`Task`] cancels the download and lets its teardown run in
+  the background; [`Task::detach`] keeps it running instead.
+- A panic in the attempt ends the task in `Failed` with
+  [`DownloadError::Panicked`]; its workers are signalled but not joined.
 
 # Temporary File and Commit Rule
 
 Both modes download into `<save path>.downloading` and rename it to the
-save path only after a successful transfer. A cancellation observed
+save path only after a successful transfer. With
+[`TaskBuilder::save_into`], the save path is the directory joined with the
+adapter's suggested filename, reduced to its final path segment; a name
+that is not a safe file name fails the task with
+[`DownloadError::InvalidFilename`]. A cancellation observed
 before the rename starts discards the result; once the rename starts,
 its outcome decides. On failure the temporary file is removed and an
 existing file at the save path is never touched.
 
-# Task Lifecycle
+# Attempt Steps
 
-Both [`SingletonTask`] and [`ConcurrentTask`] run the same sequential
-lifecycle on a local runtime, reporting each step as a [`TaskEvent`]:
+Each spawned task runs one attempt on a local runtime, on a `blocking`
+pool thread it occupies until the end (rust-lang/rust#100013):
 
-1. **Initializing** — calls [`retrieve_meta()`] to get the content size.
-   Cancellation during this step fails the task with `Cancelled`, and
-   wins when both are ready.
+1. **Initializing** — use the cached metadata or retrieve it, select the
+   mode, resolve and check the destination, then publish [`TaskInfo`].
+   Cancellation during this step ends the task in `Cancelled`, and wins
+   when both are ready.
 2. **Downloading** — publishes a snapshot with zero speed, then spawns
-   runner(s) and publishes sampled progress. Periodic samples are
-   dropped while the event channel is full; they never stall the transfer.
-3. **Finished** / **Failed** — sent last, after every runner and writer
-   has been joined and the output file has been committed or removed.
+   runner(s) and publishes sampled progress. Publishing never waits for a
+   receiver, so a slow reader cannot stall the transfer.
+3. **Finished** / **Failed** / **Cancelled** — published last, after
+   every runner and writer has been joined and the output file has been
+   committed or removed.
+
+A task is one attempt. To retry, spawn again from a clone of the builder.
 
 # Concurrent Task Components
 
@@ -136,21 +173,22 @@ The concurrent download path includes several sub-systems:
 
 - [`Progress`] — total size, downloaded bytes, and downloaded chunk
   ranges (for resumable downloads).
-- [`ProgressWithSpeed`] — extends [`Progress`] with download and
-  write speed metrics (bytes/sec).
-- [`TaskEvent`] — enum of lifecycle events:
-  `Initializing`, `Downloading(ProgressWithSpeed)`,
-  `Failed(TaskInstanceError)`, `Finished(Progress)`.
+- [`TaskStatus`] — the state, [`Progress`], [`Speed`] (download and
+  write, bytes/sec), [`TaskInfo`] once initialized, and the error.
+- `Task::drive_progress_bar` — drives an `indicatif` bar from the status
+  on its own thread (feature `progressbar`).
 
 # Builder
 
-[`TaskBuilder`] validates configuration and constructs a [`Task`]:
-- Requires an adapter, save path and cancel token.
+[`TaskBuilder`] validates configuration and spawns a [`Task`]:
+- Created by [`Task::builder`] with the adapter; requires a runtime and a
+  destination ([`TaskBuilder::save_to`] or [`TaskBuilder::save_into`]).
 - Accepts [`TaskOptions`] via [`TaskBuilder::options`].
-- Auto-selects download mode based on range stream availability.
-- Metadata retrieval and the range probe are cancellable.
-- Validates parent directory exists and target is not a directory.
-- Optionally attaches a progress bar (feature `progressbar`).
+- [`TaskBuilder::validate`] and [`TaskBuilder::spawn`] check the options
+  and, best effort, that the destination's directory exists and the
+  target is not a directory, returning a [`BuildError`]. Initialization
+  repeats the checks.
+- `Clone`, so a queue can keep validated builders and spawn them later.
 
 # Key Constants
 

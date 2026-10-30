@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use bolt_load::{
     runtime::ThreadedRuntimeImpl,
-    task::{DownloadMode, TaskBuilder},
+    task::{DownloadMode, Task},
 };
 use bolt_load_tests::adapter::simple::{SimpleTestAdapter, calculate_blake3};
 use opentelemetry::{KeyValue, global};
@@ -16,7 +16,6 @@ use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{SERVICE_NAME, SERVICE_VERSION},
 };
-use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 use tracing::{level_filters::LevelFilter, *};
 use tracing_subscriber::{
@@ -186,48 +185,36 @@ async fn test_concurrent_vs_singleton_performance() {
     let concurrent_expected_hash = adapter1.expected_hash().to_string();
     let concurrent_path = temp_dir.path().join("concurrent.bin");
 
-    let mut concurrent_task = TaskBuilder::default()
-        .adapter(adapter1)
-        .save_path(concurrent_path.clone())
+    let concurrent_task = Task::builder(adapter1)
+        .save_to(&concurrent_path)
         .prefer_mode(DownloadMode::Concurrent)
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await
+        .runtime(runtime.clone())
+        .spawn()
         .unwrap();
 
     // Test singleton mode
     // let singleton_expected_hash = adapter2.expected_hash().to_string();
     // let singleton_path = temp_dir.path().join("singleton.bin");
 
-    // let mut singleton_task = TaskBuilder::default()
-    //     .adapter(adapter2)
-    //     .save_path(singleton_path.clone())
+    // let singleton_task = Task::builder(adapter2)
+    //     .save_to(&singleton_path)
     //     .prefer_mode(DownloadMode::Singleton)
-    //     .cancel_token(CancellationToken::new())
     //     .runtime(runtime.clone())
-    //     .build()
-    //     .await
+    //     .spawn()
     //     .unwrap();
 
     info!("🏁 Starting performance comparison test (1MB)...");
 
     // Run both downloads and measure time
     let start_time = Instant::now();
-    concurrent_task.run().await.unwrap();
     concurrent_task
-        .wait()
         .await
         .expect("concurrent task should succeed");
     info!("Concurrent task finished");
     let concurrent_duration = start_time.elapsed();
 
     // let start_time = Instant::now();
-    // singleton_task.run().await.unwrap();
-    // singleton_task
-    //     .wait()
-    //     .await
-    //     .expect("singleton task should succeed");
+    // singleton_task.await.expect("singleton task should succeed");
     // info!("Singleton task finished");
     // let singleton_duration = start_time.elapsed();
 

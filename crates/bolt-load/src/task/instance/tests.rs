@@ -1,19 +1,18 @@
-use std::time::Duration;
-
 use async_stream::stream;
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
+use pretty_assertions::assert_eq;
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
-use super::{TaskEvent, TaskInstance, TaskInstanceImpl};
 use crate::{
     adapter::{
-        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, DynBoltLoadAdapter,
-        UnretryableError,
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, UnretryableError,
     },
-    runtime::ThreadedRuntimeImpl,
-    task::DownloadMode,
+    task::{
+        DownloadError, DownloadMode, TaskState,
+        test_support::{assert_transitions, record, spawn, tmp_path, watchdog},
+    },
 };
 
 // Mock adapter for testing
@@ -117,341 +116,176 @@ impl BoltLoadAdapter for MockAdapter {
     }
 }
 
-// Test helper functions
-// `needless_return` fires with one runtime feature, `unreachable_code` with both.
-#[allow(clippy::needless_return, unreachable_code)]
-fn create_test_runtime() -> ThreadedRuntimeImpl {
-    #[cfg(feature = "tokio")]
-    {
-        use crate::runtime::TokioThreadedRuntime;
-        return ThreadedRuntimeImpl::Tokio(TokioThreadedRuntime::new());
-    }
-
-    #[cfg(feature = "smol")]
-    return ThreadedRuntimeImpl::new_smol_rt();
-
-    #[cfg(not(any(feature = "tokio", feature = "smol")))]
-    panic!("No runtime feature enabled");
-}
-
 fn create_test_content(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i % 256) as u8).collect()
-}
-
-async fn wait_for_completion(
-    event_rx: async_channel::Receiver<TaskEvent>,
-    timeout: Duration,
-) -> Result<Vec<TaskEvent>, &'static str> {
-    let mut events = Vec::new();
-    let start = std::time::Instant::now();
-
-    while start.elapsed() < timeout {
-        match tokio::time::timeout(Duration::from_millis(100), event_rx.recv()).await {
-            Ok(Ok(event)) => {
-                let is_final = matches!(event, TaskEvent::Finished(_) | TaskEvent::Failed(_));
-                events.push(event);
-                if is_final {
-                    return Ok(events);
-                }
-            }
-            Ok(Err(_)) => return Err("Channel closed"),
-            Err(_) => continue, // timeout, continue polling
-        }
-    }
-    Err("Test timed out")
 }
 
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_singleton_task_basic_download() {
-    let rt = create_test_runtime();
     let content = create_test_content(5000);
-    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
-
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_singleton.txt");
+    let task = spawn(
+        DownloadMode::Singleton,
+        MockAdapter::new(content.clone()),
+        &file_path,
+        &CancellationToken::new(),
+    );
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
-    let (event_tx, event_rx) = async_channel::unbounded();
-    let cancel_token = CancellationToken::new();
+    let statuses = record(task.status()).await;
+    let output = watchdog(task).await.unwrap();
 
-    // Start the task
-    task.run(adapter, file_path.clone(), event_tx, cancel_token)
-        .unwrap();
-
-    // Wait for task completion
-    let events = wait_for_completion(event_rx, Duration::from_secs(10))
-        .await
-        .unwrap();
-    task.wait().await.unwrap();
-
-    // Verify event sequence
-    assert!(!events.is_empty());
-    assert!(matches!(events[0], TaskEvent::Initializing));
-
-    // Check final event
-    let final_event = events.last().unwrap();
-    assert!(matches!(final_event, TaskEvent::Finished(_)));
-
-    // Verify file content
-    let downloaded_content = std::fs::read(&file_path).unwrap();
-    assert_eq!(downloaded_content, content);
+    assert_transitions(&statuses);
+    assert_eq!(output.mode, DownloadMode::Singleton);
+    assert_eq!(std::fs::read(&file_path).unwrap(), content);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
 async fn test_concurrent_task_basic_download() {
-    let rt = create_test_runtime();
     let content = create_test_content(10000);
-    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
-
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_concurrent.txt");
+    let task = spawn(
+        DownloadMode::Concurrent,
+        MockAdapter::new(content.clone()),
+        &file_path,
+        &CancellationToken::new(),
+    );
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt, None);
-    let (event_tx, event_rx) = async_channel::unbounded();
-    let cancel_token = CancellationToken::new();
+    let output = watchdog(task).await.unwrap();
 
-    // Start the task
-    task.run(adapter, file_path.clone(), event_tx, cancel_token)
-        .unwrap();
-
-    // Wait for task completion
-    let events_result = wait_for_completion(event_rx, Duration::from_secs(15)).await;
-    let task_result = task.wait().await;
-
-    // Concurrent task might succeed or fail depending on implementation
-    // Just verify that if it succeeds, the file content is correct
-    if task_result.is_ok()
-        && let Ok(events) = events_result
-    {
-        eprintln!("events: {events:?}");
-        assert!(!events.is_empty());
-        assert!(matches!(events[0], TaskEvent::Initializing));
-
-        // Check if final event is success
-        let final_event = events.last().unwrap();
-        if matches!(final_event, TaskEvent::Finished(_)) {
-            // Verify file content only if task finished successfully
-            if file_path.exists() {
-                let downloaded_content = std::fs::read(&file_path).unwrap();
-                assert_eq!(downloaded_content, content);
-            }
-        }
-    }
-    // If concurrent task fails, that's also acceptable for this test
+    assert_eq!(output.mode, DownloadMode::Concurrent);
+    assert_eq!(output.progress.downloaded, content.len() as u64);
+    assert_eq!(std::fs::read(&file_path).unwrap(), content);
 }
 
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_singleton_task_cancellation() {
-    let rt = create_test_runtime();
-    let content = create_test_content(100000); // Large file to ensure cancellation timing
-    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content));
-
+    let content = create_test_content(100000);
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_cancel.txt");
-
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
-    let (event_tx, _event_rx) = async_channel::unbounded();
     let cancel_token = CancellationToken::new();
+    let task = spawn(
+        DownloadMode::Singleton,
+        MockAdapter::new(content),
+        &file_path,
+        &cancel_token,
+    );
 
-    // Start the task
-    task.run(adapter, file_path, event_tx, cancel_token.clone())
-        .unwrap();
-
-    // Cancel immediately to increase chance of cancellation
     cancel_token.cancel();
+    let result = watchdog(task).await;
 
-    // Wait for task to end
-    let result = task.wait().await;
-
-    // Task might complete successfully if it's fast enough, or fail if cancelled
-    // Both outcomes are acceptable
+    // A fast download may commit before the cancellation is observed.
     info!("Cancellation test result: {:?}", result);
+    if let Err(e) = result {
+        assert!(e.is_cancelled(), "{e:?}");
+        assert!(!file_path.exists() && !tmp_path(&file_path).exists());
+    }
 }
 
+/// A zero size is unknown and selects the singleton mode, even when the
+/// concurrent mode is preferred. An empty stream of unknown size then fails
+/// with `Empty` (#153), so only the mode is checked here.
 #[tokio::test]
 #[n0_tracing_test::traced_test]
-async fn test_concurrent_task_zero_size_failure() {
-    let rt = create_test_runtime();
-    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::zero_size());
-
+async fn test_zero_size_selects_singleton_mode() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_zero_size.txt");
+    let task = spawn(
+        DownloadMode::Concurrent,
+        MockAdapter::zero_size(),
+        &file_path,
+        &CancellationToken::new(),
+    );
+    let status = task.status();
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt, None);
-    let (event_tx, _event_rx) = async_channel::unbounded();
-    let cancel_token = CancellationToken::new();
+    let result = watchdog(task).await;
 
-    // Start the task
-    task.run(adapter, file_path, event_tx, cancel_token)
-        .unwrap();
-
-    // Wait for task to end
-    let result = task.wait().await;
-
-    // Concurrent task with zero-size might fail or succeed, both are acceptable
-    info!("Zero-size test result: {:?}", result);
+    info!("Zero-size test result: {result:?}");
+    let info = status.borrow().info.clone().expect("initialization ended");
+    assert_eq!(info.mode, DownloadMode::Singleton);
 }
 
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_singleton_task_adapter_failure() {
-    let rt = create_test_runtime();
-    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(vec![]).with_failure(true));
-
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_fail.txt");
+    let task = spawn(
+        DownloadMode::Singleton,
+        MockAdapter::new(vec![]).with_failure(true),
+        &file_path,
+        &CancellationToken::new(),
+    );
+    let rx = task.status();
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
-    let (event_tx, event_rx) = async_channel::unbounded();
-    let cancel_token = CancellationToken::new();
+    let result = watchdog(task).await;
 
-    // Start the task
-    task.run(adapter, file_path, event_tx, cancel_token)
-        .unwrap();
-
-    // Collect events to see what happened
-    let events_result = wait_for_completion(event_rx, Duration::from_secs(5)).await;
-    let task_result = task.wait().await;
-
-    // Either task fails or we get failure events
-    let task_failed = task_result.is_err()
-        || (events_result.is_ok()
-            && events_result
-                .unwrap()
-                .iter()
-                .any(|e| matches!(e, TaskEvent::Failed(_))));
-
-    if !task_failed {
-        info!("Adapter failure test: Task unexpectedly succeeded");
-    }
+    assert!(
+        matches!(result, Err(DownloadError::Metadata { .. })),
+        "{result:?}"
+    );
+    let status = rx.borrow();
+    assert_eq!(status.state, TaskState::Failed);
+    assert!(status.info.is_none());
+    assert!(!file_path.exists());
 }
 
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_progress_tracking() {
-    let rt = create_test_runtime();
     let content = create_test_content(8000);
-    let adapter = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
-
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test_progress.txt");
+    let task = spawn(
+        DownloadMode::Singleton,
+        MockAdapter::new(content.clone()),
+        &file_path,
+        &CancellationToken::new(),
+    );
 
-    let mut task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
-    let (event_tx, event_rx) = async_channel::unbounded();
-    let cancel_token = CancellationToken::new();
+    let statuses = record(task.status()).await;
+    watchdog(task).await.unwrap();
 
-    // Start the task
-    task.run(adapter, file_path.clone(), event_tx, cancel_token)
-        .unwrap();
-
-    let mut progress_events = Vec::new();
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(10);
-
-    while start.elapsed() < timeout {
-        match tokio::time::timeout(Duration::from_millis(100), event_rx.recv()).await {
-            Ok(Ok(TaskEvent::Downloading(progress))) => {
-                progress_events.push(progress);
-            }
-            Ok(Ok(TaskEvent::Finished(_))) => break,
-            Ok(Ok(TaskEvent::Failed(_))) => {
-                panic!("Task failed unexpectedly");
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => break,
-            Err(_) => continue,
-        }
-    }
-
-    // Wait for task completion
-    task.wait().await.unwrap();
-
-    // Progress events might be empty for fast downloads, that's OK
-    info!("Progress events captured: {}", progress_events.len());
-
-    // Verify file content is correct
-    let downloaded_content = std::fs::read(&file_path).unwrap();
-    assert_eq!(downloaded_content, content);
+    // Samples may be coalesced for a fast download; the order holds anyway.
+    assert_transitions(&statuses);
+    let downloaded: Vec<u64> = statuses.iter().map(|s| s.progress.downloaded).collect();
+    assert!(downloaded.is_sorted(), "{downloaded:?}");
+    info!("statuses captured: {}", statuses.len());
+    assert_eq!(std::fs::read(&file_path).unwrap(), content);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
 async fn test_concurrent_vs_singleton_comparison() {
-    let rt = create_test_runtime();
     let content = create_test_content(20000);
+    let temp_dir = TempDir::new().unwrap();
+    let file_path_concurrent = temp_dir.path().join("concurrent.txt");
+    let file_path_singleton = temp_dir.path().join("singleton.txt");
 
-    // Test concurrent task
-    let adapter_concurrent = DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()));
-    let temp_dir_concurrent = TempDir::new().unwrap();
-    let file_path_concurrent = temp_dir_concurrent.path().join("concurrent.txt");
-
-    let mut concurrent_task = TaskInstanceImpl::new(DownloadMode::Concurrent, rt.clone(), None);
-    let (event_tx_concurrent, event_rx_concurrent) = async_channel::unbounded();
-    let cancel_token_concurrent = CancellationToken::new();
-
-    concurrent_task
-        .run(
-            adapter_concurrent,
-            file_path_concurrent.clone(),
-            event_tx_concurrent,
-            cancel_token_concurrent,
-        )
-        .unwrap();
-
-    // Test singleton task
-    let adapter_singleton =
-        DynBoltLoadAdapter::new_arc(MockAdapter::new(content.clone()).with_range_support(false));
-    let temp_dir_singleton = TempDir::new().unwrap();
-    let file_path_singleton = temp_dir_singleton.path().join("singleton.txt");
-
-    let mut singleton_task = TaskInstanceImpl::new(DownloadMode::Singleton, rt, None);
-    let (event_tx_singleton, event_rx_singleton) = async_channel::unbounded();
-    let cancel_token_singleton = CancellationToken::new();
-
-    singleton_task
-        .run(
-            adapter_singleton,
-            file_path_singleton.clone(),
-            event_tx_singleton,
-            cancel_token_singleton,
-        )
-        .unwrap();
-
-    // Wait for both tasks to complete
-    let (concurrent_result, singleton_result) = tokio::join!(
-        wait_for_completion(event_rx_concurrent, Duration::from_secs(15)),
-        wait_for_completion(event_rx_singleton, Duration::from_secs(15))
+    let concurrent = spawn(
+        DownloadMode::Concurrent,
+        MockAdapter::new(content.clone()),
+        &file_path_concurrent,
+        &CancellationToken::new(),
     );
+    let singleton = spawn(
+        DownloadMode::Concurrent,
+        MockAdapter::new(content.clone()).with_range_support(false),
+        &file_path_singleton,
+        &CancellationToken::new(),
+    );
+    let (concurrent, singleton) = watchdog(async { tokio::join!(concurrent, singleton) }).await;
 
-    // Wait for task completion
-    let (concurrent_wait, singleton_wait) =
-        tokio::join!(concurrent_task.wait(), singleton_task.wait());
-
-    // At least singleton should succeed
-    assert!(singleton_result.is_ok());
-    assert!(singleton_wait.is_ok());
-
-    // Verify singleton file content
-    if file_path_singleton.exists() {
-        let singleton_content = std::fs::read(&file_path_singleton).unwrap();
-        assert_eq!(singleton_content, content);
-    }
-
-    // If concurrent task also succeeded, verify its content too
-    if concurrent_result.is_ok() && concurrent_wait.is_ok() && file_path_concurrent.exists() {
-        let concurrent_content = std::fs::read(&file_path_concurrent).unwrap();
-        assert_eq!(concurrent_content, content);
-
-        // If both files exist, they should be identical
-        if file_path_singleton.exists() {
-            let singleton_content = std::fs::read(&file_path_singleton).unwrap();
-            assert_eq!(concurrent_content, singleton_content);
-        }
-    }
-
-    info!("Concurrent task result: {:?}", concurrent_wait);
-    info!("Singleton task result: {:?}", singleton_wait);
+    assert_eq!(concurrent.unwrap().mode, DownloadMode::Concurrent);
+    assert_eq!(
+        singleton.unwrap().mode,
+        DownloadMode::Singleton,
+        "no range support selects the singleton mode"
+    );
+    assert_eq!(std::fs::read(&file_path_concurrent).unwrap(), content);
+    assert_eq!(std::fs::read(&file_path_singleton).unwrap(), content);
 }

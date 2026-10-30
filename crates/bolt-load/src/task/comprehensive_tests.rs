@@ -2,7 +2,7 @@
 //!
 //! This module contains test coverage for:
 //! - TaskBuilder configuration and validation
-//! - Task lifecycle management
+//! - The task handle: await, cancel, drop, detach, panic
 //! - Actual file download with hash verification
 //! - Error handling scenarios
 
@@ -18,12 +18,21 @@ use bolt_load_tests::adapter::simple::{
     SimpleTestAdapter, SimpleTestAdapterBuilder, calculate_blake3,
 };
 use bolt_load_utils::telemetry::*;
+use futures::task::{FutureObj, Spawn, SpawnError};
+use pretty_assertions::assert_eq;
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
+use super::test_support::{assert_transitions, record, tmp_path, watchdog};
 use crate::{
-    runtime::ThreadedRuntimeImpl,
-    task::{DownloadMode, TaskBuilder, TaskEvent, TaskManagerBuildError},
+    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta},
+    runtime::{
+        DowncastLocalRuntime, Sleep, ThreadedRuntime, ThreadedRuntimeImpl, TimerBuilder, TimerImpl,
+    },
+    task::{
+        BuildError, DownloadError, DownloadMode, StatusReceiver, Task, TaskBuilder, TaskOutput,
+        TaskState, TaskStatus,
+    },
 };
 
 /// Create test runtime
@@ -48,6 +57,24 @@ fn create_test_runtime() -> ThreadedRuntimeImpl {
     panic!("No runtime feature enabled for tests");
 }
 
+fn builder(adapter: impl BoltLoadAdapter + 'static) -> TaskBuilder {
+    Task::builder(adapter).runtime(create_test_runtime())
+}
+
+fn assert_hash(path: &std::path::Path, expected_hash: &str, size: usize) {
+    let content = std::fs::read(path).unwrap();
+    assert_eq!(
+        content.len(),
+        size,
+        "Downloaded file should have correct size"
+    );
+    assert_eq!(
+        calculate_blake3(&content),
+        expected_hash,
+        "Downloaded file hash should match expected hash"
+    );
+}
+
 // ============================================================================
 // TaskBuilder Tests
 // ============================================================================
@@ -55,534 +82,544 @@ fn create_test_runtime() -> ThreadedRuntimeImpl {
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_task_builder_basic_configuration() {
-    let runtime = create_test_runtime();
-    let adapter = SimpleTestAdapter::new(1024);
     let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("basic_test.bin");
-    let cancel_token = CancellationToken::new();
+    let save_path = temp_dir.path().join("basic_config.bin");
 
-    // Test basic builder configuration
-    let task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await;
+    let task = builder(SimpleTestAdapter::new(1024))
+        .save_to(&save_path)
+        .prefer_mode(DownloadMode::Singleton)
+        .spawn()
+        .expect("TaskBuilder should successfully spawn the task");
 
-    assert!(task.is_ok(), "TaskBuilder should successfully build task");
-
-    let task = task.unwrap();
-    assert!(!task.is_initialized(), "Task should start uninitialized");
-    assert!(!task.is_finished(), "Task should not be finished initially");
-
-    info!("✓ Basic TaskBuilder configuration test passed");
+    let output = watchdog(task).await.unwrap();
+    assert_eq!(output.path, save_path);
+    assert_eq!(output.mode, DownloadMode::Singleton);
 }
 
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_task_builder_validation_errors() {
-    let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024);
     let temp_dir = TempDir::new().unwrap();
     let save_path = temp_dir.path().join("validation_test.bin");
+    let invalid_destination = |builder: TaskBuilder| {
+        let result = builder.spawn();
+        assert!(
+            matches!(result, Err(BuildError::InvalidDestination { .. })),
+            "{result:?}"
+        );
+    };
 
-    // Test missing adapter
-    let result = TaskBuilder::default()
-        .save_path(save_path.clone())
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await;
+    // Missing runtime
+    let result = Task::builder(adapter.clone()).save_to(&save_path).spawn();
+    assert!(
+        matches!(result, Err(BuildError::MissingRuntime)),
+        "{result:?}"
+    );
 
-    assert!(matches!(
-        result,
-        Err(TaskManagerBuildError::FieldValidationFailed { .. })
-    ));
+    // Missing destination
+    let result = builder(adapter.clone()).spawn();
+    assert!(
+        matches!(result, Err(BuildError::MissingDestination)),
+        "{result:?}"
+    );
 
-    // Test missing save path
-    let result = TaskBuilder::default()
-        .adapter(adapter.clone())
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await;
+    // Invalid options
+    let result = builder(adapter.clone())
+        .save_to(&save_path)
+        .options(crate::task::TaskOptions::default().connect_timeout(Duration::ZERO))
+        .spawn();
+    assert!(
+        matches!(result, Err(BuildError::InvalidOptions { .. })),
+        "{result:?}"
+    );
 
-    assert!(matches!(
-        result,
-        Err(TaskManagerBuildError::FieldValidationFailed { .. })
-    ));
+    // The parent directory does not exist
+    invalid_destination(
+        builder(adapter.clone()).save_to(temp_dir.path().join("nonexistent/test.bin")),
+    );
 
-    // Test missing cancel token
-    let result = TaskBuilder::default()
-        .adapter(adapter.clone())
-        .save_path(save_path.clone())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(TaskManagerBuildError::FieldValidationFailed { .. })
-    ));
-
-    // Test invalid save path (parent directory does not exist)
-    let result = TaskBuilder::default()
-        .adapter(adapter.clone())
-        .save_path(temp_dir.path().join("nonexistent/test.bin"))
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(TaskManagerBuildError::FieldValidationFailed { .. })
-    ));
-
-    // Test invalid save path (parent directory is not a directory)
+    // The parent directory is not a directory
     let parent = temp_dir.path().join("nonexistent");
     std::fs::write(&parent, b"not a directory").unwrap();
-    let result = TaskBuilder::default()
-        .adapter(adapter.clone())
-        .save_path(parent.join("test.bin"))
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await;
-    assert!(matches!(
-        result,
-        Err(TaskManagerBuildError::FieldValidationFailed { .. })
-    ));
+    invalid_destination(builder(adapter.clone()).save_to(parent.join("test.bin")));
 
-    // Test invalid save path (write a directory)
-    let result = TaskBuilder::default()
-        .adapter(adapter.clone())
-        .save_path(temp_dir.path().to_path_buf())
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await;
+    // The destination is a directory
+    invalid_destination(builder(adapter.clone()).save_to(temp_dir.path()));
 
-    assert!(matches!(
-        result,
-        Err(TaskManagerBuildError::FieldValidationFailed { .. })
-    ));
+    // `save_into` a missing directory
+    invalid_destination(builder(adapter.clone()).save_into(temp_dir.path().join("missing")));
 
-    info!("✓ TaskBuilder validation errors test passed");
+    // `validate` reports the same, and the cancel token is optional
+    builder(adapter.clone())
+        .save_to(&save_path)
+        .validate()
+        .unwrap();
+    assert_eq!(adapter.call_count(), 0, "validation sends no request");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
 async fn test_task_builder_with_mode_preference() {
-    let runtime = create_test_runtime();
     let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("mode_test.bin");
 
-    // Test with range-supporting adapter and concurrent preference
-    let adapter = SimpleTestAdapter::new(2048).with_range_support(true);
-    let task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
+    let singleton = builder(SimpleTestAdapter::new(1024).with_range_support(true))
+        .save_to(temp_dir.path().join("singleton.bin"))
+        .prefer_mode(DownloadMode::Singleton)
+        .spawn()
+        .unwrap();
+    let concurrent = builder(SimpleTestAdapter::new(1024).with_range_support(true))
+        .save_to(temp_dir.path().join("concurrent.bin"))
         .prefer_mode(DownloadMode::Concurrent)
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await
+        .spawn()
         .unwrap();
 
-    // Task should be built successfully
-    assert!(!task.is_finished());
-
-    // Test with non-range-supporting adapter
-    let adapter = SimpleTestAdapter::new(2048).with_range_support(false);
-    let save_path2 = temp_dir.path().join("singleton_test.bin");
-    let task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path2)
-        .prefer_mode(DownloadMode::Concurrent)
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime)
-        .build()
-        .await
-        .unwrap();
-
-    // Should still build successfully (falls back to singleton mode)
-    assert!(!task.is_finished());
-
-    info!("✓ TaskBuilder mode preference test passed");
+    assert_eq!(
+        watchdog(singleton).await.unwrap().mode,
+        DownloadMode::Singleton
+    );
+    assert_eq!(
+        watchdog(concurrent).await.unwrap().mode,
+        DownloadMode::Concurrent
+    );
 }
 
-#[tokio::test]
-#[n0_tracing_test::traced_test]
-async fn test_task_builder_callback_configuration() {
-    let runtime = create_test_runtime();
-    let adapter = SimpleTestAdapter::new(1024);
-    let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("callback_test.bin");
-    let cancel_token = CancellationToken::new();
+/// Counts the metadata requests of the adapter it wraps.
+#[derive(Clone)]
+struct MetaCounting {
+    inner: SimpleTestAdapter,
+    meta_requests: Arc<AtomicUsize>,
+}
 
-    let callback_counter = Arc::new(AtomicUsize::new(0));
-    let callback_counter_clone = callback_counter.clone();
-
-    // Test with callback
-    let task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path)
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .on_task_state_changed(move |_event: TaskEvent| {
-            callback_counter_clone.fetch_add(1, Ordering::Relaxed);
-        })
-        .build()
-        .await;
-
-    assert!(
-        task.is_ok(),
-        "TaskBuilder with callback should build successfully"
-    );
-
-    let mut task = task.unwrap();
-
-    // Run the task to trigger callbacks
-    let run_result = task.run().await;
-    if run_result.is_ok() {
-        let _ = task.wait().await;
+impl BoltLoadAdapter for MetaCounting {
+    async fn is_range_stream_available(&self) -> bool {
+        self.inner.is_range_stream_available().await
     }
 
-    // Callback should have been called
-    assert!(
-        callback_counter.load(Ordering::Relaxed) > 0,
-        "Callback should have been invoked"
-    );
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
+        self.meta_requests.fetch_add(1, Ordering::SeqCst);
+        self.inner.retrieve_meta().await
+    }
 
-    info!("✓ TaskBuilder callback configuration test passed");
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+        self.inner.full_stream().await
+    }
+
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
+        self.inner.range_stream(start, end).await
+    }
 }
 
+/// S2: retrieve the metadata to choose where to save, then spawn without a
+/// second request.
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_task_builder_meta_retrieval() {
-    let runtime = create_test_runtime();
-    let adapter = SimpleTestAdapter::new(5000).with_filename("custom_file.txt".to_string());
+    let meta_requests = Arc::new(AtomicUsize::new(0));
+    let adapter = MetaCounting {
+        inner: SimpleTestAdapter::new(5000).with_filename("custom_file.txt".to_string()),
+        meta_requests: meta_requests.clone(),
+    };
     let temp_dir = TempDir::new().unwrap();
-    let cancel_token = CancellationToken::new();
 
-    let mut builder = TaskBuilder::default()
-        .adapter(adapter)
-        .save_dir(temp_dir.path().to_path_buf())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime);
-
-    // Test meta retrieval before building
+    let mut builder = builder(adapter);
     let meta = builder.retrieve_meta().await.unwrap();
     assert_eq!(meta.content_size, 5000);
     assert_eq!(meta.filename, Some("custom_file.txt".to_string()));
+    // Cached: a second call sends no request either.
+    builder.retrieve_meta().await.unwrap();
 
-    // Build should succeed and use the retrieved filename
-    let task = builder.build().await.unwrap();
-    assert!(!task.is_finished());
+    let output = watchdog(builder.save_into(temp_dir.path()).spawn().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(output.path, temp_dir.path().join("custom_file.txt"));
+    assert_eq!(meta_requests.load(Ordering::SeqCst), 1);
+}
 
-    info!("✓ TaskBuilder meta retrieval test passed");
+/// BUILD-6: a cloned builder spawns an independent task.
+#[tokio::test]
+#[n0_tracing_test::traced_test]
+async fn test_cloned_builders_spawn_independent_tasks() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = SimpleTestAdapter::new(4096);
+    let expected_hash = adapter.expected_hash().to_string();
+    let template = builder(adapter).prefer_mode(DownloadMode::Singleton);
+
+    let first = template
+        .clone()
+        .save_to(temp_dir.path().join("a.bin"))
+        .spawn()
+        .unwrap();
+    let second = template
+        .save_to(temp_dir.path().join("b.bin"))
+        .spawn()
+        .unwrap();
+    let (first, second) = watchdog(async { tokio::join!(first, second) }).await;
+
+    assert_hash(&first.unwrap().path, &expected_hash, 4096);
+    assert_hash(&second.unwrap().path, &expected_hash, 4096);
 }
 
 // ============================================================================
-// Task Lifecycle Tests
+// Task Handle Tests
 // ============================================================================
 
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_task_basic_lifecycle() {
-    let runtime = create_test_runtime();
-    let adapter = SimpleTestAdapter::new(2048).with_range_support(false);
     let temp_dir = TempDir::new().unwrap();
     let save_path = temp_dir.path().join("lifecycle_test.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await
+    let task = builder(SimpleTestAdapter::new(2048).with_range_support(false))
+        .save_to(&save_path)
+        .spawn()
         .unwrap();
+    let rx = task.status();
 
-    // Initial state
-    assert!(!task.is_initialized());
-    assert!(!task.is_finished());
+    let output = watchdog(task).await.unwrap();
 
-    // Run the task
-    let run_result = task.run().await;
-    assert!(run_result.is_ok(), "Task run should succeed");
-
-    // Give the async task time to process events and update state
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Task should now be initialized
-    assert!(task.is_initialized());
-
-    // Wait for completion
-    let wait_result = task.wait().await;
-    info!("Wait result: {:?}", wait_result);
-    assert!(wait_result.is_ok(), "Task should complete successfully");
-
-    // Task should be finished
-    assert!(task.is_finished());
-
-    // Debug file path and directory contents
-    info!("Expected save path: {:?}", save_path);
-    info!("Path exists: {}", save_path.exists());
-
-    // Check for partial file
-    let mut partial_path = save_path.clone();
-    if let Some(filename) = partial_path.file_name() {
-        let mut file_name = filename.to_os_string();
-        file_name.push(".partial");
-        partial_path.set_file_name(file_name);
-    }
-    info!("Partial path: {:?}", partial_path);
-    info!("Partial exists: {}", partial_path.exists());
-
-    if let Some(parent) = save_path.parent() {
-        info!("Parent directory: {:?}", parent);
-        if parent.exists() {
-            match std::fs::read_dir(parent) {
-                Ok(entries) => {
-                    info!("Directory contents:");
-                    for entry in entries.flatten() {
-                        info!("  - {:?}", entry.path());
-                    }
-                }
-                Err(e) => info!("Failed to read directory: {:?}", e),
-            }
-        } else {
-            info!("Parent directory doesn't exist");
-        }
-    }
-
-    // Verify file exists and has correct content
-    assert!(save_path.exists(), "Downloaded file should exist");
-    let downloaded_content = std::fs::read(&save_path).unwrap();
-    assert_eq!(
-        downloaded_content.len(),
-        2048,
-        "Downloaded file should have correct size"
-    );
-
-    info!("✓ Task basic lifecycle test passed");
+    let status = rx.borrow();
+    assert_eq!(status.state, TaskState::Finished);
+    assert!(status.is_terminal());
+    assert_eq!(status.fraction(), Some(1.0));
+    assert_eq!(output.mode, DownloadMode::Singleton);
+    assert_eq!(output.progress.downloaded, 2048);
+    assert!(save_path.exists());
 }
 
-#[tokio::test]
-#[n0_tracing_test::traced_test]
-async fn test_task_cancellation() {
-    let runtime = create_test_runtime();
-    let adapter = SimpleTestAdapter::new(10000).with_range_support(false); // 10KB file
-    let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("cancellation_test.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token.clone())
-        .threaded_runtime(runtime)
+/// Throttled so the download outlives the test's actions.
+fn slow_adapter() -> SimpleTestAdapter {
+    SimpleTestAdapterBuilder::new()
+        .content_size(1024 * 1024)
+        .support_range(true)
+        .max_speed(256 * 1024)
         .build()
+        .unwrap()
+}
+
+async fn wait_until_downloading(status: &mut StatusReceiver) {
+    watchdog(status.wait_for(|s| s.progress.downloaded > 0))
         .await
+        .expect("the task should start downloading");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_task_stop() {
+    let temp_dir = TempDir::new().unwrap();
+    let save_path = temp_dir.path().join("cancel_test.bin");
+    let parent = CancellationToken::new();
+    let task = builder(slow_adapter())
+        .save_to(&save_path)
+        .cancel_token(parent.clone())
+        .spawn()
+        .unwrap();
+    let mut status = task.status();
+    wait_until_downloading(&mut status).await;
+
+    let result = watchdog(task.stop()).await;
+
+    assert!(
+        matches!(result, Err(DownloadError::Cancelled)),
+        "{result:?}"
+    );
+    let last = status.borrow();
+    assert_eq!(last.state, TaskState::Cancelled);
+    assert!(
+        last.progress.downloaded > 0,
+        "progress is kept when cancelled"
+    );
+    assert!(
+        !parent.is_cancelled(),
+        "the caller's token is never cancelled"
+    );
+    assert!(!save_path.exists() && !tmp_path(&save_path).exists());
+}
+
+/// The handle's token cancels only its own task.
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_task_cancel_token_is_a_child() {
+    let temp_dir = TempDir::new().unwrap();
+    let parent = CancellationToken::new();
+    let task = builder(slow_adapter())
+        .save_to(temp_dir.path().join("child.bin"))
+        .cancel_token(parent.clone())
+        .spawn()
         .unwrap();
 
-    // Start the task
-    let run_result = task.run().await;
-    assert!(run_result.is_ok());
+    task.cancel_token().cancel();
 
-    // Cancel after a short delay
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    task.stop().await;
+    assert!(matches!(
+        watchdog(task).await,
+        Err(DownloadError::Cancelled)
+    ));
+    assert!(!parent.is_cancelled());
+}
 
-    // Wait for task to respond to cancellation
-    let wait_result = task.wait().await;
+/// S4: cancelling the parent token cancels every running task.
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_parent_token_cancels_every_task() {
+    let temp_dir = TempDir::new().unwrap();
+    let parent = CancellationToken::new();
+    let template = builder(slow_adapter()).cancel_token(parent.clone());
+    let tasks: Vec<Task> = (0..3)
+        .map(|i| {
+            template
+                .clone()
+                .save_to(temp_dir.path().join(format!("{i}.bin")))
+                .spawn()
+                .unwrap()
+        })
+        .collect();
 
-    // Task should have been cancelled or completed
-    assert!(task.is_finished());
+    parent.cancel();
 
-    info!(
-        "✓ Task cancellation test passed (result: {:?})",
-        wait_result
+    for result in watchdog(futures::future::join_all(tasks)).await {
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "{result:?}"
+        );
+    }
+}
+
+/// S6: dropping the handle cancels the download and removes its temporary
+/// file; a receiver taken before observes `Cancelled`, then `Closed`.
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_dropping_the_task_cancels_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let save_path = temp_dir.path().join("dropped.bin");
+    let adapter = slow_adapter();
+    let task = builder(adapter.clone())
+        .save_to(&save_path)
+        .spawn()
+        .unwrap();
+    let mut status = task.status();
+    wait_until_downloading(&mut status).await;
+
+    drop(task);
+
+    let statuses = record(status).await;
+    assert_transitions(&statuses);
+    assert_eq!(statuses.last().unwrap().state, TaskState::Cancelled);
+    assert!(!save_path.exists() && !tmp_path(&save_path).exists());
+    assert_eq!(adapter.active_streams(), 0);
+}
+
+/// S6: a task dropped before its attempt starts still ends in `Cancelled`
+/// without sending a request.
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_dropping_the_task_before_it_starts() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = SimpleTestAdapter::new(1024);
+    let task = builder(adapter.clone())
+        .save_to(temp_dir.path().join("never.bin"))
+        .spawn()
+        .unwrap();
+    let status = task.status();
+    drop(task);
+
+    let statuses = record(status).await;
+    assert_transitions(&statuses);
+    assert_eq!(statuses.last().unwrap().state, TaskState::Cancelled);
+    assert_eq!(adapter.call_count(), 0);
+}
+
+/// TASK-4: a detached task keeps running and stays observable.
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_detached_task_keeps_running() {
+    let temp_dir = TempDir::new().unwrap();
+    let save_path = temp_dir.path().join("detached.bin");
+    let adapter = SimpleTestAdapter::new(64 * 1024).with_range_support(true);
+    let expected_hash = adapter.expected_hash().to_string();
+    let task = builder(adapter).save_to(&save_path).spawn().unwrap();
+    let status = task.status();
+
+    task.detach();
+
+    let statuses = record(status).await;
+    assert_transitions(&statuses);
+    assert_eq!(statuses.last().unwrap().state, TaskState::Finished);
+    assert_hash(&save_path, &expected_hash, 64 * 1024);
+}
+
+/// Panics in its stream, inline in the singleton attempt.
+#[derive(Clone)]
+struct PanickingAdapter(SimpleTestAdapter);
+
+impl BoltLoadAdapter for PanickingAdapter {
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
+        self.0.retrieve_meta().await
+    }
+
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+        panic!("the adapter panicked");
+    }
+}
+
+/// S8, TASK-8: a panic becomes `Failed(Panicked)` instead of unwinding.
+#[tokio::test(flavor = "multi_thread")]
+#[n0_tracing_test::traced_test]
+async fn test_panic_becomes_an_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let save_path = temp_dir.path().join("panic.bin");
+    let task = builder(PanickingAdapter(SimpleTestAdapter::new(1024)))
+        .save_to(&save_path)
+        .spawn()
+        .unwrap();
+    let status = task.status();
+
+    let result = watchdog(task).await;
+
+    match result {
+        Err(DownloadError::Panicked { message }) => {
+            assert!(message.contains("the adapter panicked"), "{message}")
+        }
+        other => panic!("expected Panicked, got {other:?}"),
+    }
+    let statuses = record(status).await;
+    assert_transitions(&statuses);
+    assert_eq!(statuses.last().unwrap().state, TaskState::Failed);
+    assert!(!save_path.exists() && !tmp_path(&save_path).exists());
+}
+
+/// Delegates to tokio but cannot provide a local runtime.
+struct NoLocalRuntime(ThreadedRuntimeImpl);
+
+impl Spawn for NoLocalRuntime {
+    fn spawn_obj(&self, future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+        self.0.spawn_obj(future)
+    }
+}
+
+impl DowncastLocalRuntime for NoLocalRuntime {}
+
+impl TimerBuilder for NoLocalRuntime {
+    fn create_delayed_timer(&self, duration: Duration) -> TimerImpl {
+        self.0.create_delayed_timer(duration)
+    }
+
+    fn sleep(&self, duration: Duration) -> Sleep {
+        self.0.sleep(duration)
+    }
+}
+
+impl ThreadedRuntime for NoLocalRuntime {}
+
+/// INIT-3: a runtime without a local runtime fails the task instead of
+/// panicking.
+#[tokio::test]
+#[n0_tracing_test::traced_test]
+async fn test_missing_local_runtime_fails_the_task() {
+    let temp_dir = TempDir::new().unwrap();
+    let task = Task::builder(SimpleTestAdapter::new(1024))
+        .runtime(ThreadedRuntimeImpl::new_other_rt(NoLocalRuntime(
+            create_test_runtime(),
+        )))
+        .save_to(temp_dir.path().join("no-local.bin"))
+        .spawn()
+        .unwrap();
+    let status = task.status();
+
+    let result = watchdog(task).await;
+
+    assert!(
+        matches!(result, Err(DownloadError::Runtime { .. })),
+        "{result:?}"
     );
+    assert_eq!(status.borrow().state, TaskState::Failed);
+}
+
+// ============================================================================
+// Destination Tests
+// ============================================================================
+
+/// S7: a hostile filename is reduced to its final segment inside the
+/// directory; one that is not a file name fails without writing.
+#[tokio::test]
+#[n0_tracing_test::traced_test]
+async fn test_save_into_rejects_hostile_filenames() {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().join("downloads");
+    std::fs::create_dir(&dir).unwrap();
+
+    let adapter = SimpleTestAdapter::new(1024).with_filename("../../evil.bin".to_string());
+    let output = watchdog(builder(adapter).save_into(&dir).spawn().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(output.path, dir.join("evil.bin"));
+    assert!(!temp_dir.path().join("evil.bin").exists());
+
+    let adapter = SimpleTestAdapter::new(1024).with_filename("..".to_string());
+    let result = watchdog(builder(adapter).save_into(&dir).spawn().unwrap()).await;
+    assert!(
+        matches!(&result, Err(DownloadError::InvalidFilename { name }) if name == ".."),
+        "{result:?}"
+    );
+
+    let adapter = SimpleTestAdapterBuilder::new()
+        .content_size(1024)
+        .without_filename()
+        .build()
+        .unwrap();
+    let result = watchdog(builder(adapter).save_into(&dir).spawn().unwrap()).await;
+    assert!(
+        matches!(result, Err(DownloadError::MissingFilename)),
+        "{result:?}"
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(entries.len(), 1, "only evil.bin was written: {entries:?}");
 }
 
 // ============================================================================
 // Actual Download Tests with Hash Verification
 // ============================================================================
 
+async fn download_and_verify(adapter: SimpleTestAdapter, size: usize, name: &str) -> Duration {
+    let expected_hash = adapter.expected_hash().to_string();
+    let temp_dir = TempDir::new().unwrap();
+    let save_path = temp_dir.path().join(name);
+    let task = builder(adapter).save_to(&save_path).spawn().unwrap();
+
+    let start_time = Instant::now();
+    let result = task.await;
+    let duration = start_time.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "Download should complete successfully: {result:?}"
+    );
+    assert_hash(&save_path, &expected_hash, size);
+    duration
+}
+
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_small_file_download_with_hash_verification() {
-    let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(10240).with_range_support(false); // 10KB
-    let expected_hash = adapter.expected_hash().to_string();
-    let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("small_download.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await
-        .unwrap();
-
-    let start_time = Instant::now();
-
-    // Run the download
-    task.run().await.unwrap();
-    let result = task.wait().await;
-
-    let duration = start_time.elapsed();
-
-    assert!(result.is_ok(), "Download should complete successfully");
-    assert!(task.is_finished(), "Task should be finished");
-
-    // Verify file exists and calculate hash
-    assert!(save_path.exists(), "Downloaded file should exist");
-    let metadata = std::fs::metadata(&save_path).unwrap();
-    assert_eq!(
-        metadata.len(),
-        10240,
-        "Downloaded file should have correct size"
-    );
-    let downloaded_content = std::fs::read(&save_path).unwrap();
-    let actual_hash = calculate_blake3(&downloaded_content);
-
-    assert_eq!(
-        actual_hash, expected_hash,
-        "Downloaded file hash should match expected hash"
-    );
-    assert_eq!(
-        downloaded_content.len(),
-        10240,
-        "Downloaded file should have correct size"
-    );
-
-    info!("✓ Small file download test passed");
-    info!("  - Size: 10KB");
-    info!("  - Duration: {:?}", duration);
-    info!("  - Hash: {}", actual_hash);
+    let duration = download_and_verify(adapter, 10240, "small_download.bin").await;
+    info!("✓ Small file download test passed in {duration:?}");
 }
 
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_medium_file_download_with_hash_verification() {
-    let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024 * 1024).with_range_support(false); // 1MB
-    let expected_hash = adapter.expected_hash().to_string();
-    let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("medium_download.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await
-        .unwrap();
-
-    let start_time = Instant::now();
-
-    // Run the download
-    task.run().await.unwrap();
-    let result = task.wait().await;
-
-    let duration = start_time.elapsed();
-
-    assert!(result.is_ok(), "Download should complete successfully");
-
-    // Verify file and hash
-    let downloaded_content = std::fs::read(&save_path).unwrap();
-    let actual_hash = calculate_blake3(&downloaded_content);
-
-    assert_eq!(actual_hash, expected_hash, "Hash verification failed");
-    assert_eq!(
-        downloaded_content.len(),
-        1024 * 1024,
-        "File size verification failed"
-    );
-
-    info!("✓ Medium file download test passed");
-    info!("  - Size: 1MB");
-    info!("  - Duration: {:?}", duration);
-    info!("  - Hash: {}", actual_hash);
+    let duration = download_and_verify(adapter, 1024 * 1024, "medium_download.bin").await;
+    info!("✓ Medium file download test passed in {duration:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
 async fn test_large_file_download_with_hash_verification() {
-    let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new_large().with_range_support(true); // 100MB
-    let expected_hash = adapter.expected_hash().to_string();
-    let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("large_download.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await
-        .unwrap();
-
-    info!("🚀 Starting 100MB file download test...");
-    let start_time = Instant::now();
-
-    // Run the download
-    task.run().await.unwrap();
-    let result = task.wait().await;
-
-    let duration = start_time.elapsed();
-
-    assert!(
-        result.is_ok(),
-        "Large file download should complete successfully"
-    );
-
-    // Verify file exists and has correct size
-    assert!(save_path.exists(), "Downloaded file should exist");
-    let file_size = std::fs::metadata(&save_path).unwrap().len();
-    assert_eq!(
-        file_size,
-        100 * 1024 * 1024,
-        "File size should be exactly 100MB"
-    );
-
-    // Calculate and verify hash
-    info!("🔍 Calculating hash for verification...");
-    let hash_start = Instant::now();
-    let downloaded_content = std::fs::read(&save_path).unwrap();
-    let actual_hash = calculate_blake3(&downloaded_content);
-    let hash_duration = hash_start.elapsed();
-
-    assert_eq!(
-        actual_hash, expected_hash,
-        "Hash verification failed for large file"
-    );
-
-    // Calculate download speed
+    let duration = download_and_verify(adapter, 100 * 1024 * 1024, "large_download.bin").await;
     let speed_mbps = (100.0 / duration.as_secs_f64()).round();
-
-    info!("🎉 Large file download test passed!");
-    info!("  - Size: 100MB");
-    info!("  - Download time: {:?}", duration);
-    info!("  - Hash calculation time: {:?}", hash_duration);
-    info!("  - Average speed: {} MB/s", speed_mbps);
-    info!("  - Hash: {}", actual_hash);
-
-    // Clean up large file
-    let _ = std::fs::remove_file(&save_path);
+    info!("🎉 Large file download test passed in {duration:?}, {speed_mbps} MB/s");
 }
 
 // ============================================================================
@@ -592,60 +629,46 @@ async fn test_large_file_download_with_hash_verification() {
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_adapter_failure_handling() {
-    let runtime = create_test_runtime();
-    let adapter = SimpleTestAdapter::new(1024).with_failure(true);
     let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("failure_test.bin");
-    let cancel_token = CancellationToken::new();
+    let task = builder(SimpleTestAdapter::new(1024).with_failure(true))
+        .save_to(temp_dir.path().join("failure_test.bin"))
+        .spawn()
+        .expect("spawning sends no request, so it succeeds");
 
-    // Try to build task - should fail during meta retrieval
-    let build_result = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path)
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await;
+    let result = watchdog(task).await;
 
-    // Task should fail to build due to adapter failure
     assert!(
-        build_result.is_err(),
-        "Task should fail to build when adapter fails"
+        matches!(result, Err(DownloadError::Metadata { .. })),
+        "{result:?}"
     );
-
-    info!("✓ Adapter failure handling test passed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
-#[ignore]
-// TODO: this test is not working, we need to fix it
+#[ignore = "an empty stream of unknown size fails with `Empty`, see #153"]
 async fn test_zero_size_file_handling() {
-    let runtime = create_test_runtime();
-    let adapter = SimpleTestAdapter::new(0); // Zero-size file
     let temp_dir = TempDir::new().unwrap();
     let save_path = temp_dir.path().join("zero_size_test.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await
+    let task = builder(SimpleTestAdapter::new(0))
+        .save_to(&save_path)
+        .spawn()
         .unwrap();
 
-    task.run().await.unwrap();
-    let result = task.wait().await;
+    let output = watchdog(task).await.expect("should be ok");
 
-    info!("state: {:?}", task.task_state.load(Ordering::Acquire));
-    result.expect("should be ok");
-    // Zero-size downloads should complete successfully
-    assert!(save_path.exists(), "Zero-size file should exist");
+    assert_eq!(output.mode, DownloadMode::Singleton);
     let content = std::fs::read(&save_path).unwrap();
     assert!(content.is_empty(), "Zero-size file should be empty");
-    info!("✓ Zero-size file handling test passed");
+}
+
+// ============================================================================
+// Performance Tests
+// ============================================================================
+
+async fn timed(task: Task) -> (TaskOutput, Duration) {
+    let start_time = Instant::now();
+    let output = task.await.expect("the task should succeed");
+    (output, start_time.elapsed())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -653,183 +676,37 @@ async fn test_zero_size_file_handling() {
 async fn test_concurrent_vs_singleton_performance() {
     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
     let temp_dir = TempDir::new().unwrap();
-
-    // Set up adapters
     let adapter1 = SimpleTestAdapter::new(file_size).with_range_support(true);
-    info!("adapter1: {:?}", adapter1);
     let adapter2 = adapter1.clone_reset_count().with_range_support(false);
-    info!("adapter2: {:?}", adapter2);
-
-    // Test concurrent mode
-    let runtime = ThreadedRuntimeImpl::new_tokio_rt();
     let concurrent_expected_hash = adapter1.expected_hash().to_string();
-    let concurrent_path = temp_dir.path().join("concurrent.bin");
-
-    let mut concurrent_task = TaskBuilder::default()
-        .adapter(adapter1)
-        .save_path(concurrent_path.clone())
-        .prefer_mode(DownloadMode::Concurrent)
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await
-        .unwrap();
-
-    // Test singleton mode
     let singleton_expected_hash = adapter2.expected_hash().to_string();
-    let singleton_path = temp_dir.path().join("singleton.bin");
+    let runtime = ThreadedRuntimeImpl::new_tokio_rt();
 
-    let mut singleton_task = TaskBuilder::default()
-        .adapter(adapter2)
-        .save_path(singleton_path.clone())
-        .prefer_mode(DownloadMode::Singleton)
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await
+    let concurrent = Task::builder(adapter1)
+        .runtime(runtime.clone())
+        .save_to(temp_dir.path().join("concurrent.bin"))
+        .prefer_mode(DownloadMode::Concurrent)
+        .spawn()
         .unwrap();
+    let (concurrent, concurrent_duration) = timed(concurrent).await;
+    let singleton = Task::builder(adapter2)
+        .runtime(runtime)
+        .save_to(temp_dir.path().join("singleton.bin"))
+        .prefer_mode(DownloadMode::Singleton)
+        .spawn()
+        .unwrap();
+    let (singleton, singleton_duration) = timed(singleton).await;
 
-    info!("🏁 Starting performance comparison test (1MB)...");
-
-    // Run both downloads and measure time
-    let start_time = Instant::now();
-    concurrent_task.run().await.unwrap();
-    concurrent_task
-        .wait()
-        .await
-        .expect("concurrent task should succeed");
-    info!("Concurrent task finished");
-    let concurrent_duration = start_time.elapsed();
-
-    let start_time = Instant::now();
-    singleton_task.run().await.unwrap();
-    singleton_task
-        .wait()
-        .await
-        .expect("singleton task should succeed");
-    info!("Singleton task finished");
-    let singleton_duration = start_time.elapsed();
-
-    let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
-    let singleton_speed = (file_size as f64 / singleton_duration.as_secs_f64()).round();
-
-    // Verify singleton file
-    let singleton_content = std::fs::read(&singleton_path).unwrap();
-    let singleton_hash = calculate_blake3(&singleton_content);
-    let concurrent_content = std::fs::read(&concurrent_path).unwrap();
-    let concurrent_hash = calculate_blake3(&concurrent_content);
-    assert_eq!(
-        singleton_hash, singleton_expected_hash,
-        "Singleton file hash should be correct"
-    );
-    assert_eq!(
-        concurrent_hash, concurrent_expected_hash,
-        "Concurrent file hash should be correct"
-    );
-
-    info!("✓ Performance comparison test completed");
+    assert_hash(&concurrent.path, &concurrent_expected_hash, file_size);
+    assert_hash(&singleton.path, &singleton_expected_hash, file_size);
+    let mib = (1024 * 1024) as f64;
     info!(
-        "
-    - Concurrent result:
-        - Measured Speed: {concurrent_speed} MB/s
-        - Duration: {concurrent_duration:?}
-        - Hash: {concurrent_hash}
-        - File size: {file_size} bytes"
+        "concurrent: {:.0} MB/s in {concurrent_duration:?}; singleton: {:.0} MB/s in \
+         {singleton_duration:?}",
+        file_size as f64 / concurrent_duration.as_secs_f64() / mib,
+        file_size as f64 / singleton_duration.as_secs_f64() / mib,
     );
-    info!(
-        "
-    - Singleton result:
-        - Measured Speed: {singleton_speed} MB/s
-        - Duration: {singleton_duration:?}
-        - Hash: {singleton_hash}
-        - File size: {file_size} bytes"
-    );
-
-    let concurrent_content = std::fs::read(&concurrent_path).unwrap();
-    let concurrent_hash = calculate_blake3(&concurrent_content);
-    assert_eq!(
-        concurrent_hash, concurrent_expected_hash,
-        "Concurrent file hash should be correct"
-    );
-    info!("  - Both modes completed successfully with matching hashes");
 }
-
-// #[tokio::test(flavor = "multi_thread")]
-// async fn test_concurrent_performance_only() {
-//     crate::utils::test::init_tracing().await;
-
-//     let file_size = 1024 * 1024 * 1024; // 1GB for reasonable test time
-//     let temp_dir = TempDir::new().unwrap();
-
-//     // Set up adapter with range support for concurrent downloading
-//     let adapter = SimpleTestAdapter::new(file_size)
-//         .with_range_support(true)
-//         .with_delay_per_chunk(std::time::Duration::from_millis(10));
-//     info!("adapter: {:?}", adapter);
-
-//     // Test concurrent mode
-//     let runtime = ThreadedRuntimeImpl::new_tokio_rt();
-//     let expected_hash = adapter.expected_hash().to_string();
-//     let save_path = temp_dir.path().join("concurrent_performance_test.bin");
-
-//     let mut concurrent_task = TaskBuilder::default()
-//         .adapter(adapter)
-//         .save_path(save_path.clone())
-//         .prefer_mode(DownloadMode::Concurrent)
-//         .cancel_token(CancellationToken::new())
-//         .threaded_runtime(runtime.clone())
-//         .build()
-//         .await
-//         .unwrap();
-
-//     info!(
-//         "🏁 Starting concurrent performance test ({}MB)...",
-//         file_size / (1024 * 1024)
-//     );
-
-//     // Run the download and measure time
-//     let start_time = Instant::now();
-//     concurrent_task.run().await.unwrap();
-//     concurrent_task
-//         .wait()
-//         .await
-//         .expect("concurrent task should succeed");
-//     let concurrent_duration = start_time.elapsed();
-
-//     let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
-
-//     // Verify downloaded file
-//     let content = std::fs::read(&save_path).unwrap();
-//     let actual_hash = calculate_blake3(&content);
-//     assert_eq!(
-//         actual_hash, expected_hash,
-//         "Concurrent file hash should be correct"
-//     );
-
-//     info!("✓ Concurrent performance test completed");
-//     info!(
-//         "
-//     - Concurrent result:
-//         - Measured Speed: {} MB/s
-//         - Duration: {:?}
-//         - Hash: {}
-//         - File size: {} bytes",
-//         concurrent_speed / (1024.0 * 1024.0),
-//         concurrent_duration,
-//         actual_hash,
-//         file_size
-//     );
-
-//     // Additional assertions
-//     assert!(save_path.exists(), "Downloaded file should exist");
-//     assert_eq!(
-//         content.len(),
-//         file_size,
-//         "Downloaded file should have correct size"
-//     );
-
-//     info!("  - Concurrent mode completed successfully with matching hash");
-// }
 
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
@@ -838,9 +715,7 @@ async fn test_concurrent_performance_only() {
     let per_stream_speed = 10 * 1024 * 1024; // 10MB/s per stream
     let max_speed = per_stream_speed * 10; // 100MB/s total speed
     let temp_dir = TempDir::new().unwrap();
-
-    // Set up adapter with range support for concurrent downloading
-    // Use max_per_stream_speed to simulate slow downloads (equivalent to ~10ms delay per 8KB chunk)
+    // Use max_per_stream_speed to simulate slow downloads.
     let adapter = SimpleTestAdapterBuilder::new()
         .content_size(file_size)
         .support_range(true)
@@ -848,102 +723,29 @@ async fn test_concurrent_performance_only() {
         .max_speed(max_speed)
         .build()
         .expect("Failed to build adapter");
-    info!("adapter: {:?}", adapter);
-
-    // Test concurrent mode
-    let runtime = ThreadedRuntimeImpl::new_tokio_rt();
     let expected_hash = adapter.expected_hash().to_string();
-    let save_path = temp_dir.path().join("concurrent_performance_test.bin");
 
-    let mut concurrent_task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
+    let task = Task::builder(adapter)
+        .runtime(ThreadedRuntimeImpl::new_tokio_rt())
+        .save_to(temp_dir.path().join("concurrent_performance_test.bin"))
         .prefer_mode(DownloadMode::Concurrent)
-        .cancel_token(CancellationToken::new())
-        .threaded_runtime(runtime.clone())
-        .build()
-        .await
+        .spawn()
         .unwrap();
+    let (output, duration) = timed(task).await;
 
+    assert_hash(&output.path, &expected_hash, file_size);
     info!(
-        "🏁 Starting concurrent performance test ({}MB)...",
-        file_size / (1024 * 1024)
+        "concurrent: {:.0} MB/s in {duration:?}",
+        file_size as f64 / duration.as_secs_f64() / (1024.0 * 1024.0)
     );
-
-    // Run the download and measure time
-    let start_time = Instant::now();
-    concurrent_task.run().await.unwrap();
-    concurrent_task
-        .wait()
-        .await
-        .expect("concurrent task should succeed");
-    let concurrent_duration = start_time.elapsed();
-
-    let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
-
-    // Verify downloaded file
-    let content = std::fs::read(&save_path).unwrap();
-    let actual_hash = calculate_blake3(&content);
-    assert_eq!(
-        actual_hash, expected_hash,
-        "Concurrent file hash should be correct"
-    );
-
-    info!("✓ Concurrent performance test completed");
-    info!(
-        "
-    - Concurrent result:
-        - Measured Speed: {} MB/s
-        - Duration: {:?}
-        - Hash: {}
-        - File size: {} bytes",
-        concurrent_speed / (1024.0 * 1024.0),
-        concurrent_duration,
-        actual_hash,
-        file_size
-    );
-
-    // Additional assertions
-    assert!(save_path.exists(), "Downloaded file should exist");
-    assert_eq!(
-        content.len(),
-        file_size,
-        "Downloaded file should have correct size"
-    );
-
-    info!("  - Concurrent mode completed successfully with matching hash");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
 async fn test_concurrent_task_with_range_stream() {
-    let runtime = create_test_runtime();
     let adapter = SimpleTestAdapter::new(1024 * 1024).with_range_support(true);
-    let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("concurrent_range_test.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await
-        .unwrap();
-
-    task.run().await.unwrap();
-    let result = task.wait().await;
-
-    result.expect("should be ok");
-    assert!(save_path.exists(), "Downloaded file should exist");
-    let content = std::fs::read(&save_path).unwrap();
-    assert_eq!(
-        content.len(),
-        1024 * 1024,
-        "Downloaded file should have correct size"
-    );
-    info!("✓ Concurrent task with range stream test passed");
+    let duration = download_and_verify(adapter, 1024 * 1024, "concurrent_range_test.bin").await;
+    info!("✓ Concurrent task with range stream test passed in {duration:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -952,7 +754,6 @@ async fn test_concurrent_task_with_max_limit() {
     let file_size = 1024 * 1024 * 1024;
     let per_stream_speed = 10 * 1024 * 1024; // 10MB/s per stream
     let max_speed = per_stream_speed * 10; // 100MB/s total speed
-    let runtime = create_test_runtime();
     let adapter = SimpleTestAdapterBuilder::new()
         .support_range(true)
         .max_concurrent_streams(2)
@@ -961,46 +762,32 @@ async fn test_concurrent_task_with_max_limit() {
         .content_size(file_size)
         .build()
         .unwrap();
-    let temp_dir = TempDir::new().unwrap();
-    let save_path = temp_dir.path().join("concurrent_range_test.bin");
-    let cancel_token = CancellationToken::new();
-
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path(save_path.clone())
-        .cancel_token(cancel_token)
-        .threaded_runtime(runtime)
-        .build()
-        .await
-        .unwrap();
-
-    let start_time = Instant::now();
-    task.run().await.unwrap();
-    task.wait().await.expect("concurrent task should succeed");
-    let concurrent_duration = start_time.elapsed();
-
-    let concurrent_speed = (file_size as f64 / concurrent_duration.as_secs_f64()).round();
-
-    let result = task.wait().await;
-
-    result.expect("should be ok");
-    assert!(save_path.exists(), "Downloaded file should exist");
-    let content = std::fs::read(&save_path).unwrap();
-    assert_eq!(
-        content.len(),
-        file_size,
-        "Downloaded file should have correct size"
-    );
-
+    let duration = download_and_verify(adapter, file_size, "concurrent_max_limit.bin").await;
     info!(
-        "
-    - Concurrent result:
-        - Measured Speed: {} MB/s
-        - Duration: {:?}
-        - File size: {} bytes",
-        concurrent_speed / (1024.0 * 1024.0),
-        concurrent_duration,
-        file_size
+        "concurrent with a stream limit: {:.0} MB/s in {duration:?}",
+        file_size as f64 / duration.as_secs_f64() / (1024.0 * 1024.0)
     );
-    info!("✓ Concurrent task with max limit test passed");
+}
+
+// ============================================================================
+// Type Tests
+// ============================================================================
+
+/// TASK-7: the public handles and their futures are `Send + Sync`.
+#[test]
+fn test_public_types_are_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send_sync::<Task>();
+    assert_send_sync::<TaskBuilder>();
+    assert_send_sync::<TaskStatus>();
+    assert_send_sync::<TaskOutput>();
+    assert_send_sync::<DownloadError>();
+    assert_send_sync::<BuildError>();
+    assert_send_sync::<StatusReceiver>();
+    let (_publisher, mut rx) = crate::task::status::StatusPublisher::new();
+    assert_send(&rx.wait_for(|_| true));
+    assert_send(&rx.changed());
+    let mut builder = Task::builder(SimpleTestAdapter::new(1));
+    assert_send(&builder.retrieve_meta());
 }

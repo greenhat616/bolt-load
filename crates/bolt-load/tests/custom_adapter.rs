@@ -7,7 +7,7 @@ use bolt_load::{
         AdapterError, AnyAdapter, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta,
         DynBoltLoadAdapter,
     },
-    task::TaskBuilder,
+    task::{Task, TaskBuilder},
 };
 
 const SIZE: u64 = 42;
@@ -33,25 +33,19 @@ async fn content_size(mut builder: TaskBuilder) -> u64 {
 
 #[tokio::test]
 async fn concrete_adapter() {
-    assert_eq!(
-        content_size(TaskBuilder::default().adapter(FixedMeta)).await,
-        SIZE
-    );
+    assert_eq!(content_size(Task::builder(FixedMeta)).await, SIZE);
 }
 
 #[tokio::test]
 async fn boxed_erased_adapter() {
     let boxed: Box<AnyAdapter> = DynBoltLoadAdapter::new_box(FixedMeta);
-    assert_eq!(
-        content_size(TaskBuilder::default().adapter(boxed)).await,
-        SIZE
-    );
+    assert_eq!(content_size(Task::builder(boxed)).await, SIZE);
 }
 
 #[tokio::test]
 async fn shared_erased_adapter() {
     let shared: Arc<AnyAdapter> = DynBoltLoadAdapter::new_arc(FixedMeta);
-    let builder = TaskBuilder::default().adapter_arc(shared.clone());
+    let builder = Task::builder_arc(shared.clone());
     assert_eq!(content_size(builder).await, SIZE);
     assert!(!shared.is_range_stream_available().await);
 }

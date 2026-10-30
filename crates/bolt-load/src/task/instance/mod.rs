@@ -1,17 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+//! The two transfer modes of a download attempt and the lifecycle that drives
+//! them, see [`drive`].
 
-use smol_cancellation_token::CancellationToken;
-
-use super::{DownloadMode, Progress, TaskOptions};
-use crate::{
-    adapter::{AdapterError, AnyAdapter},
-    runner::TaskError,
-    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
-};
+use super::DownloadError;
 
 /// Concurrent download task implementation.
 pub mod concurrent_task;
-mod drive;
+pub(crate) mod drive;
 mod id;
 mod output_file;
 mod sampler;
@@ -21,217 +15,15 @@ mod singleton_task;
 mod tests;
 
 #[cfg(test)]
-mod event_contract_tests;
+mod status_contract_tests;
 
 #[cfg(test)]
 mod integration_test;
 #[cfg(all(test, bolt_load_probe_send))]
 mod probe_send;
 
-pub use concurrent_task::*;
+use concurrent_task::ConcurrentTaskInner;
 use id::Generator;
-pub use singleton_task::*;
+use singleton_task::SingletonTaskInner;
 
-/// The default capacity of the control channel
-///
-/// It is used to control the task runner
-#[expect(dead_code, reason = "reserved for the task control channel")]
-const DEFAULT_CONTROL_CHANNEL_CAPACITY: usize = 32;
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ProgressWithSpeed {
-    #[cfg_attr(feature = "serde", serde(flatten))]
-    progress: Progress,
-    speed: f64,
-    #[cfg_attr(feature = "serde", serde(default))]
-    write_speed: f64,
-}
-
-impl ProgressWithSpeed {
-    pub fn new(progress: Progress, speed: f64, write_speed: f64) -> Self {
-        Self {
-            progress,
-            speed,
-            write_speed,
-        }
-    }
-
-    /// Get the progress
-    pub fn progress(&self) -> &Progress {
-        &self.progress
-    }
-
-    /// Get the download speed in bytes per second
-    pub fn speed(&self) -> f64 {
-        self.speed
-    }
-
-    /// Get the write speed in bytes per second
-    pub fn write_speed(&self) -> f64 {
-        self.write_speed
-    }
-
-    /// Get the total size
-    pub fn total(&self) -> Option<u64> {
-        self.progress.total
-    }
-
-    /// Get the downloaded size
-    pub fn downloaded(&self) -> u64 {
-        self.progress.downloaded
-    }
-
-    /// Get the downloaded chunks
-    pub fn downloaded_chunks(&self) -> &[std::ops::Range<u64>] {
-        &self.progress.downloaded_chunks
-    }
-}
-
-/// The event of the task
-///
-/// It is used to push event to the manager or client
-#[derive(Debug, Clone)]
-pub enum TaskEvent {
-    /// Initializing the task, including preallocating the file and retrieve the meta
-    Initializing,
-    /// Downloading the file
-    Downloading(ProgressWithSpeed),
-    /// Failed to download the file
-    Failed(TaskInstanceError),
-    /// Finished downloading the file
-    Finished(Progress),
-}
-
-struct TaskControl {
-    token: CancellationToken,
-    handle: Option<blocking::Task<()>>,
-}
-
-impl TaskControl {
-    pub fn new(token: CancellationToken, task: blocking::Task<()>) -> Self {
-        Self {
-            token,
-            handle: Some(task),
-        }
-    }
-
-    /// Join the background task. The handle is kept until the join completes,
-    /// so dropping this future does not detach the task.
-    pub async fn wait(&mut self) {
-        if let Some(handle) = self.handle.as_mut() {
-            handle.await;
-            self.handle = None;
-        }
-    }
-
-    pub async fn stop(&mut self) {
-        self.token.cancel();
-        self.wait().await;
-    }
-}
-
-#[enum_dispatch::enum_dispatch]
-pub enum TaskInstanceImpl {
-    Singleton(SingletonTask),
-    Concurrent(ConcurrentTask),
-}
-
-#[derive(Debug, snafu::Snafu, Clone)]
-pub enum TaskInstanceError {
-    #[snafu(display("retrieve meta failed: {source}"))]
-    RetrieveMetaFailed { source: AdapterError },
-    #[snafu(display("failed to allocate file size: {source}"))]
-    AllocateFileSpaceFailed { source: Arc<std::io::Error> },
-    #[snafu(display("failed to fetch stream failed: {source}"))]
-    StreamFailed { source: AdapterError },
-    #[snafu(display("task failed: {source:?}"))]
-    Failed { source: Arc<TaskError> },
-    #[snafu(display("failed to write chunk: {source}"))]
-    WriteChunkFailed { source: Arc<std::io::Error> },
-}
-
-impl TaskInstanceError {
-    pub fn new_retrieve_meta_failed(e: AdapterError) -> Self {
-        Self::RetrieveMetaFailed { source: e }
-    }
-
-    pub fn new_stream_failed(e: AdapterError) -> Self {
-        Self::StreamFailed { source: e }
-    }
-
-    pub fn new_failed(e: TaskError) -> Self {
-        Self::Failed {
-            source: Arc::new(e),
-        }
-    }
-
-    pub fn new_write_chunk_failed(e: std::io::Error) -> Self {
-        Self::WriteChunkFailed {
-            source: Arc::new(e),
-        }
-    }
-
-    pub fn new_allocate_file_size_failed(e: std::io::Error) -> Self {
-        Self::AllocateFileSpaceFailed {
-            source: Arc::new(e),
-        }
-    }
-}
-
-type Result<T, E = TaskInstanceError> = std::result::Result<T, E>;
-
-/// The abstract trait of the task
-///
-/// implemented by singleton task and concurrent task,
-///
-/// It should be execute at the same task of the `TaskManager`,
-/// so we do not have the `Send` and `Sync` for this async fn trait
-#[enum_dispatch::enum_dispatch(TaskInstanceImpl)]
-pub(in crate::task) trait TaskInstance {
-    fn run(
-        &mut self,
-        adapter: Arc<AnyAdapter>,
-        path: PathBuf,
-        event_tx: async_channel::Sender<TaskEvent>,
-        cancel_token: CancellationToken,
-    ) -> Result<()>;
-    /// Wait for the task to finish
-    async fn wait(&mut self) -> Result<()>;
-    async fn stop(&mut self) -> Result<()>;
-}
-
-impl TaskInstanceImpl {
-    pub fn new(
-        mode: DownloadMode,
-        threaded_rt: ThreadedRuntimeImpl,
-        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-    ) -> Self {
-        Self::with_options(
-            mode,
-            threaded_rt,
-            local_runtime_builder,
-            TaskOptions::default(),
-        )
-    }
-
-    pub fn with_options(
-        mode: DownloadMode,
-        threaded_rt: ThreadedRuntimeImpl,
-        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-        options: TaskOptions,
-    ) -> Self {
-        match mode {
-            DownloadMode::Singleton => Self::Singleton(SingletonTask::with_options(
-                threaded_rt,
-                local_runtime_builder,
-                options,
-            )),
-            DownloadMode::Concurrent => Self::Concurrent(ConcurrentTask::with_options(
-                threaded_rt,
-                local_runtime_builder,
-                options,
-            )),
-        }
-    }
-}
+type Result<T, E = DownloadError> = std::result::Result<T, E>;

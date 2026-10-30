@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     runner::TaskError,
-    task::instance::{Result, TaskInstanceError},
+    task::{DownloadError, instance::Result},
 };
 
 impl DownloadLoop {
@@ -36,7 +36,7 @@ impl DownloadLoop {
                 .policy
                 .on_failure(&failure, self.manager.allocated_runner_count())
         {
-            return Err(TaskInstanceError::new_failed(e));
+            return Err(DownloadError::transfer(e));
         }
         Ok(if tick.state == TaskState::Finished {
             ControlFlow::Break(())
@@ -59,8 +59,8 @@ impl DownloadLoop {
 }
 
 #[cold]
-fn writer_full(e: WriterFullError) -> TaskInstanceError {
-    TaskInstanceError::new_failed(TaskError::Other {
+fn writer_full(e: WriterFullError) -> DownloadError {
+    DownloadError::transfer(TaskError::Other {
         message: format!(
             "writer full (invariant violation): {:?}",
             e.pending_write.range
