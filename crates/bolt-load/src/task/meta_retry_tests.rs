@@ -1,4 +1,4 @@
-//! Cancellation of the metadata retry in the task builder and both task modes.
+//! Cancellation of the metadata retry during a task's initialization.
 
 use std::{
     sync::{
@@ -12,16 +12,9 @@ use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
 use crate::{
-    adapter::{
-        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, DynBoltLoadAdapter,
-        RetryableError,
-    },
-    runner::TaskError,
+    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError},
     runtime::ThreadedRuntimeImpl,
-    task::{
-        DownloadMode, MetaRetry, TaskBuilder, TaskManagerBuildError, TaskOptions,
-        instance::{TaskEvent, TaskInstance, TaskInstanceError, TaskInstanceImpl},
-    },
+    task::{BuildError, DownloadError, MetaRetry, Task, TaskOptions, TaskState},
 };
 
 /// Far longer than [`WATCHDOG`], so finishing in time proves cancellation.
@@ -78,107 +71,77 @@ fn slow_retry() -> TaskOptions {
 }
 
 #[tokio::test]
-async fn test_builder_rejects_invalid_retry_before_requesting() {
+async fn test_spawn_rejects_invalid_retry_before_requesting() {
     let (adapter, _, calls) = SignalAdapter::new(false);
-    let mut builder = TaskBuilder::default()
-        .adapter(adapter)
-        .options(TaskOptions::default().meta_retry(MetaRetry::default().min_delay(Duration::ZERO)));
-    let result = builder.retrieve_meta().await;
+    let dir = TempDir::new().unwrap();
+    let result = Task::builder(adapter)
+        .runtime(ThreadedRuntimeImpl::new_tokio_rt())
+        .save_to(dir.path().join("file.bin"))
+        .options(TaskOptions::default().meta_retry(MetaRetry::default().min_delay(Duration::ZERO)))
+        .spawn();
     assert!(
-        matches!(
-            result,
-            Err(TaskManagerBuildError::FieldValidationFailed { .. })
-        ),
+        matches!(result, Err(BuildError::InvalidOptions { .. })),
         "{result:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
-async fn assert_build_cancelled(hang: bool) {
+/// Cancelling the caller's token during the backoff or an in-flight request
+/// ends the task in `Cancelled` without waiting for the 30 s backoff (INIT-2).
+async fn assert_task_cancelled(hang: bool) {
     let (adapter, requested, calls) = SignalAdapter::new(hang);
     let dir = TempDir::new().unwrap();
     let token = CancellationToken::new();
-    let build = TaskBuilder::default()
-        .adapter(adapter)
-        .threaded_runtime(ThreadedRuntimeImpl::new_tokio_rt())
+    let task = Task::builder(adapter)
+        .runtime(ThreadedRuntimeImpl::new_tokio_rt())
         .cancel_token(token.clone())
-        .save_path(dir.path().join("file.bin"))
+        .save_to(dir.path().join("file.bin"))
         .options(slow_retry())
-        .build();
-    let cancel = async {
-        requested.recv().await.unwrap();
-        token.cancel();
-    };
-    let (result, ()) = watchdog(futures::future::join(build, cancel)).await;
+        .spawn()
+        .unwrap();
+    watchdog(requested.recv()).await.unwrap();
+    token.cancel();
+    let status = task.status();
+    let result = watchdog(task).await;
     assert!(
-        matches!(result, Err(TaskManagerBuildError::Cancelled)),
-        "{:?}",
-        result.err()
+        matches!(result, Err(DownloadError::Cancelled)),
+        "{result:?}"
     );
+    assert_eq!(status.borrow().state, TaskState::Cancelled);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_builder_cancel_during_backoff() {
-    assert_build_cancelled(false).await;
+async fn test_cancel_during_backoff() {
+    assert_task_cancelled(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_builder_cancel_during_inflight_request() {
-    assert_build_cancelled(true).await;
+async fn test_cancel_during_inflight_request() {
+    assert_task_cancelled(true).await;
 }
 
-async fn assert_instance_cancelled(mode: DownloadMode, hang: bool) {
-    let (adapter, requested, calls) = SignalAdapter::new(hang);
-    let dir = TempDir::new().unwrap();
-    let token = CancellationToken::new();
-    let (event_tx, event_rx) = async_channel::unbounded();
-    let mut task = TaskInstanceImpl::with_options(
-        mode,
-        ThreadedRuntimeImpl::new_tokio_rt(),
-        None,
-        slow_retry(),
-    );
-    task.run(
-        DynBoltLoadAdapter::new_arc(adapter),
-        dir.path().join("file.bin"),
-        event_tx,
-        token.clone(),
-    )
-    .unwrap();
-    watchdog(requested.recv()).await.unwrap();
-    token.cancel();
-    let last = watchdog(async {
-        let mut last = None;
-        while let Ok(event) = event_rx.recv().await {
-            last = Some(event);
-        }
-        last
-    })
-    .await;
-    match last {
-        Some(TaskEvent::Failed(TaskInstanceError::Failed { source })) => {
-            assert!(
-                matches!(*source, TaskError::Cancelled),
-                "{mode:?}: {source:?}"
-            )
-        }
-        other => panic!("{mode:?}: expected Failed(Cancelled), got {other:?}"),
-    }
-    watchdog(task.wait()).await.unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "{mode:?}");
-}
-
+/// Dropping `retrieve_meta` cancels it; the cached metadata is reused.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_instance_cancel_during_backoff() {
-    for mode in [DownloadMode::Singleton, DownloadMode::Concurrent] {
-        assert_instance_cancelled(mode, false).await;
+async fn test_retrieve_meta_caches_and_drop_cancels() {
+    let (adapter, requested, calls) = SignalAdapter::new(true);
+    let mut builder = Task::builder(adapter).options(slow_retry());
+    {
+        let mut retrieve = std::pin::pin!(builder.retrieve_meta());
+        watchdog(async {
+            tokio::select! {
+                _ = &mut retrieve => panic!("the request never answers"),
+                requested = requested.recv() => requested.unwrap(),
+            }
+        })
+        .await;
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_instance_cancel_during_inflight_request() {
-    for mode in [DownloadMode::Singleton, DownloadMode::Concurrent] {
-        assert_instance_cancelled(mode, true).await;
-    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(builder.cached_meta().is_none());
+    let meta = BoltLoadAdapterMeta {
+        content_size: 7,
+        filename: None,
+    };
+    let builder = builder.meta(meta);
+    assert_eq!(builder.cached_meta().map(|m| m.content_size), Some(7));
 }

@@ -28,9 +28,9 @@ Custom adapters implement [`BoltLoadAdapter`] with plain `async fn`s
 whose futures are `Send`. Only `retrieve_meta` and `full_stream` are
 required: by default `is_range_stream_available` returns `false` and
 `range_stream` fails with `RangeStreamNotSupported`. Adapters are passed to
-[`TaskBuilder::adapter`](crate::task::TaskBuilder::adapter). An already
+[`Task::builder`](crate::task::Task::builder). An already
 type-erased adapter, built with [`DynBoltLoadAdapter::new_arc`], is
-passed to [`TaskBuilder::adapter_arc`](crate::task::TaskBuilder::adapter_arc);
+passed to [`Task::builder_arc`](crate::task::Task::builder_arc);
 a `Box<AnyAdapter>` implements the trait itself.
 
 The erased adapter implements the trait rather than inherent methods, so

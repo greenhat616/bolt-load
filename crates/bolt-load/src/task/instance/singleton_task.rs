@@ -1,8 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    pin::pin,
-    sync::Arc,
-};
+use std::{path::Path, pin::pin, sync::Arc};
 
 use async_fs::{File, OpenOptions};
 use async_io::Timer;
@@ -11,20 +7,16 @@ use futures::{AsyncWriteExt, FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
 
 use super::{
-    Result, TaskInstance, TaskInstanceError,
-    drive::{self, Transfer},
-    output_file,
+    Result,
+    drive::Transfer,
+    output_file::{OutputFile, Teardown},
     sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter},
     runner::{LifecycleEvent, StoppedReason, TaskError, TaskRunner},
-    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
-    task::{
-        Progress, RunnerId, TaskOptions,
-        instance::{ProgressWithSpeed, TaskControl, TaskEvent},
-        meta,
-    },
+    runtime::ThreadedRuntimeImpl,
+    task::{DownloadError, IoOp, Progress, RunnerId, Speed, TaskOptions, status::ProgressReporter},
 };
 
 /// Singleton task only have one runner, so we use a static id for the runner
@@ -32,145 +24,38 @@ const STATIC_RUNNER_ID: RunnerId = 0;
 
 const CONTROL_CHANNEL_CAPACITY: usize = 8;
 
-pub struct SingletonTask {
-    threaded_rt: ThreadedRuntimeImpl,
-    local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-    task: Option<TaskControl>,
-    options: TaskOptions,
-}
-
-impl SingletonTask {
-    pub fn new(
-        threaded_rt: ThreadedRuntimeImpl,
-        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-    ) -> Self {
-        Self::with_options(threaded_rt, local_runtime_builder, TaskOptions::default())
-    }
-
-    pub fn with_options(
-        threaded_rt: ThreadedRuntimeImpl,
-        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-        options: TaskOptions,
-    ) -> Self {
-        Self {
-            threaded_rt,
-            local_runtime_builder,
-            task: None,
-            options,
-        }
-    }
-}
-
-/// One download attempt, run on a local runtime by [`drive::spawn_on_local`].
-pub(super) fn singleton_attempt(
-    adapter: Arc<AnyAdapter>,
-    path: PathBuf,
-    event_tx: async_channel::Sender<TaskEvent>,
-    cancel_token: CancellationToken,
-    rt: ThreadedRuntimeImpl,
-    options: TaskOptions,
-) -> impl Future<Output = ()> + 'static {
-    let inner = SingletonTaskInner::new(adapter, path, event_tx.clone(), rt, options);
-    let task = drive::drive(inner, event_tx, cancel_token);
-    #[cfg(feature = "tracing")]
-    let task = tracing::Instrument::instrument(
-        task,
-        tracing::trace_span!(parent: None, "SingletonTask::background_task"),
-    );
-    task
-}
-
-impl TaskInstance for SingletonTask {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip_all, name = "SingletonTask::run")
-    )]
-    fn run(
-        &mut self,
-        adapter: Arc<AnyAdapter>,
-        path: PathBuf,
-        event_tx: async_channel::Sender<TaskEvent>,
-        cancel_token: CancellationToken,
-    ) -> Result<()> {
-        let options = self.options.clone();
-        let task = drive::spawn_on_local(
-            self.threaded_rt.clone(),
-            self.local_runtime_builder.clone(),
-            cancel_token.clone(),
-            // Built on the local runtime's thread, so it does not need to be `Send`.
-            move |rt| singleton_attempt(adapter, path, event_tx, cancel_token, rt, options),
-        );
-        self.task = Some(task);
-        Ok(())
-    }
-
-    async fn stop(&mut self) -> Result<()> {
-        if let Some(task) = self.task.as_mut() {
-            task.stop().await;
-        }
-        Ok(())
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        trace!(
-            "[SINGLETON TASK] wait() called, task present: {}",
-            self.task.is_some()
-        );
-        if let Some(task) = self.task.as_mut() {
-            trace!("[SINGLETON TASK] waiting for task to complete");
-            task.wait().await;
-            trace!("[SINGLETON TASK] task completed");
-        }
-        Ok(())
-    }
-}
-
-struct SingletonTaskInner {
+/// The transfer of the singleton mode: one runner streams the whole content.
+pub(crate) struct SingletonTaskInner {
+    /// `None` when the size is unknown; the stream's end finishes the download.
     total: Option<u64>,
     downloaded: u64,
-    path: PathBuf,
+    output: OutputFile,
     adapter: Arc<AnyAdapter>,
-    event_tx: async_channel::Sender<TaskEvent>,
-    rt: ThreadedRuntimeImpl,
+    reporter: ProgressReporter,
     options: TaskOptions,
 }
 
 impl SingletonTaskInner {
-    fn new(
+    pub(crate) fn new(
         adapter: Arc<AnyAdapter>,
-        path: PathBuf,
-        event_tx: async_channel::Sender<TaskEvent>,
-        rt: ThreadedRuntimeImpl,
+        output: OutputFile,
+        total: Option<u64>,
+        _rt: ThreadedRuntimeImpl,
         options: TaskOptions,
+        reporter: ProgressReporter,
     ) -> Self {
         Self {
-            total: None,
+            total,
             downloaded: 0,
-            path,
+            output,
             adapter,
-            event_tx,
-            rt,
+            reporter,
             options,
         }
     }
 }
 
 impl SingletonTaskInner {
-    /// Retrieve the meta data of the file
-    async fn retrieve_meta(&mut self) -> Result<()> {
-        let meta = meta::retrieve_meta(&self.adapter, &self.options.meta_retry, Some(&self.rt))
-            .await
-            .map_err(TaskInstanceError::new_retrieve_meta_failed)?;
-        let total = if meta.content_size == 0 {
-            None
-        } else {
-            Some(meta.content_size)
-        };
-        self.total = total;
-        self.downloaded = 0;
-        Ok(())
-    }
-
     /// Create the temporary file, sized to the total when it is known.
     async fn create_file(&self, tmp_path: &Path) -> Result<File> {
         let file = OpenOptions::new()
@@ -179,11 +64,11 @@ impl SingletonTaskInner {
             .truncate(true)
             .open(tmp_path)
             .await
-            .map_err(TaskInstanceError::new_write_chunk_failed)?;
+            .map_err(|e| DownloadError::io(IoOp::Create, tmp_path, e))?;
         if let Some(total) = self.total {
             file.set_len(total)
                 .await
-                .map_err(TaskInstanceError::new_write_chunk_failed)?;
+                .map_err(|e| DownloadError::io(IoOp::Allocate, tmp_path, e))?;
         }
         Ok(file)
     }
@@ -199,7 +84,7 @@ impl SingletonTaskInner {
                     *is_finished = true;
                     return Ok(());
                 }
-                StoppedReason::Failed(kind) => return Err(TaskInstanceError::new_failed(kind)),
+                StoppedReason::Failed(kind) => return Err(DownloadError::transfer(kind)),
             },
             LifecycleEvent::Started => {}
         }
@@ -217,31 +102,28 @@ impl SingletonTaskInner {
         self.downloaded += data.len() as u64;
         file.write_all(&data)
             .await
-            .map_err(TaskInstanceError::new_write_chunk_failed)?;
+            .map_err(|e| DownloadError::io(IoOp::Write, &self.output.tmp, e))?;
         Ok(())
     }
 
-    /// Publish a periodic progress sample; it is dropped when the channel is full.
+    /// Publish a periodic progress sample.
     fn handle_timer_tick(&self, sampler: &mut SpeedSampler, meter: &mut usize) {
         let (_, ema_speed) = sampler.sample(meter);
-        let _ = self
-            .event_tx
-            .try_send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                Transfer::progress(self),
-                ema_speed,
-                0.0,
-            )));
+        if self.reporter.is_observed() {
+            self.reporter
+                .report(Transfer::progress(self), Speed::new(ema_speed, 0.0));
+        }
     }
 
-    /// Download into the temporary file, then publish it or discard it.
-    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+    /// Download into the temporary file, then commit it or discard it.
+    async fn download(&mut self, cancel_token: &CancellationToken) -> Teardown {
         trace!(
             "[SINGLETON TASK] download() method called, path: {:?}",
-            self.path
+            self.output.dest
         );
-        let tmp_path = output_file::tmp_path_for(&self.path);
+        let tmp_path = self.output.tmp.clone();
         let transfer = self.download_to(&tmp_path, cancel_token).await;
-        output_file::commit(transfer, &tmp_path, &self.path, cancel_token).await
+        self.output.commit(transfer, cancel_token).await
     }
 
     /// Run the transfer; returns only after the runner has exited.
@@ -361,7 +243,7 @@ impl SingletonTaskInner {
                                 warn!("lifecycle stream ended unexpectedly");
                                 lifecycle_done = true;
                                 if !runner_stopped {
-                                    return Err(TaskInstanceError::new_failed(
+                                    return Err(DownloadError::transfer(
                                         TaskError::ChannelClosed,
                                     ));
                                 }
@@ -385,7 +267,7 @@ impl SingletonTaskInner {
             Some(file) => file
                 .flush()
                 .await
-                .map_err(TaskInstanceError::new_write_chunk_failed),
+                .map_err(|e| DownloadError::io(IoOp::Flush, tmp_path, e)),
             None => Ok(()),
         };
         drop(file);
@@ -395,10 +277,6 @@ impl SingletonTaskInner {
 }
 
 impl Transfer for SingletonTaskInner {
-    async fn prepare(&mut self) -> Result<()> {
-        self.retrieve_meta().await
-    }
-
     fn progress(&self) -> Progress {
         Progress {
             total: self.total,
@@ -419,7 +297,7 @@ impl Transfer for SingletonTaskInner {
         }
     }
 
-    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+    async fn download(&mut self, cancel_token: &CancellationToken) -> Teardown {
         SingletonTaskInner::download(self, cancel_token).await
     }
 }
@@ -427,14 +305,9 @@ impl Transfer for SingletonTaskInner {
 /// The error of a runner that stopped before it connected; a failed
 /// connection keeps the adapter's error.
 #[cold]
-fn connect_error(reason: StoppedReason) -> TaskInstanceError {
+fn connect_error(reason: StoppedReason) -> DownloadError {
     match reason {
-        StoppedReason::Failed(TaskError::StreamError { source }) => {
-            TaskInstanceError::new_stream_failed(source)
-        }
-        StoppedReason::Failed(error) => TaskInstanceError::new_failed(error),
-        StoppedReason::Finished => TaskInstanceError::new_failed(TaskError::Other {
-            message: "the runner finished before it connected".to_string(),
-        }),
+        StoppedReason::Failed(error) => DownloadError::transfer(error),
+        StoppedReason::Finished => DownloadError::other("the runner finished before it connected"),
     }
 }

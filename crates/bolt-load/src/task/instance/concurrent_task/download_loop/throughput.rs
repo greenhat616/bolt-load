@@ -3,10 +3,7 @@ use std::task::{Context, Poll};
 use super::{super::runner_manager::MeterSnapshot, DownloadLoop, LoopEvent};
 use crate::{
     runtime::EventTimer,
-    task::{
-        Progress,
-        instance::{ProgressWithSpeed, TaskEvent, sampler::SpeedSampler},
-    },
+    task::{Progress, Speed, instance::sampler::SpeedSampler},
 };
 
 /// Download and write throughput, sampled on its timer.
@@ -67,18 +64,18 @@ impl DownloadLoop {
         self.publish_progress(speed, write_speed);
     }
 
-    /// Publish the progress; the event is dropped when the channel is full.
+    /// Publish the progress, unless nobody observes it.
     fn publish_progress(&self, speed: f64, write_speed: f64) {
-        let _ = self
-            .event_tx
-            .try_send(TaskEvent::Downloading(ProgressWithSpeed::new(
-                Progress {
-                    total: Some(self.manager.total()),
-                    downloaded: self.manager.get_total_downloaded(),
-                    downloaded_chunks: self.manager.get_downloaded_ranges(),
-                },
-                speed,
-                write_speed,
-            )));
+        if !self.reporter.is_observed() {
+            return;
+        }
+        self.reporter.report(
+            Progress::new(
+                Some(self.manager.total()),
+                self.manager.get_total_downloaded(),
+                self.manager.get_downloaded_ranges(),
+            ),
+            Speed::new(speed, write_speed),
+        );
     }
 }

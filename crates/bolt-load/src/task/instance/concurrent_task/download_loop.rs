@@ -30,11 +30,11 @@ use super::{
     strategy::{DEFAULT_STRATEGY_TICK_INTERVAL, FailurePolicy, StrategyControl},
 };
 use crate::{
-    runner::TaskError,
     runtime::TimerBuilder,
     task::{
-        Progress, TaskOptions,
-        instance::{Result, TaskEvent, TaskInstanceError, sampler::DEFAULT_SAMPLE_INTERVAL},
+        DownloadError, Progress, TaskOptions,
+        instance::{Result, sampler::DEFAULT_SAMPLE_INTERVAL},
+        status::ProgressReporter,
     },
 };
 
@@ -58,7 +58,7 @@ pub(super) struct DownloadLoop {
     policy: FailurePolicy,
     max_concurrency: usize,
     writer: PendingWriter<FileWriter>,
-    event_tx: async_channel::Sender<TaskEvent>,
+    reporter: ProgressReporter,
     cancel: CancelSource,
     deadline: DeadlineSource,
     strategy_tick: StrategyTick,
@@ -70,7 +70,7 @@ impl DownloadLoop {
         total: u64,
         spawner: RunnerSpawner,
         file_writer: &FileWriter,
-        event_tx: async_channel::Sender<TaskEvent>,
+        reporter: ProgressReporter,
         options: &TaskOptions,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -99,7 +99,7 @@ impl DownloadLoop {
             policy,
             max_concurrency,
             writer,
-            event_tx,
+            reporter,
             cancel: CancelSource::new(cancel_token),
             deadline,
             strategy_tick: StrategyTick::new(strategy_timer.into()),
@@ -141,16 +141,14 @@ impl DownloadLoop {
 
     fn handle_event(&mut self, event: LoopEvent) -> Result<ControlFlow<()>> {
         match event {
-            LoopEvent::Cancelled => Err(TaskInstanceError::new_failed(TaskError::Cancelled)),
+            LoopEvent::Cancelled => Err(DownloadError::Cancelled),
             LoopEvent::Deadline => self.on_deadline().map(ControlFlow::Continue),
             LoopEvent::WriterCompleted(Some(completions)) => self
                 .record_completions(completions)
                 .map(ControlFlow::Continue),
-            LoopEvent::WriterCompleted(None) => {
-                Err(TaskInstanceError::new_failed(TaskError::Other {
-                    message: "writer completion channel closed unexpectedly".into(),
-                }))
-            }
+            LoopEvent::WriterCompleted(None) => Err(DownloadError::other(
+                "writer completion channel closed unexpectedly",
+            )),
             LoopEvent::StrategyTimer => {
                 self.on_strategy_tick();
                 Ok(ControlFlow::Continue(()))

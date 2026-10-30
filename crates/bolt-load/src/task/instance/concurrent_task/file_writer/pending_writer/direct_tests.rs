@@ -461,12 +461,12 @@ async fn test_cancelled_download_joins_blocked_fallback_before_finalize() {
         cancel.child_token(),
         crate::runner::DEFAULT_IDLE_TIMEOUT,
     );
-    let (events, _events_rx) = async_channel::unbounded();
+    let (reporter, _status) = crate::task::status::ProgressReporter::for_test();
     let mut download = DownloadLoop::new(
         1,
         spawner,
         &writer,
-        events,
+        reporter,
         &TaskOptions::default(),
         cancel.clone(),
     );
