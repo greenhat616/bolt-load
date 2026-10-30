@@ -579,8 +579,10 @@ dependencies = [
 name = "bolt-load-sync"
 version = "0.2.0"
 dependencies = [
+ "bolt-load-sync",
  "event-listener",
  "futures",
+ "futures-core",
  "loom",
  "pretty_assertions",
 ]

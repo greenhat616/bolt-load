@@ -27,6 +27,12 @@ with the semantics of `tokio::sync::watch`:
   the last unseen value before [`Closed`](watch::Closed).
 - **Any context**: `changed().await` works on any executor,
   `changed_blocking()` on plain threads (not on WebAssembly).
+- **Conditions**: [`Receiver::wait_for`](watch::Receiver::wait_for) (and
+  `wait_for_blocking`) returns the first value, current one included, that
+  satisfies a predicate; the final value is tested before `Closed`.
+- **Streams**: with the `stream` feature,
+  [`Receiver::into_stream`](watch::Receiver::into_stream) yields the current
+  value, then the newest after each change, as a `futures_core::Stream`.
 
 ```rust
 use bolt_load_sync::watch;

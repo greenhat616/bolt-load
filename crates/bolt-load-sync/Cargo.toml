@@ -10,11 +10,17 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# `WatchStream`, a `futures_core::Stream` over a watch receiver.
+stream = ["dep:futures-core"]
+
 [dependencies]
 event-listener = "5"
+futures-core = { version = "0.3", optional = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+bolt-load-sync = { path = ".", features = ["stream"] }
 pretty_assertions = { workspace = true }
 
 # Model checking: `RUSTFLAGS="--cfg loom" cargo test -p bolt-load-sync --release --test loom`

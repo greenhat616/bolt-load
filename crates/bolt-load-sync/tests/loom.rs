@@ -8,6 +8,7 @@ use bolt_load_sync::{
     slot,
     watch::{self, Closed},
 };
+use futures::StreamExt;
 use loom::{future::block_on, thread};
 
 /// A send racing an async waiter is never lost.
@@ -101,6 +102,70 @@ fn a_send_wakes_every_receiver() {
         }
         // Kept alive until here, so a close cannot stand in for a lost wakeup.
         drop(tx);
+    });
+}
+
+/// `wait_for` racing a send is never lost: the sender stays alive until the
+/// waiter returns, so a lost wake deadlocks the model.
+#[test]
+fn wait_for_catches_a_send_during_registration() {
+    loom::model(|| {
+        let (tx, mut rx) = watch::channel(0);
+        let sender = thread::spawn(move || {
+            tx.send_replace(1);
+            tx
+        });
+        assert_eq!(block_on(rx.wait_for(|v| *v == 1)).map(|v| *v), Ok(1));
+        drop(sender.join().unwrap());
+    });
+}
+
+/// `wait_for` tests the final value before reporting `Closed`, however the
+/// last send and the close interleave with it.
+#[test]
+fn wait_for_tests_the_final_value_racing_close() {
+    loom::model(|| {
+        let (tx, mut rx) = watch::channel(0);
+        let sender = thread::spawn(move || {
+            tx.send_replace(1);
+            drop(tx);
+        });
+        assert_eq!(block_on(rx.wait_for(|v| *v == 1)).map(|v| *v), Ok(1));
+        assert!(matches!(block_on(rx.wait_for(|v| *v == 2)), Err(Closed)));
+        sender.join().unwrap();
+    });
+}
+
+/// A pending stream registered while a send happens still yields it.
+#[test]
+fn stream_catches_a_send_during_registration() {
+    loom::model(|| {
+        let (tx, rx) = watch::channel(0);
+        let mut stream = rx.into_stream();
+        assert_eq!(block_on(stream.next()).map(|v| *v), Some(0));
+        let sender = thread::spawn(move || {
+            tx.send_replace(1);
+            tx
+        });
+        assert_eq!(block_on(stream.next()).map(|v| *v), Some(1));
+        drop(sender.join().unwrap());
+    });
+}
+
+/// The stream yields the final value before it ends.
+#[test]
+fn stream_yields_the_final_value_racing_close() {
+    loom::model(|| {
+        let (tx, rx) = watch::channel(0);
+        let mut stream = rx.into_stream();
+        assert_eq!(block_on(stream.next()).map(|v| *v), Some(0));
+        let sender = thread::spawn(move || {
+            tx.send_replace(1);
+            drop(tx);
+        });
+        assert_eq!(block_on(stream.next()).map(|v| *v), Some(1));
+        assert!(block_on(stream.next()).is_none());
+        sender.join().unwrap();
     });
 }
 
