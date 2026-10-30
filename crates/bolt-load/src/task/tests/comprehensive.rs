@@ -23,7 +23,6 @@ use pretty_assertions::assert_eq;
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
-use super::test_support::{assert_transitions, record, tmp_path, watchdog};
 use crate::{
     adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta},
     runtime::{
@@ -32,6 +31,7 @@ use crate::{
     task::{
         BuildError, DownloadError, DownloadMode, StatusReceiver, Task, TaskBuilder, TaskOutput,
         TaskState, TaskStatus,
+        test_support::{assert_transitions, record, tmp_path, watchdog},
     },
 };
 

@@ -385,10 +385,9 @@ impl PendingWriter<FileWriter> {
 }
 
 #[cfg(test)]
-mod direct_tests;
-
-#[cfg(test)]
 mod tests {
+    mod direct;
+
     use std::{
         path::PathBuf,
         sync::{Arc, Mutex},

@@ -1,3 +1,6 @@
+mod integration;
+mod status_contract;
+
 use async_stream::stream;
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;

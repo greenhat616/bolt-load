@@ -366,7 +366,7 @@ bound the number of running tasks well below the pool limit
   of the builder; each attempt gets a fresh child token and a fresh watch
   channel. This is an intentional breaking change:
   `test_successful_rerun_clears_previous_error`
-  (`termination_tests.rs:623`) becomes "a new task from the same builder
+  (`task/tests/termination.rs:623`) becomes "a new task from the same builder
   does not see the previous error".
 
 ### 4.7 `bolt_load_sync::watch` additions

@@ -2,22 +2,18 @@
 use std::ops::Range;
 
 mod builder;
-#[cfg(test)]
-mod comprehensive_tests;
 mod destination;
 mod error;
 mod handle;
 /// Task instance implementations (singleton and concurrent).
 pub mod instance;
 mod meta;
-#[cfg(test)]
-mod meta_retry_tests;
 mod options;
 mod status;
 #[cfg(test)]
-mod termination_tests;
-#[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod tests;
 
 pub use builder::*;
 pub use error::*;

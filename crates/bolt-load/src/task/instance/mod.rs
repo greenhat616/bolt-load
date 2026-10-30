@@ -11,16 +11,10 @@ mod output_file;
 mod sampler;
 mod singleton_task;
 
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod status_contract_tests;
-
-#[cfg(test)]
-mod integration_test;
 #[cfg(all(test, bolt_load_probe_send))]
 mod probe_send;
+#[cfg(test)]
+mod tests;
 
 use concurrent_task::ConcurrentTaskInner;
 use id::Generator;
