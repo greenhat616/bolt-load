@@ -41,6 +41,18 @@ Shared<T>
   mutated, and only when the future resolves, so it is cancel safe.
 - Close: `Drop for Sender` sets `CLOSED` and notifies. A receiver reports
   `Closed` only when its seen version equals the final one.
+- `wait_for(f)`: `loop { v = borrow_and_update(); if f(&v) { return v } changed().await? }`.
+  The current value is tested first. `borrow_and_update` marks the tested
+  version as seen, so a publish after it makes `changed` return, and the
+  final value is always tested before `Closed`. `f` runs outside the lock,
+  so a slow or panicking predicate cannot hold or poison it.
+  `wait_for_blocking` is the same loop over `changed_blocking`.
+- `WatchStream` (feature `stream`): the first poll yields
+  `borrow_and_update()`, even on a closed channel. Later polls check
+  `state` as `changed` does; when nothing is new they register an owned
+  `EventListener`, check again, and keep the listener across `Pending`. A
+  notified listener is dropped and the state checked again. After `None` it
+  stays ended.
 
 ### Why no wakeup is lost
 
@@ -103,7 +115,9 @@ would need `Mutex<Option<T>>` or an allocation per send, which is what
 | `send_replace` returns | `T` | `Arc<T>` |
 | `has_changed` | `Result<bool>`, errors once closed | `bool`; closure via `is_closed` |
 | Sender | `Clone` (1.53) | one handle |
-| Blocking wait | none | `changed_blocking` |
+| Blocking wait | none | `changed_blocking`, `wait_for_blocking` |
+| `wait_for` returns | `Ref<T>` | `Arc<T>` |
+| Stream | `tokio_stream::wrappers::WatchStream` | `WatchStream`, feature `stream` (`futures-core`) |
 
 ## Decisions
 
@@ -115,12 +129,14 @@ would need `Mutex<Option<T>>` or an allocation per send, which is what
 | 2026-10-15 | `listener!` instead of `Event::listen` | `listen()` boxes the listener on every wait; the boxed variant was 2-4x slower in fan-out. |
 | 2026-10-24 | `slot` beside `watch`, not `watch` for runner limits | The runner polls its limits in place; `watch` has no poll API, allocates per send and registers an `event-listener` node on every pending poll. The slot moved here from `bolt-load` to get loom coverage. |
 | 2026-10-24 | Own `AtomicWaker` | `futures`' and `atomic-waker`'s use std atomics, which loom cannot model. |
+| 2026-10-30 | `wait_for` tests the predicate outside the lock | tokio holds the read lock while the predicate runs; here the lock only guards a pointer, and a panicking predicate must not poison the channel. |
+| 2026-10-30 | `WatchStream` keeps an owned `EventListener` | A `Stream` cannot keep `listener!`'s stack-pinned node across polls. One allocation per pending wait; task status changes about four times per second. |
 | 2026-10-24 | loom pinned to tokio-rs/loom#391 (`c673a8d`) | loom 0.7.2 lets an RMW read a value older than the latest store (tokio-rs/loom#254). A standalone repro (`swap` reads the initial value, a store is published, a second `swap` still reads 0) fails on 0.7.2 and passes on `c673a8d`; the two-send slot models deadlock spuriously on 0.7.2. Remove the `[patch]` once a release carries the fix. |
 
 ## Testing
 
 ```sh
-cargo test -p bolt-load-sync
+cargo test -p bolt-load-sync          # with the `stream` feature, via a dev-dependency on itself
 RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
   cargo test -p bolt-load-sync --release --test loom
 ```
@@ -159,8 +175,13 @@ single run):
   and fan-out to two parked receivers. The fan-out model has three threads
   and is bounded to two preemptions; the others are exhaustive. Two injected
   bugs were caught as deadlocks: dropping the re-check after registration in
-  `changed`, and `notify(1)` instead of `notify(usize::MAX)`. Larger runs are
-  covered by the stress test only.
+  `changed`, and `notify(1)` instead of `notify(usize::MAX)`. `wait_for`
+  and `WatchStream` each have two models: a send during registration, and
+  the final send racing close (the predicate or stream must still see it).
+  The racing-close models are the slowest of the suite. An injected bug,
+  returning `Pending` right after registering the stream's listener without
+  checking again, was caught as a deadlock. Larger runs are
+  covered by the stress tests only.
 - The version wraps after 2^63 publications. A receiver that has not looked
   for exactly that many publications would miss the newest value; at one
   publication per nanosecond that takes about 292 years.
