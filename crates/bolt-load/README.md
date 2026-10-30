@@ -15,16 +15,15 @@ handles the rest.
 - **Adaptive concurrency** — failure-rate-based degradation and recovery strategy keeps throughput high under unstable network conditions.
 - **Multiple file-write backends** — memory-mapped I/O, thread-pool `pwrite`, Compio/io_uring, or `/dev/null` for benchmarking.
 - **Backpressure-aware** — lock-free SPSC ring-buffer channels between runners and writers with configurable queue depth.
-- **Progress & observability** — EMA speed sampling, progress events, optional `indicatif` progress bars, and `tracing` integration.
+- **Progress & observability** — latest-value status snapshots with EMA speed, optional `indicatif` progress bars, and `tracing` integration.
 - **Structured errors** — two-level retryable/unretryable classification via `snafu`, enabling intelligent retry decisions.
 
 ## Quick Start
 
 ```rust,ignore
-use bolt_load::task::TaskBuilder;
+use bolt_load::task::Task;
 use bolt_load::adapter::reqwest::IntoReqwestAdapter;
 use bolt_load::runtime::ThreadedRuntimeImpl;
-use smol_cancellation_token::CancellationToken;
 
 let client = reqwest::Client::new();
 let adapter = client.into_reqwest_adapter((
@@ -32,19 +31,18 @@ let adapter = client.into_reqwest_adapter((
     "https://example.com/large-file.bin".parse().unwrap(),
 ));
 
-let runtime = ThreadedRuntimeImpl::new_tokio_rt();
+let task = Task::builder(adapter)
+    .runtime(ThreadedRuntimeImpl::new_tokio_rt())
+    .save_to("large-file.bin")
+    .spawn()?;
 
-let mut task = TaskBuilder::default()
-    .adapter(adapter)
-    .save_path("large-file.bin".into())
-    .threaded_runtime(runtime)
-    .cancel_token(CancellationToken::new())
-    .build()
-    .await?;
-
-task.with_progress_bar();
-task.run().await?;
-task.wait().await?;
+// Observe the latest status; samples may be coalesced.
+let mut status = task.status();
+while status.changed().await.is_ok() {
+    let s = status.borrow_and_update();
+    println!("{:?} {}/{:?}", s.state, s.progress.downloaded, s.progress.total);
+}
+let output = task.await?;
 ```
 
 ## Architecture
@@ -53,7 +51,7 @@ task.wait().await?;
 ┌──────────────────────────────────────────────────────┐
 │                       Task                           │
 │  ┌──────────────────┐   ┌──────────────────────────┐ │
-│  │  SingletonTask    │   │    ConcurrentTask        │ │
+│  │  Singleton mode   │   │    Concurrent mode       │ │
 │  │  (1 runner)       │   │    (N runners)           │ │
 │  └────────┬─────────┘   └────────┬─────────────────┘ │
 │           │                      │                    │
@@ -87,8 +85,8 @@ directory and included via `#![doc = include_str!(...)]`.
 | **Singleton** | Adapter lacks range support, or content is small | Single `TaskRunner` streams the full content sequentially |
 | **Concurrent** | Adapter supports range requests | Multiple `TaskRunner` instances download non-overlapping byte ranges in parallel, with dynamic splitting of slow ranges |
 
-Mode selection is automatic based on `is_range_stream_available()`,
-or can be forced via `TaskBuilder::prefer_mode()`.
+Mode selection is automatic based on `is_range_stream_available()` and a
+known size, or the singleton mode can be forced via `TaskBuilder::prefer_mode()`.
 
 ## Concurrency Control
 

@@ -36,17 +36,16 @@ Add to your `Cargo.toml`:
 [dependencies]
 bolt-load = "0.2"
 reqwest = "0.13"
-smol-cancellation-token = "0.1"
+indicatif = "0.18"
 tokio = { version = "1", features = ["full"] }
 ```
 
 Download a file with concurrent range requests and a terminal progress bar:
 
 ```rust,ignore
-use bolt_load::task::TaskBuilder;
+use bolt_load::task::Task;
 use bolt_load::adapter::reqwest::IntoReqwestAdapter;
 use bolt_load::runtime::ThreadedRuntimeImpl;
-use smol_cancellation_token::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,23 +55,21 @@ async fn main() -> anyhow::Result<()> {
         "https://example.com/large-file.bin".parse()?,
     ));
 
-    let runtime = ThreadedRuntimeImpl::new_tokio_rt();
+    let task = Task::builder(adapter)
+        .runtime(ThreadedRuntimeImpl::new_tokio_rt())
+        .save_to("large-file.bin")
+        .spawn()?;
 
-    let mut task = TaskBuilder::default()
-        .adapter(adapter)
-        .save_path("large-file.bin".into())
-        .threaded_runtime(runtime)
-        .cancel_token(CancellationToken::new())
-        .build()
-        .await?;
-
-    task.with_progress_bar();
-    task.run().await?;
-    task.wait().await?;
+    task.drive_progress_bar(indicatif::ProgressBar::no_length());
+    let output = task.await?;
+    println!("saved {} bytes to {:?}", output.progress.downloaded, output.path);
 
     Ok(())
 }
 ```
+
+`task.status()` is a latest-value receiver of `TaskStatus` snapshots (state,
+progress, speed) for your own UI; dropping the `Task` cancels the download.
 
 ## Architecture
 
@@ -80,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 ┌──────────────────────────────────────────────────────┐
 │                       Task                           │
 │  ┌──────────────────┐   ┌──────────────────────────┐ │
-│  │  SingletonTask    │   │    ConcurrentTask        │ │
+│  │  Singleton mode   │   │    Concurrent mode       │ │
 │  │  (1 runner)       │   │    (N runners)           │ │
 │  └────────┬─────────┘   └────────┬─────────────────┘ │
 │           │                      │                    │
@@ -158,9 +155,9 @@ impl BoltLoadAdapter for MySource {
 }
 ```
 
-The futures must be `Send`. Pass the adapter with `TaskBuilder::adapter(source)`,
+The futures must be `Send`. Pass the adapter with `Task::builder(source)`,
 or share a type-erased one built by `DynBoltLoadAdapter::new_arc` with
-`TaskBuilder::adapter_arc`.
+`Task::builder_arc`.
 
 ## Development
 
