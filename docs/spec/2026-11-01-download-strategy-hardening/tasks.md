@@ -69,10 +69,11 @@
 
 ## T2 — `classify_status`（C2）
 
-- [ ] 新增 `bolt-load-adapter/src/status.rs`：`classify_status(status, retry_after, now)`，按 design §5.1 的表实现；`Retry-After` 支持秒数和 HTTP-date 两种格式，结果夹在 `[0, 120 s]`。
-- [ ] reqwest 的 `From<ReqwestError>`（`reqwest.rs:79-115`）：只要有状态码，就调用 `classify_status`，删掉嵌套在 `is_client_error()` 里的 match。
-- [ ] ureq2 的映射（`ureq2.rs:79`）改为调用 `classify_status`。
-- [ ] 两个 adapter 在出错时都要取出 `Retry-After` 头，传给 `classify_status`。
+- [x] 新增 `bolt-load-core/src/adapter/status.rs`：`classify_status(status, retry_after: Option<Duration>)`，按 design §5.1 的表实现，`retry_after` 夹到 120 s 以内。
+- [x] 新增 `bolt-load-utils` 的 `http::parse_retry_after(value, now)`：支持秒数和 HTTP-date 两种格式。
+- [x] reqwest 的 `From<ReqwestError>`（`reqwest.rs:79-115`）：只要有状态码，就调用 `classify_status`，删掉嵌套在 `is_client_error()` 里的 match。
+- [x] ureq2 的映射（`ureq2.rs:79`）改为调用 `classify_status`。
+- [x] 两个 adapter 在出错时都要取出 `Retry-After` 头，用 `parse_retry_after` 解析后传给 `classify_status`。
 
 **验证**
 

@@ -163,10 +163,17 @@ pub fn validate_range_response(
 
 ### 5.1 `classify_status`
 
-位置：`bolt-load-adapter/src/status.rs`（新增）。
+位置：
+- 分类函数在 `bolt-load-core/src/adapter/status.rs`（新增），导出为 `bolt_load_core::adapter::classify_status`。这个映射是 adapter 和引擎之间的约定（`Congestion` 触发降级，`Retryable` 计入重试），外部 adapter 只依赖 core 也能用上它，不必再依赖 `bolt-load-adapter`。
+- `Retry-After` 的解析在 `bolt-load-utils` 的 `http::parse_retry_after`（新增）。它只做纯解析，不设上限。utils 不依赖 core，这样分层不会倒置。
 
 ```rust
-pub fn classify_status(status: u16, retry_after: Option<&str>, now: SystemTime) -> AdapterError;
+// bolt-load-core
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+pub fn classify_status(status: u16, retry_after: Option<Duration>) -> AdapterError;
+
+// bolt-load-utils, feature `http`
+pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration>;
 ```
 
 | 状态 | 分类 |
@@ -179,7 +186,7 @@ pub fn classify_status(status: u16, retry_after: Option<&str>, now: SystemTime) 
 | 其它 5xx | `Retryable::Status { status }` |
 | 其它 4xx | `Unretryable::Status { status }`（D3） |
 
-- `Retry-After` 支持两种格式：秒数和 HTTP-date。解析失败时当作 `None`。结果夹在 `[0, 120 s]` 之间。
+- `Retry-After` 支持两种格式：秒数和 HTTP-date，过去的日期算作 0。解析失败时当作 `None`。`classify_status` 只对 429/503 保留这个值，并夹到 `MAX_RETRY_AFTER`（120 s）以内。
 - `Congestion` 留在 `UnretryableError` 里，和现在的 `ServiceUnavailable` 位置相同。这样 `failure_policy.rs:18` 的拥塞容忍和 `has_recent_unretryable` 降级逻辑都不需要改动。
 - 416 **不做**“回滚尺寸”的处理。IDM 的 `Try rollback` 和 416 无关（改进方案 §8 A4）。收到 416 时先重新探测 meta：`total` 变了说明资源变了，任务终止；没变说明区间计算有 bug，直接报错，不重试。
 - 409 / 412 **不**归为 `ResourceChanged`。`ResourceChanged` 只在 P3 的验证器比对失败时产生。

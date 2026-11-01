@@ -1,10 +1,12 @@
 use futures::stream::BoxStream;
 mod content_range;
 pub mod error;
+mod status;
 pub use content_range::ContentRange;
 pub use error::{AdapterError, RetryableError, UnretryableError};
 use error::{UnretryableSnafu, unretryable::RangeStreamNotSupportedSnafu};
 use snafu::ResultExt;
+pub use status::{MAX_RETRY_AFTER, classify_status};
 
 /// A download source.
 ///

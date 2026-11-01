@@ -84,6 +84,29 @@ Both error enums are `#[non_exhaustive]`; match them with a wildcard arm.
 | `RangeStreamNotSupported` | Adapter does not support range requests |
 | `Whatever` | Catch-all via `snafu` |
 
+### Classifying HTTP statuses
+
+An HTTP adapter should map error statuses with `classify_status`. The
+task depends on this mapping: it lowers concurrency on `Congestion` and
+retries only `Retryable` errors.
+
+```rust,ignore
+use bolt_load_core::adapter::classify_status;
+
+// `retry_after`: the parsed `Retry-After` delay, for example from
+// `bolt_load_utils::http::parse_retry_after`. Clamped to `MAX_RETRY_AFTER`.
+return Err(classify_status(status, retry_after));
+```
+
+| Status | Error |
+|--------|-------|
+| 401, 403 | `Unretryable(Unauthorized)` |
+| 404, 410 | `Unretryable(NotFound)` |
+| 408, other 5xx | `Retryable(Status)` |
+| 416 | `Unretryable(RangeNotSatisfiable)` |
+| 429, 503 | `Unretryable(Congestion)` |
+| other 4xx | `Unretryable(Status)` |
+
 ### Retryable Errors
 
 | Variant | Meaning |
