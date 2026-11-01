@@ -37,6 +37,9 @@ rand = "0.10"
 # for hash verification in tests
 blake3 = "1"
 
+# for the gzip-encoded fault
+flate2 = "1"
+
 # for http server test
 axum = "0.8.8"
 axum-extra = { version = "0.12.5", features = ["typed-header"] }

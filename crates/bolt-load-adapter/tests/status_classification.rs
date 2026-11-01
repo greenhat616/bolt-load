@@ -72,3 +72,51 @@ async fn retry_after_reaches_the_congestion_error() {
     ));
     server.abort();
 }
+
+#[tokio::test]
+async fn a_body_cut_off_mid_stream_is_retryable_on_both() {
+    use bolt_load_tests::adapter::{fault::RangeFault, http_server::create_range_fault_server};
+    use futures::StreamExt;
+
+    const SIZE: usize = 64 * 1024;
+    for client in ["reqwest", "ureq2"] {
+        // A fresh server, since only its first range response is cut.
+        let (port, server) = create_range_fault_server(vec![0u8; SIZE].into())
+            .await
+            .unwrap();
+        let url = Url::parse(&format!(
+            "http://127.0.0.1:{port}{}",
+            RangeFault::Truncated.path()
+        ))
+        .unwrap();
+        let stream = if client == "reqwest" {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .into_reqwest_adapter((reqwest::Method::GET, url))
+                .range_stream(0, SIZE as u64)
+                .await
+        } else {
+            ureq2::Agent::new()
+                .into_ureq_adapter(("get", url))
+                .range_stream(0, SIZE as u64)
+                .await
+        };
+        let mut stream = stream.unwrap();
+        let mut received = 0;
+        let error = loop {
+            match stream.next().await {
+                Some(Ok(bytes)) => received += bytes.len(),
+                Some(Err(e)) => break e,
+                None => panic!("{client}: the body must be cut off"),
+            }
+        };
+        assert_eq!(received, SIZE / 2, "{client}");
+        assert!(
+            matches!(error, AdapterError::Retryable { .. }),
+            "{client}: {error:?}"
+        );
+        server.abort();
+    }
+}
