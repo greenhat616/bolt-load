@@ -31,6 +31,10 @@ HTTP header parsing utilities adapted from actix-web, implementing:
   - Handles UTF-8, ISO-8859-1, and arbitrary charsets.
   - Percent-decodes the value portion.
 
+- **`parse_retry_after`** — RFC 9110 `Retry-After` parser.
+  - Accepts delay-seconds and HTTP-dates; a past date is no delay.
+  - Leaves the upper bound to the caller.
+
 ### `reader` (feature `reader`)
 
 Cross-runtime stream adapter that bridges synchronous `std::io::Read`
@@ -46,7 +50,7 @@ implementations with async `futures::Stream`.
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `tracing` | No | Enable `tracing` crate delegation |
-| `http` | No | HTTP header parsing (`ContentDisposition`, `ExtendedValue`) |
+| `http` | No | HTTP header parsing (`ContentDisposition`, `ExtendedValue`, `parse_retry_after`) |
 | `reader` | No | `CrossRuntimeStream` sync-to-async adapter |
 
 ## License

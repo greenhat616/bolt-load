@@ -33,6 +33,9 @@ struct FileHolder(Arc<tokio::sync::Mutex<tokio::fs::File>>);
 
 pub const DEFAULT_FILE_SIZE: usize = 1024 * 1024;
 
+/// The `Retry-After` seconds that `/status/429` and `/status/503` send.
+pub const STATUS_RETRY_AFTER_SECS: u64 = 7;
+
 pub async fn create_http_server() -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
     create_http_server_with_file_size(DEFAULT_FILE_SIZE).await
 }
@@ -97,9 +100,27 @@ pub async fn create_http_server_with_file_size(
         ranged.into_response()
     }
 
+    /// a handler answering with the status in the path
+    async fn status_handler(
+        axum::extract::Path(code): axum::extract::Path<u16>,
+    ) -> axum::response::Response {
+        let Ok(status) = axum::http::StatusCode::from_u16(code) else {
+            return axum::http::StatusCode::BAD_REQUEST.into_response();
+        };
+        let mut response = status.into_response();
+        if matches!(code, 429 | 503) {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(STATUS_RETRY_AFTER_SECS),
+            );
+        }
+        response
+    }
+
     let app = axum::Router::new()
         .route("/no_range", axum::routing::get(no_range_handler))
         .route("/range", axum::routing::get(range_handler))
+        .route("/status/{code}", axum::routing::get(status_handler))
         .with_state(holder);
 
     let handle = tokio::spawn(async move {

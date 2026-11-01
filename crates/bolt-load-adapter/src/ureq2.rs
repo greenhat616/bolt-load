@@ -1,19 +1,18 @@
-use std::{convert::AsRef, sync::Arc};
+use std::{convert::AsRef, sync::Arc, time::SystemTime};
 
 use blocking::unblock;
-use bolt_load_core::adapter::error::{
-    retryable::IoSnafu as RetryableIoSnafu,
-    unretryable::{
-        CongestionSnafu, IoSnafu as UnretryableIoSnafu, NotFoundSnafu, UnauthorizedSnafu,
-    },
+use bolt_load_core::adapter::error::unretryable::IoSnafu as UnretryableIoSnafu;
+use bolt_load_utils::{
+    http::{ContentDisposition, parse_retry_after},
+    reader::CrossRuntimeStream,
 };
-use bolt_load_utils::{http::ContentDisposition, reader::CrossRuntimeStream};
 use futures::Stream;
 use snafu::IntoError;
 use ureq2::{Agent, Request};
 
 use super::{
     AdapterError, AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError,
+    classify_status,
 };
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
@@ -62,31 +61,12 @@ impl From<UreqError> for AdapterError {
                 )),
             }
             .into(),
-            ureq2::Error::Status(404, _) => NotFoundSnafu { status: 404u16 }.build().into(),
-            ureq2::Error::Status(status @ (401 | 403), _) => UnauthorizedSnafu {
+            ureq2::Error::Status(status, response) => classify_status(
                 status,
-                message: format!("http status code: {status}"),
-            }
-            .build()
-            .into(),
-            ureq2::Error::Status(status @ (429 | 503), _) => CongestionSnafu {
-                status,
-                retry_after: None,
-            }
-            .build()
-            .into(),
-            ureq2::Error::Status(status, _) if status < 500 => UnretryableIoSnafu {}
-                .into_error(Arc::new(std::io::Error::other(format!(
-                    "http client error, status code: {}",
-                    status
-                ))))
-                .into(),
-            ureq2::Error::Status(status, _) => RetryableIoSnafu {}
-                .into_error(Arc::new(std::io::Error::other(format!(
-                    "http status code: {}",
-                    status
-                ))))
-                .into(),
+                response
+                    .header(http::header::RETRY_AFTER.as_str())
+                    .and_then(|v| parse_retry_after(v, SystemTime::now())),
+            ),
         }
     }
 }

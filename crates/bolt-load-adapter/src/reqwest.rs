@@ -1,19 +1,18 @@
-use std::{pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::SystemTime};
 
 use async_once_cell::OnceCell;
-use bolt_load_core::adapter::error::unretryable::{
-    CongestionSnafu, NotFoundSnafu, UnauthorizedSnafu,
-};
-use bolt_load_utils::http::ContentDisposition;
+use bolt_load_utils::http::{ContentDisposition, parse_retry_after};
 use futures::Stream;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE, RETRY_AFTER,
+};
 use snafu::IntoError;
 use url::Url;
 
 use super::{
-    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta,
+    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, classify_status,
     error::{
-        AdapterError, RetryableError, retryable::IoSnafu as RetryableIoSnafu,
+        AdapterError, retryable::IoSnafu as RetryableIoSnafu,
         unretryable::IoSnafu as UnretryableIoSnafu,
     },
 };
@@ -78,41 +77,10 @@ pub struct ReqwestError {
 
 impl From<ReqwestError> for AdapterError {
     fn from(ReqwestError { source: e }: ReqwestError) -> Self {
-        if let Some(status_code) = e.status()
-            && status_code.is_client_error()
-        {
-            match status_code {
-                reqwest::StatusCode::NOT_FOUND => {
-                    return NotFoundSnafu {
-                        status: status_code.as_u16(),
-                    }
-                    .build()
-                    .into();
-                }
-                reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
-                    return UnauthorizedSnafu {
-                        status: status_code.as_u16(),
-                        message: e.to_string(),
-                    }
-                    .build()
-                    .into();
-                }
-                reqwest::StatusCode::TOO_MANY_REQUESTS
-                | reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-                    return CongestionSnafu {
-                        status: status_code.as_u16(),
-                        retry_after: None,
-                    }
-                    .build()
-                    .into();
-                }
-                _ => {
-                    return RetryableError::Io {
-                        source: Arc::new(std::io::Error::other(e.to_string())),
-                    }
-                    .into();
-                }
-            }
+        // Responses go through `check_status`; this only catches a status
+        // error whose headers are already gone.
+        if let Some(status) = e.status() {
+            return classify_status(status.as_u16(), None);
         }
         if e.is_builder() || e.is_body() {
             return UnretryableIoSnafu {}
@@ -127,6 +95,21 @@ impl From<ReqwestError> for AdapterError {
     }
 }
 
+/// Classify an error status. Unlike `error_for_status`, this still sees the
+/// headers, so `Retry-After` reaches [`classify_status`].
+fn check_status(response: reqwest::Response) -> Result<reqwest::Response, AdapterError> {
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return Ok(response);
+    }
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_retry_after(v, SystemTime::now()));
+    Err(classify_status(status.as_u16(), retry_after))
+}
+
 impl ReqwestAdapter {
     async fn perform_head(&self) -> Result<reqwest::Response, AdapterError> {
         let response = self
@@ -134,7 +117,7 @@ impl ReqwestAdapter {
             .send()
             .await
             .map_err(ReqwestError::from)?;
-        Ok(response.error_for_status().map_err(ReqwestError::from)?)
+        check_status(response)
     }
 
     pub fn before_request(
@@ -287,9 +270,8 @@ impl BoltLoadAdapter for ReqwestAdapter {
             )
             .send()
             .await
-            .map_err(ReqwestError::from)?
-            .error_for_status()
             .map_err(ReqwestError::from)?;
+        let response = check_status(response)?;
         let stream = ReqwestStream(Box::pin(response.bytes_stream()));
         Ok(Box::pin(stream))
     }
@@ -303,9 +285,8 @@ impl BoltLoadAdapter for ReqwestAdapter {
             )
             .send()
             .await
-            .map_err(ReqwestError::from)?
-            .error_for_status()
             .map_err(ReqwestError::from)?;
+        let response = check_status(response)?;
         let stream = ReqwestStream(Box::pin(response.bytes_stream()));
         Ok(Box::pin(stream))
     }

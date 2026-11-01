@@ -57,16 +57,24 @@ multi-runner downloads for higher throughput.
 
 ## Error Mapping
 
-HTTP status codes are mapped to structured `AdapterError` variants:
+Both adapters map HTTP statuses through `bolt_load_core::adapter::classify_status`,
+so they classify every status the same way. A custom HTTP adapter should
+call it too; see the `bolt-load-core` README.
 
 | Status | Error |
 |--------|-------|
-| 401, 403 | `Unauthorized` |
-| 404 | `NotFound` |
-| 429, 503 | `Congestion` |
+| 401, 403 | `Unretryable(Unauthorized)` |
+| 404, 410 | `Unretryable(NotFound)` |
+| 408 | `Retryable(Status)` |
+| 416 | `Unretryable(RangeNotSatisfiable)` |
+| 429, 503 | `Unretryable(Congestion)`, carrying `Retry-After` |
+| Other 4xx | `Unretryable(Status)` |
+| Other 5xx | `Retryable(Status)` |
 | Network errors | `Retryable(Io)` |
-| Other 4xx | `Unretryable(Io)` |
-| Other 5xx | `Retryable(Io)` |
+
+`Retry-After` is parsed with `bolt_load_utils::http::parse_retry_after`
+(delay-seconds or an HTTP-date) and clamped to 120 s
+(`MAX_RETRY_AFTER`); a value that parses as neither is dropped.
 
 ## Features
 

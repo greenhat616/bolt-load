@@ -40,7 +40,8 @@ calling its methods through `AnyAdapter` needs `BoltLoadAdapter` in scope.
 
 [`AdapterError`] distinguishes retryable from unretryable failures:
 
-- **Retryable** — transient I/O errors (connection drops, timeouts).
+- **Retryable** — transient I/O errors (connection drops, timeouts),
+  408 and 5xx other than 503.
 - **Unretryable** — `NotFound` (404), `Unauthorized` (401/403),
   `Congestion` (429/503), `RangeStreamNotSupported`, etc.
 
