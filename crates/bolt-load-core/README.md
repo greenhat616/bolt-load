@@ -33,11 +33,17 @@ pub trait BoltLoadAdapter: Send + Sync {
 ### Metadata
 
 ```rust,ignore
+#[non_exhaustive]
 pub struct BoltLoadAdapterMeta {
     pub content_size: u64,
     pub filename: Option<String>,
 }
+
+let meta = BoltLoadAdapterMeta::new(1024).with_filename(Some("file.bin".into()));
 ```
+
+The struct is `#[non_exhaustive]`: build it with `new` and the `with_*`
+setters instead of a struct literal.
 
 ### Type Aliases
 
@@ -59,13 +65,19 @@ pub enum AdapterError {
 }
 ```
 
+Both error enums are `#[non_exhaustive]`; match them with a wildcard arm.
+
 ### Unretryable Errors
 
 | Variant | Meaning |
 |---------|---------|
-| `Unauthorized` | 401 / 403 |
-| `NotFound` | 404 |
-| `ServiceUnavailable` | 429 / 503 |
+| `Unauthorized { status, message }` | 401 / 403 |
+| `NotFound { status }` | 404 |
+| `Congestion { status, retry_after }` | 429 / 503, with the server's `Retry-After` when usable |
+| `Status { status }` | A status with no more specific variant |
+| `RangeIgnored` | The server answered a range request with the whole resource |
+| `RangeMismatch { requested, got }` | The response does not prove it carries the requested bytes |
+| `RangeNotSatisfiable { total }` | 416 |
 | `Internal` | Framework-level failures |
 | `Cancelled` | User cancellation |
 | `Io` | Wrapped `Arc<std::io::Error>` |
@@ -77,6 +89,7 @@ pub enum AdapterError {
 | Variant | Meaning |
 |---------|---------|
 | `Io` | Transient I/O errors (connection drops, timeouts) |
+| `Status { status }` | A status worth retrying, such as a 5xx |
 
 I/O errors are wrapped in `Arc` to satisfy `Clone` while remaining
 thread-safe.

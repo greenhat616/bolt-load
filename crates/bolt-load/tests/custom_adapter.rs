@@ -16,10 +16,7 @@ struct FixedMeta;
 
 impl BoltLoadAdapter for FixedMeta {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
-        Ok(BoltLoadAdapterMeta {
-            content_size: SIZE,
-            filename: None,
-        })
+        Ok(BoltLoadAdapterMeta::new(SIZE))
     }
 
     async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {

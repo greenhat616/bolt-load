@@ -30,10 +30,8 @@ struct MockAdapter {
 impl MockAdapter {
     fn new(content: Vec<u8>) -> Self {
         Self {
-            meta: BoltLoadAdapterMeta {
-                content_size: content.len() as u64,
-                filename: Some("test.txt".to_string()),
-            },
+            meta: BoltLoadAdapterMeta::new(content.len() as u64)
+                .with_filename(Some("test.txt".to_string())),
             content,
             support_range: true,
             should_fail: false,
@@ -54,10 +52,7 @@ impl MockAdapter {
         Self {
             content: vec![],
             support_range: false,
-            meta: BoltLoadAdapterMeta {
-                content_size: 0,
-                filename: Some("empty.txt".to_string()),
-            },
+            meta: BoltLoadAdapterMeta::new(0).with_filename(Some("empty.txt".to_string())),
             should_fail: false,
         }
     }

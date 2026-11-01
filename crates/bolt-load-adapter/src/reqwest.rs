@@ -2,7 +2,7 @@ use std::{pin::Pin, sync::Arc};
 
 use async_once_cell::OnceCell;
 use bolt_load_core::adapter::error::unretryable::{
-    NotFoundSnafu, ServiceUnavailableSnafu, UnauthorizedSnafu,
+    CongestionSnafu, NotFoundSnafu, UnauthorizedSnafu,
 };
 use bolt_load_utils::http::ContentDisposition;
 use futures::Stream;
@@ -83,10 +83,15 @@ impl From<ReqwestError> for AdapterError {
         {
             match status_code {
                 reqwest::StatusCode::NOT_FOUND => {
-                    return NotFoundSnafu {}.build().into();
+                    return NotFoundSnafu {
+                        status: status_code.as_u16(),
+                    }
+                    .build()
+                    .into();
                 }
                 reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
                     return UnauthorizedSnafu {
+                        status: status_code.as_u16(),
                         message: e.to_string(),
                     }
                     .build()
@@ -94,13 +99,9 @@ impl From<ReqwestError> for AdapterError {
                 }
                 reqwest::StatusCode::TOO_MANY_REQUESTS
                 | reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-                    return ServiceUnavailableSnafu {
-                        status: format!(
-                            "{} {}",
-                            status_code,
-                            status_code.canonical_reason().unwrap_or("unknown")
-                        ),
-                        description: e.to_string(),
+                    return CongestionSnafu {
+                        status: status_code.as_u16(),
+                        retry_after: None,
                     }
                     .build()
                     .into();
@@ -236,10 +237,8 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
             ContentSize::ContentRange(size) => {
                 return Ok(Context {
                     is_range_stream_available: true,
-                    meta: BoltLoadAdapterMeta {
-                        content_size: size,
-                        filename: ReqwestAdapter::suggest_filename(&response).await,
-                    },
+                    meta: BoltLoadAdapterMeta::new(size)
+                        .with_filename(ReqwestAdapter::suggest_filename(&response).await),
                 });
             }
             ContentSize::ContentLength(0) => {
@@ -257,12 +256,12 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
 
     return Ok(Context {
         is_range_stream_available,
-        meta: BoltLoadAdapterMeta {
-            content_size: ReqwestAdapter::get_content_size(&response)
+        meta: BoltLoadAdapterMeta::new(
+            ReqwestAdapter::get_content_size(&response)
                 .to_u64()
                 .unwrap_or_default(),
-            filename: ReqwestAdapter::suggest_filename(&response).await,
-        },
+        )
+        .with_filename(ReqwestAdapter::suggest_filename(&response).await),
     });
 }
 
@@ -270,10 +269,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         let context = self.get_context().await?;
 
-        Ok(BoltLoadAdapterMeta {
-            content_size: context.meta.content_size,
-            filename: context.meta.filename.clone(),
-        })
+        Ok(context.meta.clone())
     }
 
     async fn is_range_stream_available(&self) -> bool {

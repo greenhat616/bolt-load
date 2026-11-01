@@ -51,16 +51,16 @@
 
 ## T1 — 错误类型与 meta（C1）
 
-- [ ] `bolt-load-core/src/adapter/error.rs`：
+- [x] `bolt-load-core/src/adapter/error.rs`：
   - `UnretryableError` 加上 `#[non_exhaustive]`；
   - 新增 `Congestion { status, retry_after }`，替换 `ServiceUnavailable`；
   - 新增 `Status { status }`、`RangeIgnored`、`RangeMismatch { requested, got }`、`RangeNotSatisfiable { total }`；
   - `Unauthorized`、`NotFound` 带上 `status`（design §5.2）。
-- [ ] `RetryableError` 加上 `#[non_exhaustive]`，新增 `Status { status }`；同步更新 `UnretryableError::from_retryable_error`。
-- [ ] 新增 `ContentRange { first, last, complete }`，放在 core 里，因为错误类型要引用它。
-- [ ] `BoltLoadAdapterMeta` 加上 `#[non_exhaustive]`，提供 `new(content_size)` 和 `with_filename`；所有构造点（adapter、测试、`bolt-load-tests`）都改为调用它们。
-- [ ] `failure_policy.rs:18` 的 `is_congestion` 和 `runner_manager.rs:902` 的测试构造，都改用 `Congestion`。
-- [ ] 两个 adapter 原有的映射先机械地对应到新变体上，行为暂时不变。
+- [x] `RetryableError` 加上 `#[non_exhaustive]`，新增 `Status { status }`；同步更新 `UnretryableError::from_retryable_error`。
+- [x] 新增 `ContentRange { first, last, complete }`，放在 core 里，因为错误类型要引用它。
+- [x] `BoltLoadAdapterMeta` 加上 `#[non_exhaustive]`，提供 `new(content_size)` 和 `with_filename`；所有构造点（adapter、测试、`bolt-load-tests`）都改为调用它们。
+- [x] `failure_policy.rs:18` 的 `is_congestion` 和 `runner_manager.rs:902` 的测试构造，都改用 `Congestion`。
+- [x] 两个 adapter 原有的映射先机械地对应到新变体上，行为暂时不变。
 
 **验证**
 

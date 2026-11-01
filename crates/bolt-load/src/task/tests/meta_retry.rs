@@ -138,10 +138,7 @@ async fn test_retrieve_meta_caches_and_drop_cancels() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(builder.cached_meta().is_none());
-    let meta = BoltLoadAdapterMeta {
-        content_size: 7,
-        filename: None,
-    };
+    let meta = BoltLoadAdapterMeta::new(7);
     let builder = builder.meta(meta);
     assert_eq!(builder.cached_meta().map(|m| m.content_size), Some(7));
 }
