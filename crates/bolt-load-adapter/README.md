@@ -99,7 +99,9 @@ call it too; see the `bolt-load-core` README.
 | 429, 503 | `Unretryable(Congestion)`, carrying `Retry-After` |
 | Other 4xx | `Unretryable(Status)` |
 | Other 5xx | `Retryable(Status)` |
-| Network errors | `Retryable(Io)` |
+| Network errors, including a body cut off mid-stream | `Retryable(Io)` |
+| A body that cannot be decoded, such as invalid gzip from a decoding reqwest `Client` | `Unretryable(Io)` |
+| ureq2 only: a body read error of another kind, such as `InvalidInput` | `Unretryable(Io)` |
 
 `Retry-After` is parsed with `bolt_load_utils::http::parse_retry_after`
 (delay-seconds or an HTTP-date) and clamped to 120 s

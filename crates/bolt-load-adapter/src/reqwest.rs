@@ -1,4 +1,6 @@
 use std::{
+    error::Error as _,
+    io::ErrorKind,
     ops::Range,
     pin::Pin,
     sync::Arc,
@@ -90,7 +92,7 @@ impl From<ReqwestError> for AdapterError {
         if let Some(status) = e.status() {
             return classify_status(status.as_u16(), None);
         }
-        if e.is_builder() || e.is_body() {
+        if e.is_builder() || e.is_body() || is_undecodable(&e) {
             return UnretryableIoSnafu {}
                 .into_error(Arc::new(std::io::Error::other(e.to_string())))
                 .into();
@@ -230,6 +232,32 @@ impl ReqwestAdapter {
                 bolt_load_utils::telemetry::error!("failed to get context: {}", e);
             })
     }
+}
+
+/// Whether the body bytes themselves could not be decoded, as opposed to a
+/// connection that broke while they were decoded.
+///
+/// A client built with a decoder reports every body error as a decode error,
+/// plain bodies included. The source chain tells the two apart: a broken
+/// connection carries a `hyper::Error`, a decoder failure only the decoder's
+/// `io::Error` (`InvalidData` for a bad header, `UnexpectedEof` for a stream
+/// that stops early). Retrying cannot fix the latter.
+fn is_undecodable(e: &reqwest::Error) -> bool {
+    if !e.is_decode() || e.is_timeout() {
+        return false;
+    }
+    let mut undecodable = false;
+    let mut source = e.source();
+    while let Some(error) = source {
+        if error.is::<hyper::Error>() {
+            return false;
+        }
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            undecodable |= matches!(io.kind(), ErrorKind::InvalidData | ErrorKind::UnexpectedEof);
+        }
+        source = error.source();
+    }
+    undecodable
 }
 
 struct ReqwestStream<'a>(AnyStream<'a, Result<bytes::Bytes, reqwest::Error>>);
