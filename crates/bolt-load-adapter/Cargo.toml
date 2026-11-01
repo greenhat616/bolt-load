@@ -42,7 +42,10 @@ reqwest = { version = "0.13", optional = true, features = [
     "stream",
 ], default-features = false }
 # for ureq adapter
-ureq2 = { version = "2", package = "ureq", optional = true }
+# No `gzip`: a decoding client hides `Content-Encoding` from the range check.
+ureq2 = { version = "2", package = "ureq", optional = true, default-features = false, features = [
+    "tls",
+] }
 ureq3 = { version = "3", package = "ureq", optional = true }
 
 [dev-dependencies]

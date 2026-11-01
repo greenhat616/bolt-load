@@ -82,12 +82,18 @@
 
 ## T3 — Range 校验与 meta 探测（C3）
 
-- [ ] 新增 `bolt-load-adapter/src/range.rs`：`parse_content_range` 和 `validate_range_response`（design §4.1）。解析时容忍空白和大小写差异。
-- [ ] 两个 adapter 的 `range_stream`：
+- [x] 新增 `bolt-load-core/src/adapter/range.rs`：`validate_range_response`（design §4.1）；`ContentRange` 实现 `FromStr`。解析时容忍空白和大小写差异。
+- [x] 两个 adapter 的 `range_stream`：
   - 请求带上 `Accept-Encoding: identity`；
   - 先拿状态码和响应头调用 `validate_range_response`，通过之后才取 body。
-- [ ] `fetch_remote_meta`：只有 `206` 加上合法的 `Content-Range`，才认定支持 Range；删掉 `ContentLength(0)` 那个分支（`reqwest.rs:245-246`）。ureq2 做同样的改动。
-- [ ] 在 `stream.rs` 的注释里写明：`last < end − 1` 时，按短读路径处理。
+- [x] `fetch_remote_meta`：只有 `206` 加上合法的 `Content-Range`，才认定支持 Range；删掉 `ContentLength(0)` 那个分支（`reqwest.rs:245-246`）。ureq2 做同样的改动。
+- [x] 在 `stream.rs` 的注释里写明：`last < end − 1` 时，按短读路径处理。
+- [x] 审查后补充（design §4.1、§14.2）：
+  - 重复的头先合并再校验；
+  - `limit_range_body` 让超出 `Content-Range` 的 body 报 `RangeBodyTooLong`，干净地提前结束的 body 报 `RangeBodyTooShort`；
+  - 所有请求都带 `Accept-Encoding: identity`；
+  - adapter 关闭 ureq 的默认 `gzip` feature；
+  - ureq2 的 meta、Range 探测和总长度校验共用同一次 HEAD。
 
 **验证**
 
@@ -100,6 +106,8 @@
   - 缺少头；
   - `multipart/byteranges`；
   - 带 `Content-Encoding: gzip`；
+  - 重复的 `Content-Range`、分行的 `Content-Type`、非 UTF-8 的编码值；
+  - body 超出 `Content-Range`，以及 body 在 `Content-Range` 之前干净结束；
   - `200`；
   - `416` 带 `*/t`，以及 `416` 不带这个头；
   - 大小写与空白的各种变体。

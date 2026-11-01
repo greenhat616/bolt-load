@@ -1,10 +1,12 @@
 use futures::stream::BoxStream;
 mod content_range;
 pub mod error;
+mod range;
 mod status;
-pub use content_range::ContentRange;
+pub use content_range::{ContentRange, InvalidContentRange};
 pub use error::{AdapterError, RetryableError, UnretryableError};
 use error::{UnretryableSnafu, unretryable::RangeStreamNotSupportedSnafu};
+pub use range::{RangeHeaders, limit_range_body, validate_range_response};
 use snafu::ResultExt;
 pub use status::{MAX_RETRY_AFTER, classify_status};
 

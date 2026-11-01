@@ -109,8 +109,8 @@
 
 ### 4.1 共享校验函数
 
-位置：`bolt-load-adapter/src/range.rs`（新增），reqwest 和 ureq2 都调用它。
-`ContentRange` 定义在 `bolt-load-core`（错误类型 `RangeMismatch` 要引用它），`range.rs` 只放解析和校验函数。
+位置：`bolt-load-core/src/adapter/range.rs`（新增），导出为 `bolt_load_core::adapter::validate_range_response`，reqwest 和 ureq2 都调用它。理由和 §5.1 相同：校验规则是 adapter 和引擎之间的约定，外部 adapter 只依赖 core 就能用上。
+`ContentRange` 也在 core 里（错误类型 `RangeMismatch` 要引用它），解析通过 `impl FromStr for ContentRange` 提供，不放进 utils，因为 utils 不依赖 core。
 
 ```rust
 /// A parsed `Content-Range: bytes first-last/complete` header.
@@ -120,28 +120,51 @@ pub struct ContentRange {
     pub complete: Option<u64>, // `*` → None
 }
 
+impl FromStr for ContentRange { /* … */ }
+
+/// Combined header values (repeated lines joined with ", ", RFC 9110 §5.3)
+/// plus the parsed `Retry-After`.
+#[non_exhaustive]
+pub struct RangeHeaders<'a> {
+    pub content_range: Option<&'a str>,
+    pub content_type: Option<&'a str>,
+    pub content_encoding: Option<&'a str>,
+    pub retry_after: Option<Duration>, // passed on to classify_status
+}
+
 pub fn validate_range_response(
     status: u16,
-    headers: &RangeHeaders,      // Content-Range / Content-Type / Content-Encoding
+    headers: &RangeHeaders<'_>,
     requested: Range<u64>,       // half-open
     expected_total: Option<u64>,
-) -> Result<(), AdapterError>;
+) -> Result<ContentRange, AdapterError>; // the range a valid 206 carries
+
+/// Hold the body to `got`'s length: `RangeBodyTooLong` past it,
+/// `RangeBodyTooShort` if it ends cleanly before.
+pub fn limit_range_body(body: AnyBytesStream, got: ContentRange) -> AnyBytesStream;
 ```
 
 | 响应 | 结果 |
 | --- | --- |
-| `206`，带单段 `Content-Range`，满足 `first == start`、`last < end`、`complete ∈ {None, expected_total}`，并且没有 `Content-Encoding`（或者是 `identity`） | `Ok(())` |
-| `206`，但 `Content-Range` 缺失、解析失败或对不上 | `Unretryable::RangeMismatch { requested, got: Option<ContentRange> }` |
+| `206`，带单段 `Content-Range`，满足 `first == start`、`last < end`、`complete ∈ {None, expected_total}`，并且没有 `Content-Encoding`（或者是 `identity`） | `Ok(got)` |
+| `206`，但 `Content-Range` 缺失、解析失败（包括出现多行）或对不上 | `Unretryable::RangeMismatch { requested, got: Option<ContentRange> }` |
 | `206` + `multipart/byteranges` | `RangeMismatch`。我们只请求单段 |
 | `206`，但带了非 identity 的 `Content-Encoding` | `RangeMismatch`。这时 `Content-Range` 描述的是编码后的字节 |
 | `200` | `Unretryable::RangeIgnored` |
 | `416` | `Unretryable::RangeNotSatisfiable { total }`，`total` 从 `Content-Range: bytes */t` 里取 |
-| 其它 | 交给 §5 的 `classify_status` |
+| 其它 4xx、5xx | 交给 §5 的 `classify_status` |
+| 其它（1xx、3xx、非 200/206 的 2xx） | `Unretryable::Status { status }` |
 
 约束：
 
 - 必须在调用 `error_for_status()` **之前**拿到状态码和响应头，否则 416、429、503 的响应头就丢了。两个 adapter 的 `range_stream` 都改成“先校验，再取 body”。
-- range 请求显式带上 `Accept-Encoding: identity`。
+- 所有请求（HEAD、`full_stream`、range 请求、探测）都显式带上 `Accept-Encoding: identity`，和 IDM 的默认做法一致。不带这个头时，任何编码都算可接受（RFC 9110 §12.5.3），服务器返回 gzip 是合规的，文件里就会存成编码后的字节。`before_request` 仍然可以覆盖它。
+- 每个头按合并后的值传入：重复的行用 `", "` 连起来，非 UTF-8 的值有损保留。这样第二行 `Content-Range` 会导致解析失败，分行写的 `Content-Encoding` 也都会被检查到。
+- 会解压的 HTTP 客户端会同时删掉 `Content-Encoding`，响应头上看不出来（§14.2）。所以 adapter 用 `limit_range_body` 包住 body，要求 body 长度正好等于 `Content-Range` 声明的长度：
+  - 超出时，报 `Unretryable::RangeBodyTooLong { got }`，越界的那块数据不交给 runner；
+  - 干净地提前结束时，报 `Unretryable::RangeBodyTooShort { got, received }`。数据不可压缩时，解压后的 body 就是这样结束的。连接中途断开是 body 自己的错误，原样传出，仍然可以重试。
+
+  长度取的是响应自己声明的长度，不是 runner 的预算，所以切分后预算调低不会被误判。
 - `last < end − 1` 是合法的，表示服务器只给了一部分。runner 收完这部分后按短读处理，从已接收的位置重新请求。`last ≥ end` 视为 `RangeMismatch`。
 
 ### 4.2 meta 探测
