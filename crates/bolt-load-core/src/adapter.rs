@@ -1,5 +1,7 @@
 use futures::stream::BoxStream;
+mod content_range;
 pub mod error;
+pub use content_range::ContentRange;
 pub use error::{AdapterError, RetryableError, UnretryableError};
 use error::{UnretryableSnafu, unretryable::RangeStreamNotSupportedSnafu};
 use snafu::ResultExt;
@@ -42,11 +44,28 @@ pub trait BoltLoadAdapter: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BoltLoadAdapterMeta {
     /// the content size
     pub content_size: u64,
     /// suggested filename
     pub filename: Option<String>,
+}
+
+impl BoltLoadAdapterMeta {
+    /// Metadata for `content_size` bytes and no suggested filename.
+    pub fn new(content_size: u64) -> Self {
+        Self {
+            content_size,
+            filename: None,
+        }
+    }
+
+    /// Set the suggested filename.
+    pub fn with_filename(mut self, filename: Option<String>) -> Self {
+        self.filename = filename;
+        self
+    }
 }
 
 pub type AnyStream<'a, T> = BoxStream<'a, T>;
@@ -71,10 +90,7 @@ mod tests {
 
     impl BoltLoadAdapter for MetaOnly {
         async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
-            Ok(BoltLoadAdapterMeta {
-                content_size: 1,
-                filename: None,
-            })
+            Ok(BoltLoadAdapterMeta::new(1))
         }
 
         async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {

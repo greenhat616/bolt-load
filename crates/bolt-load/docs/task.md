@@ -64,7 +64,7 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   successful non-empty write in between, the task fails with
   `TaskError::RetryLimitExceeded`, which carries the last error.
 - **Unretryable failures** end the task with the adapter's original
-  error. The one exception is `ServiceUnavailable` (429/503) while other
+  error. The one exception is `Congestion` (429/503) while other
   attempts are still in flight: it is a concurrency signal for the
   concurrency strategy, still bounded by the no-progress deadline.
 - **Idle streams**: a runner whose upstream yields no non-empty data

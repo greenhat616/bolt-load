@@ -20,7 +20,7 @@ fn is_congestion(error: &TaskError) -> bool {
         error,
         TaskError::StreamError {
             source: AdapterError::Unretryable {
-                source: UnretryableError::ServiceUnavailable { .. }
+                source: UnretryableError::Congestion { .. }
             }
         }
     )
@@ -130,9 +130,9 @@ mod tests {
             runner_id: 0,
             error: TaskError::StreamError {
                 source: AdapterError::Unretryable {
-                    source: UnretryableError::ServiceUnavailable {
-                        status: "429".into(),
-                        description: "Too Many Requests".into(),
+                    source: UnretryableError::Congestion {
+                        status: 429,
+                        retry_after: None,
                     },
                 },
             },

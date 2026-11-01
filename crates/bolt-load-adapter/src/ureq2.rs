@@ -4,7 +4,7 @@ use blocking::unblock;
 use bolt_load_core::adapter::error::{
     retryable::IoSnafu as RetryableIoSnafu,
     unretryable::{
-        IoSnafu as UnretryableIoSnafu, NotFoundSnafu, ServiceUnavailableSnafu, UnauthorizedSnafu,
+        CongestionSnafu, IoSnafu as UnretryableIoSnafu, NotFoundSnafu, UnauthorizedSnafu,
     },
 };
 use bolt_load_utils::{http::ContentDisposition, reader::CrossRuntimeStream};
@@ -62,20 +62,19 @@ impl From<UreqError> for AdapterError {
                 )),
             }
             .into(),
-            ureq2::Error::Status(404, _) => NotFoundSnafu {}.build().into(),
-            ureq2::Error::Status(401, _) | ureq2::Error::Status(403, _) => UnauthorizedSnafu {
-                message: format!("http status code: {}", 401),
+            ureq2::Error::Status(404, _) => NotFoundSnafu { status: 404u16 }.build().into(),
+            ureq2::Error::Status(status @ (401 | 403), _) => UnauthorizedSnafu {
+                status,
+                message: format!("http status code: {status}"),
             }
             .build()
             .into(),
-            ureq2::Error::Status(503, _) | ureq2::Error::Status(429, _) => {
-                ServiceUnavailableSnafu {
-                    status: format!("{}", 503),
-                    description: e.to_string(),
-                }
-                .build()
-                .into()
+            ureq2::Error::Status(status @ (429 | 503), _) => CongestionSnafu {
+                status,
+                retry_after: None,
             }
+            .build()
+            .into(),
             ureq2::Error::Status(status, _) if status < 500 => UnretryableIoSnafu {}
                 .into_error(Arc::new(std::io::Error::other(format!(
                     "http client error, status code: {}",
@@ -176,10 +175,7 @@ impl BoltLoadAdapter for UreqAdapter {
         let response = self.perform_head().await?;
         let content_size = self.get_content_size(&response);
         let filename = self.suggest_filename(&response);
-        Ok(BoltLoadAdapterMeta {
-            content_size,
-            filename,
-        })
+        Ok(BoltLoadAdapterMeta::new(content_size).with_filename(filename))
     }
 
     async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {

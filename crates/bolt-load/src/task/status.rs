@@ -295,10 +295,7 @@ mod tests {
 
     fn info() -> TaskInfo {
         TaskInfo {
-            meta: BoltLoadAdapterMeta {
-                content_size: 10,
-                filename: None,
-            },
+            meta: BoltLoadAdapterMeta::new(10),
             mode: DownloadMode::Singleton,
             path: "out.bin".into(),
         }

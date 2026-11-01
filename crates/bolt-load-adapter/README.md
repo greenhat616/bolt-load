@@ -26,7 +26,7 @@ let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
 - Lazy metadata initialization — a single `Range: bytes=0-0` probe
   detects range support and caches content size
 - Request interceptors via `before_request()` callback
-- Automatic error classification (404 → `NotFound`, 429 → `ServiceUnavailable`, etc.)
+- Automatic error classification (404 → `NotFound`, 429 → `Congestion`, etc.)
 
 ### Ureq (optional, feature `ureq2`)
 
@@ -63,7 +63,7 @@ HTTP status codes are mapped to structured `AdapterError` variants:
 |--------|-------|
 | 401, 403 | `Unauthorized` |
 | 404 | `NotFound` |
-| 429, 503 | `ServiceUnavailable` |
+| 429, 503 | `Congestion` |
 | Network errors | `Retryable(Io)` |
 | Other 4xx | `Unretryable(Io)` |
 | Other 5xx | `Retryable(Io)` |

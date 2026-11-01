@@ -105,10 +105,7 @@ mod tests {
                     }
                 });
             }
-            Ok(BoltLoadAdapterMeta {
-                content_size: 42,
-                filename: None,
-            })
+            Ok(BoltLoadAdapterMeta::new(42))
         }
 
         async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {

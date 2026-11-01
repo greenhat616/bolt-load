@@ -28,21 +28,47 @@ impl From<UnretryableError> for AdapterError {
 }
 
 pub mod unretryable {
-    use std::sync::Arc;
+    use std::{ops::Range, sync::Arc, time::Duration};
 
     use snafu::prelude::*;
 
-    use super::retryable::RetryableError;
+    use super::{super::ContentRange, retryable::RetryableError};
 
     #[derive(Debug, Snafu, Clone)]
     #[snafu(visibility(pub))]
+    #[non_exhaustive]
     pub enum UnretryableError {
-        #[snafu(display("access denied: {message}"))]
-        Unauthorized { message: String },
-        #[snafu(display("resource not found"))]
-        NotFound,
-        #[snafu(display("service unavailable: {status} {description}"))]
-        ServiceUnavailable { status: String, description: String },
+        #[snafu(display("access denied ({status}): {message}"))]
+        Unauthorized { status: u16, message: String },
+        #[snafu(display("resource not found ({status})"))]
+        NotFound { status: u16 },
+        /// The server rejects the load (429/503). `retry_after` is the
+        /// server's `Retry-After`, when it sent a usable one.
+        #[snafu(display("server is congested ({status})"))]
+        Congestion {
+            status: u16,
+            retry_after: Option<Duration>,
+        },
+        /// A status with no more specific variant.
+        #[snafu(display("unexpected http status {status}"))]
+        Status { status: u16 },
+        /// The server answered a range request with the whole resource.
+        #[snafu(display("server ignored the range request"))]
+        RangeIgnored,
+        /// The response does not prove it carries the requested bytes.
+        #[snafu(display(
+            "range response does not match bytes {}-{}: {}",
+            requested.start,
+            requested.end.saturating_sub(1),
+            got.map_or_else(|| "no usable Content-Range".to_owned(), |got| got.to_string())
+        ))]
+        RangeMismatch {
+            requested: Range<u64>,
+            got: Option<ContentRange>,
+        },
+        /// 416. `total` comes from `Content-Range: bytes */total`.
+        #[snafu(display("range not satisfiable (total {total:?})"))]
+        RangeNotSatisfiable { total: Option<u64> },
         #[snafu(display("internal error: {message}"))]
         /// The error is internal. such as a http request, we do not retrieve the meta, and we call the range stream directly
         Internal { message: String },
@@ -65,6 +91,7 @@ pub mod unretryable {
         pub fn from_retryable_error(e: RetryableError) -> Self {
             match e {
                 RetryableError::Io { source: e } => Self::Io { source: e },
+                RetryableError::Status { status } => Self::Status { status },
             }
         }
     }
@@ -85,8 +112,12 @@ pub mod retryable {
 
     #[derive(Debug, Snafu, Clone)]
     #[snafu(visibility(pub))]
+    #[non_exhaustive]
     pub enum RetryableError {
         #[snafu(display("io error: {source}"))]
         Io { source: Arc<std::io::Error> },
+        /// A status worth retrying, such as 408 or a 5xx.
+        #[snafu(display("http status {status}"))]
+        Status { status: u16 },
     }
 }

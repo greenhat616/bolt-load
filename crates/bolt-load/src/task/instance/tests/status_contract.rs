@@ -142,11 +142,9 @@ impl BoltLoadAdapter for UnknownSizeAdapter {
     }
 
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
-        let meta = self.0.retrieve_meta().await?;
-        Ok(BoltLoadAdapterMeta {
-            content_size: 0,
-            ..meta
-        })
+        let mut meta = self.0.retrieve_meta().await?;
+        meta.content_size = 0;
+        Ok(meta)
     }
 
     async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {

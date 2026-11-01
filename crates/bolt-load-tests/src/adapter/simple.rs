@@ -9,7 +9,7 @@ use std::{
 
 use bolt_load_core::adapter::{
     AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta,
-    error::unretryable::{InternalSnafu, RangeStreamNotSupportedSnafu, ServiceUnavailableSnafu},
+    error::unretryable::{CongestionSnafu, InternalSnafu, RangeStreamNotSupportedSnafu},
 };
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
@@ -492,10 +492,10 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             self.content.len()
         );
 
-        Ok(BoltLoadAdapterMeta {
-            content_size: self.content.len() as u64,
-            filename: self.filename.clone(),
-        })
+        Ok(
+            BoltLoadAdapterMeta::new(self.content.len() as u64)
+                .with_filename(self.filename.clone()),
+        )
     }
 
     async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
@@ -543,9 +543,9 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         if let Some(max_concurrent_streams) = self.max_concurrent_streams
             && current_concurrency >= max_concurrent_streams
         {
-            return Err(ServiceUnavailableSnafu {
-                status: "429".to_string(),
-                description: "Max concurrent streams reached".to_string(),
+            return Err(CongestionSnafu {
+                status: 429u16,
+                retry_after: None,
             }
             .build()
             .into());
@@ -602,9 +602,9 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         if let Some(max_concurrent_streams) = self.max_concurrent_streams
             && current_concurrency >= max_concurrent_streams
         {
-            return Err(ServiceUnavailableSnafu {
-                status: "429".to_string(),
-                description: "Max concurrent streams reached".to_string(),
+            return Err(CongestionSnafu {
+                status: 429u16,
+                retry_after: None,
             }
             .build()
             .into());

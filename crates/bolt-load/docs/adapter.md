@@ -42,11 +42,11 @@ calling its methods through `AnyAdapter` needs `BoltLoadAdapter` in scope.
 
 - **Retryable** — transient I/O errors (connection drops, timeouts).
 - **Unretryable** — `NotFound` (404), `Unauthorized` (401/403),
-  `ServiceUnavailable` (429/503), `RangeStreamNotSupported`, etc.
+  `Congestion` (429/503), `RangeStreamNotSupported`, etc.
 
 A task retries retryable failures up to its consecutive failure budget
 and fails on the first unretryable one. The only exception is
-`ServiceUnavailable` (429/503) while other attempts are in flight: it is
+`Congestion` (429/503) while other attempts are in flight: it is
 answered by lowering concurrency instead (see the task module's
 *Termination* section).
 

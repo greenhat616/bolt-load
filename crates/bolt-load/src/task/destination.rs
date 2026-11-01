@@ -161,10 +161,7 @@ mod tests {
     use super::*;
 
     fn meta(filename: Option<&str>) -> BoltLoadAdapterMeta {
-        BoltLoadAdapterMeta {
-            content_size: 1,
-            filename: filename.map(String::from),
-        }
+        BoltLoadAdapterMeta::new(1).with_filename(filename.map(String::from))
     }
 
     #[test]
