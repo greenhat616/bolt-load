@@ -114,16 +114,19 @@
 
 ## T4 — 故障注入（C4）
 
-- [ ] `bolt-load-tests/src/adapter/http_server.rs` 和 `fault.rs` 新增以下服务器行为：
+- [x] `bolt-load-tests/src/adapter/http_server.rs` 和 `fault.rs` 新增以下服务器行为（`RangeFault`、`create_range_fault_server`）：
   - 忽略 Range，返回 `200` 全量；
   - `206` 但起点偏移一个字节；
   - `206` 但 `complete` 不一致；
   - 一律返回 `416`；
   - 返回 `503` 并带 `Retry-After: 2`；
   - 对 range 请求返回 gzip 编码；
+  - 对所有请求返回 gzip 编码后的完整表示，长度和区间都按编码后的字节算（`EncodedRepresentation`）；
   - body 中途截断。
-- [ ] 集成测试：对上面每一种行为，分别用两个 adapter 各跑一次完整任务。断言要么最终文件 hash 正确，要么任务以对应的类型化错误失败，**绝不允许**出现 `Completed` 但 hash 错误（G1）。
-- [ ] 回退相关的场景，在 PR-2 里先断言为失败（返回 `RangeIgnored`）；PR-3 合入后，再改成断言回退成功。
+- [x] 集成测试（`crates/bolt-load/tests/range_faults.rs`）：对上面每一种行为，分别用两个 adapter 各跑一次完整任务。断言要么最终文件 hash 正确，要么任务以对应的类型化错误失败，**绝不允许**出现 `Completed` 但 hash 错误（G1）。
+- [x] 回退相关的场景，在 PR-2 里先断言为失败（返回 `RangeIgnored`）；PR-3 合入后，再改成断言回退成功。
+- [x] 截断场景暴露出 ureq2 把 body 中途断开报成不可重试，已单独修复（design §14.1）。
+- [x] 会解压的客户端：`bolt-load-adapter/tests/content_coding.rs` 断言解压后的 range body 以 `RangeBodyTooLong`（可压缩）或 `RangeBodyTooShort`（不可压缩）失败，从中间开始的编码区间以 `Unretryable::Io` 失败；不解压的客户端以 `RangeMismatch` 失败（design §14.2）。
 
 **验证**
 

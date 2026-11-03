@@ -526,6 +526,7 @@ dependencies = [
  "pin-project-lite",
  "pretty_assertions",
  "regex",
+ "reqwest",
  "serde",
  "smol",
  "smol-cancellation-token",
@@ -537,6 +538,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tracing-tracy",
+ "ureq 2.12.1",
  "url",
  "windows-sys 0.61.2",
 ]
@@ -602,6 +604,7 @@ dependencies = [
  "bolt-load-utils",
  "bytes",
  "derive_more",
+ "flate2",
  "futures",
  "governor",
  "n0-tracing-test",

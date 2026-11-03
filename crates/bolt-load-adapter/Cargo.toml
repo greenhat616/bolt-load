@@ -57,7 +57,8 @@ ureq2 = { version = "2", package = "ureq", optional = true, default-features = f
 ureq3 = { version = "3", package = "ureq", optional = true }
 
 [dev-dependencies]
-# `gzip` for the decoding-client tests in `tests/body_decoding.rs`.
+# `gzip` for the decoding-client tests in `tests/body_decoding.rs` and
+# `tests/content_coding.rs`.
 reqwest = { version = "0.13", default-features = true, features = [
     "stream",
     "gzip",
