@@ -199,6 +199,24 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 
 struct UreqStream(AnyStream<'static, Result<bytes::Bytes, std::io::Error>>);
 
+/// Classify an error reading the body. A connection lost mid-body is
+/// retryable, as it is on reqwest; a body that cannot be decoded is not.
+fn body_error(e: std::io::Error) -> AdapterError {
+    use std::io::ErrorKind;
+
+    let source = Arc::new(e);
+    match source.kind() {
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::TimedOut
+        | ErrorKind::Interrupted
+        | ErrorKind::NetworkDown => RetryableError::Io { source }.into(),
+        _ => UnretryableIoSnafu {}.into_error(source).into(),
+    }
+}
+
 impl Stream for UreqStream {
     type Item = Result<bytes::Bytes, AdapterError>;
 
@@ -208,7 +226,7 @@ impl Stream for UreqStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.get_mut().0)
             .poll_next(cx)
-            .map_err(|e| UnretryableIoSnafu {}.into_error(Arc::new(e)).into())
+            .map_err(body_error)
     }
 }
 
@@ -297,6 +315,34 @@ impl BoltLoadAdapter for UreqAdapter {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn a_lost_connection_is_retryable_and_a_bad_body_is_not() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                matches!(
+                    body_error(Error::from(kind)),
+                    AdapterError::Retryable { .. }
+                ),
+                "{kind:?}"
+            );
+        }
+        for kind in [ErrorKind::InvalidData, ErrorKind::InvalidInput] {
+            assert!(
+                matches!(
+                    body_error(Error::from(kind)),
+                    AdapterError::Unretryable { .. }
+                ),
+                "{kind:?}"
+            );
+        }
+    }
+
     use bolt_load_tests::adapter::http_server::{self, DEFAULT_FILE_SIZE};
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
