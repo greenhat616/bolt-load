@@ -11,6 +11,6 @@ pub mod header;
 mod range;
 mod status;
 
-pub use coding::{check_content_coding, is_identity_coding};
+pub use coding::{ContentCoding, check_content_coding};
 pub use range::{RangeHeaders, limit_range_body, validate_range_response};
 pub use status::{MAX_RETRY_AFTER, classify_status};

@@ -173,7 +173,7 @@
   - utils 删除 `http` 模块和 feature，同步改 `Cargo.toml` 的 description。
   - `bolt-load-adapter` 改为依赖 `bolt-load-http`，去掉 `bolt-load-utils/http`。改 import 的地方有：两个 adapter，以及 `tests/status_classification.rs` 等测试。
   - 提交信息列出新旧路径对照，作为迁移说明。
-- [ ] C24：新增 `ContentCoding` 和 `parse_list`（design §4.5）。`check_content_coding` 和 range 校验里的编码检查都改用它，`is_identity_coding` 删除。现有实现已经不区分大小写，所以行为不变。
+- [x] C24：新增 `ContentCoding` 和 `parse_list`（design §4.5）。`check_content_coding` 和 range 校验里的编码检查都改用它，`is_identity_coding` 删除。现有实现已经不区分大小写，所以行为不变。
 - [x] 文档：
   - 新 crate 的 README：从 core README 移过来函数说明、响应表和 “Content codings” 一节。
   - core README 只留错误变体表。

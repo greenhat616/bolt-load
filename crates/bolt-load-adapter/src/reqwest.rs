@@ -9,9 +9,9 @@ use std::{
 
 use async_once_cell::OnceCell;
 use bolt_load_http::{
-    RangeHeaders, check_content_coding, classify_status,
+    ContentCoding, RangeHeaders, check_content_coding, classify_status,
     header::{ContentDisposition, parse_retry_after},
-    is_identity_coding, limit_range_body, validate_range_response,
+    limit_range_body, validate_range_response,
 };
 use futures::Stream;
 use reqwest::header::{
@@ -130,7 +130,8 @@ fn combined(response: &reqwest::Response, name: &HeaderName) -> Option<String> {
 
 /// The combined `Content-Encoding`, unless it is `identity`.
 fn content_coding(response: &reqwest::Response) -> Option<String> {
-    combined(response, &CONTENT_ENCODING).filter(|value| !is_identity_coding(value))
+    combined(response, &CONTENT_ENCODING)
+        .filter(|value| !ContentCoding::parse_list(value).is_empty())
 }
 
 fn retry_after(response: &reqwest::Response) -> Option<Duration> {
