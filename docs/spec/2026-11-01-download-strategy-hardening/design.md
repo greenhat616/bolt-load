@@ -14,6 +14,7 @@
   - runner：限速等待。
   - 任务：Range 不支持时回退到单连接、写错误、续传。
 - `bolt-load-tests`：故障注入服务器。
+- `bolt-load-decode`（新增）：单连接下载的内容解码（§4.4）。
 
 **不在范围：** 见 §13。
 **权威顺序：** 本设计 > `tasks.md` > `idm-improvement-plan.md`。改进方案只作为背景和证据，两者冲突时以本设计为准。
@@ -95,13 +96,15 @@
 | # | 决策 | 采用 | 状态 |
 | --- | --- | --- | --- |
 | D1 | `max_connections` 的默认值 | 固定 8，与 CPU 核数无关 | 待确认 |
-| D2 | 遇到 `RangeIgnored` 时怎么办 | 自动截断文件，改用单连接从头下载，并通过 `TaskStatus` 上报降级 | 待确认 |
+| D2 | Range 用不了时怎么办 | 自动截断文件，改用单连接从头下载，并通过 `TaskStatus` 上报降级。触发条件除了 `RangeIgnored`，还包括 range 响应带了内容编码，或者能看出被客户端解过码（§4.3），和 IDM 一致 | 已确认（2026-11-03，扩展到内容编码） |
 | D3 | 其它 4xx 归为不可重试 | 采纳（对齐 ureq2）；408 例外 | 已确认（2026-11-01，随 PR-1 开工） |
 | D4 | P2 什么时候做 | P1 完成之后再评估 | 待确认 |
 | D5 | 冗余对冲 | 不做 | 待确认 |
 | D6 | 切分尺寸改用单连接速率 | 和扩张控制器放在同一个开关后面，一起做 A/B | 待确认 |
 | D7 | 按 host 的能力缓存 | 随 P2 一起做，TTL 1 h，不持久化 | 待确认 |
 | D8 | 限速的公平性 | 所有 runner 共享一个桶，不做按任务的公平分配 | 待确认 |
+| D9 | 解码 crate 的后端 | `compression-codecs`，只在 crate 内部使用；gzip、deflate 默认开启，br、zstd 放在 feature 后面（§4.4） | 待确认 |
+| D10 | 在哪一层解码 | `full_stream` 把 `Content-Encoding` 和 `Content-Type` 交给引擎，由引擎决定是否解码；adapter 自己不解码（§4.4） | 待确认 |
 
 ---
 
@@ -175,10 +178,94 @@ pub fn limit_range_body(body: AnyBytesStream, got: ContentRange) -> AnyBytesStre
 
 ### 4.3 任务级回退（D2）
 
-1. runner 收到 `RangeIgnored` 后，下载循环把它升级为 `DownloadError::RangeUnsupported`，取消所有 runner，并且不再接收新的写入。
+触发回退的错误（任意一个）：
+
+| 错误 | 来自 | 说明 |
+| --- | --- | --- |
+| `RangeIgnored` | §4.1 | 服务器忽略 Range |
+| 带编码的 206 | §4.1 | 客户端不解压，看得到非 identity 的 `Content-Encoding`。现在报的是 `RangeMismatch`；T5 为它新增 `RangeContentCoded { coding }` 变体，回退只认这个变体，不认其它的 `RangeMismatch` |
+| `RangeBodyTooLong`、`RangeBodyTooShort` | §4.1 | 客户端解压后删掉了编码头，只能从长度看出来。服务器算错长度也会这样，这时回退到单连接同样安全 |
+| 解不开的 body | §14.1 | 从中间开始的编码区间。现在是 `Unretryable::Io`；T5 为它新增 `BodyUndecodable` 变体，回退只认这个变体 |
+
+步骤：
+
+1. runner 收到上面任意一个错误后，下载循环把它升级为 `DownloadError::RangeUnsupported { reason }`，取消所有 runner，并且不再接收新的写入。`reason` 区分“忽略 Range”和“内容编码”。
 2. `drive.rs` 在 `initialize` 之后的分支里捕获这个错误：等所有写入完成，截断目标文件到 0，然后以 `DownloadMode::Singleton` 重新运行一次。
-3. `TaskStatus` 里要能观察到这次降级（具体字段见 T5，沿用 `task-api-spec.md` 的状态模型，不新增事件通道）。
-4. 每个任务最多回退一次。Singleton 模式用的是 `full_stream()`（`singleton_task.rs:144`），不经过 §4.1 的校验，所以回退后不会再触发 `RangeIgnored`。
+3. 回退时**文件大小按未知处理**（`total = None`，下载到流结束为止）。meta 里的长度来自 HEAD 或探测，响应带编码时数的是编码后的字节，解码后就对不上。IDM 也是这样：响应带编码时，文件大小取实际写入的字节数（§14.2）。
+4. `TaskStatus` 里要能观察到这次降级和原因（具体字段见 T5，沿用 `task-api-spec.md` 的状态模型，不新增事件通道）。
+5. 每个任务最多回退一次。Singleton 模式用的是 `full_stream()`（`singleton_task.rs:144`），不经过 §4.1 的校验，所以回退后不会再触发这些错误。
+
+另外两条规则：
+
+- **meta 阶段就能看出编码时**（HEAD 或探测响应带非 identity 的 `Content-Encoding`，客户端不解压才看得到）：直接选 Singleton，大小按未知处理，不进入多连接。这对应 IDM 把连接数降为 1。
+- **`full_stream` 收到非 identity 编码时**：
+  - 客户端会解压：头已经被删掉，拿到的就是明文，直接写入；
+  - 客户端不解压：§4.4 的解码 crate 落地之前，以 `Unretryable::ContentCoded { coding }` 失败，不把编码后的字节当成文件写进去；落地之后交给它解码。§4.4 的例外（`Content-Type` 本身就是这种压缩格式）在 T5 里就按原样写入。
+
+### 4.4 内容编码的解码（D9、D10）
+
+目标：不管 HTTP 客户端开没开解压，单连接下载都能拿到解码后的文件。外部的 feature 不可控：用户的依赖图里可能有别的 crate 打开客户端的解压，也可能没有，所以解码必须由 bolt-load 自己负责。range 响应永远不解码，遇到编码就走 §4.3 的回退，和 IDM 一致。
+
+**位置：** 新 crate `bolt-load-decode`，对现有生态做一层薄封装。它不依赖 core：输入输出都是 `Stream<Item = Result<Bytes, E>>`，解码错误通过 `From<DecodeError>` 转成 `E`，引擎和自定义 adapter 都能直接用。
+
+```rust
+#[non_exhaustive]
+pub enum ContentCoding { Gzip, Deflate, Brotli, Zstd }
+
+impl ContentCoding {
+    /// Parse a combined `Content-Encoding` value, in the order applied.
+    /// `identity` is skipped; `x-gzip` is `Gzip`.
+    pub fn parse_list(value: &str) -> Result<Vec<ContentCoding>, DecodeError>;
+}
+
+#[non_exhaustive]
+pub struct DecodeOptions {
+    pub buffer_size: usize,      // output buffer per stream, default 64 KiB
+    pub max_output: Option<u64>, // optional bound against decompression bombs
+}
+
+pub fn decode<S, E>(body: S, codings: &[ContentCoding], options: DecodeOptions) -> Decoded<S>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: From<DecodeError>;
+
+#[non_exhaustive]
+pub enum DecodeError {
+    Unsupported { coding: String },
+    Invalid { source: io::Error },
+    TrailingData,
+    TooLarge { limit: u64 },
+}
+```
+
+**缓冲与吞吐：**
+
+- **输入不拷贝。** 传输层给的 `Bytes` 原样借用，用游标记录消费到哪里，没消费完的部分留到下一次 poll。
+- **输出用一块固定的缓冲。** 每个流一块 `BytesMut`（默认 64 KiB，可配置），解码器直接写进它的空闲容量。写满、输入耗尽或者流结束时，`split().freeze()` 交出去，不拷贝。下游释放上一块 `Bytes` 之后，`reserve` 能复用同一块分配，稳定状态下不再分配内存。
+- **每次 poll 最多产出一块输出。** 压缩比再高，单次 poll 的内存和耗时也有上限，背压自然传回网络读取。
+- **内存上界** = 输出缓冲 + 解码器状态。gzip、deflate 的窗口是 32 KiB；brotli 最大 16 MiB；zstd 设 `window_log_max = 23`（8 MiB），与 RFC 9659 §3 一致：HTTP 的 zstd 编码器不得使用超过 8 MB 的窗口，解码器必须支持到 8 MB。
+
+**解码规则：**
+
+- 多层编码（例如 `Content-Encoding: gzip, br`）按相反的顺序串联解码器。层数上限 2，超出报 `Unsupported`。
+- gzip 支持多成员（RFC 1952 允许）。
+- `deflate` 按 RFC 9110 §8.4.1.2 是 zlib 格式，但有服务器发 raw deflate：先按 zlib 解，头部不是 zlib 时改按 raw deflate 解（置信度中：主流客户端都这样兼容，实现前核对 tower-http 的做法）。
+- 流的结束标记之后还有非空数据：报 `TrailingData`。宁可失败，也不写不确定的字节。
+- 解码错误一律不可重试。
+- 不认识的编码：报 `Unsupported`，任务以类型化错误失败，不写入。
+
+**例外（按原样写入，不解码）：** `Content-Type` 本身就是这种压缩格式，例如 `application/gzip` 或 `application/x-gzip` 配 `Content-Encoding: gzip`。这是常见的服务器误配置：把 `.tar.gz` 文件标成 gzip 编码，用户要的其实是压缩包本身。浏览器对这种情况也有特殊处理（置信度中）。
+
+**在哪一层解码（D10）：**
+
+- **方案 A（建议）：** `full_stream` 在返回 body 的同时带上 `Content-Encoding` 和 `Content-Type`（core 新增一个返回类型），由引擎决定是否解码。任何 adapter 都绕不过去。代价是 `BoltLoadAdapter` trait 的破坏性变更，和 T5 的 `DownloadError` 变更放进同一个大版本。
+- **方案 B：** adapter 在 `full_stream` 里自己调用解码 crate，类似 `limit_range_body`。trait 不变，但自定义 adapter 忘了调用，就会静默写进编码后的字节。
+
+**后端（D9）：**
+
+- **方案 A（建议）：** `compression-codecs`。它是 async-compression 拆出来的同步编解码层，tower-http 用的就是它，当前依赖图里已有 0.4.41。接口是推式的：`Decode::decode(&mut input, &mut output)`，不绑定运行时，正好和上面的缓冲设计对上。它的 0.4.x 接口还在演进（已经有 `Decode` 和 `DecodeV2` 两套），所以只在 crate 内部使用，不出现在公开 API 里，并且锁定次版本。
+- **方案 B：** 直接用 flate2、brotli-decompressor、zstd（或纯 Rust 的 ruzstd）。控制更细，但代码更多。
+- 两个方案都是 gzip、deflate 默认开启（IDM 只处理这两种），br、zstd 放在 feature 后面：compression-codecs 的 zstd 依赖 C 库 libzstd。
 
 ---
 
@@ -461,6 +548,8 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 | `Doubling` 在某些网络环境下可能比 `Legacy` 差 | 默认值切换以 T13 的基准测试数据为准，在那之前 `Legacy` 一直是默认 |
 | 令牌桶粒度是一帧（emit 每次推送的大小），低限速时可能有抖动 | 桶深设下限；G8 的误差判据按 2 s 窗口计算 |
 | HTTP 客户端自动解压时会删掉 `Content-Encoding`，§4.1 的编码检查看不到（见 §14.2） | 所有请求都带 `Accept-Encoding: identity`；adapter 关闭 ureq 的 `gzip`；`limit_range_body` 要求 body 长度等于 `Content-Range`，不符就报 `RangeBodyTooLong` 或 `RangeBodyTooShort`；解不开的 body 不重试。这些只保证任务失败而不写错；下完需要 T5 的回退和解码 |
+| 服务器把 `.tar.gz` 这类压缩包标成 `Content-Encoding: gzip`，解码后用户拿到的是解压后的文件 | §4.4 的例外：`Content-Type` 本身就是这种压缩格式时，按原样写入 |
+| 解压炸弹：很小的响应解出极大的文件 | 每次 poll 最多产出一块输出，内存有上界；`DecodeOptions::max_output` 可以给输出总量设上限 |
 | IDM 的部分结论只有 dsh 一个来源（对冲、ECONNRESET 计数、HTTP 低限速时的初始连接数） | 本设计不依赖这些结论；需要用到的参数都通过自己的基准测试来定 |
 
 ---
@@ -521,7 +610,7 @@ T4 的截断场景暴露出两个 adapter 不一致：body 读到一半连接断
 
 **原先的盲区（已处理）：** 第 3、4 条之前，数据不可压缩时，解出的明文比 `Content-Range` 短，会被当成短读。任务没有写错完成，而是卡住了：剩下的区间从压缩流中间开始，解不开；reqwest 又把解码错误当成可重试的，于是一直重试，60 s 无进展后以 `NoProgress` 失败。实测（reqwest 0.13.5、gzip、4 KiB 到 4 MiB 的随机数据）每次都是这样，没有留下文件。现在第一个响应就以 `RangeBodyTooShort` 失败，从中间开始的区间以 `Unretryable::Io` 失败。
 
-**还没解决的：** 上面这些都只是让任务失败。要像 IDM 那样把文件下完，还需要两件事，留给后续 PR：
+**还没解决的：** 上面这些都只是让任务失败。要像 IDM 那样把文件下完，还需要两件事，见 §4.3 和 §4.4：
 
 - 遇到这些错误就回退到单连接，文件大小按未知处理；
 - 客户端不解压时，自己解码。
