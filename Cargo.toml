@@ -3,6 +3,7 @@ members = [
     'crates/bolt-load',
     "crates/bolt-load-core",
     "crates/bolt-load-http",
+    "crates/bolt-load-decode",
     'crates/bolt-load-adapter',
     'crates/bolt-load-tests',
     "crates/bolt-load-utils",
