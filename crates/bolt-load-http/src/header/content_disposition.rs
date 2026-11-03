@@ -538,7 +538,7 @@ mod tests {
     use http::HeaderValue;
 
     use super::{ContentDisposition, DispositionParam, DispositionType};
-    use crate::http::ExtendedValue;
+    use crate::header::ExtendedValue;
 
     #[test]
     fn test_from_raw_basic() {

@@ -59,11 +59,13 @@ impl FromStr for ContentRange {
     }
 }
 
-/// The complete length of an unsatisfied range, `bytes */complete`, as a
-/// 416 response sends it.
-pub(super) fn unsatisfied_complete(value: &str) -> Option<u64> {
-    let (star, complete) = byte_range(value)?.split_once('/')?;
-    (star.trim() == "*").then(|| number(complete)).flatten()
+impl ContentRange {
+    /// The complete length of an unsatisfied range, `bytes */complete`, as a
+    /// 416 response sends it.
+    pub fn unsatisfied_complete(value: &str) -> Option<u64> {
+        let (star, complete) = byte_range(value)?.split_once('/')?;
+        (star.trim() == "*").then(|| number(complete)).flatten()
+    }
 }
 
 /// The part after the `bytes` unit.
@@ -139,10 +141,13 @@ mod tests {
 
     #[test]
     fn reads_the_complete_length_of_an_unsatisfied_range() {
-        assert_eq!(unsatisfied_complete("bytes */100"), Some(100));
-        assert_eq!(unsatisfied_complete(" Bytes * / 100 "), Some(100));
-        assert_eq!(unsatisfied_complete("bytes 0-9/100"), None);
-        assert_eq!(unsatisfied_complete("bytes */*"), None);
-        assert_eq!(unsatisfied_complete("*/100"), None);
+        assert_eq!(ContentRange::unsatisfied_complete("bytes */100"), Some(100));
+        assert_eq!(
+            ContentRange::unsatisfied_complete(" Bytes * / 100 "),
+            Some(100)
+        );
+        assert_eq!(ContentRange::unsatisfied_complete("bytes 0-9/100"), None);
+        assert_eq!(ContentRange::unsatisfied_complete("bytes */*"), None);
+        assert_eq!(ContentRange::unsatisfied_complete("*/100"), None);
     }
 }

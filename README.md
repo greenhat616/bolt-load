@@ -123,7 +123,8 @@ The engine monitors runner failure rates over a sliding window:
 | [**bolt-load**](crates/bolt-load) | Main download engine |
 | [**bolt-load-core**](crates/bolt-load-core) | `BoltLoadAdapter` trait and error types |
 | [**bolt-load-adapter**](crates/bolt-load-adapter) | HTTP adapters: reqwest, ureq |
-| [**bolt-load-utils**](crates/bolt-load-utils) | HTTP parsing, cross-runtime streams, telemetry |
+| [**bolt-load-http**](crates/bolt-load-http) | Status, range and content-coding checks and header parsing for HTTP adapters |
+| [**bolt-load-utils**](crates/bolt-load-utils) | Cross-runtime streams, telemetry |
 | [**bolt-load-tests**](crates/bolt-load-tests) | Test adapters and HTTP server fixtures |
 
 ## Feature Flags

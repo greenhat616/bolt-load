@@ -1,16 +1,10 @@
 use futures::stream::BoxStream;
-mod coding;
 mod content_range;
 pub mod error;
-mod range;
-mod status;
-pub use coding::{check_content_coding, is_identity_coding};
 pub use content_range::{ContentRange, InvalidContentRange};
 pub use error::{AdapterError, RetryableError, UnretryableError};
 use error::{UnretryableSnafu, unretryable::RangeStreamNotSupportedSnafu};
-pub use range::{RangeHeaders, limit_range_body, validate_range_response};
 use snafu::ResultExt;
-pub use status::{MAX_RETRY_AFTER, classify_status};
 
 /// A download source.
 ///
@@ -81,9 +75,17 @@ impl BoltLoadAdapterMeta {
 
     /// Set the content coding; an `identity` value is dropped.
     pub fn with_content_encoding(mut self, content_encoding: Option<String>) -> Self {
-        self.content_encoding = content_encoding.filter(|value| !is_identity_coding(value));
+        self.content_encoding = content_encoding.filter(|value| !is_identity(value));
         self
     }
+}
+
+/// Whether a combined `Content-Encoding` value lists only `identity`.
+fn is_identity(content_encoding: &str) -> bool {
+    content_encoding
+        .split(',')
+        .map(str::trim)
+        .all(|coding| coding.is_empty() || coding.eq_ignore_ascii_case("identity"))
 }
 
 pub type AnyStream<'a, T> = BoxStream<'a, T>;
@@ -142,5 +144,17 @@ mod tests {
                 "{err:?}"
             );
         });
+    }
+
+    #[test]
+    fn meta_drops_an_identity_coding() {
+        for value in ["", "identity", " Identity ", "identity, identity", ","] {
+            let meta = BoltLoadAdapterMeta::new(1).with_content_encoding(Some(value.into()));
+            assert_eq!(meta.content_encoding, None, "{value:?}");
+        }
+        for value in ["gzip", "identity, gzip"] {
+            let meta = BoltLoadAdapterMeta::new(1).with_content_encoding(Some(value.into()));
+            assert_eq!(meta.content_encoding.as_deref(), Some(value));
+        }
     }
 }

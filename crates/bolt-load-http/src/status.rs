@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use super::{AdapterError, RetryableError, UnretryableError};
+use bolt_load_core::adapter::{AdapterError, RetryableError, UnretryableError};
 
 /// The longest `Retry-After` delay honoured; longer values are clamped.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);

@@ -12,12 +12,10 @@ use std::{
     time::Duration,
 };
 
+use bolt_load_core::adapter::{AdapterError, AnyBytesStream, ContentRange, UnretryableError};
 use futures::{Stream, StreamExt};
 
-use super::{
-    AdapterError, AnyBytesStream, ContentRange, UnretryableError, classify_status, content_range,
-    is_identity_coding,
-};
+use crate::{classify_status, is_identity_coding};
 
 /// The response headers [`validate_range_response`] reads.
 ///
@@ -89,7 +87,7 @@ pub fn validate_range_response(
         416 => Err(UnretryableError::RangeNotSatisfiable {
             total: headers
                 .content_range
-                .and_then(content_range::unsatisfied_complete),
+                .and_then(ContentRange::unsatisfied_complete),
         }
         .into()),
         400..=599 => Err(classify_status(status, headers.retry_after)),
@@ -202,8 +200,9 @@ impl Stream for RangeBody {
 
 #[cfg(test)]
 mod tests {
+    use bolt_load_core::adapter::RetryableError;
+
     use super::*;
-    use crate::adapter::RetryableError;
 
     const TOTAL: u64 = 100;
 

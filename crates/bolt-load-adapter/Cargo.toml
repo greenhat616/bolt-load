@@ -15,20 +15,21 @@ default = ["reqwest"]
 reqwest = [
     "dep:reqwest",
     "dep:hyper",
-    "bolt-load-utils/http",
+    "dep:bolt-load-http",
     "bolt-load-utils/tracing",
     "dep:async-once-cell",
 ]
 ureq2 = [
     "dep:ureq2",
     "bolt-load-utils/reader",
-    "bolt-load-utils/http",
+    "dep:bolt-load-http",
     "dep:blocking",
     "dep:http",
 ]
 
 [dependencies]
 bolt-load-core = { path = "../bolt-load-core", version = "0.2" }
+bolt-load-http = { path = "../bolt-load-http", version = "0.2", optional = true }
 bolt-load-utils = { path = "../bolt-load-utils", version = "0.2" }
 
 futures = { workspace = true }

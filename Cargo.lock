@@ -551,6 +551,7 @@ dependencies = [
  "async-once-cell",
  "blocking",
  "bolt-load-core",
+ "bolt-load-http",
  "bolt-load-tests",
  "bolt-load-utils",
  "bytes",
@@ -575,6 +576,22 @@ dependencies = [
  "dynosaur",
  "futures",
  "snafu",
+]
+
+[[package]]
+name = "bolt-load-http"
+version = "0.2.0"
+dependencies = [
+ "bolt-load-core",
+ "bytes",
+ "futures",
+ "headers",
+ "http",
+ "httpdate",
+ "language-tags",
+ "percent-encoding",
+ "pretty_assertions",
+ "regex",
 ]
 
 [[package]]
@@ -627,14 +644,7 @@ dependencies = [
  "blocking",
  "bytes",
  "futures",
- "headers",
- "http",
- "httpdate",
- "language-tags",
  "n0-tracing-test",
- "percent-encoding",
- "pretty_assertions",
- "regex",
  "tokio",
  "tracing",
 ]

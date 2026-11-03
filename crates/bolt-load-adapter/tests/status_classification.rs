@@ -5,9 +5,8 @@
 use std::time::Duration;
 
 use bolt_load_adapter::{reqwest::IntoReqwestAdapter, ureq2::IntoUreqAdapter};
-use bolt_load_core::adapter::{
-    AdapterError, AnyBytesStream, BoltLoadAdapter, UnretryableError, classify_status,
-};
+use bolt_load_core::adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, UnretryableError};
+use bolt_load_http::classify_status;
 use bolt_load_tests::adapter::http_server::{self, STATUS_RETRY_AFTER_SECS};
 use url::Url;
 
