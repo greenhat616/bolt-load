@@ -1,11 +1,11 @@
 //! Content codings of responses.
 //!
-//! Like [`validate_range_response`](super::validate_range_response), this is
+//! Like [`validate_range_response`](crate::validate_range_response), this is
 //! part of the adapter contract: the task writes a body as the file, so an
 //! HTTP adapter should check a full response with [`check_content_coding`]
 //! before handing out its body.
 
-use super::{AdapterError, UnretryableError};
+use bolt_load_core::adapter::{AdapterError, UnretryableError};
 
 /// Whether a combined `Content-Encoding` value lists only `identity`.
 pub fn is_identity_coding(content_encoding: &str) -> bool {
@@ -15,7 +15,7 @@ pub fn is_identity_coding(content_encoding: &str) -> bool {
 /// Check the `Content-Encoding` of a full response whose body the HTTP client
 /// did not decode, so that only the file's bytes are written.
 ///
-/// Pass combined values, as for [`RangeHeaders`](super::RangeHeaders). A
+/// Pass combined values, as for [`RangeHeaders`](crate::RangeHeaders). A
 /// response without a coding passes. So does one whose `Content-Type` is the
 /// format of its only coding, such as `application/gzip` with
 /// `Content-Encoding: gzip`: a server that marks a `.tar.gz` file this way

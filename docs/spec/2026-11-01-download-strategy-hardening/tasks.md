@@ -166,7 +166,7 @@
 
 编号接在 T23 之后，但顺序上紧跟 T5，排在 T23 之前。按 design §4.5（D11）实施。
 
-- [ ] C23：只搬迁，不改行为。
+- [x] C23：只搬迁，不改行为。
   - 新 crate `crates/bolt-load-http`，加入 workspace 的 `members`，依赖 core 和原 utils `http` feature 的依赖。
   - 按 design §4.5 的表搬迁，单元测试跟着文件一起走。在根模块 re-export 函数，utils 的头解析放进 `header` 模块。
   - core 删除 `status.rs`、`range.rs`、`coding.rs` 和对应的 re-export，`ContentRange` 不动。
@@ -174,12 +174,13 @@
   - `bolt-load-adapter` 改为依赖 `bolt-load-http`，去掉 `bolt-load-utils/http`。改 import 的地方有：两个 adapter，以及 `tests/status_classification.rs` 等测试。
   - 提交信息列出新旧路径对照，作为迁移说明。
 - [ ] C24：新增 `ContentCoding` 和 `parse_list`（design §4.5）。`check_content_coding` 和 range 校验里的编码检查都改用它，`is_identity_coding` 删除。现有实现已经不区分大小写，所以行为不变。
-- [ ] 文档：
+- [x] 文档：
   - 新 crate 的 README：从 core README 移过来函数说明、响应表和 “Content codings” 一节。
   - core README 只留错误变体表。
   - 更新 utils README 和 adapter README 里的路径。
   - 更新根 README 的 crate 表。
   - `bolt-load-adapter/README.md` 写自定义 adapter 的部分，改为依赖 core 和 `bolt-load-http`。
+- [x] 实现时补充（design §14.4）：`ContentRange::unsatisfied_complete` 改为公开；core 用一个私有的 `is_identity` 处理 meta 的编码。
 
 **验证**
 

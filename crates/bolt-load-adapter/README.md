@@ -57,7 +57,7 @@ Both adapters probe the server to determine range request support:
    to the same `bytes=0-0` probe.
 
 `Accept-Ranges` is only a hint, so every `range_stream` response is
-checked with `bolt_load_core::adapter::validate_range_response` before
+checked with `bolt_load_http::validate_range_response` before
 its body is read: a 200 is `RangeIgnored`, a content-encoded 206 is
 `RangeContentCoded`, and a 206 whose `Content-Range` does not start at
 the requested offset, runs past the requested end, names another total,
@@ -95,9 +95,9 @@ multi-runner downloads for higher throughput.
 
 ## Error Mapping
 
-Both adapters map HTTP statuses through `bolt_load_core::adapter::classify_status`,
+Both adapters map HTTP statuses through `bolt_load_http::classify_status`,
 so they classify every status the same way. A custom HTTP adapter should
-call it too; see the `bolt-load-core` README.
+call it too; see the `bolt-load-http` README.
 
 | Status | Error |
 |--------|-------|
@@ -113,7 +113,7 @@ call it too; see the `bolt-load-core` README.
 | ureq2 only: a body read error of another kind, such as `InvalidInput` | `Unretryable(Io)` |
 | A full response left content-coded | `Unretryable(ContentCoded)` |
 
-`Retry-After` is parsed with `bolt_load_utils::http::parse_retry_after`
+`Retry-After` is parsed with `bolt_load_http::header::parse_retry_after`
 (delay-seconds or an HTTP-date) and clamped to 120 s
 (`MAX_RETRY_AFTER`); a value that parses as neither is dropped.
 
@@ -127,7 +127,8 @@ call it too; see the `bolt-load-core` README.
 ## Dependencies
 
 Core dependencies include `bolt-load-core` (adapter trait),
-`bolt-load-utils` (HTTP header parsing, cross-runtime streams),
+`bolt-load-http` (status, range and coding checks, header parsing),
+`bolt-load-utils` (cross-runtime streams, telemetry),
 `url`, `bytes`, `futures`, and `async-lock`.
 
 ## License

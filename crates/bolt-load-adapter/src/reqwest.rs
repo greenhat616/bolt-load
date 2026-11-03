@@ -8,7 +8,11 @@ use std::{
 };
 
 use async_once_cell::OnceCell;
-use bolt_load_utils::http::{ContentDisposition, parse_retry_after};
+use bolt_load_http::{
+    RangeHeaders, check_content_coding, classify_status,
+    header::{ContentDisposition, parse_retry_after},
+    is_identity_coding, limit_range_body, validate_range_response,
+};
 use futures::Stream;
 use reqwest::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
@@ -18,13 +22,11 @@ use snafu::IntoError;
 use url::Url;
 
 use super::{
-    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange, RangeHeaders,
-    check_content_coding, classify_status,
+    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange,
     error::{
         AdapterError, UnretryableError, retryable::IoSnafu as RetryableIoSnafu,
         unretryable::IoSnafu as UnretryableIoSnafu,
     },
-    is_identity_coding, limit_range_body, validate_range_response,
 };
 
 type BeforeRequestFn =

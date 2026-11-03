@@ -9,18 +9,19 @@ use blocking::unblock;
 use bolt_load_core::adapter::{
     UnretryableError, error::unretryable::IoSnafu as UnretryableIoSnafu,
 };
-use bolt_load_utils::{
-    http::{ContentDisposition, parse_retry_after},
-    reader::CrossRuntimeStream,
+use bolt_load_http::{
+    RangeHeaders, check_content_coding, classify_status,
+    header::{ContentDisposition, parse_retry_after},
+    limit_range_body, validate_range_response,
 };
+use bolt_load_utils::reader::CrossRuntimeStream;
 use futures::Stream;
 use snafu::IntoError;
 use ureq2::{Agent, Request};
 
 use super::{
     AdapterError, AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange,
-    RangeHeaders, RetryableError, check_content_coding, classify_status, limit_range_body,
-    validate_range_response,
+    RetryableError,
 };
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
