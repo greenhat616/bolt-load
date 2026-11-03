@@ -149,7 +149,9 @@ impl BoltLoadAdapter for MyAdapter {
 | **bolt-load** | Main download engine (this crate) |
 | **bolt-load-core** | Core `BoltLoadAdapter` trait and error types |
 | **bolt-load-adapter** | HTTP adapter implementations (reqwest, ureq) |
-| **bolt-load-utils** | HTTP parsing, cross-runtime streams, conditional telemetry |
+| **bolt-load-http** | Status, range and content-coding checks and header parsing for HTTP adapters |
+| **bolt-load-decode** | Streaming gzip, deflate, br and zstd decoding of response bodies |
+| **bolt-load-utils** | Cross-runtime streams, conditional telemetry |
 | **bolt-load-tests** | Test adapters (in-memory, HTTP server) and fixtures |
 
 ## MSRV
