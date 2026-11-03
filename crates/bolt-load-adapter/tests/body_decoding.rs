@@ -4,7 +4,7 @@
 #![cfg(feature = "reqwest")]
 
 use bolt_load_adapter::reqwest::IntoReqwestAdapter;
-use bolt_load_core::adapter::{AdapterError, BoltLoadAdapter};
+use bolt_load_core::adapter::{AdapterError, BoltLoadAdapter, UnretryableError};
 use futures::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -76,7 +76,12 @@ async fn an_undecodable_body_is_unretryable() {
     ] {
         let error = body_error(url).await;
         assert!(
-            matches!(error, AdapterError::Unretryable { .. }),
+            matches!(
+                error,
+                AdapterError::Unretryable {
+                    source: UnretryableError::BodyUndecodable { .. }
+                }
+            ),
             "{case}: {error:?}"
         );
     }

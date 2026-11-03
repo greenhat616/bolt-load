@@ -1,10 +1,12 @@
-//! A content-coded range response never reaches the task as other bytes,
-//! and fails at once instead of being retried.
+//! A content-coded response never reaches the task as other bytes, and
+//! fails at once with an error the task falls back on instead of retrying.
 
 #![cfg(all(feature = "reqwest", feature = "ureq2"))]
 
 use bolt_load_adapter::{reqwest::IntoReqwestAdapter, ureq2::IntoUreqAdapter};
-use bolt_load_core::adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, UnretryableError};
+use bolt_load_core::adapter::{
+    AdapterError, AnyAdapter, AnyBytesStream, BoltLoadAdapter, DynBoltLoadAdapter, UnretryableError,
+};
 use bolt_load_tests::adapter::{fault::RangeFault, http_server::create_range_fault_server};
 use futures::StreamExt;
 use url::Url;
@@ -83,7 +85,41 @@ async fn an_encoded_range_fails_whether_or_not_the_client_decodes() {
         ("ureq2", failure(ureq.range_stream(0, total).await).await),
     ] {
         assert!(
-            matches!(error, UnretryableError::RangeMismatch { got: Some(_), .. }),
+            matches!(&error, UnretryableError::RangeContentCoded { coding } if coding == "gzip"),
+            "{client}: {error:?}"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_client_that_does_not_decode_reports_the_coding() {
+    let content = "bolt-load ".repeat(8 * 1024);
+    let (port, server) = create_range_fault_server(content.into()).await.unwrap();
+    let url = Url::parse(&format!(
+        "http://127.0.0.1:{port}{}",
+        RangeFault::EncodedRepresentation.path()
+    ))
+    .unwrap();
+    let reqwest = reqwest::Client::builder()
+        .no_proxy()
+        .no_gzip()
+        .build()
+        .unwrap()
+        .into_reqwest_adapter((reqwest::Method::GET, url.clone()));
+    let ureq = ureq2::Agent::new().into_ureq_adapter(("get", url));
+    let adapters: [(&str, Box<AnyAdapter>); 2] = [
+        ("reqwest", DynBoltLoadAdapter::new_box(reqwest)),
+        ("ureq2", DynBoltLoadAdapter::new_box(ureq)),
+    ];
+    for (client, adapter) in adapters {
+        // The meta shows the coding, so the task never tries ranges.
+        let meta = adapter.retrieve_meta().await.unwrap();
+        assert_eq!(meta.content_encoding.as_deref(), Some("gzip"), "{client}");
+        // The whole representation is not written as the file either.
+        let error = failure(adapter.full_stream().await).await;
+        assert!(
+            matches!(&error, UnretryableError::ContentCoded { coding } if coding == "gzip"),
             "{client}: {error:?}"
         );
     }
@@ -122,7 +158,7 @@ async fn a_decoded_range_of_incompressible_data_fails_at_once() {
     // change that.
     assert!(matches!(
         failure(decoding.range_stream(total / 2, total).await).await,
-        UnretryableError::Io { .. }
+        UnretryableError::BodyUndecodable { .. }
     ));
     server.abort();
 }

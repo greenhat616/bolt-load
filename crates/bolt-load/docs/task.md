@@ -31,9 +31,17 @@ The full contract, with numbered requirements, is in
 | [`Concurrent`](DownloadMode::Concurrent) | Multiple runners, parallel range-based download |
 
 The mode is selected while the task is `Initializing`: `Singleton` when
-it is preferred via [`TaskBuilder::prefer_mode`] or the size is unknown
-(zero), otherwise `Concurrent` when the adapter reports range stream
-support. [`TaskInfo::mode`] reports the choice.
+it is preferred via [`TaskBuilder::prefer_mode`], the metadata shows a
+content coding, or the size is unknown (zero), otherwise `Concurrent`
+when the adapter reports range stream support. [`TaskInfo::mode`]
+reports the choice.
+
+When ranges turn out unusable during a concurrent download (the server
+ignores them or content-codes them), the task discards what it wrote and
+starts over on one connection, with the size unknown. It does so at most
+once. The status turns `Downloading` again with progress from zero, and
+[`TaskInfo::fallback`] says why; a content coding seen in the metadata
+sets it too.
 
 # Task Lifecycle
 

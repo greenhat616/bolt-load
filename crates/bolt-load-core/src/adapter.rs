@@ -1,8 +1,10 @@
 use futures::stream::BoxStream;
+mod coding;
 mod content_range;
 pub mod error;
 mod range;
 mod status;
+pub use coding::{check_content_coding, is_identity_coding};
 pub use content_range::{ContentRange, InvalidContentRange};
 pub use error::{AdapterError, RetryableError, UnretryableError};
 use error::{UnretryableSnafu, unretryable::RangeStreamNotSupportedSnafu};
@@ -54,20 +56,32 @@ pub struct BoltLoadAdapterMeta {
     pub content_size: u64,
     /// suggested filename
     pub filename: Option<String>,
+    /// The combined `Content-Encoding` of the metadata responses, when it is
+    /// not `identity`. The content size then counts encoded bytes, and the
+    /// task downloads over one connection until the stream ends.
+    pub content_encoding: Option<String>,
 }
 
 impl BoltLoadAdapterMeta {
-    /// Metadata for `content_size` bytes and no suggested filename.
+    /// Metadata for `content_size` bytes, with no suggested filename and no
+    /// content coding.
     pub fn new(content_size: u64) -> Self {
         Self {
             content_size,
             filename: None,
+            content_encoding: None,
         }
     }
 
     /// Set the suggested filename.
     pub fn with_filename(mut self, filename: Option<String>) -> Self {
         self.filename = filename;
+        self
+    }
+
+    /// Set the content coding; an `identity` value is dropped.
+    pub fn with_content_encoding(mut self, content_encoding: Option<String>) -> Self {
+        self.content_encoding = content_encoding.filter(|value| !is_identity_coding(value));
         self
     }
 }

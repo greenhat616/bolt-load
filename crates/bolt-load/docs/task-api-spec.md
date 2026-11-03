@@ -166,6 +166,7 @@ pub struct TaskInfo {
     pub meta: BoltLoadAdapterMeta,
     pub mode: DownloadMode,
     pub path: PathBuf, // the resolved destination
+    pub fallback: Option<FallbackReason>, // STATUS-9
 }
 
 impl TaskStatus {
@@ -212,6 +213,15 @@ resume-related fields can be added later.
 - **STATUS-8** Publishing MUST NOT wait for any receiver. It MAY briefly
   wait for the watch value lock, which is held only for a pointer swap.
   Terminal publication MUST NOT be skipped when `receiver_count() == 0`.
+- **STATUS-9** A fallback to one connection (download strategy hardening,
+  design §4.3) MUST NOT add a state. The concurrent transfer is torn down
+  first; then `info` is replaced once, with `mode: Singleton` and
+  `fallback: Some(reason)`, and a `Downloading` status follows with
+  progress from zero and an unknown total. `downloaded` may therefore
+  decrease within `Downloading`, but only together with this change of
+  `info`. Metadata that shows a content coding selects `Singleton` with
+  `fallback: Some(ContentCoded)` at initialization, without a concurrent
+  transfer, unless `prefer_mode(Singleton)` already selected it.
 
 Internal: one `pub(crate) StatusPublisher` owns the only `watch::Sender`.
 The driver owns it; transfers and samplers borrow it and never keep a clone
@@ -225,8 +235,9 @@ The spawned attempt runs these steps on its local runtime, in order, while
 publishing `Initializing`:
 
 1. Use cached or injected metadata, else retrieve it under `meta_retry`.
-2. Select the mode: `prefer_mode(Singleton)`, or an unknown or zero content
-   size, selects `Singleton`. Otherwise the range probe decides.
+2. Select the mode: `prefer_mode(Singleton)`, a content coding in the
+   metadata, or an unknown or zero content size, selects `Singleton`.
+   Otherwise the range probe decides.
 3. Resolve the destination (§4.4) and check the filesystem.
 4. Publish `info`, then construct the selected transfer from the
    initialized data.

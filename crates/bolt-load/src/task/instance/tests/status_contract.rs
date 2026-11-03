@@ -13,9 +13,11 @@ use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
 use crate::{
-    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta},
+    adapter::{
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, UnretryableError,
+    },
     task::{
-        DownloadError, DownloadMode, TaskState,
+        DownloadError, DownloadMode, FallbackReason, TaskState,
         test_support::{assert_transitions, record, spawn, tmp_path, watchdog},
     },
 };
@@ -180,6 +182,82 @@ async fn test_unknown_total_downloads_in_singleton_mode() {
     assert_eq!(output.progress.downloaded, SIZE as u64);
     assert_eq!(output.progress.downloaded_chunks, vec![0..SIZE as u64]);
     assert_eq!(std::fs::read(&dest).unwrap().len(), SIZE);
+}
+
+/// Takes ranges in name only: the metadata shows a content coding, or every
+/// range request is answered with the whole resource.
+#[derive(Clone)]
+struct RangeUnusableAdapter {
+    inner: SimpleTestAdapter,
+    coded_meta: bool,
+}
+
+impl BoltLoadAdapter for RangeUnusableAdapter {
+    async fn is_range_stream_available(&self) -> bool {
+        true
+    }
+
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
+        let meta = self.inner.retrieve_meta().await?;
+        Ok(match self.coded_meta {
+            true => meta.with_content_encoding(Some("gzip".to_owned())),
+            false => meta,
+        })
+    }
+
+    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+        self.inner.full_stream().await
+    }
+
+    async fn range_stream(&self, _start: u64, _end: u64) -> Result<AnyBytesStream, AdapterError> {
+        assert!(!self.coded_meta, "coded metadata never leads to ranges");
+        Err(UnretryableError::RangeIgnored.into())
+    }
+}
+
+/// A task whose ranges cannot carry the file downloads over one connection,
+/// with an unknown total, and its info says why.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unusable_ranges_fall_back_to_one_connection() {
+    for (coded_meta, reason) in [
+        (true, FallbackReason::ContentCoded),
+        (false, FallbackReason::RangeIgnored),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("fallback.bin");
+        let token = CancellationToken::new();
+        let adapter = RangeUnusableAdapter {
+            inner: adapter_builder().build().unwrap(),
+            coded_meta,
+        };
+        let task = spawn(DownloadMode::Concurrent, adapter, &dest, &token);
+
+        let statuses = record(task.status()).await;
+        let output = watchdog(task).await.unwrap();
+
+        assert_transitions(&statuses);
+        for status in &statuses {
+            let Some(info) = status.info.as_ref() else {
+                continue;
+            };
+            // Either the concurrent start, or the fallback for its reason.
+            match info.fallback {
+                None => assert_eq!(info.mode, DownloadMode::Concurrent, "{reason:?}"),
+                Some(fallback) => {
+                    assert_eq!(fallback, reason);
+                    assert_eq!(info.mode, DownloadMode::Singleton, "{reason:?}");
+                    if status.state == TaskState::Downloading {
+                        assert_eq!(status.progress.total, None, "{reason:?}");
+                    }
+                }
+            }
+        }
+        let info = statuses.last().unwrap().info.clone().unwrap();
+        assert_eq!(info.fallback, Some(reason));
+        assert_eq!(output.mode, DownloadMode::Singleton, "{reason:?}");
+        assert_eq!(output.progress.total, Some(SIZE as u64), "{reason:?}");
+        assert_eq!(std::fs::read(&dest).unwrap().len(), SIZE, "{reason:?}");
+    }
 }
 
 /// Throttled so that the transfer spans several progress samples.

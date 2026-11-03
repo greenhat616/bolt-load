@@ -58,11 +58,12 @@ Both adapters probe the server to determine range request support:
 
 `Accept-Ranges` is only a hint, so every `range_stream` response is
 checked with `bolt_load_core::adapter::validate_range_response` before
-its body is read: a 200 is `RangeIgnored`, and a 206 whose
-`Content-Range` does not start at the requested offset, runs past the
-requested end, names another total, or comes multipart or
-content-encoded is `RangeMismatch`. Repeated header lines are combined
-first, so a second `Content-Range` or `Content-Encoding` line is seen.
+its body is read: a 200 is `RangeIgnored`, a content-encoded 206 is
+`RangeContentCoded`, and a 206 whose `Content-Range` does not start at
+the requested offset, runs past the requested end, names another total,
+or comes multipart is `RangeMismatch`. Repeated header lines are
+combined first, so a second `Content-Range` or `Content-Encoding` line
+is seen.
 
 Every request, HEAD and full downloads included, sends
 `Accept-Encoding: identity`: without the header a server may encode the
@@ -73,6 +74,14 @@ A client that decodes bodies removes `Content-Encoding` before the check
 can see it. The body is therefore held to its `Content-Range` length: it
 fails with `RangeBodyTooLong` past it, and with `RangeBodyTooShort` if it
 ends cleanly before.
+
+The task answers `RangeIgnored`, `RangeContentCoded`, these two errors
+and `BodyUndecodable` by starting over on one connection, with the size
+unknown. A full download that the client left content-coded fails with
+`ContentCoded` instead of writing the coded bytes, unless its
+`Content-Type` is the coding's own format (a `.tar.gz` served as
+`Content-Encoding: gzip`). The metadata records a coding it sees in
+`content_encoding`, and the task then skips ranges.
 
 - **Ureq** depends on ureq 2 without its default `gzip` feature. If
   another crate in your build enables it, ureq decodes again and only the
@@ -100,8 +109,9 @@ call it too; see the `bolt-load-core` README.
 | Other 4xx | `Unretryable(Status)` |
 | Other 5xx | `Retryable(Status)` |
 | Network errors, including a body cut off mid-stream | `Retryable(Io)` |
-| A body that cannot be decoded, such as invalid gzip from a decoding reqwest `Client` | `Unretryable(Io)` |
+| A body that cannot be decoded, such as invalid gzip from a decoding reqwest `Client`, or `InvalidData` on ureq2 | `Unretryable(BodyUndecodable)` |
 | ureq2 only: a body read error of another kind, such as `InvalidInput` | `Unretryable(Io)` |
+| A full response left content-coded | `Unretryable(ContentCoded)` |
 
 `Retry-After` is parsed with `bolt_load_utils::http::parse_retry_after`
 (delay-seconds or an HTTP-date) and clamped to 120 s

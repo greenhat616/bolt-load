@@ -82,7 +82,7 @@ directory and included via `#![doc = include_str!(...)]`.
 
 | Mode | When | How |
 |------|------|-----|
-| **Singleton** | Adapter lacks range support, or content is small | Single `TaskRunner` streams the full content sequentially |
+| **Singleton** | Adapter lacks range support, the size is unknown, or ranges turn out unusable (fallback) | Single `TaskRunner` streams the full content sequentially |
 | **Concurrent** | Adapter supports range requests | Multiple `TaskRunner` instances download non-overlapping byte ranges in parallel, with dynamic splitting of slow ranges |
 
 Mode selection is automatic based on `is_range_stream_available()` and a

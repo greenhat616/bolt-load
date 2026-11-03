@@ -66,6 +66,11 @@ pub mod unretryable {
             requested: Range<u64>,
             got: Option<ContentRange>,
         },
+        /// The range response would match, but it is content-coded:
+        /// `Content-Range` counts encoded bytes, which are not the file's.
+        /// `coding` is the combined `Content-Encoding`.
+        #[snafu(display("range response is content-coded ({coding})"))]
+        RangeContentCoded { coding: String },
         /// The body of a range response runs past its `Content-Range`. A
         /// client that decodes a content-coded body and drops
         /// `Content-Encoding` does this.
@@ -79,6 +84,15 @@ pub mod unretryable {
              decoded it"
         ))]
         RangeBodyTooShort { got: ContentRange, received: u64 },
+        /// The HTTP client could not decode the body, for example a
+        /// content-coded range that starts mid-stream.
+        #[snafu(display("response body cannot be decoded: {source}"))]
+        BodyUndecodable { source: Arc<std::io::Error> },
+        /// A full response is content-coded and the HTTP client left it so.
+        /// Its body is not the file. `coding` is the combined
+        /// `Content-Encoding`.
+        #[snafu(display("response is content-coded ({coding}) and was not decoded"))]
+        ContentCoded { coding: String },
         /// 416. `total` comes from `Content-Range: bytes */total`.
         #[snafu(display("range not satisfiable (total {total:?})"))]
         RangeNotSatisfiable { total: Option<u64> },

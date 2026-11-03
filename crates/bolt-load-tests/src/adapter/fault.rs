@@ -147,13 +147,18 @@ pub enum RangeFault {
     /// Cut the first range response other than the probe off halfway
     /// through its body.
     Truncated,
+    /// Answer the first range request other than the probe with the first
+    /// half of the requested range. From then on, answer every request with
+    /// 200 and [`RangeFault::replacement`], as if the resource were replaced
+    /// by a server that ignores ranges.
+    ReplacedAfterShortRange,
 }
 
 /// The `Retry-After` seconds of [`RangeFault::Congested`].
 pub const CONGESTED_RETRY_AFTER_SECS: u64 = 2;
 
 impl RangeFault {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::IgnoreRange,
         Self::ShiftedStart,
         Self::WrongTotal,
@@ -162,6 +167,7 @@ impl RangeFault {
         Self::Gzip,
         Self::EncodedRepresentation,
         Self::Truncated,
+        Self::ReplacedAfterShortRange,
     ];
 
     /// The URL path that serves this fault.
@@ -175,7 +181,17 @@ impl RangeFault {
             Self::Gzip => "/gzip",
             Self::EncodedRepresentation => "/encoded-representation",
             Self::Truncated => "/truncated",
+            Self::ReplacedAfterShortRange => "/replaced-after-short-range",
         }
+    }
+
+    /// What [`RangeFault::ReplacedAfterShortRange`] serves once replaced:
+    /// the last sixteenth of `content`, at least one byte. It differs, and is
+    /// shorter than what the first ranges write, so a file that was not
+    /// truncated shows their bytes after it.
+    pub fn replacement(content: &[u8]) -> bytes::Bytes {
+        let len = (content.len() / 16).max(1);
+        bytes::Bytes::copy_from_slice(&content[content.len() - len..])
     }
 
     /// The fault served at `/{name}`.

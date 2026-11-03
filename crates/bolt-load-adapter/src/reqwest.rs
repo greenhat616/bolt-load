@@ -19,12 +19,12 @@ use url::Url;
 
 use super::{
     AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange, RangeHeaders,
-    classify_status,
+    check_content_coding, classify_status,
     error::{
-        AdapterError, retryable::IoSnafu as RetryableIoSnafu,
+        AdapterError, UnretryableError, retryable::IoSnafu as RetryableIoSnafu,
         unretryable::IoSnafu as UnretryableIoSnafu,
     },
-    limit_range_body, validate_range_response,
+    is_identity_coding, limit_range_body, validate_range_response,
 };
 
 type BeforeRequestFn =
@@ -92,7 +92,13 @@ impl From<ReqwestError> for AdapterError {
         if let Some(status) = e.status() {
             return classify_status(status.as_u16(), None);
         }
-        if e.is_builder() || e.is_body() || is_undecodable(&e) {
+        if is_undecodable(&e) {
+            return UnretryableError::BodyUndecodable {
+                source: Arc::new(std::io::Error::new(ErrorKind::InvalidData, e.to_string())),
+            }
+            .into();
+        }
+        if e.is_builder() || e.is_body() {
             return UnretryableIoSnafu {}
                 .into_error(Arc::new(std::io::Error::other(e.to_string())))
                 .into();
@@ -118,6 +124,11 @@ fn combined(response: &reqwest::Response, name: &HeaderName) -> Option<String> {
         .map(|v| String::from_utf8_lossy(v.as_bytes()))
         .collect();
     (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// The combined `Content-Encoding`, unless it is `identity`.
+fn content_coding(response: &reqwest::Response) -> Option<String> {
+    combined(response, &CONTENT_ENCODING).filter(|value| !is_identity_coding(value))
 }
 
 fn retry_after(response: &reqwest::Response) -> Option<Duration> {
@@ -290,8 +301,10 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
         .await
         .map_err(ReqwestError::from)?;
 
-    // Only a 206 that proves its offsets shows range support.
+    // Only a 206 that proves its offsets shows range support; a coded one
+    // does not.
     let probed = check_range(&response, 0..1, None).ok();
+    let probe_coding = content_coding(&response);
     let mut is_range_stream_available = probed.is_some();
     if let Some(size) = probed.and_then(|range| range.complete) {
         return Ok(Context {
@@ -317,7 +330,8 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
                 .to_u64()
                 .unwrap_or_default(),
         )
-        .with_filename(ReqwestAdapter::suggest_filename(&response).await),
+        .with_filename(ReqwestAdapter::suggest_filename(&response).await)
+        .with_content_encoding(content_coding(&response).or(probe_coding)),
     });
 }
 
@@ -346,6 +360,11 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .await
             .map_err(ReqwestError::from)?;
         let response = check_status(response)?;
+        // A decoding client has dropped the header of what it decodes.
+        check_content_coding(
+            combined(&response, &CONTENT_ENCODING).as_deref(),
+            combined(&response, &CONTENT_TYPE).as_deref(),
+        )?;
         let stream = ReqwestStream(Box::pin(response.bytes_stream()));
         Ok(Box::pin(stream))
     }

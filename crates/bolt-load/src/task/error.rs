@@ -33,6 +33,30 @@ impl fmt::Display for IoOp {
     }
 }
 
+/// Why a task downloads over one connection although the server seemed to
+/// take ranges, see [`TaskInfo::fallback`](super::TaskInfo::fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum FallbackReason {
+    /// The server answered a range request with the whole resource.
+    RangeIgnored,
+    /// The server content-codes its responses despite
+    /// `Accept-Encoding: identity`, so ranges count encoded bytes. Also
+    /// reported when range bodies do not match their `Content-Range`, which
+    /// is what a client that decodes them sees.
+    ContentCoded,
+}
+
+impl fmt::Display for FallbackReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::RangeIgnored => "the server ignores ranges",
+            Self::ContentCoded => "the server content-codes the response",
+        })
+    }
+}
+
 /// Why a task did not finish.
 #[derive(Debug, Clone, snafu::Snafu)]
 #[non_exhaustive]
@@ -47,6 +71,14 @@ pub enum DownloadError {
     /// many consecutive failures.
     #[snafu(display("the transfer failed: {source}"))]
     Transfer { source: Arc<TaskError> },
+    /// Ranges cannot carry the file, for `reason`. The concurrent mode ends
+    /// with it, and the task then falls back to one connection, so a task
+    /// does not end with it.
+    #[snafu(display("ranges are unusable, {reason}: {source}"))]
+    RangeUnsupported {
+        reason: FallbackReason,
+        source: AdapterError,
+    },
     /// A file operation failed.
     #[snafu(display("failed to {op} {}: {source}", path.display()))]
     Io {

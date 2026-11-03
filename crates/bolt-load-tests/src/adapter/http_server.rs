@@ -150,6 +150,9 @@ struct FaultState {
     encoded: Bytes,
     /// Whether [`RangeFault::Truncated`] already cut a response.
     truncated: Arc<AtomicBool>,
+    /// Whether [`RangeFault::ReplacedAfterShortRange`] serves the
+    /// replacement.
+    replaced: Arc<AtomicBool>,
 }
 
 /// Serve `content` at every [`RangeFault::path`], misbehaving on range
@@ -165,6 +168,7 @@ pub async fn create_range_fault_server(
         encoded: gzip(&content)?,
         content,
         truncated: Arc::new(AtomicBool::new(false)),
+        replaced: Arc::new(AtomicBool::new(false)),
     };
     let app = axum::Router::new()
         .route("/{fault}", axum::routing::get(fault_handler))
@@ -260,9 +264,12 @@ async fn fault_handler(
         &state.content
     };
     let len = content.len() as u64;
+    let replaced =
+        fault == RangeFault::ReplacedAfterShortRange && state.replaced.load(Ordering::SeqCst);
     // The GET route also serves HEAD, which never gets a fault.
-    let mut response = if method == axum::http::Method::HEAD || !headers.contains_key(header::RANGE)
-    {
+    let mut response = if replaced {
+        RangeFault::replacement(content).into_response()
+    } else if method == axum::http::Method::HEAD || !headers.contains_key(header::RANGE) {
         content.clone().into_response()
     } else {
         let range = requested_range(&headers, len);
@@ -301,6 +308,11 @@ async fn fault_handler(
                 if !is_probe && !state.truncated.swap(true, Ordering::SeqCst) =>
             {
                 truncated(content, first, last, len)
+            }
+            (RangeFault::ReplacedAfterShortRange, Some((first, last)))
+                if !is_probe && !state.replaced.swap(true, Ordering::SeqCst) =>
+            {
+                partial(content, first, first + (last - first) / 2, len)
             }
             (_, Some((first, last))) => partial(content, first, last, len),
         }
@@ -532,6 +544,24 @@ mod tests {
             header(&resp, CONTENT_RANGE).as_deref(),
             Some("bytes 2-4/10")
         );
+
+        // The probe passes; the next range is short, and then the resource
+        // is replaced.
+        let resp = get(RangeFault::ReplacedAfterShortRange, Some("bytes=0-0")).await?;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let resp = get(RangeFault::ReplacedAfterShortRange, Some("bytes=2-7")).await?;
+        assert_eq!(
+            header(&resp, CONTENT_RANGE).as_deref(),
+            Some("bytes 2-4/10")
+        );
+        assert_eq!(resp.bytes().await?, "234");
+        let replacement = RangeFault::replacement(&content);
+        assert_eq!(replacement, "9");
+        for range in [Some("bytes=2-7"), None] {
+            let resp = get(RangeFault::ReplacedAfterShortRange, range).await?;
+            assert_eq!(resp.status(), StatusCode::OK, "{range:?}");
+            assert_eq!(resp.bytes().await?, replacement, "{range:?}");
+        }
 
         let resp = get(RangeFault::EncodedRepresentation, Some("bytes=2-4")).await?;
         assert_eq!(header(&resp, CONTENT_ENCODING).as_deref(), Some("gzip"));
