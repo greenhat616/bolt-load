@@ -100,6 +100,20 @@ check_content_coding(content_encoding, content_type)?;
 Also set `BoltLoadAdapterMeta::with_content_encoding` from the metadata
 responses; see the `bolt-load-core` README.
 
+`ContentCoding::parse_list` parses a combined `Content-Encoding` value
+into the codings in the order applied. Names match case-insensitively,
+`x-gzip` is `Gzip`, `identity` is skipped, and a coding this crate does
+not know is `Other` with its lowercased name.
+
+```rust,ignore
+use bolt_load_http::ContentCoding;
+
+assert_eq!(
+    ContentCoding::parse_list("identity, GZIP, br"),
+    [ContentCoding::Gzip, ContentCoding::Brotli],
+);
+```
+
 ## Header parsing (`header`)
 
 HTTP header parsing utilities adapted from actix-web, implementing:

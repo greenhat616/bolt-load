@@ -15,7 +15,7 @@ use std::{
 use bolt_load_core::adapter::{AdapterError, AnyBytesStream, ContentRange, UnretryableError};
 use futures::{Stream, StreamExt};
 
-use crate::{classify_status, is_identity_coding};
+use crate::{ContentCoding, classify_status};
 
 /// The response headers [`validate_range_response`] reads.
 ///
@@ -117,7 +117,7 @@ fn check_partial(
             // `Content-Range` of an encoded body counts encoded bytes.
             match headers
                 .content_encoding
-                .filter(|coding| !is_identity_coding(coding))
+                .filter(|coding| !ContentCoding::parse_list(coding).is_empty())
             {
                 None => Ok(got),
                 Some(coding) => Err(UnretryableError::RangeContentCoded {
