@@ -120,8 +120,9 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 bolt-load-tests = { path = "../bolt-load-tests" }
-# for the adapter integration tests (`tests/range_faults.rs`)
-reqwest = { version = "0.13", default-features = false }
+# for the adapter integration tests (`tests/range_faults.rs`); `gzip` for
+# its decoding client
+reqwest = { version = "0.13", default-features = false, features = ["gzip"] }
 # Without `gzip`, as the adapter has it; the default would turn it on.
 ureq2 = { version = "2", package = "ureq", default-features = false, features = [
     "tls",

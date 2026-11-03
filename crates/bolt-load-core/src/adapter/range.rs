@@ -16,6 +16,7 @@ use futures::{Stream, StreamExt};
 
 use super::{
     AdapterError, AnyBytesStream, ContentRange, UnretryableError, classify_status, content_range,
+    is_identity_coding,
 };
 
 /// The response headers [`validate_range_response`] reads.
@@ -66,7 +67,8 @@ impl<'a> RangeHeaders<'a> {
 ///
 /// | Response | Error |
 /// | --- | --- |
-/// | 206 that fails the checks | [`UnretryableError::RangeMismatch`] |
+/// | 206 that would pass but is content-coded | [`UnretryableError::RangeContentCoded`] |
+/// | 206 that fails the checks otherwise | [`UnretryableError::RangeMismatch`] |
 /// | 200 | [`UnretryableError::RangeIgnored`] |
 /// | 416 | [`UnretryableError::RangeNotSatisfiable`], with the total from `bytes */total` |
 /// | other 4xx, 5xx | [`classify_status`] |
@@ -103,12 +105,10 @@ fn check_partial(
     let got = headers
         .content_range
         .and_then(|value| value.parse::<ContentRange>().ok());
-    // `Content-Range` of an encoded body counts encoded bytes.
-    let plain = !headers.content_type.is_some_and(is_multipart)
-        && headers.content_encoding.is_none_or(is_identity);
+    let multipart = headers.content_type.is_some_and(is_multipart);
     match got {
         Some(got)
-            if plain
+            if !multipart
                 && got.first == requested.start
                 && got.last < requested.end
                 && match (got.complete, expected_total) {
@@ -116,7 +116,17 @@ fn check_partial(
                     _ => true,
                 } =>
         {
-            Ok(got)
+            // `Content-Range` of an encoded body counts encoded bytes.
+            match headers
+                .content_encoding
+                .filter(|coding| !is_identity_coding(coding))
+            {
+                None => Ok(got),
+                Some(coding) => Err(UnretryableError::RangeContentCoded {
+                    coding: coding.to_owned(),
+                }
+                .into()),
+            }
         }
         _ => Err(UnretryableError::RangeMismatch { requested, got }.into()),
     }
@@ -127,14 +137,6 @@ fn is_multipart(content_type: &str) -> bool {
         let media_type = value.split(';').next().unwrap_or_default().trim();
         media_type.eq_ignore_ascii_case("multipart/byteranges")
     })
-}
-
-/// Whether every listed coding is `identity`.
-fn is_identity(content_encoding: &str) -> bool {
-    content_encoding
-        .split(',')
-        .map(str::trim)
-        .all(|coding| coding.is_empty() || coding.eq_ignore_ascii_case("identity"))
 }
 
 /// Hold `body` to exactly the bytes `got` covers.
@@ -273,6 +275,15 @@ mod tests {
         assert_eq!(mismatch(validate(206, headers("bytes */100"))), Some(None));
     }
 
+    fn content_coded(result: Result<ContentRange, AdapterError>) -> Option<String> {
+        match result {
+            Err(AdapterError::Unretryable {
+                source: UnretryableError::RangeContentCoded { coding },
+            }) => Some(coding),
+            _ => None,
+        }
+    }
+
     #[test]
     fn rejects_a_multipart_or_encoded_partial_response() {
         let multipart = headers("bytes 10-19/100")
@@ -280,8 +291,14 @@ mod tests {
         assert!(mismatch(validate(206, multipart)).is_some());
         for encoding in ["gzip", "GZIP", "identity, gzip"] {
             let encoded = headers("bytes 10-19/100").with_content_encoding(Some(encoding));
-            assert!(mismatch(validate(206, encoded)).is_some(), "{encoding:?}");
+            assert_eq!(
+                content_coded(validate(206, encoded)).as_deref(),
+                Some(encoding)
+            );
         }
+        // Coded and with other bytes: the offsets are the problem to report.
+        let shifted = headers("bytes 11-19/100").with_content_encoding(Some("gzip"));
+        assert!(mismatch(validate(206, shifted)).is_some());
     }
 
     #[test]
@@ -296,7 +313,7 @@ mod tests {
         assert!(mismatch(validate(206, multipart)).is_some());
         // A value that was not UTF-8, kept lossily.
         let garbled = headers("bytes 10-19/100").with_content_encoding(Some("\u{FFFD}"));
-        assert!(mismatch(validate(206, garbled)).is_some());
+        assert!(content_coded(validate(206, garbled)).is_some());
     }
 
     fn body(chunks: &[&'static [u8]]) -> AnyBytesStream {

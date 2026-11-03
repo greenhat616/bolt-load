@@ -8,7 +8,7 @@ use std::{
 
 use bolt_load_sync::watch;
 
-use super::{DownloadError, DownloadMode, Progress};
+use super::{DownloadError, DownloadMode, FallbackReason, Progress};
 use crate::adapter::BoltLoadAdapterMeta;
 
 /// The lifecycle state of a task.
@@ -65,15 +65,26 @@ impl Speed {
 }
 
 /// What initialization decided, available from the end of `Initializing` on.
+///
+/// A fallback to one connection replaces it once, see [`Self::fallback`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TaskInfo {
     /// The metadata the download is based on.
     pub meta: BoltLoadAdapterMeta,
-    /// The selected mode.
+    /// The mode of the transfer.
     pub mode: DownloadMode,
     /// The resolved destination.
     pub path: PathBuf,
+    /// Why the task downloads over one connection although the server
+    /// seemed to take ranges; the mode is then `Singleton` and the total
+    /// unknown.
+    ///
+    /// Set when the metadata shows a content coding, or when ranges failed
+    /// during the download. In the latter case the task starts over: the
+    /// status turns `Downloading` again with this info and progress from
+    /// zero.
+    pub fallback: Option<FallbackReason>,
 }
 
 /// A snapshot of a task, published through a [`StatusReceiver`].
@@ -133,12 +144,20 @@ struct Shared {
     /// Whether the terminal status was published; later publishes are
     /// ignored. Held while publishing, so none can follow the terminal one.
     terminal: Mutex<bool>,
-    info: OnceLock<Arc<TaskInfo>>,
+    /// Set when downloading starts, replaced by a fallback.
+    info: Mutex<Option<Arc<TaskInfo>>>,
     /// The temporary file of the transfer, for cleanup after a panic.
     temp_file: OnceLock<PathBuf>,
 }
 
 impl Shared {
+    fn info(&self) -> Option<Arc<TaskInfo>> {
+        self.info
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn publish(&self, status: TaskStatus) {
         let terminal = self.terminal.lock().unwrap_or_else(PoisonError::into_inner);
         if *terminal {
@@ -165,7 +184,7 @@ impl StatusPublisher {
         let shared = Shared {
             tx,
             terminal: Mutex::new(false),
-            info: OnceLock::new(),
+            info: Mutex::new(None),
             temp_file: OnceLock::new(),
         };
         (Self(Arc::new(shared)), rx)
@@ -184,10 +203,11 @@ impl StatusPublisher {
         ));
     }
 
-    /// End initialization: record `info` and publish the first `Downloading`
-    /// status, with zero speed.
+    /// Record `info` and publish a `Downloading` status with zero speed: the
+    /// first one, or the first after a fallback.
     pub(crate) fn downloading(&self, info: TaskInfo, temp_file: PathBuf, progress: Progress) {
-        let info = self.0.info.get_or_init(|| Arc::new(info)).clone();
+        let info = Arc::new(info);
+        *self.0.info.lock().unwrap_or_else(PoisonError::into_inner) = Some(info.clone());
         let _ = self.0.temp_file.set(temp_file);
         self.0.publish(TaskStatus::new(
             TaskState::Downloading,
@@ -217,7 +237,7 @@ impl StatusPublisher {
         let status = TaskStatus {
             error,
             leftover_temp_file,
-            ..TaskStatus::new(state, progress, self.0.info.get().cloned())
+            ..TaskStatus::new(state, progress, self.0.info())
         };
         let mut terminal = self
             .0
@@ -270,7 +290,7 @@ impl ProgressReporter {
     pub(crate) fn report(&self, progress: Progress, speed: Speed) {
         self.0.publish(TaskStatus {
             speed,
-            ..TaskStatus::new(TaskState::Downloading, progress, self.0.info.get().cloned())
+            ..TaskStatus::new(TaskState::Downloading, progress, self.0.info())
         });
     }
 
@@ -298,6 +318,7 @@ mod tests {
             meta: BoltLoadAdapterMeta::new(10),
             mode: DownloadMode::Singleton,
             path: "out.bin".into(),
+            fallback: None,
         }
     }
 
@@ -327,6 +348,43 @@ mod tests {
         assert!(status.error.is_none());
         assert!(status.info.is_some(), "info stays in later states");
         assert!(publisher.is_finished());
+    }
+
+    #[test]
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "lists holding one downloaded range"
+    )]
+    fn a_fallback_replaces_the_info() {
+        let (publisher, rx) = StatusPublisher::new();
+        publisher.initializing();
+        let concurrent = TaskInfo {
+            mode: DownloadMode::Concurrent,
+            ..info()
+        };
+        publisher.downloading(
+            concurrent,
+            "out.bin.downloading".into(),
+            Progress::default(),
+        );
+        publisher
+            .reporter()
+            .report(Progress::new(Some(10), 5, vec![0..5]), Speed::default());
+        let fallback = TaskInfo {
+            fallback: Some(FallbackReason::RangeIgnored),
+            ..info()
+        };
+        publisher.downloading(fallback, "out.bin.downloading".into(), Progress::default());
+        let status = rx.borrow();
+        assert_eq!(status.state, TaskState::Downloading);
+        assert_eq!(status.progress, Progress::default(), "starts over");
+        let info = status.info.as_ref().unwrap();
+        assert_eq!(info.mode, DownloadMode::Singleton);
+        assert_eq!(info.fallback, Some(FallbackReason::RangeIgnored));
+        drop(status);
+        publisher.finish(Ok(()), Progress::new(Some(3), 3, vec![0..3]), None);
+        let info = rx.borrow().info.clone().unwrap();
+        assert_eq!(info.fallback, Some(FallbackReason::RangeIgnored), "kept");
     }
 
     #[test]

@@ -77,7 +77,11 @@ Both error enums are `#[non_exhaustive]`; match them with a wildcard arm.
 | `Status { status }` | A status with no more specific variant |
 | `RangeIgnored` | The server answered a range request with the whole resource |
 | `RangeMismatch { requested, got }` | The response does not prove it carries the requested bytes |
+| `RangeContentCoded { coding }` | A range response that would match, but is content-coded |
+| `RangeBodyTooLong { got }`, `RangeBodyTooShort { got, received }` | A range body longer or shorter than its `Content-Range` |
 | `RangeNotSatisfiable { total }` | 416 |
+| `BodyUndecodable { source }` | The HTTP client could not decode the body |
+| `ContentCoded { coding }` | A full response the HTTP client left content-coded |
 | `Internal` | Framework-level failures |
 | `Cancelled` | User cancellation |
 | `Io` | Wrapped `Arc<std::io::Error>` |
@@ -132,7 +136,8 @@ Ok(limit_range_body(body, got))
 
 | Response | Error |
 |----------|-------|
-| 206 with other offsets, another total, multipart or content-encoded | `Unretryable(RangeMismatch)` |
+| 206 that would pass but is content-encoded | `Unretryable(RangeContentCoded)` |
+| 206 with other offsets, another total, or multipart | `Unretryable(RangeMismatch)` |
 | 200 | `Unretryable(RangeIgnored)` |
 | 416 | `Unretryable(RangeNotSatisfiable)`, with the total from `bytes */total` |
 | other 4xx, 5xx | `classify_status` |
@@ -150,6 +155,30 @@ the body to its `Content-Range` length:
 - if it ends cleanly before, the stream fails with
   `Unretryable(RangeBodyTooShort)`. Decoded data that does not compress
   ends this way.
+
+The task answers `RangeIgnored`, `RangeContentCoded`, the two body
+length errors and `BodyUndecodable` by downloading over one connection
+instead; any other `RangeMismatch` fails the task. So report a body your
+client cannot decode as `BodyUndecodable`, not as `Io`.
+
+### Content codings
+
+The task writes a full stream as the file. An HTTP adapter should check
+a full response with `check_content_coding` before reading the body:
+it fails with `Unretryable(ContentCoded)` when the client left a coding
+in place. A response whose `Content-Type` is the format of its only
+coding passes, such as `application/gzip` with `Content-Encoding: gzip`,
+since a server that marks a `.tar.gz` file this way means the archive.
+
+```rust,ignore
+use bolt_load_core::adapter::check_content_coding;
+
+check_content_coding(content_encoding, content_type)?;
+```
+
+Set `BoltLoadAdapterMeta::with_content_encoding` from the metadata
+responses. A coded size counts encoded bytes, so the task then skips
+ranges and downloads until the stream ends.
 
 ### Retryable Errors
 

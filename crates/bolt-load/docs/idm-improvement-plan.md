@@ -309,7 +309,7 @@ IDM 的 `y_sc`（§8 A5）不只看“有没有数据”，还会比较“按速
 | PR | 内容 | 依赖 | 是否破坏 API | 规模估计 |
 | --- | --- | --- | --- | --- |
 | 1 | P0-2 状态码分类 + 错误类型加 `#[non_exhaustive]` + P0-4 部分测试。**已完成**（#159、#160，见 [实施 spec](../../../docs/spec/2026-11-01-download-strategy-hardening/tasks.md) T1、T2） | — | 是（core 错误类型） | 中 |
-| 2 | P0-1 Range 校验（两个 adapter）+ meta 探测修正 + 对抗测试 | 1 | 否 | 中 |
+| 2 | P0-1 Range 校验（两个 adapter）+ meta 探测修正 + 对抗测试。**已完成**（#162–#164，见实施 spec T3、T4；body 错误分类见 design §14.1） | 1 | 否 | 中 |
 | 3 | P0-1 任务级 `RangeUnsupported` 回退到 Singleton，P0-5 扩展到内容编码 | 2 | 是（`DownloadError` 新变体） | 中 |
 | 3b | P0-5 `bolt-load-decode` 解码 crate，单连接下载自己解码 | 3 | 是（按 D10 方案 A，`full_stream` 的返回类型） | 中 |
 | 4 | P0-3 写错误结构化 | — | 是（`TaskError` 新变体） | 小 |

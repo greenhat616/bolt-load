@@ -25,7 +25,7 @@
 | | C2 `fix(adapter): classify HTTP statuses the same way in reqwest and ureq2` | T2 | |
 | PR-2 Range 校验 | C3 `fix(adapter)!: reject range responses whose offsets cannot be proven` | T3 | PR-1 |
 | | C4 `test(tests): add range fault scenarios to the test server` | T4 | |
-| PR-3 单连接回退 | C5 `feat(task): fall back to a single connection when ranges are ignored or content-coded` | T5 | PR-2 |
+| PR-3 单连接回退 | C5 `feat(task)!: fall back to a single connection when ranges are ignored or content-coded` | T5 | PR-2 |
 | PR-3b 内容解码 | C21 `feat(decode): add a streaming content decoder crate` | T23 | PR-3 |
 | | C22 `feat(task)!: decode content-coded full downloads` | | |
 | PR-4 写错误 | C6 `feat(task)!: keep the io error kind and range of write failures` | T6 | — |
@@ -136,16 +136,21 @@
 
 ## T5 — 单连接回退（C5）
 
-- [ ] core 新增 `UnretryableError` 变体，让回退只匹配确定的原因（design §4.3）：
+- [x] core 新增 `UnretryableError` 变体，让回退只匹配确定的原因（design §4.3）：
   - `RangeContentCoded { coding }`：`validate_range_response` 在只有编码这一个问题时返回它，不再返回 `RangeMismatch`；
   - `BodyUndecodable`：reqwest 的 `is_undecodable`、ureq2 的 `InvalidData` 改为返回它，不再返回 `Unretryable::Io`；
   - `ContentCoded { coding }`：`full_stream` 收到客户端没有解掉的编码时返回它。
-- [ ] 在 `DownloadLoop` 里，把 runner 返回的 `RangeIgnored`、`RangeContentCoded`、`RangeBodyTooLong`、`RangeBodyTooShort`、`BodyUndecodable` 升级为 `DownloadError::RangeUnsupported { reason }`：取消所有 runner，等写入全部完成。
-- [ ] `task/instance/drive.rs`（第 202 行附近）捕获这个错误：截断目标文件，以 `DownloadMode::Singleton` 重新运行，大小按未知处理（`total = None`）。每个任务只回退一次。
-- [ ] meta 阶段：HEAD 或探测响应带非 identity 编码时，直接选 Singleton，大小按未知处理。
-- [ ] 两个 adapter 的 `full_stream`：响应带非 identity 编码时，返回 `ContentCoded`，不写入；`Content-Type` 本身就是这种压缩格式时例外（design §4.4）。T23 落地后改为解码。
-- [ ] 在 `TaskStatus` 里表达这次降级：先读 `crates/bolt-load/docs/task-api-spec.md` 的状态模型，再选择新增字段或复用现有字段，并在 design 里记录选择结果。
-- [ ] `crates/bolt-load/docs/task-api-spec.md` 补充一条规则，说明这次降级在状态中如何体现。
+- [x] 在 `DownloadLoop` 里，把 runner 返回的 `RangeIgnored`、`RangeContentCoded`、`RangeBodyTooLong`、`RangeBodyTooShort`、`BodyUndecodable` 升级为 `DownloadError::RangeUnsupported { reason }`：取消所有 runner，等写入全部完成。
+- [x] `task/instance/drive.rs`（第 202 行附近）捕获这个错误：截断目标文件，以 `DownloadMode::Singleton` 重新运行，大小按未知处理（`total = None`）。每个任务只回退一次。
+- [x] meta 阶段：HEAD 或探测响应带非 identity 编码时，直接选 Singleton，大小按未知处理。
+- [x] 两个 adapter 的 `full_stream`：响应带非 identity 编码时，返回 `ContentCoded`，不写入；`Content-Type` 本身就是这种压缩格式时例外（design §4.4）。T23 落地后改为解码。
+- [x] 在 `TaskStatus` 里表达这次降级：先读 `crates/bolt-load/docs/task-api-spec.md` 的状态模型，再选择新增字段或复用现有字段，并在 design 里记录选择结果。
+- [x] `crates/bolt-load/docs/task-api-spec.md` 补充一条规则，说明这次降级在状态中如何体现。
+- [x] 实现时补充（design §14.3）：
+  - `BoltLoadAdapterMeta` 新增 `content_encoding`，两个 adapter 从 HEAD（reqwest 还有探测响应）里取；
+  - core 新增 `check_content_coding` 和 `is_identity_coding`；
+  - 选择结果：`TaskInfo::fallback`，回退时替换一次 `info`（STATUS-9）；
+  - 故障服务器新增 `ReplacedAfterShortRange`，`range_faults.rs` 加了会解压的 reqwest 客户端。
 
 **验证**
 

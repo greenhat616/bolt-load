@@ -6,7 +6,9 @@ use std::{
 };
 
 use blocking::unblock;
-use bolt_load_core::adapter::error::unretryable::IoSnafu as UnretryableIoSnafu;
+use bolt_load_core::adapter::{
+    UnretryableError, error::unretryable::IoSnafu as UnretryableIoSnafu,
+};
 use bolt_load_utils::{
     http::{ContentDisposition, parse_retry_after},
     reader::CrossRuntimeStream,
@@ -17,7 +19,8 @@ use ureq2::{Agent, Request};
 
 use super::{
     AdapterError, AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange,
-    RangeHeaders, RetryableError, classify_status, limit_range_body, validate_range_response,
+    RangeHeaders, RetryableError, check_content_coding, classify_status, limit_range_body,
+    validate_range_response,
 };
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
@@ -213,6 +216,7 @@ fn body_error(e: std::io::Error) -> AdapterError {
         | ErrorKind::TimedOut
         | ErrorKind::Interrupted
         | ErrorKind::NetworkDown => RetryableError::Io { source }.into(),
+        ErrorKind::InvalidData => UnretryableError::BodyUndecodable { source }.into(),
         _ => UnretryableIoSnafu {}.into_error(source).into(),
     }
 }
@@ -235,6 +239,7 @@ impl BoltLoadAdapter for UreqAdapter {
         self.with_head(|response| {
             BoltLoadAdapterMeta::new(self.get_content_size(response))
                 .with_filename(self.suggest_filename(response))
+                .with_content_encoding(combined(response, &http::header::CONTENT_ENCODING))
         })
         .await
     }
@@ -249,6 +254,10 @@ impl BoltLoadAdapter for UreqAdapter {
         let res = unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
             .await
             .map_err(AdapterError::from)?;
+        check_content_coding(
+            combined(&res, &http::header::CONTENT_ENCODING).as_deref(),
+            combined(&res, &http::header::CONTENT_TYPE).as_deref(),
+        )?;
         let reader = res.into_reader();
         let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
         let ureq_stream = UreqStream(Box::pin(stream));
@@ -332,15 +341,18 @@ mod test {
                 "{kind:?}"
             );
         }
-        for kind in [ErrorKind::InvalidData, ErrorKind::InvalidInput] {
-            assert!(
-                matches!(
-                    body_error(Error::from(kind)),
-                    AdapterError::Unretryable { .. }
-                ),
-                "{kind:?}"
-            );
-        }
+        assert!(matches!(
+            body_error(Error::from(ErrorKind::InvalidData)),
+            AdapterError::Unretryable {
+                source: UnretryableError::BodyUndecodable { .. }
+            }
+        ));
+        assert!(matches!(
+            body_error(Error::from(ErrorKind::InvalidInput)),
+            AdapterError::Unretryable {
+                source: UnretryableError::Io { .. }
+            }
+        ));
     }
 
     use bolt_load_tests::adapter::http_server::{self, DEFAULT_FILE_SIZE};

@@ -19,7 +19,7 @@ use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
-        DownloadError, DownloadMode, Progress, TaskInfo, TaskOptions,
+        DownloadError, DownloadMode, FallbackReason, Progress, TaskInfo, TaskOptions,
         destination::{self, Destination},
         meta,
         status::StatusPublisher,
@@ -120,6 +120,7 @@ fn report_panic(
 struct Initialized {
     meta: BoltLoadAdapterMeta,
     mode: DownloadMode,
+    fallback: Option<FallbackReason>,
     path: PathBuf,
 }
 
@@ -130,30 +131,84 @@ pub(super) async fn run(attempt: Attempt, rt: ThreadedRuntimeImpl, publisher: St
         publisher.initializing();
         let cancel_token = attempt.cancel_token.clone();
         let initialized = until_cancelled(&cancel_token, initialize(&attempt, &rt)).await;
-        let Initialized { meta, mode, path } = match initialized {
+        let Initialized {
+            meta,
+            mode,
+            fallback,
+            path,
+        } = match initialized {
             Ok(initialized) => initialized,
             Err(e) => return publisher.finish(Err(e), Progress::default(), None),
         };
-        trace!("[TASK] initialized, mode: {mode:?}, path: {path:?}");
+        trace!("[TASK] initialized, mode: {mode:?}, fallback: {fallback:?}, path: {path:?}");
         let output = OutputFile::new(path.clone());
         let tmp = output.tmp.clone();
         let total = meta.content_size;
-        let info = TaskInfo { meta, mode, path };
+        // A zero size is unknown, and a coded size is not the file's: download
+        // until the stream ends.
+        let singleton_total = (total != 0 && meta.content_encoding.is_none()).then_some(total);
+        let info = TaskInfo {
+            meta,
+            mode,
+            path,
+            fallback,
+        };
         let Attempt {
             adapter, options, ..
         } = attempt;
-        let reporter = publisher.reporter();
         let (teardown, progress) = match mode {
             DownloadMode::Singleton => {
-                // A zero size is unknown: download until the stream ends.
-                let total = (total != 0).then_some(total);
-                let transfer =
-                    SingletonTaskInner::new(adapter, output, total, rt, options, reporter);
+                let transfer = SingletonTaskInner::new(
+                    adapter,
+                    output,
+                    singleton_total,
+                    rt,
+                    options,
+                    publisher.reporter(),
+                );
                 drive(transfer, info, tmp, &publisher, &cancel_token).await
             }
             DownloadMode::Concurrent => {
-                let transfer =
-                    ConcurrentTaskInner::new(adapter, output, total, rt, options, reporter);
+                let transfer = ConcurrentTaskInner::new(
+                    adapter.clone(),
+                    output.clone(),
+                    total,
+                    rt.clone(),
+                    options.clone(),
+                    publisher.reporter(),
+                );
+                let (teardown, progress) = drive(
+                    transfer,
+                    info.clone(),
+                    tmp.clone(),
+                    &publisher,
+                    &cancel_token,
+                )
+                .await;
+                let Err(DownloadError::RangeUnsupported { reason, source }) = &teardown.result
+                else {
+                    return publisher.finish(
+                        teardown.result,
+                        progress,
+                        teardown.leftover_temp_file,
+                    );
+                };
+                // The concurrent teardown removed what it wrote; the
+                // singleton truncates the file again when it starts.
+                warn!("[TASK] falling back to one connection, {reason}: {source}");
+                let info = TaskInfo {
+                    mode: DownloadMode::Singleton,
+                    fallback: Some(*reason),
+                    ..info
+                };
+                let transfer = SingletonTaskInner::new(
+                    adapter,
+                    output,
+                    None,
+                    rt,
+                    options,
+                    publisher.reporter(),
+                );
                 drive(transfer, info, tmp, &publisher, &cancel_token).await
             }
         };
@@ -197,16 +252,24 @@ async fn initialize(
             .await
             .map_err(|source| DownloadError::Metadata { source })?,
     };
-    let mode = if attempt.prefer_mode == Some(DownloadMode::Singleton) || meta.content_size == 0 {
-        DownloadMode::Singleton
-    } else if attempt.adapter.is_range_stream_available().await {
-        DownloadMode::Concurrent
+    let (mode, fallback) = if attempt.prefer_mode == Some(DownloadMode::Singleton) {
+        (DownloadMode::Singleton, None)
+    } else if meta.content_encoding.is_some() {
+        // Ranges of a coded response count encoded bytes.
+        (DownloadMode::Singleton, Some(FallbackReason::ContentCoded))
+    } else if meta.content_size != 0 && attempt.adapter.is_range_stream_available().await {
+        (DownloadMode::Concurrent, None)
     } else {
-        DownloadMode::Singleton
+        (DownloadMode::Singleton, None)
     };
     let path = attempt.destination.resolve(&meta)?;
     destination::check(&path).await?;
-    Ok(Initialized { meta, mode, path })
+    Ok(Initialized {
+        meta,
+        mode,
+        fallback,
+        path,
+    })
 }
 
 /// Run `fut` unless `token` is cancelled first; cancellation wins a tie.
