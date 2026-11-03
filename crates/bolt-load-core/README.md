@@ -107,6 +107,50 @@ return Err(classify_status(status, retry_after));
 | 429, 503 | `Unretryable(Congestion)` |
 | other 4xx | `Unretryable(Status)` |
 
+### Validating range responses
+
+`range_stream` must yield exactly the requested bytes, since the task
+writes them at the requested offset. An HTTP adapter should check each
+range response with `validate_range_response` before reading the body.
+It passes a 206 whose `Content-Range` starts at the requested offset
+and ends before the requested end, returns that range, and classifies
+everything else. Pass each header as its combined value: repeated lines
+joined with `", "`.
+
+```rust,ignore
+use bolt_load_core::adapter::{RangeHeaders, limit_range_body, validate_range_response};
+
+let headers = RangeHeaders::default()
+    .with_content_range(content_range)
+    .with_content_type(content_type)
+    .with_content_encoding(content_encoding)
+    .with_retry_after(retry_after);
+// `expected_total`: the content size from the meta, if known.
+let got = validate_range_response(status, &headers, start..end, expected_total)?;
+Ok(limit_range_body(body, got))
+```
+
+| Response | Error |
+|----------|-------|
+| 206 with other offsets, another total, multipart or content-encoded | `Unretryable(RangeMismatch)` |
+| 200 | `Unretryable(RangeIgnored)` |
+| 416 | `Unretryable(RangeNotSatisfiable)`, with the total from `bytes */total` |
+| other 4xx, 5xx | `classify_status` |
+
+A 206 that ends before the requested end is valid; the stream ends
+short and the task requests the rest again. `ContentRange` parses a
+`Content-Range` value with `str::parse`.
+
+An HTTP client that decodes a content-coded body also drops
+`Content-Encoding`, so the headers look plain. `limit_range_body` holds
+the body to its `Content-Range` length:
+
+- past it, the stream fails with `Unretryable(RangeBodyTooLong)` before
+  the extra bytes reach the task;
+- if it ends cleanly before, the stream fails with
+  `Unretryable(RangeBodyTooShort)`. Decoded data that does not compress
+  ends this way.
+
 ### Retryable Errors
 
 | Variant | Meaning |

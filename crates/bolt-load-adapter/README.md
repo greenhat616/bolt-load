@@ -43,14 +43,43 @@ let adapter = agent.into_ureq_adapter(("GET", url));
 - Blocking I/O offloaded to `blocking` thread pool for async compatibility
 - Request interceptors via `before_request()` callback
 - Custom request execution via `call()` callback (useful for mocking)
-- HEAD response caching for range support detection
+- One cached HEAD response for the meta, range detection and the total
+  that range responses must name
 
 ## Range Request Detection
 
 Both adapters probe the server to determine range request support:
 
-1. **Reqwest**: sends `Range: bytes=0-0`, checks for `Content-Range` in response
-2. **Ureq**: checks `Accept-Ranges: bytes` header, falls back to a probe request
+1. **Reqwest**: sends `Range: bytes=0-0`; range support needs a 206 whose
+   `Content-Range` is `bytes 0-0/…`. Otherwise `Accept-Ranges: bytes` on
+   a HEAD response counts.
+2. **Ureq**: checks `Accept-Ranges: bytes` on a HEAD response, falls back
+   to the same `bytes=0-0` probe.
+
+`Accept-Ranges` is only a hint, so every `range_stream` response is
+checked with `bolt_load_core::adapter::validate_range_response` before
+its body is read: a 200 is `RangeIgnored`, and a 206 whose
+`Content-Range` does not start at the requested offset, runs past the
+requested end, names another total, or comes multipart or
+content-encoded is `RangeMismatch`. Repeated header lines are combined
+first, so a second `Content-Range` or `Content-Encoding` line is seen.
+
+Every request, HEAD and full downloads included, sends
+`Accept-Encoding: identity`: without the header a server may encode the
+body (RFC 9110 §12.5.3), and the file would hold the encoded bytes.
+`before_request` can still replace it.
+
+A client that decodes bodies removes `Content-Encoding` before the check
+can see it. The body is therefore held to its `Content-Range` length: it
+fails with `RangeBodyTooLong` past it, and with `RangeBodyTooShort` if it
+ends cleanly before.
+
+- **Ureq** depends on ureq 2 without its default `gzip` feature. If
+  another crate in your build enables it, ureq decodes again and only the
+  cap is left.
+- **Reqwest** uses the `Client` you pass in. Build it with `no_gzip()`,
+  `no_brotli()`, `no_zstd()` and `no_deflate()` if it may enable
+  decoding; these exist even without the features.
 
 When range requests are available, bolt-load can use concurrent
 multi-runner downloads for higher throughput.
@@ -66,7 +95,7 @@ call it too; see the `bolt-load-core` README.
 | 401, 403 | `Unretryable(Unauthorized)` |
 | 404, 410 | `Unretryable(NotFound)` |
 | 408 | `Retryable(Status)` |
-| 416 | `Unretryable(RangeNotSatisfiable)` |
+| 416 | `Unretryable(RangeNotSatisfiable)`, carrying the total from `bytes */total` on range requests |
 | 429, 503 | `Unretryable(Congestion)`, carrying `Retry-After` |
 | Other 4xx | `Unretryable(Status)` |
 | Other 5xx | `Retryable(Status)` |

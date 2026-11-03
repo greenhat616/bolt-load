@@ -66,6 +66,19 @@ pub mod unretryable {
             requested: Range<u64>,
             got: Option<ContentRange>,
         },
+        /// The body of a range response runs past its `Content-Range`. A
+        /// client that decodes a content-coded body and drops
+        /// `Content-Encoding` does this.
+        #[snafu(display("range response body runs past {got}; the client may have decoded it"))]
+        RangeBodyTooLong { got: ContentRange },
+        /// The body of a range response ends cleanly before its
+        /// `Content-Range` is covered. A client that decodes a body that
+        /// does not compress does this; so does a server that miscounts.
+        #[snafu(display(
+            "range response body ends after {received} bytes of {got}; the client may have \
+             decoded it"
+        ))]
+        RangeBodyTooShort { got: ContentRange, received: u64 },
         /// 416. `total` comes from `Content-Range: bytes */total`.
         #[snafu(display("range not satisfiable (total {total:?})"))]
         RangeNotSatisfiable { total: Option<u64> },
