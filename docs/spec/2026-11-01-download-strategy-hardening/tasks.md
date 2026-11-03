@@ -14,7 +14,7 @@
 4. **测试不用 sleep**：
    - 退避、冷却、增益窗口相关的逻辑，都把 `now: Instant` 作为参数传入（design §8.1）。
    - 故障注入测试使用 `bolt-load-tests` 的服务器，不访问外网。
-5. **开工前的决策**：PR-1 开工前，确认 design §3 的 D3；PR-3 开工前，确认 D2；PR-5 开工前，确认 D1；PR-7 开工前，确认 D5 和 D6；PR-8 开工前，确认 D4、D7、D8。确认结果先写回 `design.md`，再动代码。
+5. **开工前的决策**：PR-1 开工前，确认 design §3 的 D3；PR-3 开工前，确认 D2；PR-3b 开工前，确认 D9 和 D10；PR-5 开工前，确认 D1；PR-7 开工前，确认 D5 和 D6；PR-8 开工前，确认 D4、D7、D8。确认结果先写回 `design.md`，再动代码。
 6. **偏差记录**：实现和 design 不一致时，在 design 末尾追加“实现说明”一节，写明原因。不要悄悄偏离设计。
 
 ## 1. 提交与 PR 划分
@@ -25,7 +25,9 @@
 | | C2 `fix(adapter): classify HTTP statuses the same way in reqwest and ureq2` | T2 | |
 | PR-2 Range 校验 | C3 `fix(adapter)!: reject range responses whose offsets cannot be proven` | T3 | PR-1 |
 | | C4 `test(tests): add range fault scenarios to the test server` | T4 | |
-| PR-3 单连接回退 | C5 `feat(task): fall back to a single connection when ranges are ignored` | T5 | PR-2 |
+| PR-3 单连接回退 | C5 `feat(task): fall back to a single connection when ranges are ignored or content-coded` | T5 | PR-2 |
+| PR-3b 内容解码 | C21 `feat(decode): add a streaming content decoder crate` | T23 | PR-3 |
+| | C22 `feat(task)!: decode content-coded full downloads` | | |
 | PR-4 写错误 | C6 `feat(task)!: keep the io error kind and range of write failures` | T6 | — |
 | PR-5 连接上限 | C7 `feat(task): make the connection limit configurable` | T7 | — |
 | | C8 `fix(task): reserve a runner slot before splitting a chunk` | T8 | |
@@ -134,15 +136,44 @@
 
 ## T5 — 单连接回退（C5）
 
-- [ ] 在 `DownloadLoop` 里，把 runner 返回的 `RangeIgnored` 升级为 `DownloadError::RangeUnsupported`：取消所有 runner，等写入全部完成。
-- [ ] `task/instance/drive.rs`（第 202 行附近）捕获这个错误：截断目标文件，以 `DownloadMode::Singleton` 重新运行。每个任务只回退一次。
+- [ ] core 新增 `UnretryableError` 变体，让回退只匹配确定的原因（design §4.3）：
+  - `RangeContentCoded { coding }`：`validate_range_response` 在只有编码这一个问题时返回它，不再返回 `RangeMismatch`；
+  - `BodyUndecodable`：reqwest 的 `is_undecodable`、ureq2 的 `InvalidData` 改为返回它，不再返回 `Unretryable::Io`；
+  - `ContentCoded { coding }`：`full_stream` 收到客户端没有解掉的编码时返回它。
+- [ ] 在 `DownloadLoop` 里，把 runner 返回的 `RangeIgnored`、`RangeContentCoded`、`RangeBodyTooLong`、`RangeBodyTooShort`、`BodyUndecodable` 升级为 `DownloadError::RangeUnsupported { reason }`：取消所有 runner，等写入全部完成。
+- [ ] `task/instance/drive.rs`（第 202 行附近）捕获这个错误：截断目标文件，以 `DownloadMode::Singleton` 重新运行，大小按未知处理（`total = None`）。每个任务只回退一次。
+- [ ] meta 阶段：HEAD 或探测响应带非 identity 编码时，直接选 Singleton，大小按未知处理。
+- [ ] 两个 adapter 的 `full_stream`：响应带非 identity 编码时，返回 `ContentCoded`，不写入；`Content-Type` 本身就是这种压缩格式时例外（design §4.4）。T23 落地后改为解码。
 - [ ] 在 `TaskStatus` 里表达这次降级：先读 `crates/bolt-load/docs/task-api-spec.md` 的状态模型，再选择新增字段或复用现有字段，并在 design 里记录选择结果。
 - [ ] `crates/bolt-load/docs/task-api-spec.md` 补充一条规则，说明这次降级在状态中如何体现。
 
 **验证**
 
-- T4 中“忽略 Range”的场景改为断言：最终 hash 正确，并且观察到了降级。
+- T4 中“忽略 Range”和 `Gzip` 的场景改为断言：最终 hash 正确，并且观察到了降级。
+- `EncodedRepresentation`：
+  - 会解压的客户端：回退后最终 hash 正确；
+  - 不解压的客户端：以 `ContentCoded` 失败（T23 落地后改为 hash 正确）。
 - 新增测试：回退之后，文件里不残留多连接阶段写入的数据（用前后内容不同的测试文件来验证）。
+
+## T23 — 内容解码（C21、C22）
+
+编号接在 T22 之后，但顺序上紧跟 T5。
+
+- [ ] 新 crate `crates/bolt-load-decode`，按 design §4.4 实现 `ContentCoding`、`DecodeOptions`、`decode` 和 `DecodeError`：
+  - 后端按 D9 的结论选；gzip、deflate 默认开启，br、zstd 放在 feature 后面；
+  - 输入不拷贝，输出用固定大小的 `BytesMut`，每次 poll 最多产出一块；
+  - 多层编码、多成员 gzip、zlib 和 raw deflate 两种格式、结束后的多余数据、`max_output`。
+- [ ] C22：按 D10 的结论接入。方案 A：core 给 `full_stream` 新增带 `Content-Encoding` 和 `Content-Type` 的返回类型，由 Singleton 路径解码，两个 adapter 和测试 adapter 一起改。
+- [ ] T5 的 `ContentCoded` 失败改为解码；`Unsupported` 的编码仍然报错。
+- [ ] 更新 adapter README：用户不必再为了正确性关闭客户端的解压。
+
+**验证**
+
+- 性质测试：随机数据 × 每种编码 × 随机切块（包括逐字节输入），解码结果与原文一致。
+- 损坏的输入、截断的流、结束后的多余数据、超出 `max_output`，各自报对应的错误。
+- 内存：解压比很高的输入，输出块的大小不超过 `buffer_size`。
+- 基准测试：同一份数据，吞吐不低于 reqwest 自带解码的 90%（criterion）。
+- `range_faults.rs` 的 `EncodedRepresentation`：两个客户端都完成，hash 正确。
 
 ## T6 — 写错误结构化（C6）
 

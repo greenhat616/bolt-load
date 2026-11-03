@@ -152,9 +152,17 @@
 - 416；
 - 503 带 `Retry-After: 2`；
 - 对 range 请求返回 gzip 编码；
-- 返回中途截断的 body。
+- 返回中途截断的 body；
+- 整个表示都经过 gzip 编码，区间按编码后的字节算。
 
 断言：**最终文件 hash 正确，或者任务以对应的类型化错误失败**。绝不允许出现“`Completed` 但内容错误”。
+
+#### P0-5 内容编码（D2 扩展、D9、D10）
+
+PR-2 的实现过程中发现：服务器无视 `Accept-Encoding: identity` 时，会解压的 HTTP 客户端会删掉 `Content-Encoding`，range 校验看不出来（spec design §14.2）。PR-2 已经保证这种情况下任务失败而不是写错。要像 IDM 那样把文件下完，还要做两件事：
+
+- **回退（随 PR 3）：** range 响应带编码，或者能看出被解过码（长度不符、解不开），都按 `RangeIgnored` 处理，截断文件改用单连接，文件大小按未知处理。IDM 也是看到编码就把连接数降为 1，文件大小取实际写入的字节数。
+- **自己解码（PR 3b）：** 单连接下载拿到编码数据时，由 bolt-load 自己解码，不依赖 HTTP 客户端的 feature。新 crate `bolt-load-decode` 薄封装现有的编解码库，输入不拷贝，输出用固定大小的缓冲，内存有上界。细节见 spec design §4.4。
 
 ---
 
@@ -302,7 +310,8 @@ IDM 的 `y_sc`（§8 A5）不只看“有没有数据”，还会比较“按速
 | --- | --- | --- | --- | --- |
 | 1 | P0-2 状态码分类 + 错误类型加 `#[non_exhaustive]` + P0-4 部分测试。**已完成**（#159、#160，见 [实施 spec](../../../docs/spec/2026-11-01-download-strategy-hardening/tasks.md) T1、T2） | — | 是（core 错误类型） | 中 |
 | 2 | P0-1 Range 校验（两个 adapter）+ meta 探测修正 + 对抗测试 | 1 | 否 | 中 |
-| 3 | P0-1 任务级 `RangeUnsupported` 回退到 Singleton | 2 | 是（`DownloadError` 新变体） | 小 |
+| 3 | P0-1 任务级 `RangeUnsupported` 回退到 Singleton，P0-5 扩展到内容编码 | 2 | 是（`DownloadError` 新变体） | 中 |
+| 3b | P0-5 `bolt-load-decode` 解码 crate，单连接下载自己解码 | 3 | 是（按 D10 方案 A，`full_stream` 的返回类型） | 中 |
 | 4 | P0-3 写错误结构化 | — | 是（`TaskError` 新变体） | 小 |
 | 5 | P1-1 公开 `max_connections`（含 S2 预算默认值）+ P1-2 容量安全切分 + `SplitCandidate` | — | 否（新增 API；预算默认值在多核机器上会变小） | 中 |
 | 6 | P1-3 退避 / `Retry-After` + P1-4 预算三层化（S3） | 1, 5 | 否 | 大 |
@@ -319,13 +328,15 @@ IDM 的 `y_sc`（§8 A5）不只看“有没有数据”，还会比较“按速
 | # | 决策 | 选项 | 建议 |
 | --- | --- | --- | --- |
 | D1 | `max_connections` 的默认值 | A：固定 8（IDM 默认值，与 CPU 无关）；B：`min(CPU, 8)`；C：保持 CPU 核数 | **A**。连接数取决于网络和服务器，和 CPU 无关；对 32 核机器来说，32 条连接很容易触发 429 |
-| D2 | 遇到 `RangeIgnored` 时 | A：自动截断文件并改用单连接从头下载；B：直接以类型化错误失败，由调用方决定 | **A**，同时通过 `TaskStatus` 把降级事件上报出去 |
+| D2 | 遇到 `RangeIgnored` 时 | A：自动截断文件并改用单连接从头下载；B：直接以类型化错误失败，由调用方决定 | **A**，同时通过 `TaskStatus` 把降级事件上报出去。**已确认**（2026-11-03），并扩展到内容编码（P0-5） |
 | D3 | 其它 4xx 归为不可重试 | 对齐 ureq2 现有行为 | 采纳；408 例外 |
 | D4 | P2 跨任务限额做不做 | 现在做 / 等有多任务 UI 之后再做 | 建议在 P1 完成后再评估 |
 | D5 | 冗余对冲（hedged download） | 做 / 不做 | **暂不做**。IDM 的触发条件在 b16 上没能定位（§8 A2）。等 P1 落地后，如果基准测试显示尾延迟仍然明显，再考虑“endgame 改派” |
 | D6 | S1 切分尺寸改用单连接速率 | A：和 P1-5 一起放在 feature flag 后，A/B 之后再决定；B：单独先合入 | **A**。它会改变切分节奏，必须和扩张控制器一起评估 |
 | D7 | S7 按 host 的能力缓存 | 做 / 不做；TTL 取多少 | **随 P2 一起做**，TTL 1 h；不做持久化 |
 | D8 | 限速的公平性 | A：所有 runner 共享一个桶，不做公平分配；B：按任务 DRR | **A**。先保证总量受控，有多任务 UI 的需求时再加 B |
+| D9 | 解码 crate 的后端 | A：`compression-codecs`（async-compression 的同步编解码层）；B：直接用 flate2、brotli-decompressor、zstd | **A**，只在 crate 内部使用并锁定次版本 |
+| D10 | 在哪一层解码 | A：`full_stream` 带上编码信息，由引擎解码；B：adapter 自己解码 | **A**。任何 adapter 都绕不过去，代价是 trait 的破坏性变更 |
 
 ---
 
