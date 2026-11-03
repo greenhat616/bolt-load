@@ -14,6 +14,7 @@
   - runner：限速等待。
   - 任务：Range 不支持时回退到单连接、写错误、续传。
 - `bolt-load-tests`：故障注入服务器。
+- `bolt-load-http`（新增）：adapter 用的 HTTP 校验与解析，从 core 和 utils 搬来（§4.5）。
 - `bolt-load-decode`（新增）：单连接下载的内容解码（§4.4）。
 
 **不在范围：** 见 §13。
@@ -105,6 +106,7 @@
 | D8 | 限速的公平性 | 所有 runner 共享一个桶，不做按任务的公平分配 | 待确认 |
 | D9 | 解码 crate 的后端 | `compression-codecs`，只在 crate 内部使用；gzip、deflate 默认开启，br、zstd 放在 feature 后面（§4.4） | 待确认 |
 | D10 | 在哪一层解码 | `full_stream` 把 `Content-Encoding` 和 `Content-Type` 交给引擎，由引擎决定是否解码；adapter 自己不解码（§4.4） | 待确认 |
+| D11 | HTTP 校验与解析放在哪 | 新 crate `bolt-load-http`，依赖 core：搬入 core 里只有 adapter 调用的函数，以及 utils 的 `http` 模块；新增 `ContentCoding`。core 只留 trait、meta、错误类型和 `ContentRange`（§4.5） | 已确认（2026-11-03） |
 
 ---
 
@@ -114,6 +116,8 @@
 
 位置：`bolt-load-core/src/adapter/range.rs`（新增），导出为 `bolt_load_core::adapter::validate_range_response`，reqwest 和 ureq2 都调用它。理由和 §5.1 相同：校验规则是 adapter 和引擎之间的约定，外部 adapter 只依赖 core 就能用上。
 `ContentRange` 也在 core 里（错误类型 `RangeMismatch` 要引用它），解析通过 `impl FromStr for ContentRange` 提供，不放进 utils，因为 utils 不依赖 core。
+
+> D11 之后，`validate_range_response`、`RangeHeaders` 和 `limit_range_body` 移到 `bolt-load-http`；`ContentRange` 和它的解析留在 core（§4.5）。
 
 ```rust
 /// A parsed `Content-Range: bytes first-last/complete` header.
@@ -206,17 +210,10 @@ pub fn limit_range_body(body: AnyBytesStream, got: ContentRange) -> AnyBytesStre
 
 目标：不管 HTTP 客户端开没开解压，单连接下载都能拿到解码后的文件。外部的 feature 不可控：用户的依赖图里可能有别的 crate 打开客户端的解压，也可能没有，所以解码必须由 bolt-load 自己负责。range 响应永远不解码，遇到编码就走 §4.3 的回退，和 IDM 一致。
 
-**位置：** 新 crate `bolt-load-decode`，对现有生态做一层薄封装。它不依赖 core：输入输出都是 `Stream<Item = Result<Bytes, E>>`，解码错误通过 `From<DecodeError>` 转成 `E`，引擎和自定义 adapter 都能直接用。
+**位置：** 新 crate `bolt-load-decode`，对现有生态做一层薄封装。输入输出都是 `Stream<Item = Result<Bytes, E>>`，解码错误通过 `From<DecodeError>` 转成 `E`，不绑定 `AdapterError`，引擎和自定义 adapter 都能直接用。编码的枚举 `ContentCoding` 和它的解析在 `bolt-load-http`（D11，§4.5），这个 crate 依赖它，不再自己解析头。
 
 ```rust
-#[non_exhaustive]
-pub enum ContentCoding { Gzip, Deflate, Brotli, Zstd }
-
-impl ContentCoding {
-    /// Parse a combined `Content-Encoding` value, in the order applied.
-    /// `identity` is skipped; `x-gzip` is `Gzip`.
-    pub fn parse_list(value: &str) -> Result<Vec<ContentCoding>, DecodeError>;
-}
+use bolt_load_http::ContentCoding;
 
 #[non_exhaustive]
 pub struct DecodeOptions {
@@ -224,7 +221,13 @@ pub struct DecodeOptions {
     pub max_output: Option<u64>, // optional bound against decompression bombs
 }
 
-pub fn decode<S, E>(body: S, codings: &[ContentCoding], options: DecodeOptions) -> Decoded<S>
+/// Fails with `Unsupported` for `ContentCoding::Other`, a coding whose
+/// feature is off, or more layers than the limit.
+pub fn decode<S, E>(
+    body: S,
+    codings: &[ContentCoding],
+    options: DecodeOptions,
+) -> Result<Decoded<S>, DecodeError>
 where
     S: Stream<Item = Result<Bytes, E>>,
     E: From<DecodeError>;
@@ -258,7 +261,7 @@ pub enum DecodeError {
 
 **在哪一层解码（D10）：**
 
-- **方案 A（建议）：** `full_stream` 在返回 body 的同时带上 `Content-Encoding` 和 `Content-Type`（core 新增一个返回类型），由引擎决定是否解码。任何 adapter 都绕不过去。代价是 `BoltLoadAdapter` trait 的破坏性变更，和 T5 的 `DownloadError` 变更放进同一个大版本。
+- **方案 A（建议）：** `full_stream` 在返回 body 的同时带上 `Content-Encoding` 和 `Content-Type`（core 新增一个返回类型），由引擎决定是否解码。任何 adapter 都绕不过去。core 不能引用 `bolt-load-http`（会成环），所以这个返回类型带原始的头值，由引擎用 `ContentCoding::parse_list` 解析。代价是 `BoltLoadAdapter` trait 的破坏性变更，和 T5 的 `DownloadError` 变更放进同一个大版本。
 - **方案 B：** adapter 在 `full_stream` 里自己调用解码 crate，类似 `limit_range_body`。trait 不变，但自定义 adapter 忘了调用，就会静默写进编码后的字节。
 
 **后端（D9）：**
@@ -266,6 +269,72 @@ pub enum DecodeError {
 - **方案 A（建议）：** `compression-codecs`。它是 async-compression 拆出来的同步编解码层，tower-http 用的就是它，当前依赖图里已有 0.4.41。接口是推式的：`Decode::decode(&mut input, &mut output)`，不绑定运行时，正好和上面的缓冲设计对上。它的 0.4.x 接口还在演进（已经有 `Decode` 和 `DecodeV2` 两套），所以只在 crate 内部使用，不出现在公开 API 里，并且锁定次版本。
 - **方案 B：** 直接用 flate2、brotli-decompressor、zstd（或纯 Rust 的 ruzstd）。控制更细，但代码更多。
 - 两个方案都是 gzip、deflate 默认开启（IDM 只处理这两种），br、zstd 放在 feature 后面：compression-codecs 的 zstd 依赖 C 库 libzstd。
+
+### 4.5 HTTP 辅助 crate（D11）
+
+**为什么拆：**
+
+- **core 应该只放 adapter 和引擎之间的契约**：trait、meta、错误类型。现在 core 里还有一批只有 adapter 调用的 HTTP 函数。已核对调用方：`classify_status`、`validate_range_response`、`limit_range_body`、`check_content_coding` 只被 reqwest、ureq2 和它们的测试调用。引擎只用到 `ContentRange` 和错误类型。
+- **HTTP 头的解析分在两处。** 一处是 core，一处是 utils 的 `http` feature。之所以分开，只是因为 utils 不依赖 core（§4.1、§5.1）。结果是 `Retry-After` 在 utils 里解析，上限却在 core 里设。
+- **T23 需要一个 content-coding 枚举，现有 crate 都没有**（已读 lock 里的源码）：
+  - `http` 1.5 只有头名常量，比如 `CONTENT_ENCODING`。
+  - `headers` 0.4.2 的 `ContentEncoding` 只有构造函数 `gzip()`、`brotli()`、`zstd()` 和一个 `contains(&str)`。它的内部字段私有，也没有迭代器，所以拿不到 coding 列表，也拿不到未知 coding 的名字。`contains` 用 `==` 比较，大小写敏感，而 RFC 9110 §8.4.1 规定 coding 名不区分大小写。
+  - `headers::ContentRange` 比 core 的解析器宽松：单位比较大小写敏感，数字两侧不容许空白，不检查 `last < complete`，还接受 `bytes */N`。所以仍然用 core 自己的解析器。
+
+**依赖方向：**
+
+- `bolt-load-http` 依赖 core，因为它的函数返回 `AdapterError`。它还接手 utils `http` feature 的依赖：`http`、`headers`、`regex`、`language-tags`、`percent-encoding`、`httpdate`。
+- core 不能依赖 `bolt-load-http`，否则成环，所以 core 不 re-export 搬走的函数。旧路径直接删除（全局约束 3，不保留兼容层）。
+- 依赖 `bolt-load-http` 的有三方：
+  - `bolt-load-adapter`；
+  - `bolt-load-decode`，用它的 `ContentCoding`；
+  - 引擎，T23 解码时用它解析 `full_stream` 交出的头值。
+
+  引擎本来就无条件依赖 `bolt-load-adapter`，所以实际的编译量不变。
+- utils 删掉 `http` 模块和 feature，只留 reader 和 telemetry。
+- `BoltLoadAdapterMeta::content_encoding` 仍然是 `Option<String>`：core 引用不了 `ContentCoding`。
+
+**搬迁：**
+
+| 现在 | 之后 |
+| --- | --- |
+| core `adapter::{classify_status, MAX_RETRY_AFTER}` | `bolt_load_http::{classify_status, MAX_RETRY_AFTER}` |
+| core `adapter::{validate_range_response, RangeHeaders, limit_range_body}` | `bolt_load_http::{validate_range_response, RangeHeaders, limit_range_body}` |
+| core `adapter::check_content_coding` | `bolt_load_http::check_content_coding` |
+| core `adapter::is_identity_coding` | 删除，改为 `ContentCoding::parse_list(value).is_empty()` |
+| utils `http::{ContentDisposition, parse_retry_after, parse_extended_value, …}` | `bolt_load_http::header::{…}` |
+| core `adapter::{ContentRange, InvalidContentRange}` 和 `FromStr` | 不动：错误变体和引擎都引用它 |
+
+函数签名不变，仍然接收 `&str` 和 `u16`，不改成 `HeaderMap`：ureq2 用的不是 `http` 1 的类型，改了反而要多一层转换。
+
+**`ContentCoding`：**
+
+```rust
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentCoding {
+    Gzip,
+    Deflate,
+    Brotli,
+    Zstd,
+    /// A coding this crate does not know, lowercased.
+    Other(String),
+}
+
+impl ContentCoding {
+    /// Parse a combined `Content-Encoding` value, in the order applied.
+    /// Names match case-insensitively, `x-gzip` is `Gzip`, and `identity`
+    /// and empty items are skipped.
+    pub fn parse_list(value: &str) -> Vec<ContentCoding>;
+
+    /// The registered name, such as `gzip` or `br`.
+    pub fn as_str(&self) -> &str;
+}
+```
+
+- **解析不会失败。** 认识不认识，由调用方决定：`check_content_coding` 把非空列表报成 `ContentCoded`（`.tar.gz` 的例外不变）；`decode` 把 `Other` 报成 `Unsupported`。
+- **`ContentCoded { coding }` 和 `RangeContentCoded { coding }` 仍然带原始头值（`String`）**，日志里能看到服务器实际发了什么。
+- **只解析响应头**，不处理 `Accept-Encoding` 的 q 值语法。
 
 ---
 
@@ -276,6 +345,7 @@ pub enum DecodeError {
 位置：
 - 分类函数在 `bolt-load-core/src/adapter/status.rs`（新增），导出为 `bolt_load_core::adapter::classify_status`。这个映射是 adapter 和引擎之间的约定（`Congestion` 触发降级，`Retryable` 计入重试），外部 adapter 只依赖 core 也能用上它，不必再依赖 `bolt-load-adapter`。
 - `Retry-After` 的解析在 `bolt-load-utils` 的 `http::parse_retry_after`（新增）。它只做纯解析，不设上限。utils 不依赖 core，这样分层不会倒置。
+- D11 之后，`classify_status`、`MAX_RETRY_AFTER` 和 `parse_retry_after` 都在 `bolt-load-http`。外部 adapter 依赖 core 和 `bolt-load-http`，仍然不必依赖 `bolt-load-adapter`（§4.5）。
 
 ```rust
 // bolt-load-core
@@ -549,6 +619,7 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 | 令牌桶粒度是一帧（emit 每次推送的大小），低限速时可能有抖动 | 桶深设下限；G8 的误差判据按 2 s 窗口计算 |
 | HTTP 客户端自动解压时会删掉 `Content-Encoding`，§4.1 的编码检查看不到（见 §14.2） | 所有请求都带 `Accept-Encoding: identity`；adapter 关闭 ureq 的 `gzip`；`limit_range_body` 要求 body 长度等于 `Content-Range`，不符就报 `RangeBodyTooLong` 或 `RangeBodyTooShort`；解不开的 body 不重试。这些只保证任务失败而不写错。T5 起，会解压的客户端回退到单连接后能下完；不解压的客户端以 `ContentCoded` 失败，下完要等 T23 的解码 |
 | 服务器把 `.tar.gz` 这类压缩包标成 `Content-Encoding: gzip`，解码后用户拿到的是解压后的文件 | §4.4 的例外：`Content-Type` 本身就是这种压缩格式时，按原样写入 |
+| D11 把 HTTP 函数从 core 和 utils 移到 `bolt-load-http`，外部 adapter 的 import 会编译失败 | 提交信息加 `!`，列出新旧路径对照（§4.5 的表）；函数签名不变，只改 import 和依赖 |
 | 解压炸弹：很小的响应解出极大的文件 | 每次 poll 最多产出一块输出，内存有上界；`DecodeOptions::max_output` 可以给输出总量设上限 |
 | IDM 的部分结论只有 dsh 一个来源（对冲、ECONNRESET 计数、HTTP 低限速时的初始连接数） | 本设计不依赖这些结论；需要用到的参数都通过自己的基准测试来定 |
 

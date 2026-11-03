@@ -14,7 +14,7 @@
 4. **测试不用 sleep**：
    - 退避、冷却、增益窗口相关的逻辑，都把 `now: Instant` 作为参数传入（design §8.1）。
    - 故障注入测试使用 `bolt-load-tests` 的服务器，不访问外网。
-5. **开工前的决策**：PR-1 开工前，确认 design §3 的 D3；PR-3 开工前，确认 D2；PR-3b 开工前，确认 D9 和 D10；PR-5 开工前，确认 D1；PR-7 开工前，确认 D5 和 D6；PR-8 开工前，确认 D4、D7、D8。确认结果先写回 `design.md`，再动代码。
+5. **开工前的决策**：PR-1 开工前，确认 design §3 的 D3；PR-3 开工前，确认 D2；PR-3a 开工前，确认 D11（已确认）；PR-3b 开工前，确认 D9 和 D10；PR-5 开工前，确认 D1；PR-7 开工前，确认 D5 和 D6；PR-8 开工前，确认 D4、D7、D8。确认结果先写回 `design.md`，再动代码。
 6. **偏差记录**：实现和 design 不一致时，在 design 末尾追加“实现说明”一节，写明原因。不要悄悄偏离设计。
 
 ## 1. 提交与 PR 划分
@@ -26,7 +26,9 @@
 | PR-2 Range 校验 | C3 `fix(adapter)!: reject range responses whose offsets cannot be proven` | T3 | PR-1 |
 | | C4 `test(tests): add range fault scenarios to the test server` | T4 | |
 | PR-3 单连接回退 | C5 `feat(task)!: fall back to a single connection when ranges are ignored or content-coded` | T5 | PR-2 |
-| PR-3b 内容解码 | C21 `feat(decode): add a streaming content decoder crate` | T23 | PR-3 |
+| PR-3a HTTP 辅助 crate | C23 `refactor(http)!: move the HTTP helpers from core and utils into bolt-load-http` | T24 | PR-3 |
+| | C24 `refactor(http): parse content codings into ContentCoding` | | |
+| PR-3b 内容解码 | C21 `feat(decode): add a streaming content decoder crate` | T23 | PR-3a |
 | | C22 `feat(task)!: decode content-coded full downloads` | | |
 | PR-4 写错误 | C6 `feat(task)!: keep the io error kind and range of write failures` | T6 | — |
 | PR-5 连接上限 | C7 `feat(task): make the connection limit configurable` | T7 | — |
@@ -160,11 +162,37 @@
   - 不解压的客户端：以 `ContentCoded` 失败（T23 落地后改为 hash 正确）。
 - 新增测试：回退之后，文件里不残留多连接阶段写入的数据（用前后内容不同的测试文件来验证）。
 
+## T24 — HTTP 辅助 crate（C23、C24）
+
+编号接在 T23 之后，但顺序上紧跟 T5，排在 T23 之前。按 design §4.5（D11）实施。
+
+- [ ] C23：只搬迁，不改行为。
+  - 新 crate `crates/bolt-load-http`，加入 workspace 的 `members`，依赖 core 和原 utils `http` feature 的依赖。
+  - 按 design §4.5 的表搬迁，单元测试跟着文件一起走。在根模块 re-export 函数，utils 的头解析放进 `header` 模块。
+  - core 删除 `status.rs`、`range.rs`、`coding.rs` 和对应的 re-export，`ContentRange` 不动。
+  - utils 删除 `http` 模块和 feature，同步改 `Cargo.toml` 的 description。
+  - `bolt-load-adapter` 改为依赖 `bolt-load-http`，去掉 `bolt-load-utils/http`。改 import 的地方有：两个 adapter，以及 `tests/status_classification.rs` 等测试。
+  - 提交信息列出新旧路径对照，作为迁移说明。
+- [ ] C24：新增 `ContentCoding` 和 `parse_list`（design §4.5）。`check_content_coding` 和 range 校验里的编码检查都改用它，`is_identity_coding` 删除。现有实现已经不区分大小写，所以行为不变。
+- [ ] 文档：
+  - 新 crate 的 README：从 core README 移过来函数说明、响应表和 “Content codings” 一节。
+  - core README 只留错误变体表。
+  - 更新 utils README 和 adapter README 里的路径。
+  - 更新根 README 的 crate 表。
+  - `bolt-load-adapter/README.md` 写自定义 adapter 的部分，改为依赖 core 和 `bolt-load-http`。
+
+**验证**
+
+- C23 之后，全量测试不改断言就通过：只有 import 变了。
+- `cargo tree -p bolt-load-core` 里不出现 `bolt-load-http`、`http`、`headers`。
+- C24 的单元测试覆盖这些输入：大小写混合、`x-gzip`、`identity` 和空项、多层编码、未知编码（`Other`，小写）、前后空白。
+- `RUSTDOCFLAGS=-Dwarnings cargo doc` 不新增警告，包括搬走之后的文档内链。
+
 ## T23 — 内容解码（C21、C22）
 
-编号接在 T22 之后，但顺序上紧跟 T5。
+编号接在 T22 之后，但顺序上紧跟 T24。
 
-- [ ] 新 crate `crates/bolt-load-decode`，按 design §4.4 实现 `ContentCoding`、`DecodeOptions`、`decode` 和 `DecodeError`：
+- [ ] 新 crate `crates/bolt-load-decode`，依赖 `bolt-load-http`（取 `ContentCoding`），按 design §4.4 实现 `DecodeOptions`、`decode` 和 `DecodeError`：
   - 后端按 D9 的结论选；gzip、deflate 默认开启，br、zstd 放在 feature 后面；
   - 输入不拷贝，输出用固定大小的 `BytesMut`，每次 poll 最多产出一块；
   - 多层编码、多成员 gzip、zlib 和 raw deflate 两种格式、结束后的多余数据、`max_output`。
