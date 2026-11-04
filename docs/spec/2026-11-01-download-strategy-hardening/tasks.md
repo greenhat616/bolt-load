@@ -198,9 +198,10 @@
   - 输入不拷贝，输出用固定大小的 `BytesMut`，每次 poll 最多产出一块；
   - 多层编码、多成员 gzip、zlib 和 raw deflate 两种格式、结束后的多余数据、`max_output`。
   - 实现说明见 design §14.5。
-- [ ] C22：按 D10 的结论接入。方案 A：core 给 `full_stream` 新增带 `Content-Encoding` 和 `Content-Type` 的返回类型，由 Singleton 路径解码，两个 adapter 和测试 adapter 一起改。
-- [ ] T5 的 `ContentCoded` 失败改为解码；`Unsupported` 的编码仍然报错。
-- [ ] 更新 adapter README：用户不必再为了正确性关闭客户端的解压。
+- [x] C22：按 D10 的结论接入。方案 A：core 给 `full_stream` 新增带 `Content-Encoding` 和 `Content-Type` 的返回类型，由 Singleton 路径解码，两个 adapter 和测试 adapter 一起改。
+- [x] T5 的 `ContentCoded` 失败改为解码；`Unsupported` 的编码仍然报错。
+- [x] 更新 adapter README：用户不必再为了正确性关闭客户端的解压。
+- [x] 实现时补充（design §14.6）：解码后大小按未知处理，`total` 在连接后才交给 runner（STATUS-10）；引擎新增 `gzip`、`deflate`、`br`、`zstd` feature。
 
 **验证**
 

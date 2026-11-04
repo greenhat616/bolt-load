@@ -12,7 +12,7 @@ use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
 use crate::{
-    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError},
+    adapter::{AdapterError, BoltLoadAdapter, BoltLoadAdapterMeta, FullResponse, RetryableError},
     runtime::ThreadedRuntimeImpl,
     task::{BuildError, DownloadError, MetaRetry, Task, TaskOptions, TaskState},
 };
@@ -61,7 +61,7 @@ impl BoltLoadAdapter for SignalAdapter {
         .into())
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         unreachable!("the metadata request never succeeds")
     }
 }

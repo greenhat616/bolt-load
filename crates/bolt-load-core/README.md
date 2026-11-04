@@ -22,8 +22,8 @@ pub trait BoltLoadAdapter: Send + Sync {
     /// Fetch metadata (content size, suggested filename).
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError>;
 
-    /// Stream the entire content.
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError>;
+    /// Stream the entire content, with the headers the task decodes it by.
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError>;
 
     /// Stream a byte range `[start, end)`.
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError>;
@@ -44,6 +44,23 @@ let meta = BoltLoadAdapterMeta::new(1024).with_filename(Some("file.bin".into()))
 
 The struct is `#[non_exhaustive]`: build it with `new` and the `with_*`
 setters instead of a struct literal.
+
+### Full responses
+
+`full_stream` returns a `FullResponse`: the body, and the combined
+`Content-Encoding` and `Content-Type` of the response. The task decodes
+the body as `content_encoding` says, so a source without codings sets
+neither:
+
+```rust,ignore
+let response = FullResponse::new(body)
+    .with_content_encoding(content_encoding)
+    .with_content_type(content_type);
+```
+
+`content_encoding` describes the body as handed out: when the HTTP
+client decodes the body and drops the header, it is `None`. Like
+`BoltLoadAdapterMeta`, the struct is `#[non_exhaustive]`.
 
 ### Type Aliases
 
@@ -80,8 +97,8 @@ Both error enums are `#[non_exhaustive]`; match them with a wildcard arm.
 | `RangeContentCoded { coding }` | A range response that would match, but is content-coded |
 | `RangeBodyTooLong { got }`, `RangeBodyTooShort { got, received }` | A range body longer or shorter than its `Content-Range` |
 | `RangeNotSatisfiable { total }` | 416 |
-| `BodyUndecodable { source }` | The HTTP client could not decode the body |
-| `ContentCoded { coding }` | A full response the HTTP client left content-coded |
+| `BodyUndecodable { source }` | The body cannot be decoded, by the HTTP client or by the task |
+| `ContentCoded { coding }` | A full response coded in a way the task cannot decode |
 | `Internal` | Framework-level failures |
 | `Cancelled` | User cancellation |
 | `Io` | Wrapped `Arc<std::io::Error>` |
@@ -92,9 +109,11 @@ Both error enums are `#[non_exhaustive]`; match them with a wildcard arm.
 
 An HTTP adapter produces these errors through
 [`bolt-load-http`](../bolt-load-http): `classify_status` for error
-statuses, `validate_range_response` and `limit_range_body` for range
-responses, and `check_content_coding` for full responses. The task
-depends on the result, so a custom HTTP adapter should call them too.
+statuses, and `validate_range_response` and `limit_range_body` for range
+responses. The task depends on the result, so a custom HTTP adapter
+should call them too. For a full response it hands over the
+`Content-Encoding` and `Content-Type` in `FullResponse`; the task picks
+what to decode with `codings_to_decode`.
 
 `ContentRange` stays here, since the range errors carry it; it parses a
 `Content-Range` value with `str::parse`.
