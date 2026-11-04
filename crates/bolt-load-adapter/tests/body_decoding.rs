@@ -56,7 +56,7 @@ async fn body_error(url: Url) -> AdapterError {
         .build()
         .unwrap()
         .into_reqwest_adapter((reqwest::Method::GET, url));
-    let mut stream = adapter.full_stream().await.unwrap();
+    let mut stream = adapter.full_stream().await.unwrap().body;
     loop {
         match stream.next().await {
             Some(Ok(_)) => {}

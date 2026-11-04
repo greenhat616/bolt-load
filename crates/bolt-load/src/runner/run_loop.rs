@@ -105,14 +105,18 @@ impl TaskRunner {
     /// Like [`Self::run`], but once `Started` is published, wait for `ready`
     /// before streaming, so a consumer can prepare for the data without the
     /// idle and drain timeouts running.
+    ///
+    /// `ready` resolves to the size the stream must have, which replaces the
+    /// builder's [`total`](super::TaskRunnerBuilder::total): the connection
+    /// can show that the expected size does not apply, as for a decoded body.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, name = "TaskRunner::run", fields(runner_id = self.id))
     )]
-    pub(crate) async fn run_after_started(&mut self, ready: impl Future<Output = ()>) {
+    pub(crate) async fn run_after_started(&mut self, ready: impl Future<Output = Option<u64>>) {
         let mut run = RunnerLoop::new(self);
         if poll_fn(|cx| run.poll_until_started(cx)).await {
-            ready.await;
+            run.runner.total = ready.await;
             run.handle_step(Step::Started(Ok(())));
             poll_fn(|cx| run.poll_run(cx)).await;
         }

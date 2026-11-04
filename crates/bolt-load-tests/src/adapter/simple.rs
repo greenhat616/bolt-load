@@ -8,7 +8,7 @@ use std::{
 };
 
 use bolt_load_core::adapter::{
-    AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta,
+    AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, FullResponse,
     error::unretryable::{CongestionSnafu, InternalSnafu, RangeStreamNotSupportedSnafu},
 };
 use bolt_load_utils::telemetry::*;
@@ -498,7 +498,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         )
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         info!(
             "[TEST ADAPTER] full_stream() called, content size: {}",
             self.content.len()
@@ -555,7 +555,11 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             "[TEST ADAPTER] full_stream() creating stream with chunk_size: {}",
             self.chunk_size
         );
-        Ok(self.body_stream(0, self.content.len(), guard))
+        Ok(FullResponse::new(self.body_stream(
+            0,
+            self.content.len(),
+            guard,
+        )))
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
@@ -695,7 +699,7 @@ mod tests {
         let adapter = SimpleTestAdapter::new(size);
         let expected_hash = adapter.expected_hash().to_string();
 
-        let stream = adapter.full_stream().await.unwrap();
+        let stream = adapter.full_stream().await.unwrap().body;
         assert_eq!(adapter.call_count(), 1);
 
         // Collect all data from stream
@@ -915,7 +919,7 @@ mod tests {
     #[n0_tracing_test::traced_test]
     async fn test_chunk_size_behavior() {
         let adapter = SimpleTestAdapter::new(10000); // 10KB content
-        let stream = adapter.full_stream().await.unwrap();
+        let stream = adapter.full_stream().await.unwrap().body;
 
         let mut chunk_count = 0;
         let mut total_size = 0;
@@ -994,7 +998,7 @@ mod tests {
             .unwrap();
 
         let start_time = Instant::now();
-        let stream = adapter.full_stream().await.unwrap();
+        let stream = adapter.full_stream().await.unwrap().body;
 
         let mut downloaded_size = 0;
         let mut stream = std::pin::pin!(stream);
@@ -1051,7 +1055,7 @@ mod tests {
             .unwrap();
 
         let start_time = Instant::now();
-        let stream = adapter.full_stream().await.unwrap();
+        let stream = adapter.full_stream().await.unwrap().body;
 
         let mut downloaded_size = 0;
         let mut stream = std::pin::pin!(stream);
@@ -1170,7 +1174,7 @@ mod tests {
             .unwrap();
 
         let start_time = Instant::now();
-        let stream = adapter.full_stream().await.unwrap();
+        let stream = adapter.full_stream().await.unwrap().body;
 
         let mut downloaded_size = 0;
         let mut stream = std::pin::pin!(stream);
@@ -1222,7 +1226,7 @@ mod tests {
             .unwrap();
 
         let start_time = Instant::now();
-        let stream = adapter.full_stream().await.unwrap();
+        let stream = adapter.full_stream().await.unwrap().body;
 
         let mut downloaded_size = 0;
         let mut stream = std::pin::pin!(stream);
@@ -1268,7 +1272,7 @@ mod tests {
             .unwrap();
 
         let start_time = Instant::now();
-        let stream = adapter.full_stream().await.unwrap();
+        let stream = adapter.full_stream().await.unwrap().body;
         let connection_elapsed = start_time.elapsed();
 
         // Verify the connection delay was applied

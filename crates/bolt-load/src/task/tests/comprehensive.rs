@@ -24,7 +24,7 @@ use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
 use crate::{
-    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta},
+    adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, FullResponse},
     runtime::{
         DowncastLocalRuntime, Sleep, ThreadedRuntime, ThreadedRuntimeImpl, TimerBuilder, TimerImpl,
     },
@@ -201,7 +201,7 @@ impl BoltLoadAdapter for MetaCounting {
         self.inner.retrieve_meta().await
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         self.inner.full_stream().await
     }
 
@@ -455,7 +455,7 @@ impl BoltLoadAdapter for PanickingAdapter {
         self.0.retrieve_meta().await
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         panic!("the adapter panicked");
     }
 }
