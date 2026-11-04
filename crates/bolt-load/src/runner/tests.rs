@@ -655,41 +655,40 @@ async fn test_empty_frames_mid_stream_are_skipped() {
     assert_eq!(received, b"abcdef");
 }
 
+/// An empty stream is an empty body (#153), whether it yields nothing or only
+/// empty frames, when its total is unknown or zero.
 #[tokio::test]
-async fn test_empty_stream() {
-    let (_control_tx, control_rx) = async_channel::bounded(1);
-    let cancel_token = CancellationToken::new();
-    // Create an empty stream
-    let test_stream = stream! {
-        yield Ok(Bytes::from(vec![]));
-    };
-
-    let (mut runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
-        .stream(Box::pin(test_stream))
-        .runner_id(1)
-        .control_signal(control_rx)
-        .cancel_token(cancel_token.clone())
-        .build()
-        .unwrap();
-
-    let runner_handle = tokio::spawn(async move {
-        runner.run().await;
-    });
-
-    let mut got_empty_error = false;
-    let mut lifecycle_rx = pin!(lifecycle_rx);
-    while let Some(msg) = lifecycle_rx.next().await {
-        error!("msg: {msg:?}");
-        if let LifecycleEvent::Stopped(StoppedReason::Failed(e)) = msg
-            && e.is_empty()
-        {
-            got_empty_error = true;
-            break;
-        }
+async fn test_empty_stream_finishes_unless_bytes_are_due() {
+    fn no_items() -> AnyBytesStream {
+        Box::pin(futures::stream::empty())
+    }
+    fn empty_frames() -> AnyBytesStream {
+        Box::pin(stream! {
+            yield Ok(Bytes::new());
+            yield Ok(Bytes::new());
+        })
     }
 
-    runner_handle.await.unwrap();
-    assert!(got_empty_error);
+    for (name, stream) in [
+        ("no items", no_items as fn() -> AnyBytesStream),
+        ("empty frames", empty_frames),
+    ] {
+        for total in [None, Some(0)] {
+            let (received, finished, failed) = run_runner_and_collect(stream(), total).await;
+            assert!(
+                finished && failed.is_none(),
+                "{name}, total {total:?}: {failed:?}"
+            );
+            assert!(received.is_empty(), "{name}, total {total:?}");
+        }
+
+        let (_, finished, failed) = run_runner_and_collect(stream(), Some(3)).await;
+        assert!(!finished, "{name}");
+        assert!(
+            matches!(failed, Some(TaskError::SmallerThanTotalSize)),
+            "{name}: {failed:?}"
+        );
+    }
 }
 
 #[tokio::test]

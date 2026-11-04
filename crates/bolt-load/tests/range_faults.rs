@@ -7,56 +7,26 @@
 
 #![cfg(all(feature = "reqwest", feature = "ureq2", feature = "tokio"))]
 
+mod common;
+
 use std::time::Duration;
 
 use bolt_load::{
-    adapter::{AdapterError, AnyAdapter, DynBoltLoadAdapter, UnretryableError},
+    adapter::{AdapterError, UnretryableError},
     runner::TaskError,
     runtime::ThreadedRuntimeImpl,
     task::{DownloadError, DownloadMode, FallbackReason, Task},
 };
-use bolt_load_adapter::{reqwest::IntoReqwestAdapter, ureq2::IntoUreqAdapter};
 use bolt_load_tests::adapter::{
     fault::{CONGESTED_RETRY_AFTER_SECS, RangeFault},
     http_server::create_range_fault_server,
     simple::{calculate_blake3, create_deterministic_content},
 };
 use bytes::Bytes;
+use common::Client;
 use url::Url;
 
 const SIZE: usize = 256 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Client {
-    Reqwest,
-    /// reqwest with its gzip decoder, which hides `Content-Encoding`.
-    DecodingReqwest,
-    Ureq2,
-}
-
-impl Client {
-    const ALL: [Self; 3] = [Self::Reqwest, Self::DecodingReqwest, Self::Ureq2];
-
-    fn adapter(self, url: Url) -> Box<AnyAdapter> {
-        match self {
-            Client::Reqwest | Client::DecodingReqwest => {
-                let mut client = reqwest::Client::builder().no_proxy();
-                if self == Client::Reqwest {
-                    client = client.no_gzip().no_brotli().no_zstd().no_deflate();
-                }
-                DynBoltLoadAdapter::new_box(
-                    client
-                        .build()
-                        .unwrap()
-                        .into_reqwest_adapter((reqwest::Method::GET, url)),
-                )
-            }
-            Client::Ureq2 => {
-                DynBoltLoadAdapter::new_box(ureq2::Agent::new().into_ureq_adapter(("get", url)))
-            }
-        }
-    }
-}
 
 /// How a task on `client` must end under `fault`.
 enum Outcome {
