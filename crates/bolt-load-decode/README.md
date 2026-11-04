@@ -6,10 +6,11 @@ Streaming content decoding for
 A full download writes the response body as the file, so a body with a
 `Content-Encoding` has to be decoded first. Whether the HTTP client
 decodes depends on features that anything in the dependency graph can
-turn on, so bolt-load decodes the body itself. `decode` wraps a body
-stream and decodes it as the chunks arrive. It works on any
-`Stream<Item = Result<Bytes, E>>`; its errors reach the stream through
-`E: From<DecodeError>`.
+turn on, so bolt-load decodes the body itself: the task calls `decode`
+on every content-coded full download, so an adapter hands out the body
+as its client delivers it. `decode` wraps a body stream and decodes it as
+the chunks arrive. It works on any `Stream<Item = Result<Bytes, E>>`;
+its errors reach the stream through `E: From<DecodeError>`.
 
 ```rust,ignore
 use bolt_load_decode::{ContentCoding, DecodeOptions, decode};
@@ -54,6 +55,17 @@ error, and an error from the body passes through unchanged.
   cannot take more memory or time per poll.
 - Decoder state: 32 KiB for gzip and deflate, up to 16 MiB for br, up to
   8 MiB for zstd.
+
+## Performance
+
+`benches/against_reqwest.rs` downloads one gzip-coded response from a
+local server twice: decoded by reqwest itself, and by `decode` on a
+client that does not decode. The target is at least 90 % of reqwest's
+throughput.
+
+```sh
+cargo bench -p bolt-load-decode --bench against_reqwest
+```
 
 ## Dependencies
 

@@ -2316,23 +2316,19 @@ async fn test_run_after_started_holds_the_timeouts_until_ready() {
             std::task::Poll::Ready(item.take())
         }));
         let (_control_tx, control_rx) = async_channel::bounded(1);
-        let mut builder = TaskRunner::builder()
+        let (mut runner, mut lifecycle_rx, mut data_rx) = TaskRunner::builder()
             .stream(stream)
             .runner_id(1)
             .control_signal(control_rx)
             .cancel_token(CancellationToken::new())
             .idle_timeout(Duration::from_millis(50))
-            .data_drain_timeout(Duration::from_millis(50));
-        if let Some(total) = total {
-            builder = builder.total(total);
-        }
-        let (mut runner, mut lifecycle_rx, mut data_rx) = builder.build().unwrap();
+            .data_drain_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             runner
-                .run_after_started(async move {
-                    let _ = ready_rx.await;
-                })
+                .run_after_started(async move { ready_rx.await.ok().and(total) })
                 .await;
         });
 
@@ -2352,5 +2348,36 @@ async fn test_run_after_started_holds_the_timeouts_until_ready() {
             "{total:?}: {reason:?}"
         );
         assert_eq!(received, 10);
+    }
+}
+
+/// The size `ready` resolves to replaces the builder's: `None` lets a stream
+/// longer than the expected size through, a size limits it.
+#[tokio::test]
+async fn test_run_after_started_takes_the_total_from_ready() {
+    for (ready, received) in [(None, 30), (Some(30), 30), (Some(20), 20)] {
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let (mut runner, mut lifecycle_rx, mut data_rx) = TaskRunner::builder()
+            .stream(Box::pin(futures::stream::iter(
+                (0..3).map(|_| Ok(Bytes::from_static(&[1; 10]))),
+            )))
+            .total(10)
+            .runner_id(1)
+            .control_signal(control_rx)
+            .cancel_token(CancellationToken::new())
+            .data_drain_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            runner.run_after_started(async move { ready }).await;
+        });
+
+        let (got, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+        handle.await.unwrap();
+        assert!(
+            matches!(reason, StoppedReason::Finished),
+            "{ready:?}: {reason:?}"
+        );
+        assert_eq!(got, received, "{ready:?}");
     }
 }

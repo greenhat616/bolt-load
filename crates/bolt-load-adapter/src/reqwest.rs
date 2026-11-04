@@ -9,7 +9,7 @@ use std::{
 
 use async_once_cell::OnceCell;
 use bolt_load_http::{
-    ContentCoding, RangeHeaders, check_content_coding, classify_status,
+    ContentCoding, RangeHeaders, classify_status,
     header::{ContentDisposition, parse_retry_after},
     limit_range_body, validate_range_response,
 };
@@ -22,7 +22,7 @@ use snafu::IntoError;
 use url::Url;
 
 use super::{
-    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange,
+    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange, FullResponse,
     error::{
         AdapterError, UnretryableError, retryable::IoSnafu as RetryableIoSnafu,
         unretryable::IoSnafu as UnretryableIoSnafu,
@@ -352,7 +352,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
         }
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         let response = self
             .apply_before_request(
                 self.client
@@ -364,12 +364,12 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .map_err(ReqwestError::from)?;
         let response = check_status(response)?;
         // A decoding client has dropped the header of what it decodes.
-        check_content_coding(
-            combined(&response, &CONTENT_ENCODING).as_deref(),
-            combined(&response, &CONTENT_TYPE).as_deref(),
-        )?;
+        let content_encoding = combined(&response, &CONTENT_ENCODING);
+        let content_type = combined(&response, &CONTENT_TYPE);
         let stream = ReqwestStream(Box::pin(response.bytes_stream()));
-        Ok(Box::pin(stream))
+        Ok(FullResponse::new(Box::pin(stream))
+            .with_content_encoding(content_encoding)
+            .with_content_type(content_type))
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
@@ -471,7 +471,7 @@ mod test {
         let url = Url::parse(&format!("http://localhost:{port}/no_range")).unwrap();
         let client = local_client();
         let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
-        let mut stream = adapter.full_stream().await.unwrap();
+        let mut stream = adapter.full_stream().await.unwrap().body;
         let mut bytes = bytes::BytesMut::new();
         while let Some(item) = stream.next().await {
             bytes.extend_from_slice(&item.unwrap());

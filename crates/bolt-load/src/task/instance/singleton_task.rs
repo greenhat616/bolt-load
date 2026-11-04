@@ -1,4 +1,11 @@
-use std::{path::Path, pin::pin, sync::Arc};
+use std::{
+    path::Path,
+    pin::pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_fs::{File, OpenOptions};
 use async_io::Timer;
@@ -9,6 +16,7 @@ use smol_cancellation_token::CancellationToken;
 use super::{
     Result,
     drive::Transfer,
+    full_body::file_body,
     output_file::{OutputFile, Teardown},
     sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
 };
@@ -27,6 +35,7 @@ const CONTROL_CHANNEL_CAPACITY: usize = 8;
 /// The transfer of the singleton mode: one runner streams the whole content.
 pub(crate) struct SingletonTaskInner {
     /// `None` when the size is unknown; the stream's end finishes the download.
+    /// A decoded body drops it once connected.
     total: Option<u64>,
     downloaded: u64,
     output: OutputFile,
@@ -139,19 +148,27 @@ impl SingletonTaskInner {
         // The runner fails with `ChannelClosed` once every control sender is
         // gone, so the sender must outlive it.
         let (control_tx, control_rx) = async_channel::bounded(CONTROL_CHANNEL_CAPACITY);
-        let adapter = self.adapter.clone();
-        let mut builder = TaskRunner::builder()
-            .connector(async move { adapter.full_stream().await })
+        // Set before `Started`: whether the body is decoded.
+        let decoded = Arc::new(AtomicBool::new(false));
+        let connect = {
+            let adapter = self.adapter.clone();
+            let decoded = decoded.clone();
+            async move {
+                let body = file_body(adapter.full_stream().await?)?;
+                decoded.store(body.decoded, Ordering::Relaxed);
+                Ok(body.stream)
+            }
+        };
+        // The total reaches the runner once connected, see `Started` below.
+        let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+            .connector(connect)
             .runner_id(STATIC_RUNNER_ID)
             .control_signal(control_rx)
             .cancel_token(runner_token.clone())
             .idle_timeout(self.options.stream_idle_timeout)
-            .connect_timeout(self.options.connect_timeout);
-        if let Some(total) = self.total {
-            builder = builder.total(total);
-        }
-        let (mut runner, lifecycle_rx, data_rx) =
-            builder.build().expect("failed to build task runner");
+            .connect_timeout(self.options.connect_timeout)
+            .build()
+            .expect("failed to build task runner");
 
         let mut meter = 0;
         let mut sampler = SpeedSampler::new();
@@ -166,14 +183,12 @@ impl SingletonTaskInner {
             let mut runner_stopped = false;
             let mut data_done = false;
             let mut lifecycle_done = false;
-            // Streaming starts once the file is ready.
-            let (file_ready_tx, file_ready_rx) = oneshot::channel::<()>();
+            // Streaming starts once the file is ready, with the total.
+            let (file_ready_tx, file_ready_rx) = oneshot::channel::<Option<u64>>();
             let mut file_ready_tx = Some(file_ready_tx);
             let mut fut = pin!(
                 runner
-                    .run_after_started(async move {
-                        let _ = file_ready_rx.await;
-                    })
+                    .run_after_started(async move { file_ready_rx.await.ok().flatten() })
                     .fuse()
             );
             let mut lifecycle_rx = pin!(lifecycle_rx);
@@ -219,12 +234,17 @@ impl SingletonTaskInner {
                         match event {
                             Some(LifecycleEvent::Started) => {
                                 trace!("[SINGLETON TASK] stream obtained successfully");
+                                if decoded.load(Ordering::Relaxed) {
+                                    // The size counts the coded bytes.
+                                    debug!("[SINGLETON TASK] decoding the body, size unknown");
+                                    self.total = None;
+                                }
                                 file = Some(self.create_file(tmp_path).await?);
                                 // Measure the speed from the first byte on.
                                 sampler = SpeedSampler::new();
                                 timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
                                 if let Some(file_ready_tx) = file_ready_tx.take() {
-                                    let _ = file_ready_tx.send(());
+                                    let _ = file_ready_tx.send(self.total);
                                 }
                             }
                             Some(LifecycleEvent::Stopped(reason)) if file.is_none() => {

@@ -88,6 +88,12 @@ directory and included via `#![doc = include_str!(...)]`.
 Mode selection is automatic based on `is_range_stream_available()` and a
 known size, or the singleton mode can be forced via `TaskBuilder::prefer_mode()`.
 
+A content-coded full response is decoded as it is written, with up to two
+codings: gzip and deflate by default, br and zstd behind features. Its
+size is then unknown until the stream ends. A coding the build cannot
+decode fails the task with `ContentCoded`. Range responses are never
+decoded: a coded range makes the task fall back to one connection.
+
 ## Concurrency Control
 
 The concurrent download engine continuously monitors runner outcomes:
@@ -116,6 +122,9 @@ reassigned to new runners via the `DynamicStrategy`.
 | `tracing` | Yes | Distributed tracing instrumentation |
 | `progressbar` | Yes | Terminal progress bars via `indicatif` |
 | `mmap` | Yes | Memory-mapped file writer backend |
+| `gzip`, `deflate` | Yes | Decode content-coded full downloads |
+| `br` | No | Decode `br` |
+| `zstd` | No | Decode `zstd`; builds the libzstd C library |
 
 ## File Writer Backends
 
@@ -137,7 +146,7 @@ use bolt_load_core::adapter::*;
 impl BoltLoadAdapter for MyAdapter {
     async fn is_range_stream_available(&self) -> bool { /* ... */ }
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> { /* ... */ }
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> { /* ... */ }
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> { /* ... */ }
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> { /* ... */ }
 }
 ```
