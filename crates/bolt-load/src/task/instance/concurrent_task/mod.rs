@@ -14,6 +14,32 @@ use crate::{
     task::{DownloadError, Progress, TaskOptions, status::ProgressReporter},
 };
 
+/// A failed operation on the temporary file, as [`DownloadError::Io`] with
+/// its io error, the way the singleton mode reports it.
+fn file_error(tmp_path: &Path, error: FileWriterError) -> DownloadError {
+    DownloadError::io(error.op(), tmp_path, error.into_io_error())
+}
+
+/// Create the writer of the temporary file and size it to `total`.
+#[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+async fn create_file_writer(tmp_path: &Path, total: u64) -> Result<FileWriter> {
+    FileWriter::new(tmp_path, total)
+        .await
+        .map_err(|error| match error {
+            FileWriterBuilderError::RangeWriter { source } => file_error(tmp_path, source),
+            // Every kind `FileWriter::new` picks is given its file or path.
+            FileWriterBuilderError::Validation { message } => DownloadError::other(message),
+        })
+}
+
+/// Join the writer's workers and sync the temporary file to disk.
+async fn finalize_file_writer(writer: impl FileRangeWriter, tmp_path: &Path) -> Result<()> {
+    writer
+        .finalize()
+        .await
+        .map_err(|error| file_error(tmp_path, error))
+}
+
 mod chunk_planner;
 mod download_loop;
 /// File writer implementations for concurrent downloads.
@@ -74,17 +100,6 @@ impl ConcurrentTaskInner {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    async fn create_file_writer(&self, tmp_path: &Path) -> Result<FileWriter> {
-        let total_size = self
-            .progress
-            .total
-            .ok_or_else(|| DownloadError::other("the concurrent task has no size"))?;
-        FileWriter::new(tmp_path, total_size)
-            .await
-            .map_err(|e| DownloadError::other(e.to_string()))
-    }
-
     /// Download into the temporary file, then commit it or discard it.
     ///
     /// Returns only after every owned worker has exited.
@@ -106,7 +121,7 @@ impl ConcurrentTaskInner {
             .progress
             .total
             .expect("A concurrent task should have a total size");
-        let file_writer = self.create_file_writer(tmp_path).await?;
+        let file_writer = create_file_writer(tmp_path, total).await?;
 
         let runners_cancel_token = cancel_token.child_token();
         // Fallback cancellation signal on unwinding; `DownloadLoop::finish` cancels explicitly.
@@ -132,10 +147,7 @@ impl ConcurrentTaskInner {
         let transfer_result = download.finish(transfer_result, &mut self.progress).await;
         // Always join the writer workers, so the file handle is released before
         // the temporary file is renamed or removed.
-        let finalize_result = file_writer
-            .finalize()
-            .await
-            .map_err(|e| DownloadError::other(e.to_string()));
+        let finalize_result = finalize_file_writer(file_writer, tmp_path).await;
 
         // The first error takes precedence.
         transfer_result.and(finalize_result)
@@ -153,5 +165,90 @@ impl Transfer for ConcurrentTaskInner {
 
     async fn download(&mut self, cancel_token: &CancellationToken) -> Teardown {
         ConcurrentTaskInner::download(self, cancel_token).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, ops::Range};
+
+    use bytes::Bytes;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::task::IoOp;
+
+    /// The operation, path and io error kind of a file error.
+    fn file_error_parts(error: &DownloadError) -> (IoOp, &Path, io::ErrorKind) {
+        let DownloadError::Io { op, path, source } = error else {
+            panic!("expected a file error, got {error:?}");
+        };
+        (*op, path.as_path(), source.kind())
+    }
+
+    /// Writes nothing and fails `finalize` with an io error of its kind.
+    struct FailingFinalize(io::ErrorKind);
+
+    impl FileRangeWriter for FailingFinalize {
+        async fn write_range(&self, _: Range<u64>, _: Bytes) -> Result<(), FileWriterError> {
+            Ok(())
+        }
+
+        async fn finalize(self) -> Result<(), FileWriterError> {
+            Err(FileWriterError::Finalize {
+                source: CommandError::Io {
+                    source: io::Error::new(self.0, "injected"),
+                },
+                path: "elsewhere.tmp".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_created_is_a_create_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_path = dir.path().join("missing").join("file.tmp");
+
+        let Err(error) = create_file_writer(&tmp_path, 4).await else {
+            panic!("created a file in a missing directory");
+        };
+        assert_eq!(
+            file_error_parts(&error),
+            (IoOp::Create, tmp_path.as_path(), io::ErrorKind::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_size_the_file_system_refuses_is_an_allocate_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_path = dir.path().join("file.tmp");
+
+        // The pool writer always sizes the file; the kind `FileWriter::new`
+        // picks may not.
+        let Err(FileWriterBuilderError::RangeWriter { source }) =
+            FileWriter::new_with_kind(&tmp_path, u64::MAX, FileRangeWriterKind::Pool).await
+        else {
+            panic!("sized a file to u64::MAX");
+        };
+        let error = file_error(&tmp_path, source);
+        let (op, path, _) = file_error_parts(&error);
+        assert_eq!((op, path), (IoOp::Allocate, tmp_path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_finalize_is_a_flush_error_on_the_temporary_file() {
+        let tmp_path = Path::new("file.tmp");
+        for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+            let error = finalize_file_writer(FailingFinalize(kind), tmp_path)
+                .await
+                .unwrap_err();
+            assert_eq!(file_error_parts(&error), (IoOp::Flush, tmp_path, kind));
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("failed to flush file.tmp: injected"),
+                "{error}"
+            );
+        }
     }
 }
