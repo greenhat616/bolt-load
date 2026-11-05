@@ -5,7 +5,10 @@ use std::{
 
 use bolt_load_utils::telemetry::*;
 
-use super::{super::strategy::StrategyAction, DownloadLoop, LoopEvent};
+use super::{
+    super::{runner_manager::RunnerSlot, strategy::StrategyAction},
+    DownloadLoop, LoopEvent,
+};
 use crate::{runtime::EventTimer, task::RunnerId};
 
 /// The strategy's periodic tick.
@@ -56,12 +59,11 @@ impl DownloadLoop {
             // Split the given task into two separate tasks
             StrategyAction::SplitGivenTask(task_id) => {
                 trace!("[TASK] Strategy: split given task: {task_id}");
-                let incomplete_range = self
-                    .manager
-                    .get_runner_state(task_id)
-                    .map(|s| s.incomplete_range())
-                    .expect("task id not found");
-                self.split(task_id, incomplete_range);
+                let Some(state) = self.manager.get_runner_state(task_id) else {
+                    trace!("[TASK] skip splitting runner {task_id}: it has no chunk");
+                    return;
+                };
+                self.split(task_id, state.incomplete_range());
             }
             // Change the max concurrency
             StrategyAction::ChangeMaxConcurrency(new_max_concurrency) => {
@@ -77,25 +79,51 @@ impl DownloadLoop {
     }
 
     /// Split the given runner's incomplete range in two, spawning a runner for the second half.
+    ///
+    /// The new runner's slot is reserved first, so the runner is only
+    /// shrunk when the second half can be handed over; without a free slot
+    /// nothing changes. Should the second half not be allocated after all,
+    /// it stays unassigned, for the strategy to create a runner for.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, fields(runner_id, range))
     )]
     pub(super) fn split(&mut self, runner_id: RunnerId, incomplete_range: Range<u64>) {
+        let Some(slot) = self.manager.try_reserve_slot() else {
+            trace!("[TASK] skip splitting runner {runner_id}: no runner slot is free");
+            return;
+        };
         let half_size = (incomplete_range.end - incomplete_range.start) / 2;
         if let Err(e) = self.manager.resize_runner(runner_id, half_size) {
             trace!("[TASK] skip splitting runner {runner_id}: {e}");
+            self.manager.release(slot);
             return;
         }
-        self.spawn_runner(incomplete_range.start + half_size..incomplete_range.end);
+        self.spawn_in(
+            slot,
+            incomplete_range.start + half_size..incomplete_range.end,
+        );
     }
 
+    /// Spawn a runner for `range`; without a free slot, or when `range` is
+    /// taken, nothing changes.
     pub(super) fn spawn_runner(&mut self, range: Range<u64>) {
+        let Some(slot) = self.manager.try_reserve_slot() else {
+            trace!("[TASK] skip spawning a runner for {range:?}: no runner slot is free");
+            return;
+        };
+        self.spawn_in(slot, range);
+    }
+
+    fn spawn_in(&mut self, slot: RunnerSlot, range: Range<u64>) {
         let spawner = &self.spawner;
-        self.manager
-            .spawn_runner_with_chunk(range.clone(), |runner_id, limits| {
-                spawner.spawn(range, runner_id, limits)
-            })
-            .expect("failed to allocate runner with chunk");
+        let spawned = self
+            .manager
+            .spawn_in(slot, range.clone(), |runner_id, limits| {
+                spawner.spawn(range.clone(), runner_id, limits)
+            });
+        if !spawned {
+            trace!("[TASK] skip spawning a runner for {range:?}: the range is taken");
+        }
     }
 }

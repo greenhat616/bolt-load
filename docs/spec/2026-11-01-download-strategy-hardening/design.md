@@ -839,3 +839,34 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 整个任务级别的测试要单连接下载 4 s 以上，策略才会拆分，太慢，所以“只有一个 runner”放在下载循环里测。
   - 变异检查：下载循环不读配置（固定为 8）、默认预算不随 `max_connections` 变化、`FailurePolicy` 不用解析后的值、`TaskBuilder::max_connections` 不写入，各自都有测试失败。
   - `rg available_parallelism crates/bolt-load/src/task` 只剩 pool writer 的写入线程数，与连接数无关。
+
+### 14.11 容量安全的切分（PR-5，C8）
+
+- **问题。** 旧的 `split()` 先缩小原 runner，再去分配新 runner 的 ID；分配不到就 `expect` panic。策略的闸门看的是活跃 chunk 数，而 runner 的 ID 要等它停止才释放。所以 chunk 已经下完、`Stopped` 还没处理的 runner 仍占着 ID，策略却以为还有空位。旧代码在这个时序下会 panic：`strategy_tick.rs:99`，`failed to allocate runner with chunk`。用下面的测试在旧代码上复现过。
+- **做法。**
+  - `RunnerManager` 新增 `try_reserve_slot()`（原来的 `allocate_runner`，返回 `#[must_use]` 的 `RunnerSlot`）、`release(slot)` 和 `spawn_in(slot, range, spawn)`。`spawn_in` 分配不到区间时会释放槽位，返回 `false`。`spawn_runner_with_chunk` 只剩测试在用，改为 `#[cfg(test)]`。
+  - `split()` 分三步：先占槽位，占不到就记一条 `trace` 并返回，什么都不改；再 resize，失败就释放槽位；最后 `spawn_in`。如果第三步分配不到后半段，后半段留作未分配区间，由并发控制策略之后为它创建 runner，不会丢失。
+  - `spawn_runner`（`CreateTask`）占不到槽位时记一条 `trace` 后跳过，不再 `expect`。
+  - `SplitGivenTask` 的目标 runner 已经没有 chunk 时跳过，去掉了 `expect("task id not found")`。tasks.md 没列这一项，但它也是同一类 panic。
+  - `find_chunk_to_split` 返回 `SplitCandidate::{Unassigned, Running { runner, range }}`。策略只处理 `Running`，`Unassigned` 交给并发控制策略，去掉了 `strategy/mod.rs:88` 的 `expect`。
+  - 闸门：QuickStart 改为 `current × 2 <= max`；Normal 改为 `current < max`，等价于 `current + 1 <= max`，这样写是因为 clippy 的 `int_plus_one` 会拒绝 `+ 1 <=`。最后一个槽位现在也能用上。
+- **验证。**
+  - 回归测试：
+    - 槽位全被占用时，`SplitAllTask`、`SplitGivenTask` 和 `CreateTask` 什么都不改：区间不变，不发限额，不丢区间。腾出一个槽位后，`CreateTask` 又能成功。
+    - 4 个连接中，2 个 runner 已经下完但还没停止，策略 tick 时不拆分；其中一个停止后，同一次 `SplitAllTask` 里第一个拆分用掉这个槽位，第二个跳过。旧代码在第一次 tick 就 panic。
+    - `test_rejected_split_spawn_reclaims_its_slot_once`：拆分出的 runner 被 runtime 拒绝，在下载循环处理之前一直占着槽位，期间另一次拆分用的是别的槽位。runner manager 的生命周期轮询报告这次拒绝后，只收回它一个槽位；原 runner 保持缩小，后半段重新可分配。被拒绝的 spawn 会让任务终止，下载循环不会再建 runner；测试随后手动建一个 runner，确认收回的槽位和后半段都能再分配。
+  - 闸门的单元测试：2/4 时 QuickStart 拆分全部，3/4 时 Normal 拆分一个，4/4 和 1/1 时不拆分。
+  - 性质测试：`proptest`（工作区已在用，bolt-load 新增为 dev 依赖），256 组，每组最多 64 步。随机交替执行建 runner（包括区间已被占用的情况）、`Started`、进度、完成、失败、`SplitAllTask`、`SplitGivenTask`（包括不存在的 runner）、`ChangeMaxConcurrency`（1 到 2 × 上限）和真实策略的 tick。每一步之后都检查：
+    - 不 panic；
+    - 占用的 ID 数和活跃 runner 数都不超过 `max_connections`；
+    - 每个被占用的 ID 都属于持有 chunk 的 runner，没有泄漏；
+    - chunk 和未分配区间恰好覆盖 `[0, total)`，互不重叠；
+    - 已接收的字节数不减少。
+  - 变异检查，每种都有测试失败：
+    - 先 resize 再占槽位；
+    - resize 失败后不释放槽位；
+    - 区间被占用时不释放槽位；
+    - 占不到槽位就 panic；
+    - `SplitGivenTask` 找不到 runner 就 panic；
+    - 恢复旧的 QuickStart 闸门；
+    - 恢复旧的 Normal 闸门。
