@@ -1,6 +1,9 @@
 use std::{fmt, io, path::PathBuf, sync::Arc};
 
-use crate::{adapter::AdapterError, runner::TaskError};
+use crate::{
+    adapter::AdapterError,
+    runner::{TaskError, storage_hint},
+};
 
 /// The file operation of a [`DownloadError::Io`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,9 +15,11 @@ pub enum IoOp {
     Create,
     /// Sizing the temporary file.
     Allocate,
-    /// Writing the content.
+    /// Writing the content in the singleton mode. The concurrent mode
+    /// reports [`TaskError::Write`] instead, with the range.
     Write,
-    /// Flushing the content.
+    /// Flushing the content. The singleton mode buffers its writes, so a
+    /// write may also fail here.
     Flush,
     /// Moving the temporary file to the destination.
     Rename,
@@ -67,8 +72,9 @@ pub enum DownloadError {
     /// The metadata could not be retrieved.
     #[snafu(display("failed to retrieve the metadata: {source}"))]
     Metadata { source: AdapterError },
-    /// The transfer failed: a stream error, a timeout, no progress, or too
-    /// many consecutive failures.
+    /// The transfer failed: a stream error, a timeout, no progress, too
+    /// many consecutive failures, or a failed write in the concurrent mode
+    /// ([`TaskError::Write`]).
     #[snafu(display("the transfer failed: {source}"))]
     Transfer { source: Arc<TaskError> },
     /// Ranges cannot carry the file, for `reason`. The concurrent mode ends
@@ -79,8 +85,9 @@ pub enum DownloadError {
         reason: FallbackReason,
         source: AdapterError,
     },
-    /// A file operation failed.
-    #[snafu(display("failed to {op} {}: {source}", path.display()))]
+    /// A file operation failed. A full disk or an exceeded quota adds a
+    /// hint to the message.
+    #[snafu(display("failed to {op} {}: {source}{}", path.display(), storage_hint(source)))]
     Io {
         op: IoOp,
         path: PathBuf,
@@ -162,4 +169,23 @@ pub enum BuildError {
     InvalidOptions { reason: &'static str },
     #[snafu(display("invalid destination {}: {reason}", path.display()))]
     InvalidDestination { path: PathBuf, reason: &'static str },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_disk_adds_a_hint_to_a_file_error() {
+        let error = DownloadError::io(IoOp::Flush, "file.tmp", io::ErrorKind::StorageFull.into());
+        let message = error.to_string();
+        assert!(
+            message.starts_with("failed to flush file.tmp: "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("; free up disk space, then download again"),
+            "{message}"
+        );
+    }
 }
