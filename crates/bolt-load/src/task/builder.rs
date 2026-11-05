@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 
 use bolt_load_core::adapter::AdapterError;
 use smol_cancellation_token::CancellationToken;
@@ -86,9 +86,17 @@ impl TaskBuilder {
         self
     }
 
-    /// Set the termination options, see [`TaskOptions`].
+    /// Set the connection limit and the termination options, see
+    /// [`TaskOptions`].
     pub fn options(mut self, options: TaskOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Set [`TaskOptions::max_connections`]. A later
+    /// [`options`](Self::options) call replaces it.
+    pub fn max_connections(mut self, limit: NonZeroUsize) -> Self {
+        self.options.max_connections = limit;
         self
     }
 
@@ -189,5 +197,23 @@ impl std::fmt::Debug for TaskBuilder {
             .field("options", &self.options)
             .field("meta", &self.meta)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bolt_load_tests::adapter::simple::SimpleTestAdapter;
+
+    use super::*;
+    use crate::task::DEFAULT_MAX_CONNECTIONS;
+
+    #[test]
+    fn test_max_connections_sets_the_option() {
+        let limit = NonZeroUsize::new(3).unwrap();
+        let builder = Task::builder(SimpleTestAdapter::new(1024)).max_connections(limit);
+        assert_eq!(builder.options.max_connections, limit);
+        // `options` replaces the whole set, the limit included.
+        let builder = builder.options(TaskOptions::default());
+        assert_eq!(builder.options.max_connections, DEFAULT_MAX_CONNECTIONS);
     }
 }

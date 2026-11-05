@@ -37,7 +37,7 @@ pub struct FailurePolicy {
 impl FailurePolicy {
     pub fn new(options: &TaskOptions, now: Instant) -> Self {
         Self {
-            max_consecutive: options.max_consecutive_failures,
+            max_consecutive: options.resolved_max_consecutive_failures(),
             no_progress: options.no_progress_timeout,
             consecutive: 0,
             last_progress_at: now,
@@ -150,6 +150,21 @@ mod tests {
                 assert_eq!(limit, 3);
                 assert!(source.is_stream_error());
             }
+            other => panic!("expected RetryLimitExceeded, got {other:?}"),
+        }
+    }
+
+    /// Without a set limit, the policy allows `2 × max_connections` failures.
+    #[test]
+    fn test_default_limit_follows_max_connections() {
+        let options =
+            TaskOptions::default().max_connections(std::num::NonZeroUsize::new(16).unwrap());
+        let mut p = FailurePolicy::new(&options, Instant::now());
+        for _ in 1..32 {
+            assert!(p.on_failure(&retryable(), 0).is_none());
+        }
+        match p.on_failure(&retryable(), 0) {
+            Some(TaskError::RetryLimitExceeded { limit, .. }) => assert_eq!(limit, 32),
             other => panic!("expected RetryLimitExceeded, got {other:?}"),
         }
     }
