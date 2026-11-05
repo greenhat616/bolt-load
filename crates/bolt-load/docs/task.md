@@ -183,7 +183,10 @@ The concurrent download path includes several sub-systems:
   Wrapped in [`PendingWriter`] for backpressure queuing.
 - **StrategyControl** — dynamic optimization:
   - [`ConcurrencyControlStrategy`] — adjusts runner count based on load.
-  - [`DynamicStrategy`] — splits slow runners' remaining ranges.
+  - [`DynamicStrategy`] — splits slow runners' remaining ranges. A
+    split reserves the new runner's slot first: without a free one it
+    changes nothing, so a task never runs more than
+    `max_connections` runners.
 - **SpeedSampler** — EMA-based speed calculation (α = 0.33,
   interval = 250 ms).
 - **ID Generator** — [`BitVec`]-backed runner ID allocator with

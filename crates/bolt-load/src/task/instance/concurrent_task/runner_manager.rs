@@ -98,7 +98,7 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 
 use super::{
     ChunkPlanner, PlannerGuard,
-    chunk_planner::{ChunkState, ChunkStatus, Resize},
+    chunk_planner::{ChunkState, ChunkStatus, Resize, SplitCandidate},
     strategy::RunnerOutcomeSampler,
 };
 use crate::{
@@ -148,8 +148,12 @@ pub enum ResizeError {
     Limit { source: SendError },
 }
 
-/// Runner registration information
-pub struct RunnerRegistration {
+/// A reserved runner ID and the mailbox for its limits.
+///
+/// Reserved by [`RunnerManager::try_reserve_slot`]; give it back with
+/// [`RunnerManager::spawn_in`] or [`RunnerManager::release`].
+#[must_use = "a reserved slot must be spawned in or released"]
+pub struct RunnerSlot {
     /// Runner ID
     pub runner_id: RunnerId,
     /// The limits the manager sends to the runner
@@ -229,16 +233,20 @@ impl RunnerManager {
 
     // ==================== ID Generator Related Methods ====================
 
-    /// Allocates a new runner ID and the mailbox for its limits
+    /// Reserve a runner ID and the mailbox for its limits.
     ///
-    /// # Returns
-    /// * `Some(RunnerRegistration)` - If allocation is successful
-    /// * `None` - If maximum concurrency has been reached
-    pub fn allocate_runner(&mut self) -> Option<RunnerRegistration> {
+    /// `None` when every ID is taken: a runner keeps its ID until it
+    /// stops, even after its chunk is complete.
+    pub fn try_reserve_slot(&mut self) -> Option<RunnerSlot> {
         let runner_id = self.id_generator.next()?;
         let (sender, limits) = limit_mailbox();
         self.limit_senders.insert(runner_id, sender);
-        Some(RunnerRegistration { runner_id, limits })
+        Some(RunnerSlot { runner_id, limits })
+    }
+
+    /// Give back a slot no runner was spawned in.
+    pub fn release(&mut self, slot: RunnerSlot) {
+        self.release_runner(slot.runner_id);
     }
 
     /// Releases a runner ID and its associated resources
@@ -394,10 +402,7 @@ impl RunnerManager {
 
     /// Finds a chunk that can be split
     #[inline]
-    pub fn find_chunk_to_split(
-        &self,
-        required_size: u64,
-    ) -> Option<(Option<RunnerId>, Range<u64>)> {
+    pub fn find_chunk_to_split(&self, required_size: u64) -> Option<SplitCandidate> {
         self.chunk_planner.find_chunk_to_split(required_size)
     }
 
@@ -417,22 +422,20 @@ impl RunnerManager {
     ///
     /// # Returns
     /// * `None` - If unable to allocate a runner ID or the range
-    pub fn allocate_runner_with_chunk(&mut self, range: Range<u64>) -> Option<RunnerRegistration> {
-        let registration = self.allocate_runner()?;
-        if !self.allocate_chunk(range, registration.runner_id) {
-            self.release_runner(registration.runner_id);
+    pub fn allocate_runner_with_chunk(&mut self, range: Range<u64>) -> Option<RunnerSlot> {
+        let slot = self.try_reserve_slot()?;
+        if !self.allocate_chunk(range, slot.runner_id) {
+            self.release(slot);
             return None;
         }
         self.chunk_planner
-            .mark_running(registration.runner_id)
+            .mark_running(slot.runner_id)
             .expect("the chunk was just allocated");
-        Some(registration)
+        Some(slot)
     }
 
+    #[cfg(test)]
     /// Allocate a runner for `range` and spawn it with `spawn`.
-    ///
-    /// The chunk stays pending until the runner reports `Started`. A rejected
-    /// spawn is reported by the next tick, once.
     ///
     /// # Returns
     /// * `None` - If unable to allocate a runner ID or the range
@@ -441,19 +444,35 @@ impl RunnerManager {
         range: Range<u64>,
         spawn: impl FnOnce(RunnerId, LimitReceiver) -> Result<RunnerChannels, SpawnFailed>,
     ) -> Option<()> {
-        let registration = self.allocate_runner()?;
-        let runner_id = registration.runner_id;
+        let slot = self.try_reserve_slot()?;
+        self.spawn_in(slot, range, spawn).then_some(())
+    }
+
+    /// Allocate `range` to the runner of `slot` and spawn it with `spawn`.
+    ///
+    /// The chunk stays pending until the runner reports `Started`. A rejected
+    /// spawn is reported by the next tick, once.
+    ///
+    /// Returns `false`, with the slot released, when `range` cannot be
+    /// allocated.
+    pub fn spawn_in(
+        &mut self,
+        slot: RunnerSlot,
+        range: Range<u64>,
+        spawn: impl FnOnce(RunnerId, LimitReceiver) -> Result<RunnerChannels, SpawnFailed>,
+    ) -> bool {
+        let runner_id = slot.runner_id;
         if !self.chunk_planner.allocate_pending_chunk(range, runner_id) {
-            self.release_runner(runner_id);
-            return None;
+            self.release(slot);
+            return false;
         }
-        match spawn(runner_id, registration.limits) {
+        match spawn(runner_id, slot.limits) {
             Ok(channels) => {
                 self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx)
             }
             Err(failed) => self.spawn_failures.push_back((runner_id, failed)),
         }
-        Some(())
+        true
     }
 
     #[cfg(test)]
@@ -546,6 +565,26 @@ impl RunnerManager {
         }
     }
 
+    /// Handle a runner's `Started` as its lifecycle event would.
+    #[cfg(test)]
+    pub(super) fn mark_started(&mut self, runner_id: RunnerId) {
+        self.chunk_planner
+            .mark_running(runner_id)
+            .expect("a connecting runner has a chunk");
+        if let Some(data_rx) = self.connecting_data.remove(&runner_id) {
+            self.data_aggregator.register(runner_id, data_rx);
+        }
+    }
+
+    /// The allocated range of every chunk.
+    #[cfg(test)]
+    pub(super) fn chunk_ranges(&self) -> Vec<Range<u64>> {
+        self.chunk_planner
+            .iter_chunks()
+            .map(|chunk| chunk.allocated.clone())
+            .collect()
+    }
+
     #[cfg(test)]
     pub async fn tick(&mut self) -> RunnerTick {
         std::future::poll_fn(|cx| self.poll_tick(cx, true)).await
@@ -583,18 +622,18 @@ mod tests {
         let mut manager = RunnerManager::new(1000, 2);
 
         // Allocate the first runner
-        let reg1 = manager.allocate_runner().unwrap();
+        let reg1 = manager.try_reserve_slot().unwrap();
         assert_eq!(reg1.runner_id, 0);
         assert_eq!(manager.allocated_runner_count(), 1);
 
         // Allocate the second runner
-        let reg2 = manager.allocate_runner().unwrap();
+        let reg2 = manager.try_reserve_slot().unwrap();
         assert_eq!(reg2.runner_id, 1);
         assert_eq!(manager.allocated_runner_count(), 2);
         assert!(manager.is_full());
 
         // Cannot allocate more
-        assert!(manager.allocate_runner().is_none());
+        assert!(manager.try_reserve_slot().is_none());
 
         // Release the first runner
         manager.release_runner(reg1.runner_id);
@@ -602,14 +641,14 @@ mod tests {
         assert!(!manager.is_full());
 
         // Can allocate again
-        let reg3 = manager.allocate_runner().unwrap();
+        let reg3 = manager.try_reserve_slot().unwrap();
         assert_eq!(reg3.runner_id, 0); // Reuse released ID
     }
 
     #[test]
     fn test_limit_runner() {
         let mut manager = RunnerManager::new(1000, 2);
-        let mut reg = manager.allocate_runner().unwrap();
+        let mut reg = manager.try_reserve_slot().unwrap();
 
         manager.limit_runner(reg.runner_id, 500).unwrap();
         assert_eq!(reg.limits.try_recv(), Some(500));

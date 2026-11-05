@@ -12,6 +12,8 @@ use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
 pub use runner_outcome_sampler::{FailureKind as RunnerFailureKind, RunnerOutcomeSampler};
 
+use super::chunk_planner::SplitCandidate;
+
 pub const DEFAULT_STRATEGY_TICK_INTERVAL: Duration = Duration::from_millis(1500); // 1.5 seconds
 
 #[derive(Debug)]
@@ -79,13 +81,15 @@ impl StrategyControl {
         // TODO: move this to dynamic strategy inner?
         let planned_chunk_size = (current_speed * 2.0) as u64;
 
-        if let Some((runner_id, suggested_range)) =
-            runner_manager.find_chunk_to_split(planned_chunk_size)
-            && active_runners < max_concurrency
+        // An unassigned range is left to the concurrency control, which
+        // creates runners for it.
+        if active_runners < max_concurrency
+            && let Some(SplitCandidate::Running {
+                runner: runner_id,
+                range: suggested_range,
+            }) = runner_manager.find_chunk_to_split(planned_chunk_size)
             && suggested_range.end - suggested_range.start >= planned_chunk_size
         {
-            let runner_id =
-                runner_id.expect("A empty chunk is not processed by concurrency control");
             // split the chunk
             let mut strategy_context = DynamicStrategyContext {
                 speed: current_speed,
