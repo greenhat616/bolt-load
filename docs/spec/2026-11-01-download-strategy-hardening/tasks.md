@@ -33,7 +33,7 @@
 | PR-3c 空 body | C25 `fix(runner)!: finish an empty body of unknown size` | T25 | PR-3b |
 | PR-4 写错误 | C6 `feat(task)!: keep the io error kind and range of write failures` | T6 | — |
 | PR-4a 文件错误 | C26 `fix(task): report the file errors of the concurrent mode as Io` | T26 | PR-4 |
-| PR-5 连接上限 | C7 `feat(task): make the connection limit configurable` | T7 | — |
+| PR-5 连接上限 | C7 `feat(task)!: make the connection limit configurable` | T7 | — |
 | | C8 `fix(task): reserve a runner slot before splitting a chunk` | T8 | |
 | PR-6 退避与预算 | C9 `feat(task): back off failed ranges and honour Retry-After` | T9 | PR-1、PR-5 |
 | | C10 `feat(task): budget failures per range` | T10 | |
@@ -250,16 +250,16 @@
 
 ## T7 — 连接上限（C7）
 
-- [ ] `TaskOptions::max_concurrency`（`options.rs:111-113`）改为公开的 `max_connections: NonZeroUsize`。新增 `DEFAULT_MAX_CONNECTIONS = 8`（D1），`TaskBuilder::max_connections`。
-- [ ] `download_loop.rs:77-83` 改为读取这个配置，不再调用 `available_parallelism()`。
-- [ ] `default_max_consecutive_failures()`（`options.rs:13-16`）改为 `max(8, 2 × max_connections)`。由于它依赖 `max_connections`，计算时机改为 build 阶段。
-- [ ] 更新 README 和 crate 文档里关于并发的描述。
+- [x] `TaskOptions::max_concurrency`（`options.rs:111-113`）改为公开的 `max_connections: NonZeroUsize`。新增 `DEFAULT_MAX_CONNECTIONS = 8`（D1），`TaskBuilder::max_connections`。
+- [x] `download_loop.rs:77-83` 改为读取这个配置，不再调用 `available_parallelism()`。
+- [x] `default_max_consecutive_failures()`（`options.rs:13-16`）改为 `max(8, 2 × max_connections)`。由于它依赖 `max_connections`，计算时机改为 build 阶段：`max_consecutive_failures` 改为 `Option<usize>`，`None` 在任务开始时按 `max_connections` 算出（design §14.10）。
+- [x] 更新 README 和 crate 文档里关于并发的描述。
 
 **验证**
 
 - 单元测试：
   - 默认值是 8；
-  - 设置为 1 时，始终只有一个 runner；
+  - 设置为 1 时，始终只有一个 runner（在下载循环里测，见 design §14.10）；
   - 失败预算的默认值随 `max_connections` 变化。
 - `rg "available_parallelism" crates/bolt-load/src/task` 只剩下与连接数无关的用法，或者没有结果。
 

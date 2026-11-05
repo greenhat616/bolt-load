@@ -58,8 +58,6 @@ use file_writer::*;
 use runner_manager::RunnerManager;
 use runner_spawner::RunnerSpawner;
 
-static DEFAULT_MAX_CONCURRENCY: usize = 4;
-
 /// The transfer of the concurrent mode: runners download ranges in parallel.
 pub(crate) struct ConcurrentTaskInner {
     rt: ThreadedRuntimeImpl,
