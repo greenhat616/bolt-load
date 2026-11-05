@@ -51,7 +51,9 @@ a runner that is still connecting.
   for the consumer to accept remaining buffered data.
 - **Size validation**: checks that downloaded bytes match the declared
   total (if known), producing [`ExceededTotalSize`] or
-  [`SmallerThanTotalSize`] errors on mismatch.
+  [`SmallerThanTotalSize`] errors on mismatch. An unknown total accepts
+  any length, zero included: a stream that ends without an error finishes,
+  even with no bytes.
 
 # Key Types
 

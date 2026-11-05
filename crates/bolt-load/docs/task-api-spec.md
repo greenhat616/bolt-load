@@ -227,6 +227,12 @@ resume-related fields can be added later.
   counts the coded bytes, so `total` becomes `None` before the first byte
   is counted, and `Finished` reports the decoded size. `info` does not
   change.
+- **STATUS-11** A body of unknown size that ends without an error ends
+  `Finished` with what it carried, nothing included: an empty body, decoded
+  or not, is an empty file with `total == Some(0)`
+  ([#153](https://github.com/greenhat616/bolt-load/issues/153)). A full
+  download accepts any status outside 4xx and 5xx, so `204 No Content` is an
+  empty file too.
 
 Internal: one `pub(crate) StatusPublisher` owns the only `watch::Sender`.
 The driver owns it; transfers and samplers borrow it and never keep a clone
@@ -588,11 +594,6 @@ protocol and correctness, kimi for API ergonomics.
   the temporary path is derived only by `OutputFile::new`, once per
   attempt during initialization, and a new `DownloadError` variant fits
   the `#[non_exhaustive]` enum.
-- **Empty content of unknown size**
-  ([#153](https://github.com/greenhat616/bolt-load/issues/153)). A zero
-  `content_size` means "unknown", so an empty stream fails the singleton
-  runner with `TaskError::Empty` instead of producing an empty file. This
-  spec only unifies the mode selection (§4.3, step 2).
 - Whether `TaskId` is needed for correlation in a future multi-task manager.
 
 ## 12. Implementation notes
@@ -610,7 +611,7 @@ tests and the loom models. Where it differs from or refines §4:
 | Sample cost | Progress samples are skipped while the channel has no receiver; the terminal status is always published (STATUS-8). |
 | Panic handler | Holds a second handle to the status sender, so the channel closes when the attempt's thread returns, right after the terminal status. |
 | Probe | `probe_send.rs` now probes the single attempt future, `drive::run`. |
-| Zero size | Selects the singleton mode; an empty stream still fails with `Empty` (#153). `test_zero_size_file_handling` stays ignored. |
+| Zero size | Selects the singleton mode. An empty stream failed with `Empty` until #153 was fixed; now an empty body is an empty file (STATUS-11), and `test_zero_size_file_handling` runs. |
 | Removed | `TaskEvent`, `ProgressWithSpeed`, `TaskInstanceError`, `TaskManagerBuildError`, `TaskInstance`, `TaskInstanceImpl`, `SingletonTask`, `ConcurrentTask`, `TaskControl`, the atomic `TaskState`, `TaskStateControl`, `TaskCommand`, the `atomic_enum` dependency. |
 
 Loom: the four new watch models pass with the existing seven watch and
