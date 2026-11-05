@@ -32,6 +32,7 @@
 | | C22 `feat(task)!: decode content-coded full downloads` | | |
 | PR-3c 空 body | C25 `fix(runner)!: finish an empty body of unknown size` | T25 | PR-3b |
 | PR-4 写错误 | C6 `feat(task)!: keep the io error kind and range of write failures` | T6 | — |
+| PR-4a 文件错误 | C26 `fix(task): report the file errors of the concurrent mode as Io` | T26 | PR-4 |
 | PR-5 连接上限 | C7 `feat(task): make the connection limit configurable` | T7 | — |
 | | C8 `fix(task): reserve a runner slot before splitting a chunk` | T8 | |
 | PR-6 退避与预算 | C9 `feat(task): back off failed ranges and honour Retry-After` | T9 | PR-1、PR-5 |
@@ -232,6 +233,20 @@
 **验证**
 
 - 用一个注入写失败的 writer 做单元测试：断言 `ErrorKind` 和 `range` 都被保留，任务以 `Write` 失败结束。
+
+## T26 — 并发模式的文件错误（C26）
+
+编号接在 T25 之后，顺序上紧跟 T6。补上 design §14.8 记下的缺口。
+
+- [x] 并发模式创建文件、预分配和 finalize 的失败改为 `DownloadError::Io`，分别是 `Create`、`Allocate`、`Flush`。路径是临时文件，保留 `io::ErrorKind`（design §14.9）。
+- [x] 清点其余的 `Other`：都不是文件错误，保留；“并发任务没有大小”一处删掉（design §14.9）。
+
+**验证**
+
+- 在不存在的目录里建文件，报 `Io { op: Create }`，kind 是 `NotFound`。
+- pool writer 把文件设为 `u64::MAX` 字节，报 `Io { op: Allocate }`。
+- finalize 失败的 writer 报 `Io { op: Flush }`，保留 kind。
+- 把任一处映射改回去，对应的测试失败。
 
 ## T7 — 连接上限（C7）
 

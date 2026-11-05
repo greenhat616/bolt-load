@@ -92,6 +92,10 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   `IoOp::Write` or `IoOp::Flush`, without a range. Both keep the
   `io::ErrorKind`, and a full disk or an exceeded quota adds a hint to
   the message.
+- **Other file failures** end the task the same way. Both modes report
+  creating and sizing the temporary file as `DownloadError::Io` with
+  `IoOp::Create` or `IoOp::Allocate`. The concurrent mode reports its
+  final sync, after the writer workers exit, with `IoOp::Flush`.
 - **Metadata request**: [`TaskBuilder::retrieve_meta`] and the task's
   initialization retry retryable metadata errors as
   [`TaskOptions::meta_retry`] allows, with jittered exponential backoff
