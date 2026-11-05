@@ -302,7 +302,8 @@ fn outcome(result: &Result<()>) -> &'static str {
     };
     match &**source {
         TaskError::NoProgress { .. } => "deadline",
-        TaskError::Other { message } if message.starts_with("write failed") => "writer",
+        // The write `make_ready` dispatched, whose spawn was rejected.
+        TaskError::Write { range, .. } if *range == (0..1) => "writer",
         // A rejected runner spawn is an unretryable attempt failure.
         TaskError::Other { .. } => "runner",
         other => panic!("unexpected loop error: {other:?}"),
