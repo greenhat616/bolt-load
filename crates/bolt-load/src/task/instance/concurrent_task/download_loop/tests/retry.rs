@@ -70,6 +70,7 @@ fn spawn_test_runner(download: &mut DownloadLoop, range: Range<u64>) -> TestRunn
             Ok(RunnerChannels {
                 lifecycle_rx,
                 data_rx,
+                stop: Default::default(),
             })
         })
         .unwrap();
