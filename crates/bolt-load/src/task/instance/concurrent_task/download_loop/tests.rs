@@ -928,6 +928,7 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
             &mut download.manager,
             Instant::now(),
             false,
+            None,
         ) else {
             continue;
         };
@@ -1246,10 +1247,11 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
     file_writer.finalize().await.unwrap();
 }
 
+mod growth;
 mod retry;
 
 /// Random sequences of the loop's steps, including failures that back their
-/// range off, congestion and time passing.
+/// range off, congestion and time passing, under either growth strategy.
 mod split_properties {
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
@@ -1262,7 +1264,7 @@ mod split_properties {
         },
         *,
     };
-    use crate::adapter::UnretryableError;
+    use crate::{adapter::UnretryableError, task::GrowthStrategy};
 
     const TOTAL: u64 = 64 << 20;
     const MAX_CONNECTIONS: usize = 8;
@@ -1602,10 +1604,18 @@ mod split_properties {
         #[test]
         fn splits_stay_within_the_limit_and_cover_the_file(
             max_connections in 1..=MAX_CONNECTIONS,
+            growth in prop_oneof![Just(GrowthStrategy::Legacy), Just(GrowthStrategy::Doubling)],
             ops in prop::collection::vec(op(), 1..64),
         ) {
-            let (mut download, _file_writer) =
-                futures::executor::block_on(parked_loop(TOTAL, max_connections));
+            let options = TaskOptions::default()
+                .max_connections(NonZeroUsize::new(max_connections).unwrap())
+                .growth_strategy(growth);
+            let (mut download, _file_writer) = futures::executor::block_on(loop_with_options(
+                ThreadedRuntimeImpl::new_other_rt(ScriptedRuntime::new(TimerKind::Scripted)),
+                DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
+                TOTAL,
+                &options,
+            ));
             let mut now = Instant::now();
             let mut downloaded = 0;
             for op in ops {

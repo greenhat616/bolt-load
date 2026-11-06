@@ -1167,3 +1167,122 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `TaskBuilder::max_attempts_per_range` 不写入：`test_max_attempts_per_range_sets_the_option`；
     - 先查连续失败、再查预算：`test_the_range_budget_comes_before_the_consecutive_limit` 和 `a_timeout_after_data_restarts_the_range`；
     - 区间为空时也检查预算：`test_a_complete_range_is_not_exhausted`。
+
+### 14.14 Doubling 扩张控制器与切分尺寸（PR-7，C11）
+
+- **做法。**
+  - 开关（§9.1）：
+    - 新增 `GrowthStrategy { Legacy, Doubling }`，默认 `Legacy`，标了 `#[non_exhaustive]`。新增 feature `unstable-strategy`。
+    - 打开这个 feature（或者在测试里）时，才有 `TaskOptions::growth_strategy` 字段、`TaskOptions::growth_strategy(s)` 和 `TaskBuilder::growth_strategy(s)`，`GrowthStrategy` 也才从 `bolt_load::task` 导出。不打开时，这个类型只在 crate 内可见，任务一律用 `Legacy`，由 crate 内部的 `TaskOptions::resolved_growth_strategy()` 决定。
+    - 带 cfg 的字段和几个 trait：`Clone`、`PartialEq`、`Debug` 都是派生的，字段在时自动带上它；`Default` 是手写的，同样带 cfg，取 `Legacy`。
+    - `TaskOptions` 是 `#[non_exhaustive]`，别的 crate 既不能用结构体字面量构造它，也不能不写 `..` 就解构它。所以依赖图里有一个 crate 打开了这个 feature（cargo 会合并 feature），也不会让其它 crate 编译失败；它们不设置这个字段，拿到的还是 `Legacy`，行为不变。
+    - 不打开 feature 时，`Doubling` 这个变体从来不会被构造出来，标了 `expect(dead_code)`。`Doubling` 的代码照样编译，只是选不到。
+  - 每个策略 tick 的顺序：
+    - 和 `Legacy` 一样，先走并发控制（`ConcurrencyControlStrategy`）；它有动作，这个 tick 就不扩张。
+    - 然后 `Doubling` 依次检查，任何一条不满足就不扩张：
+      1. 之前停滞过（见下）。
+      2. 距上次扩张不到 2 s（`GROW_INTERVAL`）。
+      3. `allowed` 为 0，或者已经达到上限。
+      4. 拥塞，即 `now < congestion_until`（§8.1）。这是 `Doubling` 自己的检查；`split` 也会再查一遍。
+      5. 有 runner 正在连接，或者在这个 tick 里没有字节被接受。
+      6. 设了限速，并且速度达到限速的 85%。现在还没有限速，`speed_limit` 恒为 `None`，这里只是给 P2 留的接口。
+      7. 停滞判断，见下。
+    - 都通过时，`target = min(allowed × 2, 上限)`，发出 `StrategyAction::Grow(target − allowed)`。
+  - “与 tick 对齐”：扩张只在 tick 上决定，选上次扩张之后至少 2 s 的第一个 tick。tick 间隔是 1.5 s，所以实际上每隔一个 tick（3 s）最多扩张一次。
+  - `allowed` 取活跃 runner 数，也就是 Pending 和 Running 状态的 chunk 数（`get_active_runners_count`）。不取下载循环当前的并发上限 `max_concurrency`：这个上限从 `max_connections` 起步，取它的话，第一个 tick 就“已达上限”了。IDM 的 `started` 数的也是正在用的连接（`idm-strategy-full.md` §3.2）。
+  - 上限取下载循环当前的 `max_concurrency`，不直接用 `max_connections`：
+    - `max_concurrency` 从 `max_connections` 起步，只有并发控制会改它。遇到不可重试的失败时，立即降到当前的活跃数；失败率高时每次减 1；恢复时每次加 1，最多回到 `max_connections`。
+    - `Doubling` 只加 runner，不改上限，所以降级一直有效；上限恢复之后，扩张才能用上恢复出来的部分。
+    - 两个策略就这样组合：减少连接归并发控制，增加连接归 `Doubling`，两者受同一个上限约束。
+  - 速度窗口：
+    - 每个策略 tick 采样一次，时间用 tick 传进来的 `now`，策略里不调用 `Instant::now()`。
+    - 任务速度 = 这个 tick 里 planner 接受的字节数 ÷ tick 的时长。比较的是整个任务的速度，不是每个 runner 的速度。
+    - 扩张前的窗口，是决定扩张的那个 tick；扩张后的窗口，是之后第一个通过检查 1–6 的 tick。两个窗口都是一个 tick 长（1.5 s）。
+  - 停滞：
+    - 只判断完整的翻倍，也就是这次扩张加的 runner 数等于扩张前的活跃数。扩张后窗口的速度低于扩张前的 1.10 倍，就是停滞。停滞之后，这次下载不再扩张。
+    - 被上限截断、或者有切分被拒绝的扩张，照样算扩张，2 s 的间隔从它算起，但不判断，也不会解除已有的停滞。连接数只多一小步，本来就不能指望总速度多 10%。比如并发控制把上限一格一格地恢复（11 到 12），每条连接各 1 MiB/s 时增益只有 9%，判断的话就会永久停在 12。
+    - 每次翻倍只判断一次。判断时，如果活跃 runner 比翻倍刚完成时少（有 runner 下完了或者失败了），这个窗口就量不出这次翻倍的效果。这时不下结论，这次判断作废，可以继续扩张。
+    - 翻倍到上限之后，检查 3 先拦住，所以这次翻倍不会被判断。等 runner 下完、活跃数降下来，判断作废，`Doubling` 会再切分，补回到上限。
+  - 落地：
+    - `Grow(n)` 由下载循环执行。每次都选剩余最多的 Running chunk，先看它够不够大（见切分尺寸），再走 T8 的 `split`：先占槽位，再缩小原 runner，最后 spawn。
+    - 遇到 chunk 不够大，或者 `split` 被拒绝（拥塞、没有空闲槽位、缩小失败），就停下。
+    - 下载循环把实际加了几个 runner 报回控制器（`StrategyControl::on_grown`）。一个都没加，不算扩张：不更新上次扩张的时间，下一个 tick 可以再试。加了一部分，也算扩张，更新上次扩张的时间，但不判断停滞（见上）。
+    - `split` 和 `spawn_in` 改为返回有没有 spawn 出 runner；`Legacy` 的调用点不看返回值。
+  - 每个 runner 的速率（T12）：
+    - 在 `download_loop/throughput.rs` 的 `RunnerRates` 里。只有 `Doubling` 采样，每个策略 tick 一次，用 tick 的 `now`。
+    - 读的是 planner 接受的字节。一个 chunk 只属于一次尝试，所以 chunk 已下载部分的增长，就是这个 runner 被接受的字节；被截掉的字节不算。
+    - 速率 = 两次采样之间的增长 ÷ 两次采样的间隔。窗口是一个 tick，也就是 1.5 s。
+    - 一次尝试用（ID，chunk 的 generation）识别。planner 每交出一个 chunk，就给它一个新的 generation（单调递增的计数）；chunk 缩小时不变，切分出的新 chunk 拿新的。所以切分后原 runner 的速率还在；同一个 ID 没收到数据就失败、再领回同一个起点时，也是新的尝试，从没有速率开始。只用（ID，起点）识别是不够的：那样新尝试会接着用旧尝试的基线。第一次采样到的 runner 也没有速率。
+    - 同一次采样还给出任务速度，以及“有没有 runner 在连接、或者这个 tick 没有数据”。T13 和 T27 可以复用这个采样。
+  - 切分尺寸（T12）：
+    - `planned = max(donor_speed × 2 s, min_chunk_size)`。`donor_speed` 是被切 runner 自己的速率；还没有速率时，用 `throughput.per_runner_speed`。
+    - `planned` 是门槛，不是切出来的大小：chunk 的剩余量至少是 `planned` 才切，也就是被切的 runner 按自己的速度还要下 2 s 以上。切点仍然在一半。
+    - 这就是 S1 的本意：`Legacy` 的门槛按任务总速率算，`Doubling` 按 donor 自己的速率算。
+    - `Legacy` 不变：`planned_chunk_size` 仍然是 `current_speed * 2.0`，`get_incomplete_states` 里 `2 × min_chunk_size` 的下限也不变。
+- **与 §9.2、§9.3 的偏差。**
+  - 上限用下载循环当前的 `max_concurrency`，不是 `max_connections`。没有降级时两者相等；降级之后，`Doubling` 不会越过降级后的上限（见上）。
+  - §9.2 没说停滞什么时候判、判几次。这里每次翻倍只判一次；判的时候活跃 runner 少于翻倍刚完成时的数，就不判。停滞之后不再恢复。
+  - §9.2 对每次扩张都要求 10% 的增益，这个数是按翻倍定的。这里只判断完整的翻倍；被上限或拒绝截断的扩张只加了一小步，不能指望多 10%，所以不判断（2026-11-07 与 lead 确认）。
+  - 每次扩张只看剩余最多的那个 chunk。它不够大就停下，不再去找别的 chunk。
+  - §9.3 的 `clamp(donor_speed × 2 s, min_chunk_size, remaining / 2)` 改为 `max(donor_speed × 2 s, min_chunk_size)`，并且只当门槛用（2026-11-06 与 lead 确认）：
+    - 为什么去掉上界 `remaining / 2`：切分总在一半处切，`planned` 只决定一个 chunk 值不值得切。代码里 `Legacy` 的 `planned_chunk_size` 也只是这样一个门槛。当门槛用时，`planned` 永远不超过剩余量的一半，剩余量也就永远够，这个门槛永远不起作用，donor 的速率也就不影响任何结果。
+    - 为什么不把 `planned` 当成切出来的大小（新 runner 分到的，或者原 runner 留下的）：bolt-load 的 runner 不像 IDM 的连接那样会被复用，下完自己的 chunk 就停，不会接着去切别的块。短的那一边大约 2 s 就下完，它的槽位空着，`Doubling` 只好不停地再切，连接数会一直在 2 附近来回。
+  - 85% 的限速闸门：限速还没有实现，只留了接口。
+- **已知限制。**
+  - 节奏是 3 s，不是 2 s：tick 是 1.5 s，扩张要等上次扩张之后至少 2 s 的第一个 tick。第一个 tick 在开始时立即触发，由并发控制建第一个 runner；之后最快在 1.5 s、4.5 s、7.5 s 翻倍，7.5 s 才到 8 条连接。`Legacy` 的 QuickStart 每个 tick 都可以翻倍，最快 4.5 s 到 8 条。T14 的基准测试会量出差别。
+  - 停滞之后不再扩张，下完的 runner 也不补。收尾阶段，连接数会随着 runner 下完逐渐减少。没停滞时，下完的 runner 会通过正常的扩张补上。
+  - 只判断完整的翻倍，所以扩张如果一直只是部分的，就永远不会下结论：比如上限一格一格地恢复，或者在上限处反复 8 → 7 → 8（一个 runner 下完、再切一个补上）。这时即使真的停滞了（总速度不再变化）也发现不了，循环会一直切分补位。这是接受了的盲区：连接数不超过当前上限，每次补位之间至少隔 2 s。T14 要量它的代价。`test_refills_at_the_limit_are_never_judged` 和 `doubling_refills_a_step_at_a_time_without_any_gain` 把这个行为固定下来。
+  - 剩余最多的 chunk 优先：它不到自己的门槛就停下，不再看别的 chunk。别的 chunk 剩得少一些、但 runner 更慢，门槛更低，本来可以切，也不会被选上。T14 要测连接速度不一的场景。
+  - 速率只看一个 tick（1.5 s）。runner 攒满 32 KiB 才交一帧，所以慢于约 21 KiB/s（32 KiB ÷ 1.5 s）的 runner，有的 tick 里看起来没有数据，那个 tick 就不扩张。
+  - writer 满的时候，下载循环不取 runner 的数据，这个 tick 看起来也没有数据，不扩张。这是有意的：瓶颈在写入时，加连接没有用。
+  - `planned` 的下限是 `min_chunk_size`，所以剩余量在 `min_chunk_size` 到 `2 × min_chunk_size` 之间、donor 又慢的 chunk 也会被切，两半都小于 `min_chunk_size`。`Legacy` 的 `SplitGivenTask` 也是这样（只要求剩余量 ≥ `min_chunk_size`）。T27 的“没有可切的活”按 `2 × min_chunk_size` 定义（§9.6），和这里的门槛不一样，T27 开工时要对齐。
+- **验证。**
+  - `DoublingStrategy` 的单元测试，速度序列和时间点都由测试构造，不 sleep：
+    - `test_steady_growth_doubles_up_to_the_limit`：每个 runner 加 1 MiB/s，按 1.5 s 的 tick 走，连接数依次是 1、2、4、8，然后停在上限；
+    - `test_the_target_is_capped_at_the_limit`：上限 6 时是 1、2、4、6；
+    - `test_no_growth_at_the_limit`：活跃数达到或超过上限（包括降级后的上限）时不扩张，低于上限时只扩到上限；
+    - `test_growth_stops_below_a_ten_percent_gain`：增益正好 1.10 时继续扩张，1.0999 时停滞，之后速度再高也不扩张；
+    - `test_no_growth_when_the_speed_drops`：扩张后速度下降，停滞；
+    - `test_a_tick_with_fewer_runners_does_not_judge_the_growth`：扩张后有 runner 下完，这次不判，继续扩张；下一次扩张照常判，停滞后不再扩张；
+    - `test_runners_that_stopped_at_the_limit_are_replaced`：扩到上限时不判；runner 下完之后补回上限；
+    - `test_refills_at_the_limit_are_never_judged`：在上限处反复 8 → 7 → 8，总速度一直不变，每次都不判断，每次都补回 8（已知限制里的盲区）；
+    - `test_no_growth_while_a_runner_is_inactive`：有 runner 不活跃时不扩张，扩张的判断也等到全部活跃的 tick；
+    - `test_no_growth_while_congested`：拥塞时不扩张，也不算扩张，下一个 tick 就能扩张；
+    - `test_no_growth_without_a_speed`：第一次采样没有速度，不扩张；
+    - `test_the_grow_interval`：上次扩张后 2 s − 1 ns 不扩张，2 s 扩张；按 1.5 s 的 tick，下一个 tick 不扩张，再下一个扩张；
+    - `test_a_refused_split_is_no_growth`：一个都没加不算扩张，下一个 tick 再试；加了一部分算扩张，2 s 从这次算起；
+    - `test_a_truncated_growth_is_not_judged`：4 个 runner 要加 4 个、只加了 2 个，之后速度没变，照样扩张；上限从 12 一格一格恢复到 13、16，每条连接 1 MiB/s，11 到 12、12 到 13 都不判断，照样扩张；之后一次完整的翻倍（16 到 32）没有变快，停滞；
+    - `test_no_growth_near_the_speed_limit`：限速接口，速度到 85% 时不扩张，低于时扩张；
+    - `test_planned_split_size_follows_the_donor`：donor 都是 3 MiB/s 时，2 个 runner 和 8 个 runner（每 runner 平均速度不同）算出的 `planned` 相同，都是 6 MiB；没有速率时用平均速度；不低于 `min_chunk_size`，NaN 和无穷大也有定义。
+  - `ChunkPlanner` 的单元测试 `test_every_claim_is_a_new_generation`：缩小和切分时原 chunk 的 generation 不变，切出的新 chunk 拿新的；没收到数据就失败、同一个 ID 领回同一个起点时，也拿新的。
+  - `RunnerRates` 的单元测试（`throughput.rs`）：速率的窗口是两次采样之间的时间；被截掉的字节不算；新 runner 有数据就算活跃、但没有速率；在连接的 runner、这个 tick 没有数据的 runner 都不算活跃；下完的 chunk 不再采样；切分后速率还在；ID 换了 chunk 就没有速率；`test_a_retry_on_the_same_start_starts_without_a_rate`：没收到数据就失败、同一个 ID 领回同一个起点时，第一次采样没有速率，第二次才有；`test_claims_from_a_merged_cooldown_are_new_attempts`：两个相邻的区间都没收到数据就失败，冷却记录合成一条；runner 0 先领取其中一部分、下完，再领取剩下的部分，三次的 generation 互不相同，每次新尝试的第一次采样都没有速率；同一时刻采样两次，没有速度也没有速率。
+  - 下载循环的测试（`download_loop/tests/growth.rs`，用脚本化的 runtime，runner 停在 spawn 处，由测试标记开始、交付字节，每个 tick 都传入时间）：
+    - `doubling_grows_through_split_up_to_the_limit`：`max_connections = 4`，经过真实的 `split`，连接数是 1、2、4；第二个 tick 太早不扩张；到 4 之后每个 tick 都不超过 4 个槽位；区间始终恰好覆盖整个文件；
+    - `doubling_counts_only_the_splits_a_slot_took`：一个槽位被占着时，2 到 4 只加了 1 个；下一次不判断这次截断的扩张，但没有空闲槽位，什么都没加，也不算扩张；槽位放出来之后，1.5 s 后的 tick 就补上，不用再等 2 s；
+    - `doubling_refills_a_step_at_a_time_without_any_gain`：同样的恢复过程，但总速度固定（每个 tick 一共 512 KiB，平分给运行中的 runner）。每一步都不判断，所以没有停滞，循环照样扩张到 16（已知限制里的盲区）；
+    - `doubling_grows_back_as_the_limit_recovers_a_step_at_a_time`：经过真实的 `StrategyControl` 和 `ConcurrencyControlStrategy`。8 个 runner，`max_connections = 16`；一个 503 让并发控制把上限降到 8；30 s 后开始恢复，每 15 s 加 1。每个 runner 每个 tick 交同样多的字节，总速度和 runner 数成正比，10 个以后每一步的增益都不到 10%。上限依次是 8 到 16，循环跟着一格一格扩张，最后是 16 个 runner，没有停滞；任何时候活跃数都不超过当时的上限；
+    - `doubling_waits_for_every_runner_and_the_congestion`：runner 在连接、或者这个 tick 没有数据时不扩张；503 带 `Retry-After: 2` 之后，拥塞期间的 tick 不扩张；`congestion_until − 1 ns` 时策略不发出 `Grow`，`congestion_until` 时发出，那个 tick 扩张；
+    - `doubling_stops_at_a_plateau`：两个 runner 合起来不比一个快，停滞，之后速度再高也不扩张；
+    - `doubling_judges_the_gain_at_ten_percent`：速度是量出来的，有浮点误差，所以在 1.10 两边各差 1 KiB：高的扩张，低的不扩张；
+    - `doubling_splits_only_a_chunk_of_the_planned_size`：14 MiB/s 时 `planned` 是 28 MiB，剩下的比它少 1 B，不切，也不算扩张；1 s 后的速率算出的 `planned` 正好等于剩余量，在一半处切，原 runner 收到新上限；
+    - `planned_split_size_follows_the_donor_rate`：每个 runner 3 MiB/s，任务速度分别是 6 MiB/s（2 个 runner）和 24 MiB/s（8 个 runner），`planned` 都是 6 MiB；还没有速率时用每 runner 的平均速度；
+    - `legacy_is_the_default_and_unchanged`：不设开关和设成 `Legacy` 时，都不采样，策略仍是 dynamic：1.5 MiB/s 时 `SplitAllTask(3 MiB)`，降到 0.5 MiB/s 时因为 `abs()` 仍然 `SplitAllTask(1 MiB)`。
+  - `Legacy` 的单元测试 `test_legacy_thresholds_and_abs`：QuickStart 正好 1 MiB/s 不切、多 1 B/s 切，降速也切；Normal 阶段两边各在 1 MiB/s 处切换。
+  - 性质测试 `splits_stay_within_the_limit_and_cover_the_file` 改为随机选 `Legacy` 或 `Doubling`，原来的断言都对 `Doubling` 成立：不超过上限，槽位不泄漏，区间恰好覆盖文件，拥塞期间不建连接。
+  - `TaskOptions` 和 `TaskBuilder` 的设置方法各有单元测试；默认值是 `Legacy`；派生的 `Clone`、`PartialEq` 包含这个字段。
+  - 已有测试：只有机械的改动，`execute` 多了一个参数（`Legacy` 传 `None`）。
+  - 变异检查，每种都有测试失败：
+    - 去掉停滞判断：`test_growth_stops_below_a_ten_percent_gain`、`test_no_growth_when_the_speed_drops`、`test_a_tick_with_fewer_runners_does_not_judge_the_growth`、`test_a_truncated_growth_is_not_judged`、`doubling_stops_at_a_plateau` 和 `doubling_judges_the_gain_at_ten_percent`；
+    - 1.10 改成 1.0：同样 6 个里的 5 个（降速那个不受影响）；
+    - 去掉 `Doubling` 自己的拥塞检查：`test_no_growth_while_congested` 和 `doubling_waits_for_every_runner_and_the_congestion`；
+    - 去掉不活跃 runner 的检查：`test_no_growth_while_a_runner_is_inactive` 和 `doubling_waits_for_every_runner_and_the_congestion`；
+    - 目标不按上限截断：`test_the_target_is_capped_at_the_limit`、`test_no_growth_at_the_limit`、`test_runners_that_stopped_at_the_limit_are_replaced`、`test_a_truncated_growth_is_not_judged` 和 `doubling_grows_back_as_the_limit_recovers_a_step_at_a_time`；
+    - 截断的扩张也判断停滞：`test_a_truncated_growth_is_not_judged` 和 `doubling_grows_back_as_the_limit_recovers_a_step_at_a_time`；
+    - 尝试只用（ID，chunk 起点）识别，不用 generation：`test_a_retry_on_the_same_start_starts_without_a_rate`；
+    - 门槛改用任务速度：`planned_split_size_follows_the_donor_rate`；
+    - 去掉门槛（剩余量少于 `planned` 也切）：`doubling_splits_only_a_chunk_of_the_planned_size`；
+    - `planned` 可以低于 `min_chunk_size`：`test_planned_split_size_follows_the_donor`；
+    - `Legacy` 改动：去掉 `abs()`（`test_legacy_thresholds_and_abs`、`legacy_is_the_default_and_unchanged`、`test_strategy_tick_while_finished_runners_keep_their_slots`）；QuickStart 阈值改成 0.5 MiB/s（`test_legacy_thresholds_and_abs`）；`planned` 改成速度 × 3（`legacy_is_the_default_and_unchanged`）；`Legacy` 走 `Doubling`（`legacy_is_the_default_and_unchanged` 和两个原有的 dynamic 策略测试）；默认值改成 `Doubling`（6 个测试）；
+    - 判断停滞时不看活跃数：`test_a_tick_with_fewer_runners_does_not_judge_the_growth` 和 `test_runners_that_stopped_at_the_limit_are_replaced`；
+    - 一个都没加也算扩张：`test_a_refused_split_is_no_growth`、`doubling_counts_only_the_splits_a_slot_took` 和 `doubling_splits_only_a_chunk_of_the_planned_size`；
+    - 去掉 2 s 间隔：`test_the_grow_interval`、`test_a_refused_split_is_no_growth`、`doubling_grows_through_split_up_to_the_limit` 和 `doubling_judges_the_gain_at_ten_percent`。
