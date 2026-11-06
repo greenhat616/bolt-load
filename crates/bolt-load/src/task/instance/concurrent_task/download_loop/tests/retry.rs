@@ -1,15 +1,20 @@
-//! Backoff of failed ranges and `Retry-After` in the loop (design §8.1).
+//! Backoff of failed ranges, `Retry-After` and the failure budget of a
+//! range in the loop (design §8.1, §8.2).
 //!
 //! Every step gets its time passed in, except in two tests that wait for
 //! real time: `loop_retries_after_the_backoff_without_a_tick` waits for the
 //! loop's own timer, and `retry_after_holds_back_the_requests_to_the_server`
 //! for `Retry-After` at a real server.
 
-use std::{ops::Range, pin::pin, sync::Arc, task::Context};
+use std::{num::NonZeroU32, ops::Range, pin::pin, sync::Arc, task::Context};
 
 use async_ringbuf::{
     AsyncHeapRb,
     traits::{Producer, Split},
+};
+use bolt_load_tests::adapter::{
+    fault::{FaultKind, FaultPlan},
+    simple::SimpleTestAdapterBuilder,
 };
 use pretty_assertions::assert_eq;
 
@@ -196,6 +201,8 @@ async fn retry_after_holds_back_every_new_connection() {
             Cooldown {
                 end: TOTAL,
                 attempts: 1,
+                // A congestion is not charged to the range.
+                charged: 0,
                 not_before: until
             }
         )]
@@ -381,6 +388,174 @@ fn loop_retries_after_the_backoff_without_a_tick() {
         drop(download);
         file_writer.finalize().await.unwrap();
     });
+}
+
+/// A loop on `rt` with `options`, whose parked runners fail to connect with
+/// a retryable error once the test runs them.
+async fn failing_loop(rt: &ScriptedRuntime, options: &TaskOptions) -> (DownloadLoop, FileWriter) {
+    let adapter = SimpleTestAdapterBuilder::new()
+        .content_size(1)
+        .support_range(true)
+        .range_connect_plan(FaultPlan::AlwaysFail(FaultKind::Retryable))
+        .build()
+        .unwrap();
+    loop_with_options(
+        ThreadedRuntimeImpl::new_other_rt(rt.clone()),
+        DynBoltLoadAdapter::new_arc(adapter),
+        TOTAL,
+        options,
+    )
+    .await
+}
+
+/// The only runner the loop spawned since the last call.
+fn single_parked(rt: &ScriptedRuntime) -> futures::future::FutureObj<'static, ()> {
+    let mut parked = rt.take_parked();
+    assert_eq!(parked.len(), 1, "expected one new runner");
+    parked.pop().unwrap()
+}
+
+/// `runner` delivers `len` bytes, which the loop accepts at `now` and
+/// writes; the write completes.
+async fn deliver_and_write(
+    download: &mut DownloadLoop,
+    runner: &mut TestRunner,
+    len: usize,
+    now: Instant,
+) {
+    runner
+        ._data
+        .try_push(DataFrame {
+            data: bytes::Bytes::from(vec![0; len]),
+        })
+        .unwrap();
+    let tick = download.manager.tick().await;
+    assert!(tick.downloaded.is_some());
+    assert!(download.on_runner(tick, now).unwrap().is_continue());
+    let completions = download.writer.tick().await.unwrap();
+    download.record_completions(completions).unwrap();
+}
+
+/// G6 through the loop: the range of a runner that keeps failing is
+/// retried after each backoff, while another runner writes between its
+/// failures, so the consecutive failures never reach their limit of 2. The
+/// range's third failure ends the task with `RangeExhausted`, which carries
+/// that failure, not an earlier one.
+#[tokio::test]
+async fn a_failing_range_ends_the_task_while_another_runner_writes() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let options = TaskOptions::default()
+        .max_connections(NonZeroUsize::new(2).unwrap())
+        .max_consecutive_failures(2)
+        .max_attempts_per_range(NonZeroU32::new(3).unwrap());
+    let (mut download, file_writer) = failing_loop(&rt, &options).await;
+    let mut healthy = spawn_test_runner(&mut download, 0..HALF);
+    healthy.lifecycle.try_push(LifecycleEvent::Started).unwrap();
+    download.manager.tick().await;
+    // The first step creates a runner for the other half.
+    let mut now = Instant::now();
+    download.on_strategy_tick(now);
+
+    for attempt in 1..=2 {
+        // It fails to connect.
+        single_parked(&rt).await;
+        let tick = download.manager.tick().await;
+        let failure = tick.failure.as_ref().unwrap();
+        assert!(failure.error.is_retryable(), "{failure:?}");
+        assert_eq!(
+            (failure.range.clone(), failure.attempts, failure.charged),
+            (HALF..TOTAL, attempt, attempt)
+        );
+        assert!(download.on_runner(tick, now).unwrap().is_continue());
+
+        // The other runner writes, which resets the consecutive failures.
+        deliver_and_write(&mut download, &mut healthy, 1024, now).await;
+
+        // The range is retried once its backoff ends.
+        let (range, cooldown) = single_cooldown(&download);
+        assert_eq!((range, cooldown.charged), (HALF..TOTAL, attempt));
+        download.on_deadline(cooldown.not_before - NANO).unwrap();
+        assert_eq!(download.manager.allocated_runner_count(), 1);
+        now = cooldown.not_before;
+        download.on_deadline(now).unwrap();
+        assert_eq!(download.manager.allocated_runner_count(), 2);
+    }
+
+    // The third attempt is lost instead.
+    drop(single_parked(&rt));
+    let tick = download.manager.tick().await;
+    match download.on_runner(tick, now) {
+        Err(DownloadError::Transfer { source }) => match &*source {
+            TaskError::RangeExhausted {
+                range,
+                attempts,
+                source,
+            } => {
+                assert_eq!((range.clone(), *attempts), (HALF..TOTAL, 3));
+                assert!(matches!(**source, TaskError::ChannelClosed), "{source:?}");
+            }
+            other => panic!("expected RangeExhausted, got {other:?}"),
+        },
+        other => panic!("expected RangeExhausted, got {other:?}"),
+    }
+
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A timeout after the runner delivered bytes is a restart: with one
+/// consecutive failure and one attempt per range allowed, the task goes on
+/// and retries the rest of the range after a backoff. That retry failing
+/// without data is the range's first charged failure, which ends the task.
+#[tokio::test]
+async fn a_timeout_after_data_restarts_the_range() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let options = TaskOptions::default()
+        .max_connections(NonZeroUsize::new(2).unwrap())
+        .max_consecutive_failures(1)
+        .max_attempts_per_range(NonZeroU32::new(1).unwrap());
+    let (mut download, file_writer) = failing_loop(&rt, &options).await;
+    let mut runner = spawn_test_runner(&mut download, 0..TOTAL);
+    runner.lifecycle.try_push(LifecycleEvent::Started).unwrap();
+    download.manager.tick().await;
+    let t0 = Instant::now();
+    deliver_and_write(&mut download, &mut runner, 1024, t0).await;
+
+    runner
+        .lifecycle
+        .try_push(LifecycleEvent::failed(TaskError::Timeout))
+        .unwrap();
+    let tick = download.manager.tick().await;
+    let failure = tick.failure.as_ref().unwrap();
+    assert_eq!(
+        (failure.received, failure.attempts, failure.charged),
+        (1024, 1, 0)
+    );
+    assert!(download.on_runner(tick, t0).unwrap().is_continue());
+    let (range, cooldown) = single_cooldown(&download);
+    assert_eq!(
+        (range, cooldown.attempts, cooldown.charged),
+        (1024..TOTAL, 1, 0)
+    );
+
+    // The first step at the end of the backoff retries the rest.
+    let end = cooldown.not_before;
+    download.on_strategy_tick(end);
+    let state = download.manager.get_runner_state(0).unwrap();
+    assert_eq!(
+        (state.allocated.clone(), state.attempts, state.charged),
+        (1024..TOTAL, 1, 0)
+    );
+    drop(single_parked(&rt));
+    let tick = download.manager.tick().await;
+    assert!(matches!(
+        download.on_runner(tick, end),
+        Err(DownloadError::Transfer { source })
+            if matches!(&*source, TaskError::RangeExhausted { range, attempts: 1, .. } if *range == (1024..TOTAL))
+    ));
+
+    drop(download);
+    file_writer.finalize().await.unwrap();
 }
 
 /// Aborts the server task when dropped, also when a test panics, so that

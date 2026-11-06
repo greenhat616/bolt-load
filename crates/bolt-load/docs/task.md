@@ -71,6 +71,19 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   [`TaskOptions::max_consecutive_failures`] retryable failures without a
   successful non-empty write in between, the task fails with
   `TaskError::RetryLimitExceeded`, which carries the last error.
+- **Failures of one range** (concurrent mode): the other connections'
+  writes do not reset them. Once a range has failed
+  [`TaskOptions::max_attempts_per_range`] times, the task fails with
+  `TaskError::RangeExhausted`, which names the range and carries its last
+  error. A `Congestion` failure is not counted. The count goes with the
+  range like its backoff, see below. When a failure reaches both limits,
+  the task fails with `RangeExhausted`.
+- **Restarts** (concurrent mode): a timeout or a dropped stream after the
+  attempt delivered bytes counts neither as a consecutive failure nor
+  for its range. The range keeps the delivered bytes and only backs off,
+  so every restart makes progress. A timeout before any byte, a failed
+  connect and any other retryable failure count, a lost runner even
+  after it delivered bytes.
 - **Unretryable failures** end the task with the adapter's original
   error. The one exception is `Congestion` (429/503) while other
   attempts are still in flight: it is a concurrency signal for the
@@ -121,6 +134,7 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 | `max_connections` | 8, whatever the CPU count |
 | `no_progress_timeout` | 60 s |
 | `max_consecutive_failures` | `max(8, 2 × max_connections)` |
+| `max_attempts_per_range` | 5 |
 | `stream_idle_timeout` | 30 s |
 | `connect_timeout` | 30 s |
 | `meta_retry` | 3 retries, 200 ms – 2 s per wait |

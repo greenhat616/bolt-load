@@ -885,7 +885,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - 合并：退回的区间和它重叠或相接的记录合成一条，`attempts` 取较大值，`not_before` 取较晚值。这样任何字节都不会早于它原来的 `not_before` 被领取。旁边的新字节不并进来，仍然是新的。
     - 部分领取：领取的部分带走覆盖到的记录里最大的 `attempts`；记录在领取范围以外的部分，保留原来的 `attempts` 和 `not_before`。正常流程不会领取冷却中的区间（见门控），只有直接调用才会出现。
     - 切分：后半段从 0 开始。`resize` 让出的尾部原来属于 chunk，没有记录；`split_chunk` 的新 chunk 也从 0 开始。原 chunk 保留自己的 `attempts`。
-  - 两步记录：runner manager 处理失败时只释放区间，`AttemptFailure` 带上 `range` 和 `attempts`。下载循环在 `on_runner` 里拿到 `now`，再算退避、写记录，两步之间没有别的代码运行。任务取消时 runner 不报失败，所以不退避。T10 可以直接拿 `AttemptFailure::attempts` 和 `max_attempts_per_range` 比较。
+  - 两步记录：runner manager 处理失败时只释放区间，`AttemptFailure` 带上 `range` 和 `attempts`。下载循环在 `on_runner` 里拿到 `now`，再算退避、写记录，两步之间没有别的代码运行。任务取消时 runner 不报失败，所以不退避。`attempts` 只决定退避；T10 的每区间预算不比较它，而是比较另一个计数 `charged`，见 §14.13。
   - 退避函数：backon 1.6.0（`Cargo.lock`）的 `ExponentialBuilder`，最小 0.5 s，×2，最大 30 s，`with_jitter()`。
     - 第 n 次失败（从 1 数）的基础延迟是 `min(0.5 s × 2^(n−1), 30 s)`。
     - backon 的抖动是加性的：`d + d × U[0, 1)`，结果落在 `[d, 2d)`；而且抖动加在 `max_delay` 截断之后。所以和 `meta.rs` 一样，结果再截到 30 s。第 n 次的等待在 `[d, min(2d, 30 s)]` 之间，从第 7 次起恒为 30 s。
@@ -963,3 +963,98 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `split` 不检查拥塞：`retry_after_holds_back_every_new_connection`；
     - 领取时不带上 `attempts`：4 个 `ChunkPlanner` 测试、4 个下载循环测试和性质测试；
     - 唤醒创建不等降级：`test_create_tasks_waits_for_the_first_step_and_the_degradation` 和 `wake_up_before_the_degradation_leaves_the_retry_to_a_later_tick`。
+
+### 14.13 每区间失败预算（PR-6，C10）
+
+- **做法。**
+  - 三层都在 `FailurePolicy::on_failure` 里判定，顺序如下：
+    1. 不可重试的失败照旧：别的连接还在途时，429/503 交给并发控制，任务继续；其它不可重试的失败直接结束任务。
+    2. 重启：本次尝试收到过数据之后的超时或断流，只退避，然后返回。它不计入连续失败，也不记到区间的预算上。
+    3. 每区间预算：区间记过的失败数达到 `max_attempts_per_range` 时，任务以 `RangeExhausted` 结束。
+    4. 任务级连续失败：和原来一样，`on_write_ok` 会清零。
+  - 两个上限在同一次失败上同时达到时，返回 `RangeExhausted`。它说明是哪个区间，还带着这个区间最后一次的错误，比“连续失败太多”更有用。
+  - “收到过数据”指这次尝试有字节被 planner 接收，也就是 chunk 的已下载部分不为空：
+    - 被截掉的字节不算，例如 runner 读到缩小后的上限之前多发的部分；
+    - 还在通道里、没被取走就超时的字节也不算；
+    - 一个 chunk 只属于一次尝试，领取时已下载部分是空的。所以失败时已下载部分的长度，就是这次尝试交付的字节数。`mark_failed` 把它放进 `Released::received`，runner manager 再把它带到 `AttemptFailure::received`。
+    - 这样定义，每次重启都会让区间变短，重启不可能在没有进展的情况下一直进行。
+  - “超时或断流”对应的错误（按 §14.1 的分类）：
+    - `TaskError::Timeout`：空闲超时、数据排空超时和连接超时。连接超时发生在连上之前，一定没有数据，所以总是计入；
+    - `RetryableError::Io`：连接失败（没有数据，计入），或者 body 读到一半断开，例如连接被重置、EOF 来得太早；
+    - `TaskError::SmallerThanTotalSize`：body 正常结束，但没到区间末尾。
+    - 不算重启：可重试的状态码（`RetryableError::Status`），它在第一个字节之前就到了；`ChannelClosed`，它表示 runner 丢了，是本地的问题，不是连接断了。
+  - 两个计数。区间上有两个失败计数，名字和规则以这里为准：
+    - `attempts`（C9，不变）：这个区间失败过几次。每次任务挺过去的失败都加 1，包括被容忍的 429/503。它只决定退避多长（§8.1、§14.12）。
+    - `charged`（本次新增）：这个区间记到预算上的失败数，每区间预算只比较它。
+      - 加 1 的失败：可重试、并且不是重启的失败。也就是连接失败、没有数据的超时、`ChannelClosed`、可重试的状态码，以及没有数据时的断流。
+      - 不加的失败：重启（收到过数据之后的超时或断流），以及 429/503。其它不可重试的失败直接结束任务，也不加。
+      - 判定写在 `failure_policy.rs` 的 `charges_range` 里。
+    - 两个计数随区间走的规则相同：
+      - 存在 `ChunkState::charged` 和 `Cooldown::charged` 里，和 `attempts` 并排；
+      - 相接或重叠的冷却记录合并时，各自取较大值；
+      - 新 chunk 领取区间时，各自取它覆盖到的记录里的最大值，新字节算 0；
+      - 切分出的后半段（`resize` 让出的尾部和 `split_chunk` 的新 chunk）都从 0 开始，原 chunk 保留自己的值；
+      - `PlannerGuard` 回滚时随整个 planner 一起恢复。
+    - 所以总有 `charged ≤ attempts`。
+    - 传递：`mark_failed` 在 `Released::charged` 里返回失败之前的值，因为 planner 不知道失败的原因。runner manager 构造 `AttemptFailure` 时调用 `charges_range`，算出包含这次在内的 `AttemptFailure::charged`。`back_off` 把 `attempts` 和 `charged` 一起写进冷却记录。
+  - 空区间：runner 在区间下完之后才失败时，退回的区间是空的。这时没有可耗尽的东西，不检查预算。连续失败照常按上面的规则算：重启不计，其余可重试的失败计入。
+  - 公开 API 的变化：
+    - 新增 `TaskError::RangeExhausted { range, attempts, source }`。消息是 `bytes {start}..{end} failed {attempts} times, last error: {source}`，`source()` 指向最后一次的错误，写法和 `RetryLimitExceeded` 一样。`TaskError` 不是 `#[non_exhaustive]`，加变体是破坏性变更，所以提交信息带 `!`。
+    - 新增 `TaskOptions::max_attempts_per_range: NonZeroU32` 和常量 `DEFAULT_MAX_ATTEMPTS_PER_RANGE`（5）。`TaskOptions::max_attempts_per_range(n)` 和 `TaskBuilder::max_attempts_per_range(n)` 设置它，和 C7 的 `max_connections` 一样；之后再调用 `options(...)` 会整体替换掉它。`TaskOptions` 是 `#[non_exhaustive]`，加字段不破坏兼容。
+    - 类型本身保证至少为 1，所以不需要构建时检查。等于 1 时，区间第一次记到预算上的失败就结束任务；重启和 429/503 仍然只退避。
+    - `DownloadError::Transfer` 的文档加上了这种情况。没有别的地方按 `TaskError` 的变体做映射，所以不用改别的代码。
+- **与 §8.2 的偏差。**
+  - 预算比较的是 `charged`，不是 `attempts`，所以有两个计数。
+    - §8.2 的表里，重启一行写的是“不计入连续失败，只走 §8.1 的退避；`attempts` 照常增加”，兜底一栏是 `no_progress_timeout`，不是预算。每区间预算一行又写 `attempts >= max_attempts_per_range`。两处放在一起是矛盾的：如果预算直接数 `attempts`，重启就不只是退避了。
+    - 具体的后果：网络不稳定时，一个大区间每次都收到一些数据、然后断开，断 5 次任务就失败了。原来的代码在这种情况下会一直下完。
+    - 429/503 也会悄悄耗掉预算。服务器限制连接数时，并发控制降级 30 s 后会多开一个连接试探，可能每次都落在同一个区间上。这个区间被拒 4 次之后，再来一次普通的失败，任务就结束了。
+    - 改进方案也是这么分的：P1-4 第 1 条说重启“整体由 `no_progress_timeout` 兜底”；P1-7 的 S4 第 3 条说重启“不计入失败预算……但计入 `attempts`”。
+    - 所以 `attempts` 仍按 §8.1 增加，C9 的退避和它的断言都不变；预算另外计数。
+  - 不记预算的失败怎么收尾：
+    - 重启一定会结束：重启要求这次尝试有字节被 planner 接收，所以每次重启都让区间严格变短。区间只有有限个字节，重启的次数也就有限。没有进展的失败都不是重启，都要记预算。
+    - 429/503（§8.2 没说计不计入，这里不计入）：只有别的连接还在途时才被容忍；没有别的连接时，它像原来一样直接结束任务。被容忍期间，`no_progress_timeout` 也照常有效。
+  - G6 仍然成立：它针对的是“健康连接掩盖一个反复失败的区间”。没有进展的失败都记到这个区间的预算上，别的连接写成功也不会清零它。每次都有进展的区间不算反复失败，它会一点点下完。
+  - `RangeExhausted` 比 §8.2 多一个 `attempts` 字段，用来在消息里写出次数。它等于 `charged`，也就是上限，可能比决定退避的 `attempts` 小。`source` 是这次失败的错误。
+  - `range` 是最后一次失败退回的区间。区间收到过数据时，它只是还没下完的那部分。
+- **已知限制。**
+  - 重启只受 `no_progress_timeout` 约束。服务器每次只发很少的字节就停住时，每次重启都有进展，无进展超时不会触发，下载会很慢但不会失败。以后 §9.5 的低速重启可以处理这种情况。
+  - 区间被切分后，新的一半从 0 开始计数（§8.1 的规则，C9 已经这样做）。一个坏区间被切成几段时，每段都有自己的预算。
+  - runner 丢失（`ChannelClosed`）总是记到预算上，即使它之前收到过数据。
+- **验证。**
+  - `FailurePolicy` 的单元测试（`AttemptFailure` 都用 runner manager 的构造函数生成，记不记预算走真实的判定）：
+    - `test_a_failing_range_ends_the_task_despite_healthy_writes`（G6）：连续失败上限是 2。区间先后以 5 种不同的错误失败，每两次之间别的连接写成功一次。前 4 次任务继续，第 5 次以 `RangeExhausted { range, attempts: 5 }` 结束，`source` 是第 5 次的错误；
+    - `test_without_writes_the_consecutive_limit_ends_the_task_first`：同样的失败，中间没有写入时，第 2 次就以 `RetryLimitExceeded` 结束；
+    - `test_a_timeout_after_data_is_not_a_consecutive_failure`：两个上限都是 1。收到数据之后的超时、连接重置和提前结束都不结束任务，连续失败数保持 0，预算也不记；
+    - `test_a_timeout_without_data_still_counts`：没有数据的超时计入连续失败，第 2 次以 `RetryLimitExceeded` 结束；
+    - `test_what_restarts_and_what_is_charged`：上面的错误分类表，以及不可重试的失败（包括 429/503）都不记预算；
+    - `test_the_range_budget_ends_at_exactly_its_limit`：上限是 3 时，记到第 2 次继续，第 3 次结束；上限是 1 时，第一次记的失败就结束，而重启仍然只退避；
+    - `test_restarts_and_congestion_are_not_charged`：区间已经失败 6 次，但都是重启或 429/503，预算还是 0；之后第 2 次记的失败才结束任务；
+    - `test_the_range_budget_comes_before_the_consecutive_limit`：两个上限同时达到时，返回 `RangeExhausted`；
+    - `test_a_complete_range_is_not_exhausted`：退回的区间为空时，不检查预算，但仍计入连续失败。
+  - `ChunkPlanner`：`test_charged_failures_are_carried_like_attempts` 里 `charged` 和 `attempts` 不相等，验证两者各自取较大值、领取时带走、切分出的区间从 0 开始，以及 `mark_failed` 返回失败之前的 `charged` 和收到的字节数。C9 测试里的辅助函数改为每次失败都记预算，所以 C9 的合并、部分领取和切分测试也同时覆盖了 `charged`。
+  - runner manager：`test_a_failure_reports_only_the_bytes_the_planner_accepted` 直接检查 `received` 的边界，三个 runner 都以超时结束：
+    - 数据排空超时，帧还都在通道里：`received = 0`，这次失败记预算（`charged = 1`）；
+    - 接收了一帧，下一帧还在通道里：`received` 只算接收的 100 字节，这次是重启（`charged = 0`），退回的是剩下的部分；
+    - chunk 缩小到已下载部分之后 50 字节，runner 读到新上限之前又发了 200 字节：planner 只接收 50 字节，`received` 是 150，不是 300。
+  - 下载循环的测试（显式传入 `now`）：
+    - `a_failing_range_ends_the_task_while_another_runner_writes`：两个连接，连续失败上限 2，每区间上限 3。一个测试控制的 runner 下载前半段；后半段的 runner 由循环自己创建，用真实的 runner 和 adapter 连接，连接失败（可重试的 io 错误）。每次失败后，另一个 runner 交付 1 KiB，写入完成，连续失败清零；区间在 `not_before − 1 ns` 时不重试，在 `not_before` 时由唤醒重试。第 3 次的 runner 丢失（`ChannelClosed`），任务以 `RangeExhausted { range: 后半段, attempts: 3 }` 结束，`source` 是 `ChannelClosed`，不是前两次的 io 错误；
+    - `a_timeout_after_data_restarts_the_range`：两个上限都是 1。runner 交付 1 KiB 后超时，`AttemptFailure` 带着 `received = 1024`、`charged = 0`，任务继续；剩下的部分冷却，`attempts = 1`、`charged = 0`。冷却结束后的 step 重建 runner，它没有数据就丢失了，这是区间第一次记的失败，任务以 `RangeExhausted` 结束。这个测试检查 `received` 从 planner 一路传到了 `FailurePolicy`。
+  - 性质测试：`Fail` 新增超时一种（有数据时是重启），失败改用 `AttemptFailure::new` 构造。每次失败后检查：`mark_failed` 返回失败之前的 `charged`；`charged` 只在 `ChannelClosed`、或没有数据的超时时加 1，429/503 和重启不加；冷却记录的 `charged` 不小于这次的值。每一步之后还检查：冷却记录和每个 runner 的 chunk 都满足 `charged ≤ attempts`；新建的 runner 的 `charged` 等于它领取到的记录里最大的 `charged`；切分出的后半段（落在这一步之前已有 chunk 的范围里）`attempts` 和 `charged` 都是 0。
+  - `TaskError` 的消息和 `source()`、默认值 5、两个设置方法各有单元测试。
+  - 已有测试：C9 关于 `attempts` 的断言一条都没改。只有机械的改动：`Released` 和 `Cooldown` 的字面量加了新字段（C9 的 503 测试里是 `charged: 0`，同时验证了 503 不记预算）；C9 测试的 `cool_down` 调用多了一个参数，值和 `attempts` 相同。`termination.rs` 里 `RetryLimitExceeded` 的测试把连续失败上限设成 2 或 3，比 5 小，结果不变。
+  - 变异检查，每种都有测试失败：
+    - 去掉预算检查：6 个测试，包括两个下载循环测试；
+    - `>=` 改成 `>`：同样 6 个测试；
+    - 收到数据之后的超时计入连续失败：`test_a_timeout_after_data_is_not_a_consecutive_failure` 和 `a_timeout_after_data_restarts_the_range`；
+    - 没有数据的超时不计入：3 个 `FailurePolicy` 测试和性质测试；
+    - `source` 不是最后一次的错误（改用上一次失败的错误）：`test_a_failing_range_ends_the_task_despite_healthy_writes` 和 `a_failing_range_ends_the_task_while_another_runner_writes`；
+    - 429/503 也记预算：`test_restarts_and_congestion_are_not_charged`、`test_what_restarts_and_what_is_charged`、`retry_after_holds_back_every_new_connection` 和性质测试；
+    - 重启也记预算：`test_a_timeout_after_data_is_not_a_consecutive_failure`、`test_what_restarts_and_what_is_charged`、`a_timeout_after_data_restarts_the_range` 和性质测试；
+    - 切分出的后半段继承前面 chunk 的 `charged`：`test_split_range_starts_without_attempts` 和性质测试；
+    - 有数据时 `received` 报 0：2 个 `ChunkPlanner` 测试、`test_a_failure_reports_only_the_bytes_the_planner_accepted` 和 `a_timeout_after_data_restarts_the_range`；
+    - 领取时不带走 `charged`：3 个 `ChunkPlanner` 测试、`a_failing_range_ends_the_task_while_another_runner_writes` 和性质测试；
+    - 合并时不取较大的 `charged`：`test_adjacent_cooldowns_merge`；
+    - `FailurePolicy` 不读配置（固定为 5）：5 个测试；
+    - `TaskBuilder::max_attempts_per_range` 不写入：`test_max_attempts_per_range_sets_the_option`；
+    - 先查连续失败、再查预算：`test_the_range_budget_comes_before_the_consecutive_limit` 和 `a_timeout_after_data_restarts_the_range`；
+    - 区间为空时也检查预算：`test_a_complete_range_is_not_exhausted`。
