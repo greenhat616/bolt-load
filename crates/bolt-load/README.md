@@ -110,6 +110,15 @@ reassigned to new runners via the `DynamicStrategy`. A split first
 reserves a slot for the new runner, so it never exceeds
 `max_connections`; without a free slot the ranges stay as they are.
 
+The unstable `unstable-strategy` feature adds
+`TaskOptions::growth_strategy`, to try the `Doubling` strategy instead.
+At most every 2 s, while every runner delivers data and the task is not
+held back by a 429 or 503, it doubles the runners up to the current
+limit, by splitting the running ranges with the most left. A split needs
+at least 2 s of work at the split runner's own rate. Once a doubling
+gains less than 10% in speed, it stops adding runners. It may change or
+go away.
+
 A failed range is retried after a backoff: 0.5 s after its first
 failure, doubling up to 30 s, with jitter. A 429 or 503 holds back every
 new connection of the task, splits included, for its `Retry-After` when
@@ -146,6 +155,7 @@ a lost runner even after it delivered bytes.
 | `gzip`, `deflate` | Yes | Decode content-coded full downloads |
 | `br` | No | Decode `br` |
 | `zstd` | No | Decode `zstd`; builds the libzstd C library |
+| `unstable-strategy` | No | Unstable: `TaskOptions::growth_strategy` chooses the `Doubling` growth strategy |
 
 ## File Writer Backends
 

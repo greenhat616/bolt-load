@@ -138,6 +138,7 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 | `stream_idle_timeout` | 30 s |
 | `connect_timeout` | 30 s |
 | `meta_retry` | 3 retries, 200 ms – 2 s per wait |
+| `growth_strategy` | `Legacy`; only with the unstable `unstable-strategy` feature |
 
 Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a
 stalled stream ends the task with `NoProgress` before its runner can time
@@ -214,6 +215,16 @@ The concurrent download path includes several sub-systems:
     split reserves the new runner's slot first: without a free one it
     changes nothing, so a task never runs more than
     `max_connections` runners.
+  - `DoublingStrategy` — unstable, chosen by `growth_strategy` with the
+    `unstable-strategy` feature. At the first strategy tick at least
+    2 s after its last growth, while no runner connects, every runner
+    had bytes accepted in the tick and no 429 or 503 holds the task
+    back, it doubles the runners up to the current limit. Each new
+    runner splits the running range with the most left, if that range
+    holds at least 2 s of work at its runner's own rate. A doubling that
+    gains less than 10% in speed stops it for the rest of the task. It
+    only adds runners; lowering the limit stays with the concurrency
+    strategy.
 - **SpeedSampler** — EMA-based speed calculation (α = 0.33,
   interval = 250 ms).
 - **ID Generator** — [`BitVec`]-backed runner ID allocator with
