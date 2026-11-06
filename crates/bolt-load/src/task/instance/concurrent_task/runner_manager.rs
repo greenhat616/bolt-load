@@ -7,7 +7,7 @@
 //! - Channels for sending control messages to specific runners
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     task::{Context, Poll},
     time::Instant,
@@ -15,6 +15,7 @@ use std::{
 
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
+use smol_cancellation_token::CancellationToken;
 
 /// A chunk of data downloaded by a runner, ready to be written to disk.
 #[derive(Debug)]
@@ -44,6 +45,16 @@ pub(super) struct AttemptFailure {
     /// [`Released::received`](super::chunk_planner::Released::received);
     /// 0 for a failed connect.
     pub received: u64,
+    /// The loop stopped the runner for being slow (design §9.5), see
+    /// [`Self::slow`].
+    // Not `expect`: without tracing, `runner_id` and this field are
+    // reported as one unread pair, which fulfils only the first
+    // expectation.
+    #[cfg_attr(
+        not(feature = "tracing"),
+        allow(dead_code, reason = "only read by tracing and the tests")
+    )]
+    pub slow: bool,
 }
 
 impl AttemptFailure {
@@ -63,6 +74,23 @@ impl AttemptFailure {
             range: released.range,
             attempts: released.attempts,
             received: released.received,
+            slow: false,
+        }
+    }
+
+    /// The attempt of a runner the loop stopped for being slow, whose range
+    /// was `released` (design §9.5, §14.15).
+    ///
+    /// It is reported as a retryable [`TaskError::Timeout`]: the runner
+    /// fell too far behind the others for too long. So it is classified
+    /// like one (design §8.2): after accepted bytes it is a restart, which
+    /// is neither charged nor a consecutive failure; without, it is
+    /// charged, so a runner that never delivers cannot be restarted
+    /// forever.
+    pub(super) fn slow(runner_id: RunnerId, released: Released) -> Self {
+        Self {
+            slow: true,
+            ..Self::new(runner_id, TaskError::Timeout, true, released)
         }
     }
 }
@@ -152,10 +180,13 @@ mod stream;
 use data::DataAggregator;
 use lifecycle::LifecycleAggregator;
 
-/// The receiving ends of a spawned runner.
+/// The receiving ends of a spawned runner, and its own stop.
 pub(super) struct RunnerChannels {
     pub lifecycle_rx: LifecycleReceiver,
     pub data_rx: DataFrameReceiver,
+    /// Cancels this runner alone: a child of the task's cancellation, see
+    /// [`RunnerManager::stop_runner`].
+    pub stop: CancellationToken,
 }
 
 /// A runner that could not be spawned.
@@ -231,6 +262,11 @@ pub struct RunnerManager {
     /// An entry is created when a runner delivers data and removed when it
     /// stops or is lost; snapshots reset the counts but keep the entries.
     meters: HashMap<RunnerId, usize>,
+    /// Each spawned runner's own stop, until it is released.
+    stops: HashMap<RunnerId, CancellationToken>,
+    /// Runners stopped by [`Self::stop_runner`] that have not reported
+    /// `Stopped` yet.
+    stopping: HashSet<RunnerId>,
 }
 
 impl RunnerManager {
@@ -250,6 +286,8 @@ impl RunnerManager {
             connecting_data: HashMap::with_capacity(max_concurrency),
             data_aggregator: DataAggregator::with_capacity(max_concurrency),
             meters: HashMap::with_capacity(max_concurrency),
+            stops: HashMap::with_capacity(max_concurrency),
+            stopping: HashSet::new(),
         }
     }
 
@@ -288,6 +326,7 @@ impl RunnerManager {
     /// This will:
     /// - Close and remove the limit mailbox
     /// - Remove from RunnerNotification (legacy) and aggregators (new)
+    /// - Forget the runner's stop, and that it was stopping
     /// - Recycle the runner ID
     pub fn release_runner(&mut self, runner_id: RunnerId) {
         // The runner sees its limits closed once the sender is dropped
@@ -295,7 +334,44 @@ impl RunnerManager {
         self.lifecycle_aggregator.remove(runner_id);
         self.connecting_data.remove(&runner_id);
         self.data_aggregator.unregister(runner_id);
+        self.stops.remove(&runner_id);
+        self.stopping.remove(&runner_id);
         self.id_generator.release(runner_id);
+    }
+
+    /// Stop the runner of `runner_id` alone, for the loop to restart its
+    /// range (design §9.5, §14.15); returns whether it was stopped.
+    ///
+    /// The runner is cancelled through its own stop, so it reports
+    /// `Stopped` with [`TaskError::Cancelled`], which is then an
+    /// [`AttemptFailure::slow`]: its range is released from the bytes the
+    /// planner accepted. Its slot is freed only then. A runner that
+    /// completes or fails on its own before it notices the stop is handled
+    /// as such.
+    ///
+    /// Only a running runner with bytes left is stopped, once; not one
+    /// without a stop of its own.
+    pub fn stop_runner(&mut self, runner_id: RunnerId) -> bool {
+        let running = self
+            .chunk_planner
+            .get_runner_state(runner_id)
+            .is_some_and(|state| state.status == ChunkStatus::Running && !state.is_complete());
+        if !running || self.stopping.contains(&runner_id) {
+            return false;
+        }
+        let Some(stop) = self.stops.get(&runner_id) else {
+            return false;
+        };
+        stop.cancel();
+        self.stopping.insert(runner_id);
+        true
+    }
+
+    /// Whether the runner was stopped by [`Self::stop_runner`] and has not
+    /// reported `Stopped` yet.
+    #[inline]
+    pub fn is_stopping(&self, runner_id: RunnerId) -> bool {
+        self.stopping.contains(&runner_id)
     }
 
     /// Gets the number of currently allocated runners
@@ -479,10 +555,12 @@ impl RunnerManager {
     }
 
     /// The running runner with the most left to download, see
-    /// [`ChunkPlanner::largest_running_chunk`]
+    /// [`ChunkPlanner::largest_running_chunk`]; not one that is stopping,
+    /// whose range is about to be released.
     #[inline]
     pub fn largest_running_chunk(&self) -> Option<(RunnerId, Range<u64>)> {
-        self.chunk_planner.largest_running_chunk()
+        self.chunk_planner
+            .largest_running_chunk(|runner_id| self.stopping.contains(&runner_id))
     }
 
     /// The smallest chunk the planner hands out
@@ -560,7 +638,8 @@ impl RunnerManager {
         }
         match spawn(runner_id, slot.limits) {
             Ok(channels) => {
-                self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx)
+                self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx);
+                self.stops.insert(runner_id, channels.stop);
             }
             Err(failed) => self.spawn_failures.push_back((runner_id, failed)),
         }
@@ -872,6 +951,7 @@ mod tests {
         let channels = RunnerChannels {
             lifecycle_rx,
             data_rx,
+            stop: Default::default(),
         };
         (channels, lifecycle_tx, data_tx)
     }
@@ -1398,6 +1478,7 @@ mod tests {
                 Ok(RunnerChannels {
                     lifecycle_rx,
                     data_rx,
+                    stop: Default::default(),
                 })
             })
             .unwrap();
@@ -1636,5 +1717,115 @@ mod tests {
                 bytes: 5
             }
         );
+    }
+
+    /// A runner on `range` whose channels the test drives, and its stop.
+    fn spawn_stoppable_runner(
+        manager: &mut RunnerManager,
+        range: Range<u64>,
+    ) -> (
+        crate::runner::LifecycleSender,
+        crate::runner::DataFrameSender,
+        CancellationToken,
+    ) {
+        let stop = CancellationToken::new();
+        let mut senders = None;
+        manager
+            .spawn_runner_with_chunk(range, |_, _limits| {
+                let (channels, lifecycle_tx, data_tx) = test_channels();
+                senders = Some((lifecycle_tx, data_tx));
+                Ok(RunnerChannels {
+                    stop: stop.clone(),
+                    ..channels
+                })
+            })
+            .unwrap();
+        let (lifecycle_tx, data_tx) = senders.unwrap();
+        (lifecycle_tx, data_tx, stop)
+    }
+
+    /// A runner is stopped alone through its own stop, once, and only
+    /// while it runs with bytes left. Its `Stopped` with `Cancelled` is
+    /// then a slow attempt, released from the bytes the planner accepted:
+    /// a frame still in its channel is dropped. Its slot is freed then,
+    /// and the concurrency strategy does not count it.
+    #[tokio::test]
+    async fn test_a_stopped_runner_is_a_slow_attempt() {
+        let mut manager = RunnerManager::new(1000, 4);
+        let (mut lifecycle_tx, mut data_tx, stop) = spawn_stoppable_runner(&mut manager, 0..500);
+        let unstoppable = manager.allocate_runner_with_chunk(500..1000).unwrap();
+        assert!(!manager.stop_runner(unstoppable.runner_id), "no stop");
+        assert!(!manager.stop_runner(0), "still connecting");
+        assert!(!stop.is_cancelled());
+
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        manager.tick().await;
+        push_frame(&mut data_tx, 100).await;
+        assert_eq!(manager.tick().await.downloaded.unwrap().range, 0..100);
+        assert!(manager.stop_runner(0));
+        assert!(stop.is_cancelled() && manager.is_stopping(0));
+        assert!(!manager.stop_runner(0), "stopped once");
+        assert_eq!(manager.allocated_runner_count(), 2);
+
+        push_frame(&mut data_tx, 50).await;
+        lifecycle_tx
+            .try_push(LifecycleEvent::failed(TaskError::Cancelled))
+            .unwrap();
+        let failure = manager.tick().await.failure.unwrap();
+        assert!(failure.slow && failure.retryable, "{failure:?}");
+        assert!(matches!(failure.error, TaskError::Timeout));
+        assert_eq!(
+            (
+                failure.range,
+                failure.received,
+                failure.attempts,
+                failure.charged
+            ),
+            (100..500, 100, 1, 0)
+        );
+        assert_eq!(manager.get_total_downloaded(), 100);
+        assert_eq!(manager.allocated_runner_count(), 1);
+        assert!(!manager.is_stopping(0));
+        assert_eq!(manager.runner_outcome_sampler_mut().stats().total, 0);
+        // The released ID is a new runner, not a stopping one.
+        let (_lifecycle_tx, _data_tx, stop) = spawn_stoppable_runner(&mut manager, 100..500);
+        assert!(!manager.is_stopping(0) && !stop.is_cancelled());
+    }
+
+    /// A stopping runner whose chunk the planner completed before its
+    /// `Stopped` finished it, whatever it reports: no failure, and nothing
+    /// is released. The growth does not split a stopping runner.
+    #[tokio::test]
+    async fn test_a_runner_that_completes_while_stopping_finishes() {
+        for finished in [true, false] {
+            let reason = || {
+                if finished {
+                    StoppedReason::Finished
+                } else {
+                    StoppedReason::Failed(TaskError::Cancelled)
+                }
+            };
+            let mut manager = RunnerManager::new(1000, 4);
+            let (mut lifecycle_tx, mut data_tx, _stop) =
+                spawn_stoppable_runner(&mut manager, 0..800);
+            let _other = manager.allocate_runner_with_chunk(800..1000).unwrap();
+            lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+            manager.tick().await;
+            assert_eq!(manager.largest_running_chunk(), Some((0, 0..800)));
+            assert!(manager.stop_runner(0));
+            assert_eq!(manager.largest_running_chunk(), Some((1, 800..1000)));
+
+            push_frame(&mut data_tx, 800).await;
+            assert_eq!(manager.tick().await.downloaded.unwrap().range, 0..800);
+            lifecycle_tx
+                .try_push(LifecycleEvent::Stopped(reason()))
+                .unwrap();
+            let tick = manager.tick().await;
+            assert!(tick.failure.is_none(), "{:?}: {tick:?}", reason());
+            assert_eq!(tick.state, TaskState::Downloading);
+            assert_eq!(manager.get_available_ranges(), [], "{:?}", reason());
+            assert_eq!(manager.allocated_runner_count(), 1, "{:?}", reason());
+            assert_eq!(manager.runner_outcome_sampler_mut().stats().completed, 1);
+        }
     }
 }

@@ -904,6 +904,7 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
             Ok(RunnerChannels {
                 lifecycle_rx,
                 data_rx,
+                stop: Default::default(),
             })
         })
         .unwrap();
@@ -1167,6 +1168,7 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
             Ok(RunnerChannels {
                 lifecycle_rx,
                 data_rx,
+                stop: Default::default(),
             })
         })
         .unwrap();
@@ -1248,6 +1250,7 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
 }
 
 mod growth;
+mod restart;
 mod retry;
 
 /// Random sequences of the loop's steps, including failures that back their

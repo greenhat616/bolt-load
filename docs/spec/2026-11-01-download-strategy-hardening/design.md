@@ -634,6 +634,7 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
 表里要处理的现状（C9）：
 
 - 现在没法单独停掉一个 runner：所有 runner 共用任务的 cancel token。能做的只有丢掉它的 limit sender，它会以 `ChannelClosed` 停下；生命周期处理把这当成可重试的失败，先调用 `mark_failed`。runner 因取消停下时，处理也是先 `mark_failed`，再跳过失败上报（`runner_manager/lifecycle.rs`）。
+  - C12 之后：每个 runner 有自己的停止开关（任务令牌的子令牌），`RunnerManager::stop_runner` 只停它一个；被停的 runner 报 `Cancelled` 时按低速重启处理，其余 runner 被取消时仍然跳过失败上报（§14.15）。已经决定怎么结束的 runner（拿着错误或已下完、在交最后一段缓冲或等帧被取走）不理这个开关。对冲的败方可以用同一个开关停下，但 T27 要记下停止的原因（低速重启还是对冲败方），manager 按原因处理，不能把被停之后的 `Cancelled` 一律当低速。
 - spawn 被拒绝现在按不可重试的连接失败处理，任务终止（§14.11），处理时同样会 `mark_failed`。
 - 生命周期通道没发 `Stopped` 就关闭时，`handle_runner_lost` 也是先 `mark_failed`，再释放槽位；任务还没完成时，上报一次 `ChannelClosed` 的可重试失败（`runner_manager/lifecycle.rs`）。
 
@@ -1286,3 +1287,127 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - 判断停滞时不看活跃数：`test_a_tick_with_fewer_runners_does_not_judge_the_growth` 和 `test_runners_that_stopped_at_the_limit_are_replaced`；
     - 一个都没加也算扩张：`test_a_refused_split_is_no_growth`、`doubling_counts_only_the_splits_a_slot_took` 和 `doubling_splits_only_a_chunk_of_the_planned_size`；
     - 去掉 2 s 间隔：`test_the_grow_interval`、`test_a_refused_split_is_no_growth`、`doubling_grows_through_split_up_to_the_limit` 和 `doubling_judges_the_gain_at_ten_percent`。
+
+### 14.15 低速 runner 重启（PR-7，C12）
+
+- **做法。**
+  - 只在 `Doubling` 下生效。只有 `Doubling` 采样每个 runner 的字节数（`RunnerRates`），`Legacy` 没有这份数据，不重启任何 runner。
+  - 单独停掉一个 runner：
+    - 以前所有 runner 共用任务的 cancel token（取消令牌），没法只停一个（§9.6 末尾）。
+    - 现在 spawn runner 时，除了任务令牌，再给它一个任务令牌的子令牌，作为它自己的停止开关（`RunnerChannels::stop`，runner 一侧是 `TaskRunnerBuilder::stop_token`）。取消子令牌只停这一个 runner；取消任务令牌仍然停掉全部。
+    - runner manager 记下每个 runner 的停止开关。`stop_runner` 只停正在运行（Running）、还有剩余字节的 runner，每个只停一次，并记下它“正在停止”。
+    - 不用“丢掉 limit sender”的办法：那样 runner 以 `ChannelClosed` 结束，按 §14.13 收到过数据也要记预算。
+  - 停止开关什么时候生效：
+    - runner 还没决定怎么结束时，停止开关和任务令牌一样让它停下，报 `Cancelled`。包括：在连接；在读流（缓冲里的字节随之丢掉）；在交一段缓冲，而当前这一项（adapter 一次交来的数据）后面还有内容。
+    - runner 已经决定怎么结束时，停止开关不打断它，它照原样结束。包括：流已经结束、出错或空闲超时，它正在交最后一段缓冲；控制信号出错之后它正在交缓冲；它在等数据通道里的帧被取走（drain）。它最后报自己的错误，或者报完成。停止开关只是不改写这个结果；任务取消、交付失败和原有的 drain 超时照旧生效，比如帧一直没被取走，drain 超时后仍然报 `Timeout`。
+    - 任务令牌照旧，在任何时候都让 runner 报 `Cancelled`。
+    - 为什么这样分：已经决定的结果是真实的。比如不可重试的错误被改成 `Cancelled`，就会被当成低速停止，变成可重试的 `Timeout`，有数据时连预算都不记。已经下完、正在等帧被取走的 runner 报完成，区间也不用重下。
+  - runner 报告 `Stopped` 时，manager 先看它是不是被停的：
+    - 被停的、报的是 `Cancelled`：按低速处理（`AttemptFailure::slow`）。区间从 planner 已经接受的位置退回，下载循环照常退避（§14.12）。还在它数据通道里、没被取走的帧，随通道一起丢掉。
+    - 在注意到停止之前自己下完了：报 `Finished`，或者报 `Cancelled` 但 planner 已经接受了整个 chunk。两种都按完成处理：不算失败，什么都不释放，所以区间不会被释放两次。
+    - 自己出错了：按它自己的错误处理。包括停止开关被拉下时，它已经拿着错误、正在交最后一段缓冲或等帧被取走的情况（见上）。
+    - 槽位在处理 `Stopped` 时回收，和别的 runner 一样（§14.11）。
+  - 分类（§8.2、§14.13）：低速停止报为可重试的 `TaskError::Timeout`，因为这个 runner 在 10 s 里远远落后于别的 runner。所以失败策略把它当超时处理：
+    - 这次尝试有字节被接受：是重启。不记预算，不算连续失败，`attempts + 1`，然后退避。
+    - 没有字节被接受：和没数据的超时一样，`charged + 1`，也算一次连续失败。所以一直不交数据的 runner 不会每 10 s 被重启一次、却永远耗不尽预算：到 `max_attempts_per_range` 次时任务以 `RangeExhausted` 结束，`source` 是 `Timeout`。
+    - `AttemptFailure` 多了一个 `slow` 字段，区分低速停止和 runner 自己的超时，只用于日志和测试。
+    - 并发控制的结果采样（`RunnerOutcomeSampler`）不记这次停止：这是下载循环自己的决定，不是服务器出错，不应该让并发降级。
+  - 窗口字节（`RunnerRates::window_bytes`）：
+    - `RunnerRates` 保留最近一个窗口的采样，不再只留上一次。
+    - 窗口的起点，是“最后一次采样之前至少 `slow_window`（10 s）”的那些采样里最晚的一次。tick 是 1.5 s，所以窗口实际是 10.5 s。所有 runner 用同一个窗口。
+    - 窗口字节 = 窗口内这个 runner 被 planner 接受的字节。窗口一样长，所以比字节就是比速率。
+    - 只有在窗口起点已经在运行、并且一直是同一次尝试（同一个 generation）的 runner 才有窗口字节。比窗口年轻的、窗口起点还在连接的、窗口内换了尝试的，都不评判。
+    - 时间都取 tick 传进来的 `now`。
+  - 判定（`strategy/slow_restart.rs`）：每个策略 tick 一次，在扩张之前。依次检查：
+    1. 没有限速（P2 之前恒为真）；
+    2. 不在拥塞期间（新增，见偏差）；
+    3. 有窗口字节的 runner 至少 3 个（`MIN_JUDGED_RUNNERS`）；
+    4. 中位数取这些 runner 的窗口字节；
+    5. 候选：`窗口字节 + F < 0.25 × max(中位数 − F, 0)`（严格小于，正好在边界上不算“低于”），并且剩余量 ≥ `2 × min_chunk_size`（正好 2 倍算）。F 是一帧，即 runner 攒够才交出的缓冲大小 `BUFFER_SIZE`（32 KiB），见决定；
+    6. 有多个候选时，只停最慢的一个；字节相同时取 ID 小的。
+  - 已经在停止的 runner 不参与评判，也不算进中位数。这一步在下载循环的 `may_restart` 里，T27 要在同一个地方排除对冲中的一对 runner（§9.6）。
+  - 与 C11 的配合：
+    - 重启在扩张之前判定。扩张选“剩余最多的 Running chunk”时，跳过正在停止的 runner（慢 runner 的剩余往往最多），所以同一个 tick 的扩张不会去切它。
+    - 重启不调用 `on_grown`，不算扩张。
+    - 被停的 runner 在处理 `Stopped` 之前仍然是活跃 runner，也还占着槽位。之后活跃数少 1。如果正有一次翻倍等着判断，这次判断作废（§14.14：活跃数少于翻倍刚完成时，不下结论）。这是合理的：少了一个 runner，这个 tick 量不出翻倍的效果，既不能说停滞，也不能说有增益。
+    - 区间冷却结束后，由唤醒或并发控制的 `CreateTask` 补回 runner，也可能由 `Doubling` 的扩张补回。补回的 runner 是新的尝试，要再满一个窗口才会被评判。
+- **决定。**
+  - 每个 tick 最多重启一个，停最慢的。原因：停掉一个连接后，其余连接的速率会变（带宽重新分配），下一个 tick 用新的数据再判断，比一次停掉好几个稳妥，也不会对同一个服务器同时发出一批重连。几个慢 runner 要几个 tick（每个 1.5 s）才停完，和 10 s 的窗口相比不算慢。
+  - 至少 3 个有完整窗口的 runner，中位数只从它们算。2 个的中位数就是平均值，一个快 runner 就能定下门槛。它们都是活跃 runner，所以 §9.5 的条件 3（至少 3 个活跃 runner）一定满足，代码里不再单独检查活跃数。
+  - 偶数个时，中位数取中间两个的平均。这是通常的定义；4 个以上时，最慢的那个不会落在中间两个里。
+  - 两边各让出一帧（2026-11-07 与 lead 确认）：
+    - runner 攒满一帧（32 KiB）才交出去。一个窗口里数到的字节，可能比真实的少一帧（窗口结束时还在缓冲里），也可能多一帧（窗口开始前已经读到、窗口里才交出的那一帧）。
+    - 所以候选按它最多可能交了多少算（加一帧），中位数按最少可能交了多少算（减一帧），再比较。
+    - 例子：3 个 runner 都是 2 KiB/s，一个窗口约 21 KiB。缓冲的相位不同，两个各交了一帧，第三个一帧也没交，数到的是 32 KiB、32 KiB、0。不让这一帧，第三个会被停；它的缓冲被丢掉，`received = 0`，还要记预算，`max_attempts_per_range = 1` 时任务直接以 `RangeExhausted` 结束，其实什么问题都没有。让出一帧后，没有谁被判慢。
+    - MiB/s 的速度下，一帧的影响量不出来。别的 runner 都很快、自己一帧都没交的 runner，照样被停。
+    - 没有再加单独的下限（比如“中位数低于若干帧就不判”）：边界本身已经有这个效果，中位数不到 5 帧时谁都不会被判慢（见已知限制），再加一个常量只是重复。
+  - 已经决定怎么结束的 runner，停止开关不打断它（2026-11-07 与 lead 确认，见做法）。runner 同时拿着任务令牌和自己的停止开关，所以能分清是任务取消还是只停它一个。拿着 `Ok(())` 在等帧被取走的 runner 也不打断，它最后报完成。
+  - 会不会连锁重启：
+    - 每次重启都要有 3 个有完整窗口的 runner。被停的不再评判，补回的要等 10 s 以上才会被评判。所以只剩 3 个时停掉一个，剩下 2 个，不会接着停第二个。
+    - runner 多时，可能连续几个 tick 各停一个。但每一个都要低于中位数的 25%。去掉最慢的那个，中位数只会不变或变大，所以后面被停的确实比别人慢很多，这正是要重启的。
+    - 同一个区间反复慢：有数据时，每次重启都让区间变短（§14.13）；没数据时，每次都记预算，最多 `max_attempts_per_range` 次。
+- **与 §9.5 的偏差。**
+  - 条件 3 改为“至少 3 个有完整窗口的 runner”，比“至少 3 个活跃 runner”严（2026-11-07 与 lead 确认）。
+  - 新增：拥塞期间（`congestion_until` 之前）不重启。退回的区间在拥塞结束前反正不能重连，停掉一个还在交数据的连接只会更慢（2026-11-07 与 lead 确认）。
+  - 比的是窗口字节，并且两边各让出一帧，不是直接拿速率和中位数的 25% 比（见决定）。
+  - 窗口和 tick 对齐：从至少 10 s 之前的最近一次采样算起，1.5 s 的 tick 下是 10.5 s。
+  - §9.5 只写了 `attempts += 1`。这里按 §14.13 再分两种：有数据的停止是重启，不记预算；没数据的停止记预算。
+  - 低速停止没有新的公开错误类型：`TaskError` 是公开的、不是 `#[non_exhaustive]`，加变体会破坏兼容。它在 crate 内部用 `AttemptFailure::slow` 区分，对外报 `Timeout`（2026-11-07 与 lead 确认）。
+- **已知限制。**
+  - 被停 runner 已经读到、但 manager 还没取走的数据会丢掉，区间从已接受的位置重新下载。丢掉的是：数据通道里的帧（最多 32 帧，每帧最多 32 KiB）、runner 自己的缓冲（最多 32 KiB），以及当前这一项还没放进缓冲的部分。adapter 一项可以有好几 MiB，所以没有固定的上限。
+  - 慢链接上不重启：中位数每个窗口不到 5 帧（160 KiB，约 15 KiB/s）时，谁都不会被判慢，连一帧都没交的 runner 也不会。这时的字节数分不清“慢”和“缓冲相位不同”。这样的 runner 只受空闲超时（默认 30 s）约束。
+  - writer 满时下载循环不取数据，这段时间所有 runner 的字节一起偏少。按比例比较，不会因此误判，但可能推迟发现。
+  - 默认值 10 s 和 0.25 还没有经过基准测试校准，留给 T14。
+  - 已经决定怎么结束的 runner 不理停止开关：正在交最后一段缓冲时，它要等数据通道有空位；在 drain 时，最多等 5 s 的 drain 超时。这段时间它一直占着槽位，也不会被再次评判。
+  - 被停的 runner 的生命周期通道没发 `Stopped` 就关闭时，仍按丢失处理（`ChannelClosed`，记预算）。正常的 runner 被取消时总会发 `Stopped`。
+  - manager 把“被停、报 `Cancelled`”一律当低速停止。T27 的对冲败方也要用这个停止开关，那时要先记下停止的原因（低速重启还是对冲败方），再分别处理，见 §9.6 的说明。
+- **验证。**
+  - `slow_restart.rs` 的单元测试，字节数都由测试构造：
+    - `test_a_runner_below_a_quarter_of_the_median_is_restarted`：正好在边界上（`字节 + F = 0.25 × (中位数 − F)`）不重启，中位数多 4 B 就重启；候选是 0 或 1 MiB 都试；
+    - `test_runners_a_frame_apart_are_not_slow`：速率相同、只是相位不同的 runner，`[F, F, 0]`、`[2F, 2F, F]`、`[2F, 2F, 0]` 和 4 个的情况都不重启；
+    - `test_a_silent_runner_next_to_fast_ones_is_restarted`：别的都在 7 MiB 左右，一帧没交或只交了一帧的都被停；
+    - `test_a_runner_near_its_end_is_not_restarted`：剩余量比 `2 × min_chunk_size` 少 1 B 不重启，正好相等重启；
+    - `test_no_restart_with_two_runners`：两个 runner 差得再远也不重启，加上第三个就重启；
+    - `test_the_median_of_an_even_count`：偶数个取中间两个的平均，正好在边界上不重启、多 1 B 重启；改取偏下或偏上的中间值，结果都会不同；
+    - `test_only_the_slowest_is_restarted`：一次只停最慢的，字节相同取 ID 小的，最慢的快下完时停次慢的；
+    - `test_no_restart_under_a_speed_limit_or_a_congestion`、`test_median`。
+  - `RunnerRates` 的单元测试：
+    - `test_window_bytes_need_a_full_window`：比 10 s 少 1 ns 时没有窗口字节，正好 10 s 时有；按 1.5 s 的 tick，窗口是 10.5 s，只保留 8 次采样；
+    - `test_window_bytes_belong_to_a_running_attempt`：窗口起点还在连接的、窗口内换了尝试的都没有窗口字节，切分后还有。
+  - runner 的单元测试 `test_a_stop_keeps_the_end_a_runner_decided`，runner 由测试手动推进：
+    - 停止开关让在读流的、在交缓冲而当前项后面还有内容的 runner 报 `Cancelled`；
+    - 不打断已经决定的结果：流出错后在 drain 的，报原来的流错误；流结束后在 drain 的，报完成；流出错后在交最后一段缓冲（数据通道满）的，报原来的流错误；控制信号出错后在交缓冲的，报 `ExceededTotalSize`；
+    - 同样 6 种情况，取消任务令牌时都报 `Cancelled`。
+  - `FailurePolicy`：`test_a_slow_runner_is_classified_like_a_timeout`。有数据的低速停止连续 8 次，都不记预算、不算连续失败；没数据的记预算，算连续失败，第 2 次以 `RangeExhausted` 结束，`source` 是 `Timeout`。
+  - runner manager：
+    - `test_a_stopped_runner_is_a_slow_attempt`：还在连接的、没有停止开关的都不停；只停一次；退回已接受位置之后的部分，通道里的帧丢掉；槽位在 `Stopped` 时回收；不记入结果采样；回收的 ID 再用时不带“正在停止”。
+    - `test_a_runner_that_completes_while_stopping_finishes`：被停之后 chunk 被全部接受，报 `Finished` 或 `Cancelled` 都按完成处理；扩张跳过正在停止的 runner。
+  - 下载循环的测试（`download_loop/tests/restart.rs`，用脚本化的 runtime，显式传入时间）。除最后一个外，另外 3 个 runner 每个 tick 各交 1 MiB：
+    - `a_slow_runner_is_stopped_and_its_range_retried`：被评判的是一个真实的 runner，停在 spawn 处，由测试手动推进。它交 64 KiB 后停住。满 10 s 之前 1 ns 不停；满 10 s 时下载循环通过它自己的停止开关停掉它，槽位一直占到它报 `Stopped`。它报 `Cancelled`，区间从 64 KiB 处退回，`attempts = 1`、`charged = 0`。连续失败上限和每区间上限都是 1，只要记了其中一个，任务就会结束，但任务照常继续。冷却结束前 1 ns 不领取，结束时由唤醒领取，`attempts = 1`、`charged = 0`。
+    - `a_slow_runner_without_data_exhausts_its_range`：真实 runner 一直不交数据。每次停止 `charged` 加 1，第 3 次以 `RangeExhausted { attempts: 3 }` 结束，`source` 是 `Timeout`。
+    - `a_stop_keeps_the_error_a_runner_holds`：真实 runner 交了 96 KiB 后流以不可重试的错误结束，3 帧还在通道里等着被取走时被判慢、被停。它继续等帧被取走，然后报原来的流错误：`slow = false`、不可重试，任务以这个错误结束，没有冷却记录。
+    - `a_runner_that_completes_while_stopping_is_no_failure`：决定停止之后、runner 注意到之前，它的 chunk 被全部接受。报 `Finished` 或 `Cancelled` 都不算失败，不释放、不退避，槽位只回收一次。在这之前，下一个 tick 不再评判它，扩张也不选它。
+    - `legacy_never_restarts`：同样的场景跑 30 s，`Doubling` 停掉慢 runner，`Legacy` 不采样，也不停。
+    - `runners_at_the_same_low_rate_are_never_restarted`：3 个真实 runner 都是 2 KiB/s，窗口开始时缓冲里分别有 30、15、0 KiB。第一个完整窗口数到的是两个 32 KiB 和一个 0；之后每个窗口每个 runner 交一帧或不交。跑 30 s，没有一个被停。
+  - 已有测试：只有机械改动，测试里构造的 `RunnerChannels` 加了 `stop`。
+  - 变异检查，每种都有测试失败：
+    - 去掉门槛（候选不再和中位数比）：`test_a_runner_below_a_quarter_of_the_median_is_restarted`、`test_a_runner_near_its_end_is_not_restarted`、`test_runners_a_frame_apart_are_not_slow`、`test_the_median_of_an_even_count` 和 `runners_at_the_same_low_rate_are_never_restarted`；
+    - `<` 改成 `<=`：`test_a_runner_below_a_quarter_of_the_median_is_restarted` 和 `test_the_median_of_an_even_count`；
+    - 候选不加一帧：`test_a_runner_below_a_quarter_of_the_median_is_restarted`、`test_runners_a_frame_apart_are_not_slow` 和 `test_the_median_of_an_even_count`；
+    - 中位数不减一帧：`test_a_runner_below_a_quarter_of_the_median_is_restarted` 和 `test_the_median_of_an_even_count`；
+    - 两边都不让一帧：上面这三个测试，以及 `runners_at_the_same_low_rate_are_never_restarted`；
+    - 去掉剩余量门槛：`test_a_runner_near_its_end_is_not_restarted` 和 `test_only_the_slowest_is_restarted`；
+    - 去掉“至少 3 个”：`test_no_restart_with_two_runners`；
+    - 去掉完整窗口的要求（取上一次采样作起点）：两个 `RunnerRates` 测试，以及 `a_slow_runner_is_stopped_and_its_range_retried`、`a_slow_runner_without_data_exhausts_its_range` 和 `runners_at_the_same_low_rate_are_never_restarted`；
+    - 有数据的停止也记预算：`test_a_slow_runner_is_classified_like_a_timeout`、`test_a_stopped_runner_is_a_slow_attempt` 和 `a_slow_runner_is_stopped_and_its_range_retried`；
+    - 没数据的停止不记预算：`test_a_slow_runner_is_classified_like_a_timeout` 和 `a_slow_runner_without_data_exhausts_its_range`；
+    - 改为丢掉 limit sender 来停（runner 以 `ChannelClosed` 结束）：`test_a_stopped_runner_is_a_slow_attempt` 和 4 个下载循环测试；
+    - 停止开关在 drain 时也打断 runner、盖掉它拿着的结果：`a_stop_keeps_the_error_a_runner_holds`；
+    - 停止开关打断已经决定结果、正在交最后一段缓冲的 runner：`test_a_stop_keeps_the_end_a_runner_decided`；
+    - 控制信号出错之后，停止开关仍然打断：`test_a_stop_keeps_the_end_a_runner_decided`；
+    - `Legacy` 也采样并重启：`legacy_never_restarts` 和 `legacy_is_the_default_and_unchanged`；
+    - 扩张不跳过正在停止的 runner：`test_a_runner_that_completes_while_stopping_finishes` 和 `a_runner_that_completes_while_stopping_is_no_failure`；
+    - 不检查“停止之前已经下完”：同样这两个测试；
+    - 偶数个时中位数取偏下的中间值：`test_median` 和 `test_the_median_of_an_even_count`；
+    - 去掉拥塞门槛、去掉限速门槛：各自都让 `test_no_restart_under_a_speed_limit_or_a_congestion` 失败。
+    - 已知会偶发失败的 `test_save_into_rejects_hostile_filenames` 在其中 2 次里也失败了，和这些变异无关。

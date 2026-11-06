@@ -734,13 +734,19 @@ impl ChunkPlanner {
     /// incomplete range; `None` when no running chunk is incomplete.
     ///
     /// A connecting runner is left alone, as by
-    /// [`Self::get_incomplete_states`].
-    pub fn largest_running_chunk(&self) -> Option<(RunnerId, Range<u64>)> {
+    /// [`Self::get_incomplete_states`], and so is every runner `skip`
+    /// names.
+    pub fn largest_running_chunk(
+        &self,
+        skip: impl Fn(RunnerId) -> bool,
+    ) -> Option<(RunnerId, Range<u64>)> {
         self.chunks
             .values()
             .filter(|c| c.status == ChunkStatus::Running && !c.is_complete())
-            .max_by_key(|c| c.remaining())
-            .and_then(|c| Some((c.runner_id?, c.incomplete_range())))
+            .filter_map(|c| Some((c.runner_id?, c)))
+            .filter(|&(runner_id, _)| !skip(runner_id))
+            .max_by_key(|(_, c)| c.remaining())
+            .map(|(runner_id, c)| (runner_id, c.incomplete_range()))
     }
 
     /// Get state of a specific runner

@@ -11,6 +11,7 @@ mod doubling_strategy;
 mod dynamic_strategy;
 mod failure_policy;
 mod runner_outcome_sampler;
+mod slow_restart;
 
 pub use backoff::Backoff;
 #[cfg(test)]
@@ -24,6 +25,7 @@ use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
 pub(super) use failure_policy::charges_range;
 pub use runner_outcome_sampler::{FailureKind as RunnerFailureKind, RunnerOutcomeSampler};
+pub use slow_restart::{JudgedRunner, SLOW_WINDOW, SlowRestartContext, slow_runner};
 
 use super::chunk_planner::SplitCandidate;
 use crate::task::GrowthStrategy;

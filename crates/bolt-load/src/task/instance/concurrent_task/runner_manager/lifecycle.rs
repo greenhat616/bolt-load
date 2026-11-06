@@ -147,6 +147,7 @@ impl RunnerManager {
             }
             LifecycleEvent::Stopped(reason) => reason,
         };
+        let stopped_slow = self.stopping.contains(&runner_id);
         self.meters.remove(&runner_id);
         // Remove control channel when runner stops
         self.release_runner(runner_id);
@@ -171,6 +172,9 @@ impl RunnerManager {
             }
             StoppedReason::Failed(kind) => kind,
         };
+        if stopped_slow && kind.is_cancelled() {
+            return self.handle_stopped_slow(runner_id);
+        }
         error!("runner {runner_id} failed: {kind:?}");
         let released = self
             .chunk_planner
@@ -191,6 +195,40 @@ impl RunnerManager {
             });
         let retryable = is_attempt_retryable(&kind);
         RunnerTick::with_failure(AttemptFailure::new(runner_id, kind, retryable, released))
+    }
+
+    /// Handle a runner that stopped on [`RunnerManager::stop_runner`]: its
+    /// range is released from the bytes the planner accepted, as an
+    /// [`AttemptFailure::slow`].
+    ///
+    /// The bytes it delivered that were not accepted yet are dropped with
+    /// its data receiver. A chunk the runner completed before it noticed
+    /// the stop is finished: no failure, and nothing is released.
+    ///
+    /// The concurrency strategy does not count the stop as an outcome: the
+    /// loop decided it, the server did not fail.
+    fn handle_stopped_slow(&mut self, runner_id: RunnerId) -> RunnerTick {
+        let complete = self
+            .chunk_planner
+            .get_runner_state(runner_id)
+            .is_some_and(|state| state.is_complete());
+        if complete {
+            trace!("runner {runner_id} completed its chunk before it stopped");
+            return if self.mark_runner_completed(runner_id) {
+                RunnerTick::finished()
+            } else {
+                RunnerTick::downloading()
+            };
+        }
+        let released = self
+            .chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        debug!(
+            "runner {runner_id} stopped for being slow, released range: {:?}",
+            released.range
+        );
+        RunnerTick::with_failure(AttemptFailure::slow(runner_id, released))
     }
 
     /// Handle a runner that stopped before it connected; its range is
