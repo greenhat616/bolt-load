@@ -20,8 +20,12 @@ impl DownloadLoop {
             failure.attempts,
             not_before - now
         );
-        self.manager
-            .cool_down(failure.range.clone(), failure.attempts, not_before);
+        self.manager.cool_down(
+            failure.range.clone(),
+            failure.attempts,
+            failure.charged,
+            not_before,
+        );
         if let Some(at) = self.next_retry(now) {
             self.deadline.wake_by(at);
         }

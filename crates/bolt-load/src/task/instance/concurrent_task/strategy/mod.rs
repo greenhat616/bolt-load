@@ -17,6 +17,7 @@ pub use backoff::MIN_RANGE_BACKOFF;
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
+pub(super) use failure_policy::charges_range;
 pub use runner_outcome_sampler::{FailureKind as RunnerFailureKind, RunnerOutcomeSampler};
 
 use super::chunk_planner::SplitCandidate;

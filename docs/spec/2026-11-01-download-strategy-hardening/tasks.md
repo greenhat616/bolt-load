@@ -36,7 +36,7 @@
 | PR-5 连接上限 | C7 `feat(task)!: make the connection limit configurable` | T7 | — |
 | | C8 `fix(task): reserve a runner slot before splitting a chunk` | T8 | |
 | PR-6 退避与预算 | C9 `feat(task): back off failed ranges and honour Retry-After` | T9 | PR-1、PR-5 |
-| | C10 `feat(task): budget failures per range` | T10 | |
+| | C10 `feat(task)!: budget failures per range` | T10 | |
 | PR-7 扩张控制器 | C11 `feat(task): add the doubling growth strategy behind unstable-strategy` | T11、T12 | PR-5、PR-6 |
 | | C12 `feat(task): restart slow runners under the doubling strategy` | T13 | |
 | | C13 `bench(task): compare the growth strategies` | T14 | |
@@ -298,11 +298,11 @@
 
 ## T10 — 每区间预算（C10）
 
-- [ ] `FailurePolicy` 改为三层（design §8.2）：
+- [x] `FailurePolicy` 改为三层（design §8.2）：
   - 收到过数据之后的 `Timeout` 或断流，不计入连续失败；
-  - `attempts >= max_attempts_per_range` 时，返回 `TaskError::RangeExhausted { range, source }`；
+  - `charged >= max_attempts_per_range` 时，返回 `TaskError::RangeExhausted { range, attempts, source }`。`charged` 是区间记到预算上的失败数，重启和 429/503 都不记；决定退避的 `attempts` 不参与比较（design §14.13）；
   - 任务级连续失败计数保持不变。
-- [ ] 新增 `TaskOptions::max_attempts_per_range`，默认 5。
+- [x] 新增 `TaskOptions::max_attempts_per_range`，默认 5。类型是 `NonZeroU32`，`TaskBuilder` 也有同名的设置方法（design §14.13）。
 
 **验证**
 

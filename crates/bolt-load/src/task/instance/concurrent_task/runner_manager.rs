@@ -37,6 +37,34 @@ pub(super) struct AttemptFailure {
     pub range: Range<u64>,
     /// Failed attempts on `range`, this one included.
     pub attempts: u32,
+    /// Failures on `range` charged to its budget, this one included when
+    /// [`charges_range`] charges it (design §14.13).
+    pub charged: u32,
+    /// Bytes the planner accepted from this attempt, see
+    /// [`Released::received`](super::chunk_planner::Released::received);
+    /// 0 for a failed connect.
+    pub received: u64,
+}
+
+impl AttemptFailure {
+    /// The failure of the runner whose range was `released`.
+    pub(super) fn new(
+        runner_id: RunnerId,
+        error: TaskError,
+        retryable: bool,
+        released: Released,
+    ) -> Self {
+        let charge = charges_range(&error, retryable, released.received);
+        Self {
+            runner_id,
+            charged: released.charged.saturating_add(charge.into()),
+            error,
+            retryable,
+            range: released.range,
+            attempts: released.attempts,
+            received: released.received,
+        }
+    }
 }
 
 /// Bytes received from runners since the previous snapshot.
@@ -104,8 +132,8 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 
 use super::{
     ChunkPlanner, PlannerGuard,
-    chunk_planner::{ChunkState, ChunkStatus, Resize, SplitCandidate},
-    strategy::RunnerOutcomeSampler,
+    chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SplitCandidate},
+    strategy::{RunnerOutcomeSampler, charges_range},
 };
 use crate::{
     runner::{
@@ -403,8 +431,15 @@ impl RunnerManager {
 
     /// Back an available range off, see [`ChunkPlanner::cool_down`]
     #[inline]
-    pub fn cool_down(&mut self, range: Range<u64>, attempts: u32, not_before: Instant) {
-        self.chunk_planner.cool_down(range, attempts, not_before);
+    pub fn cool_down(
+        &mut self,
+        range: Range<u64>,
+        attempts: u32,
+        charged: u32,
+        not_before: Instant,
+    ) {
+        self.chunk_planner
+            .cool_down(range, attempts, charged, not_before);
     }
 
     /// Until when a backoff still holds `range` back at `now`
@@ -1447,6 +1482,75 @@ mod tests {
                 runners: 1,
                 bytes: 150
             }
+        );
+    }
+
+    /// A failure reports as received only what the planner accepted from
+    /// the attempt (design §14.13): not the frames left in the channel when
+    /// the drain timed out, nor the bytes clipped after a resize. Only an
+    /// attempt with accepted bytes restarts; any other is charged.
+    #[tokio::test]
+    async fn test_a_failure_reports_only_the_bytes_the_planner_accepted() {
+        use async_ringbuf::traits::Producer;
+
+        let mut manager = RunnerManager::new(1000, 3);
+        let timed_out = || LifecycleEvent::failed(TaskError::Timeout);
+
+        // The drain timed out with every frame still in the channel.
+        let first = manager
+            .allocate_runner_with_chunk(0..300)
+            .unwrap()
+            .runner_id;
+        let (mut lifecycle_tx, mut data_tx) = register_test_channels(&mut manager, first);
+        push_frame(&mut data_tx, 100).await;
+        lifecycle_tx.try_push(timed_out()).unwrap();
+        let failure = manager.tick_lifecycle_only().await.failure.unwrap();
+        assert_eq!(
+            (
+                failure.range,
+                failure.received,
+                failure.attempts,
+                failure.charged
+            ),
+            (0..300, 0, 1, 1)
+        );
+
+        // One frame was accepted, the next one was left in the channel.
+        let second = manager
+            .allocate_runner_with_chunk(300..600)
+            .unwrap()
+            .runner_id;
+        let (mut lifecycle_tx, mut data_tx) = register_test_channels(&mut manager, second);
+        push_frame(&mut data_tx, 100).await;
+        assert_eq!(manager.tick().await.downloaded.unwrap().range, 300..400);
+        push_frame(&mut data_tx, 50).await;
+        lifecycle_tx.try_push(timed_out()).unwrap();
+        let failure = manager.tick_lifecycle_only().await.failure.unwrap();
+        assert_eq!(
+            (
+                failure.range,
+                failure.received,
+                failure.attempts,
+                failure.charged
+            ),
+            (400..600, 100, 1, 0)
+        );
+
+        // The chunk shrank to end 50 bytes after its 100 downloaded ones,
+        // but the runner sent 200 more before it read its new limit.
+        let mut third = manager.allocate_runner_with_chunk(600..1000).unwrap();
+        let (mut lifecycle_tx, mut data_tx) = register_test_channels(&mut manager, third.runner_id);
+        push_frame(&mut data_tx, 100).await;
+        manager.tick().await;
+        manager.resize_runner(third.runner_id, 50).unwrap();
+        assert_eq!(third.limits.try_recv(), Some(150));
+        push_frame(&mut data_tx, 200).await;
+        assert_eq!(manager.tick().await.downloaded.unwrap().range, 700..750);
+        lifecycle_tx.try_push(timed_out()).unwrap();
+        let failure = manager.tick_lifecycle_only().await.failure.unwrap();
+        assert_eq!(
+            (failure.range, failure.received, failure.charged),
+            (750..750, 150, 0)
         );
     }
 
