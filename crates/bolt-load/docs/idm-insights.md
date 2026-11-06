@@ -45,7 +45,7 @@
 | 维度 | IDM（观测 + 推断） | bolt-load 现状 | 建议动作 |
 | --- | --- | --- | --- |
 | 初始分片 | 连接数上限来自配置（默认 8），再按「服务器维度」二次限制；分片边界按固定粒度对齐 | 并发上限 = `available_parallelism()`（CPU 核数），无配置项 | 引入 `max_connections` 与 `max_per_host_connections`，不要用 CPU 核数当连接数 |
-| 切分触发 | 按**实测单连接吞吐**推算目标分片大小（速度 × 时间窗）；~~并做加性/乘性增长~~（b16 复核：增长式只作用在局部切分候选值上，Q 固定为 11680） | 以 1 MiB/s 绝对阈值 + 全局速度差判断，`±1 MiB/s` 的差值在慢链路上几乎不触发；`abs()` 使**降速**也会触发 `SplitAllTask` | 用「每连接增益」判定；改为相对判据；区分升/降速 |
+| 切分触发 | 按**实测单连接吞吐**推算目标分片大小（速度 × 时间窗）；~~并做加性/乘性增长~~（b16 复核：增长式只作用在局部切分候选值上，~~Q 固定为 11680~~；b18 复核：Q 在 11680 和 116800 两档之间切换） | 以 1 MiB/s 绝对阈值 + 全局速度差判断，`±1 MiB/s` 的差值在慢链路上几乎不触发；`abs()` 使**降速**也会触发 `SplitAllTask` | 用「每连接增益」判定；改为相对判据；区分升/降速 |
 | 分片大小 | 下限用固定常量（观测到 11680 / 23360 / 46720 这一族常量，与 `1460×8/16/32` 完全吻合，疑似按 MSS 倍数取整），并按「包大小」对齐分片边界 | `DEFAULT_MIN_CHUNK_SIZE = 1 MiB`，切分点 = 剩余区间一半，无对齐 | 保留 1 MiB 下限，增加「切分点对齐到 64 KiB / 4 KiB 文件块」避免碎片 |
 | 超限保护 | 单次只插入一个新分片，且插入前校验剩余量是否够「三倍包大小」；有 `Need optional connections` / `Optional connections not needed` 的显式闸门 | `SplitAllTask` 会**对每个未完成 runner 同时切分**，不检查 `active < max_concurrency`，一个 tick 可能把连接数翻倍并越过上限 | 切分动作必须与并发上限原子校验（复核：当前闸门下不会越界，风险在于 `split()` 不是原子操作） |
 | 尾部分片 | `ChunksListItem::JoinWithNext`：~~剩余量不足以再切时把相邻小块合并~~ 合并的是**已完成**的项 | 只切不合，但尾片仍有连接在下 | ~~增加 merge 动作~~ 不做 |
@@ -67,7 +67,7 @@
 
 1. 为每个新分片分配一个序号：`*(in_ECX + 0x94) += 1; item[0x18] = *(in_ECX + 0x94);`；
 2. 用 `%s%ld` 拼出分片文件名并 `CreateFile`（`local_164[0x16]` 串成链表，`param_1[0x2a]` 指回当前片）；
-3. 每片记录 `start/end`（`item[2]/item[3]`）、归属连接号、以及 `alt/altN`（备用地址与备用计数）。
+3. 每片记录 `start/end`（`item[2]/item[3]`）、归属连接号、以及 `alt/altN`（~~备用地址与备用计数~~ b18 复核：一个指向同一区间的另一份，一个标记自己是原份还是对冲份）。
 
 这与磁盘上的 `DwnlData` 目录完全对应：一个下载目录里是「基名 + 数字后缀」的一串临时文件。**推断**：IDM 用「分片文件」换取了写路径的简单性和崩溃后的可诊断性；代价是完成时要 `JoinFile` 合并一次（多一次全量 I/O）。
 
@@ -80,11 +80,13 @@ bolt-load 走的是相反路线：单文件 + 区间写（`mmap_writer`/`pool_wr
 - 目标分片尺寸参与 `__alldiv(size, 2)`：新片拿目标量的一半；
 - 还有一族硬编码常量：`0x2da0 (11680)`、`0x5b40 (23360)`、`0xb680 (46720)`、`0xb681/0x5b43`，以及 `size*5 < 0x2da0 ? size += 0x2da0 : size = size*2 + 0x5b43` 这样的**加性/乘性增长**。
 
-`11680 = 1460 × 8`，`23360 = 1460 × 16`，`46720 = 1460 × 32`。**推断**：这些是「MSS 的倍数」，用于给分片尺寸/边界一个与网络包对齐的最小粒度；增长公式则是「小步加性、大值乘性」的自适应放大（类似 TCP 拥塞窗口的 AIMD 直觉）。另有按 `param_3`（包大小）对齐边界的取余运算：`*puVar13 = (param_3 - rem) + *puVar13`。
+`11680 = 1460 × 8`，`23360 = 1460 × 16`，`46720 = 1460 × 32`。**推断**：这些是「MSS 的倍数」，用于给分片尺寸/边界一个与网络包对齐的最小粒度；~~增长公式则是「小步加性、大值乘性」的自适应放大（类似 TCP 拥塞窗口的 AIMD 直觉）。~~（b16 复核：增长式只作用在局部切分候选值上，见下。）另有按 `param_3`（包大小）对齐边界的取余运算：`*puVar13 = (param_3 - rem) + *puVar13`。
 
 > 精确语义（单位、触发条件）受反编译精度限制，标为**推断**；但「分片尺寸由吞吐量推导 + 对齐到固定粒度」这一模式是清晰的。
 
 > **b16 复核（IDA）**：“AIMD 式自适应放大”不成立。量子 Q 的初值固定为 11680。增长式作用在 `Insert` 里的一个局部切分候选值上，这个值由**被切连接自己的速率**推出（`[conn+0x3D0]` × −1000.0），取上限后减半。所以“按吞吐推导”成立，但依据是单个连接的速率，不是任务总速率。
+
+> **b18 复核**：Q 不是固定的。每次判断一条连接能否复用时，IDM 会把 Q 设成 11680 B 或 116800 B：本下载 body 写入间隔的均值 < 1.1 s、且下载速度 > 116800 B/s 时取后者。这仍然不是 AIMD。
 
 ### 2.3 切分有闸门，不会一次翻倍
 
@@ -147,8 +149,8 @@ bolt-load 的对应实现：`runner` 有 `DEFAULT_IDLE_TIMEOUT = 30s`（`runner/
 
 - `The data transfer has been interrupted and the server does not support "resume".` → 明确「不能续传」，只能整文件重下；
 - ~~`Try rollback, set chunksize to %I64d` → 416/短读这类问题回滚分片尺寸；~~ b16 复核：这条出现在续传前的分片文件重建里，作用是把超长的分片临时文件截到区间长度，和 416/短读无关；
-- `The file chunk %d is reassigned to connection %d.` / `The file chunk of connection %d is reassigned to connection %d.` → 分片**改派**给其它连接，而不是让整任务失败；
-- `ChunksList::AddAlternative` / `ApplyAlternative` / `CheckAlternative`（`Add alternative connection (%ld) for connection %ld`）→ 同一分片的**备用地址**（多 IP / 多 URL）故障转移；
+- `The file chunk %d is reassigned to connection %d.` / `The file chunk of connection %d is reassigned to connection %d.` → 分片**改派**给其它连接，而不是让整任务失败（b18 复核：HTTP 里这条日志对应的是下完分片的连接接管下一个分片；连接失败后怎样转交仍未复核，见完整版 §4.5）；
+- `ChunksList::AddAlternative` / `ApplyAlternative` / `CheckAlternative`（`Add alternative connection (%ld) for connection %ld`）→ ~~同一分片的**备用地址**（多 IP / 多 URL）故障转移~~ **b18 复核**：不是换地址的故障转移，而是**对冲**。IDM 给静默最久的连接加一条同来源的连接，重复下载同一区间，先写入数据的一份胜出，原连接不停（见完整版 §3.5）；
 - `IDM started to download the file using one connection because of data corruption when newly received data in several connections did not match the same data downloaded earlier.` → 多连接数据互相矛盾时，**降级为单连接**并重来；
 - `Some chunks matched with start of file! Deleting all, except first.` / `Strart data for this chunk is matched with start of the file!!!` → 恢复时用「分片首字节 == 文件首字节」识别偏移错乱。
 
@@ -313,11 +315,11 @@ let runner_id = runner_id.expect("A empty chunk is not processed by concurrency 
 > - 第 2 条：初值 11680 已确认，但“MSS 倍数”的业务口径仍是推断。
 > - 第 3 条：已解决。单位是秒，两个状态机分别是 30/300 s 和 120/300 s。
 > - 第 5 条：部分解决。按站点的连接数存放在 `MCN\<scheme>://host[path]\number`，每个下载各自读取。
-> - 第 6 条：`ApplyAlternative` 的选择规则只有 dsh 一个来源；改派的调用链仍未追完。
+> - 第 6 条：已解决（b18 复核，见完整版 §3.5、§4.5）。下载过程中先写入数据的一份胜出；“改派”日志对应下完分片后接管下一个分片。
 
 1. IDM 的**初始**分片数量公式（按文件大小阈值还是直接按连接数均分）。观测只到「插入单片时用剩余量的 1/2、且受 23 KB/3×包大小闸门约束」。
 2. `0x2da0/0x5b40/0xb680` 的业务含义（MSS 倍数是强推断，但常量也可能来自其它口径）。
 3. 30 / 300 两个超时值的单位（ms / 100ms / s）。行为上「分级、且重启不计失败」是明确的，绝对值不确定。
 4. `MaxConnectionsNumber` 的运行期上限（注册表里是 8，UI 上通常允许更高，但未在二进制中定位到 clamp 边界）。
 5. IDM 与服务器「按 host 的连接上限」的具体计数维度（host、IP、还是 URL 前缀）。
-6. 反编译的 `FUN_0058fdf0` 是 HTTP 连接状态机的一部分；分片改派与 `AddAlternative` 的调用链未逐条追完，仅由字符串与函数名佐证。
+6. 反编译的 `FUN_0058fdf0` 是 HTTP 连接状态机的一部分；~~分片改派与 `AddAlternative` 的调用链未逐条追完，仅由字符串与函数名佐证。~~ b18 复核：两条调用链都已追完，见完整版 §3.5、§4.5。
