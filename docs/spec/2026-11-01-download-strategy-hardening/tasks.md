@@ -282,11 +282,11 @@
 
 ## T9 — 区间退避与 `Retry-After`（C9）
 
-- [ ] `ChunkPlanner` 的可用区间增加 `attempts` 和 `not_before`。切分时，新区间的 `attempts` 从 0 开始；合并时取较大值（design §8.1）。
-- [ ] runner 失败、区间退回可用池时，计算退避：使用 backon 的 `ExponentialBuilder`，参数为 0.5 s、×2、上限 30 s、满抖动。
-- [ ] 增加任务级的 `congestion_until`：遇到 `Congestion { retry_after }` 时更新它，取值 `max(retry_after, backoff)`，上限 120 s。
-- [ ] `ConcurrencyControlStrategy` 下发 `CreateTask` 时，跳过还在冷却期的区间；在 `congestion_until` 之前，不新建任何连接。
-- [ ] `download_loop/deadline.rs` 增加一个唤醒点，取“最早的 `not_before`”和 `congestion_until` 中较早的那个。
+- [x] `ChunkPlanner` 的可用区间增加 `attempts` 和 `not_before`。切分时，新区间的 `attempts` 从 0 开始；合并时取较大值（design §8.1）。用空隙旁边的 `cooldowns` 表实现，合并时 `not_before` 取较晚值（design §14.12）。
+- [x] runner 失败、区间退回可用池时，计算退避：使用 backon 的 `ExponentialBuilder`，参数为 0.5 s、×2、上限 30 s、满抖动。backon 的抖动是加性的，不是满抖动，见 design §14.12。
+- [x] 增加任务级的 `congestion_until`：遇到 `Congestion { retry_after }` 时更新它，取值 `max(retry_after, backoff)`，上限 120 s。
+- [x] `ConcurrencyControlStrategy` 下发 `CreateTask` 时，跳过还在冷却期的区间；在 `congestion_until` 之前，不新建任何连接。`spawn_runner` 和 `split` 自己也检查。
+- [x] `download_loop/deadline.rs` 增加一个唤醒点，取“最早的 `not_before`”和 `congestion_until` 中较早的那个。拥塞期间直接取 `congestion_until`（design §14.12）。
 
 **验证**
 

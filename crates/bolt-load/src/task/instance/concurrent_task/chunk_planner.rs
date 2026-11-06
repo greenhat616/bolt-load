@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     num::NonZeroUsize,
     ops::Range,
+    time::Instant,
 };
 
 use crate::task::RunnerId;
@@ -21,6 +22,46 @@ pub struct ChunkState {
     pub runner_id: Option<RunnerId>,
     /// Runner status
     pub status: ChunkStatus,
+    /// Failed attempts on the range before this chunk's, carried over from
+    /// the [`Cooldown`]s it was claimed from (design §8.1).
+    pub attempts: u32,
+}
+
+/// The backoff of an available range that failed runners gave back
+/// (design §8.1).
+///
+/// Available bytes outside every cooldown are fresh: no failed attempt,
+/// and claimable at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cooldown {
+    /// The end of the range, which starts at the cooldown's key.
+    pub end: u64,
+    /// Failed attempts on the range.
+    pub attempts: u32,
+    /// The range may not be claimed before this instant.
+    pub not_before: Instant,
+}
+
+impl Cooldown {
+    /// One cooldown for two that overlap or touch: the larger attempts and
+    /// the later `not_before`, so no byte is claimed earlier than either
+    /// allowed.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            end: self.end.max(other.end),
+            attempts: self.attempts.max(other.attempts),
+            not_before: self.not_before.max(other.not_before),
+        }
+    }
+}
+
+/// The unfinished range of a failed runner, given back to the available
+/// pool by [`ChunkPlanner::mark_failed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Released {
+    pub range: Range<u64>,
+    /// Failed attempts on `range`, the released one included.
+    pub attempts: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +130,7 @@ impl ChunkState {
             downloaded: allocated.start..allocated.start,
             runner_id,
             status,
+            attempts: 0,
         }
     }
 
@@ -143,6 +185,10 @@ pub struct ChunkPlanner {
     runner_to_chunk: HashMap<RunnerId, u64>,
     /// Bytes accepted into all chunks; no operation ever drops accepted bytes.
     accepted_bytes: u64,
+    /// Available ranges backing off after a failure, keyed by start. They
+    /// never overlap a chunk or each other, and keep their attempts after
+    /// `not_before` until claimed.
+    cooldowns: BTreeMap<u64, Cooldown>,
 }
 
 impl ChunkPlanner {
@@ -154,6 +200,7 @@ impl ChunkPlanner {
             chunks: BTreeMap::new(),
             runner_to_chunk: HashMap::new(),
             accepted_bytes: 0,
+            cooldowns: BTreeMap::new(),
         }
     }
 
@@ -218,9 +265,13 @@ impl ChunkPlanner {
             return false;
         }
 
-        // Create new chunk state
+        // Create new chunk state, counting on from the failed attempts on it
         let start = range.start;
-        let chunk_state = ChunkState::new(range, runner_id, status);
+        let attempts = self.take_cooldowns(&range);
+        let chunk_state = ChunkState {
+            attempts,
+            ..ChunkState::new(range, runner_id, status)
+        };
         self.chunks.insert(start, chunk_state);
 
         // Update runner mapping
@@ -294,14 +345,17 @@ impl ChunkPlanner {
         }
     }
 
-    /// Mark a runner as failed and release the chunk
-    pub fn mark_failed(&mut self, runner_id: RunnerId) -> Result<Range<u64>, Error> {
+    /// Mark a runner as failed and release the unfinished part of its chunk.
+    ///
+    /// The released range is fresh until [`Self::cool_down`] backs it off.
+    pub fn mark_failed(&mut self, runner_id: RunnerId) -> Result<Released, Error> {
         let range = self
             .runner_to_chunk
             .remove(&runner_id)
             .ok_or(Error::RunnerNotFound { runner_id })?;
 
         if let Some(mut chunk) = self.chunks.remove(&range) {
+            let attempts = chunk.attempts.saturating_add(1);
             // Return the unfinished portion
             let unfinished = chunk.downloaded.end..chunk.allocated.end;
 
@@ -309,7 +363,10 @@ impl ChunkPlanner {
             if chunk.downloaded.start == chunk.downloaded.end {
                 let allocated = chunk.allocated.clone();
                 // Chunk is already removed, just return the range
-                Ok(allocated)
+                Ok(Released {
+                    range: allocated,
+                    attempts,
+                })
             } else {
                 // Keep the downloaded portion as a finished chunk
                 chunk.allocated.end = chunk.downloaded.end;
@@ -317,11 +374,119 @@ impl ChunkPlanner {
                 chunk.runner_id = None;
                 // Re-insert the chunk; its start is unchanged
                 self.chunks.insert(range, chunk);
-                Ok(unfinished)
+                Ok(Released {
+                    range: unfinished,
+                    attempts,
+                })
             }
         } else {
             Err(Error::ChunkNotFound { runner_id })
         }
+    }
+
+    /// Back the available `range` off: it may be claimed again from
+    /// `not_before`, and has failed `attempts` times.
+    ///
+    /// It merges with the cooldowns it overlaps or touches into one, which
+    /// takes the larger attempts and the later `not_before`. Fresh bytes
+    /// next to it stay fresh.
+    pub fn cool_down(&mut self, range: Range<u64>, attempts: u32, not_before: Instant) {
+        if range.is_empty() {
+            return;
+        }
+        debug_assert!(
+            self.get_available_ranges()
+                .iter()
+                .any(|available| available.start <= range.start && range.end <= available.end),
+            "{range:?} is not available"
+        );
+        let mut start = range.start;
+        let mut merged = Cooldown {
+            end: range.end,
+            attempts,
+            not_before,
+        };
+        if let Some((&before, &cooldown)) = self.cooldowns.range(..range.start).next_back()
+            && cooldown.end >= range.start
+        {
+            self.cooldowns.remove(&before);
+            start = before;
+            merged = merged.merge(cooldown);
+        }
+        while let Some((&after, &cooldown)) = self.cooldowns.range(range.start..=merged.end).next()
+        {
+            self.cooldowns.remove(&after);
+            merged = merged.merge(cooldown);
+        }
+        self.cooldowns.insert(start, merged);
+    }
+
+    /// The starts of the cooldowns overlapping `range`.
+    fn overlapping_cooldowns(&self, range: &Range<u64>) -> impl Iterator<Item = u64> + '_ {
+        let before = self
+            .cooldowns
+            .range(..range.start)
+            .next_back()
+            .filter(|(_, cooldown)| cooldown.end > range.start);
+        before
+            .into_iter()
+            .chain(self.cooldowns.range(range.start..range.end))
+            .map(|(&start, _)| start)
+    }
+
+    /// Take `range` out of the cooldowns, for a chunk claiming it; returns
+    /// the most failed attempts among the cooldowns it overlaps, 0 for fresh
+    /// bytes. What is left of them outside `range` keeps its backoff.
+    fn take_cooldowns(&mut self, range: &Range<u64>) -> u32 {
+        let starts: Vec<u64> = self.overlapping_cooldowns(range).collect();
+        let mut attempts = 0;
+        for start in starts {
+            let cooldown = self
+                .cooldowns
+                .remove(&start)
+                .expect("the start was just found");
+            attempts = attempts.max(cooldown.attempts);
+            if start < range.start {
+                self.cooldowns.insert(
+                    start,
+                    Cooldown {
+                        end: range.start,
+                        ..cooldown
+                    },
+                );
+            }
+            if range.end < cooldown.end {
+                self.cooldowns.insert(range.end, cooldown);
+            }
+        }
+        attempts
+    }
+
+    /// The latest instant a cooldown overlapping `range` holds it back
+    /// until, if one still does at `now`.
+    pub fn cooling_until(&self, range: &Range<u64>, now: Instant) -> Option<Instant> {
+        self.overlapping_cooldowns(range)
+            .map(|start| self.cooldowns[&start].not_before)
+            .filter(|not_before| *not_before > now)
+            .max()
+    }
+
+    /// The earliest instant after `now` a cooldown ends.
+    pub fn next_cooldown_end(&self, now: Instant) -> Option<Instant> {
+        self.cooldowns
+            .values()
+            .map(|cooldown| cooldown.not_before)
+            .filter(|not_before| *not_before > now)
+            .min()
+    }
+
+    /// The cooldowns, as ranges, in order.
+    #[cfg(test)]
+    pub fn cooldowns(&self) -> Vec<(Range<u64>, Cooldown)> {
+        self.cooldowns
+            .iter()
+            .map(|(&start, &cooldown)| (start..cooldown.end, cooldown))
+            .collect()
     }
 
     /// Split a chunk at the given position
@@ -388,6 +553,33 @@ impl ChunkPlanner {
         ranges
     }
 
+    /// The available ranges a runner may claim at `now`: those of
+    /// [`Self::get_available_ranges`] without the cooldowns that have not
+    /// ended. A cooldown that ended merges with the fresh bytes around it.
+    pub fn get_eligible_ranges(&self, now: Instant) -> Vec<Range<u64>> {
+        // Cooldowns lie within the available ranges, in the same order.
+        let mut cooling = self
+            .cooldowns
+            .iter()
+            .filter(|(_, cooldown)| cooldown.not_before > now)
+            .map(|(&start, cooldown)| start..cooldown.end)
+            .peekable();
+        let mut ranges = Vec::new();
+        for available in self.get_available_ranges() {
+            let mut cursor = available.start;
+            while let Some(cooldown) = cooling.next_if(|cooldown| cooldown.start < available.end) {
+                if cursor < cooldown.start {
+                    ranges.push(cursor..cooldown.start);
+                }
+                cursor = cursor.max(cooldown.end);
+            }
+            if cursor < available.end {
+                ranges.push(cursor..available.end);
+            }
+        }
+        ranges
+    }
+
     /// Get all downloaded ranges (for progress reporting)
     pub fn get_downloaded_ranges(&self) -> Vec<Range<u64>> {
         let mut ranges: Vec<_> = self
@@ -441,11 +633,14 @@ impl ChunkPlanner {
     }
 
     /// Find a chunk to split or evict based on download progress
-    pub fn find_chunk_to_split(&self, required_size: u64) -> Option<SplitCandidate> {
+    ///
+    /// A range backing off at `now` is no candidate: it does not stop
+    /// running chunks from being split.
+    pub fn find_chunk_to_split(&self, required_size: u64, now: Instant) -> Option<SplitCandidate> {
         // If there are still range that is not being asigned to a runner
         let mut available_range: Option<Range<u64>> = None;
         // First try to find a suitable available range
-        for range in self.get_available_ranges() {
+        for range in self.get_eligible_ranges(now) {
             if range.end - range.start >= required_size {
                 available_range = Some(range.start..range.start + required_size);
                 break;
@@ -780,7 +975,7 @@ mod tests {
         assert!(planner.update_progress(1, 150).is_ok());
 
         // Mark as failed
-        let unfinished = planner.mark_failed(1).unwrap();
+        let unfinished = planner.mark_failed(1).unwrap().range;
         assert_eq!(unfinished, 250..500);
 
         // The downloaded portion should be kept
@@ -1135,7 +1330,7 @@ mod tests {
         assert!(planner.mark_finished(1).is_ok());
 
         // Mark one as failed
-        let unfinished = planner.mark_failed(2).unwrap();
+        let unfinished = planner.mark_failed(2).unwrap().range;
         assert_eq!(unfinished, 350..400);
 
         // Check final state
@@ -1206,7 +1401,7 @@ mod tests {
         assert!(planner.update_progress(3, 50).is_ok());
 
         // Runner 2 failed
-        let unfinished = planner.mark_failed(2).unwrap();
+        let unfinished = planner.mark_failed(2).unwrap().range;
         assert_eq!(unfinished, 500..600);
 
         // Check available ranges
@@ -1243,7 +1438,9 @@ mod tests {
         let mut planner = ChunkPlanner::new(10 * 1024 * 1024); // 10MB total
 
         // When no chunks exist, entire file is available, should return available range
-        let Some(SplitCandidate::Unassigned(range)) = planner.find_chunk_to_split(100) else {
+        let Some(SplitCandidate::Unassigned(range)) =
+            planner.find_chunk_to_split(100, Instant::now())
+        else {
             panic!("the whole file is unassigned");
         };
         assert!(range.end - range.start >= 100);
@@ -1256,7 +1453,9 @@ mod tests {
         assert!(planner.mark_running(2).is_ok());
 
         // Should return available range when available ranges exist
-        let Some(SplitCandidate::Unassigned(range)) = planner.find_chunk_to_split(100) else {
+        let Some(SplitCandidate::Unassigned(range)) =
+            planner.find_chunk_to_split(100, Instant::now())
+        else {
             panic!("a gap is unassigned");
         };
         // Check if range is reasonable, exact match not required
@@ -1276,7 +1475,7 @@ mod tests {
         // Should now find chunk with most remaining work: runner 3 has not
         // downloaded anything of its 3MB.
         assert_eq!(
-            planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE),
+            planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE, Instant::now()),
             Some(SplitCandidate::Running {
                 runner: 3,
                 range: chunk_size..chunk_size + DEFAULT_MIN_CHUNK_SIZE,
@@ -1303,7 +1502,7 @@ mod tests {
         );
 
         // Should now have no chunks large enough to split
-        let result = planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE);
+        let result = planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE, Instant::now());
         assert!(result.is_none());
     }
 
@@ -1441,7 +1640,7 @@ mod tests {
         let mut planner = ChunkPlanner::new(100);
         assert!(planner.allocate_chunk(0..100, Some(1)));
         planner.update_progress(1, 30).unwrap();
-        assert_eq!(planner.mark_failed(1).unwrap(), 30..100);
+        assert_eq!(planner.mark_failed(1).unwrap().range, 30..100);
         assert_eq!(planner.get_available_ranges(), vec![30..100]);
         assert!(planner.allocate_chunk(30..100, Some(2)));
         assert_eq!(planner.get_runner_state(2).unwrap().allocated, 30..100);
@@ -1508,7 +1707,7 @@ mod tests {
         assert!(planner.update_progress(2, 100).is_ok());
 
         // 3. Runner 1 failed, reallocate
-        let unfinished = planner.mark_failed(1).unwrap();
+        let unfinished = planner.mark_failed(1).unwrap().range;
         assert_eq!(unfinished, 200..500);
 
         // Check available ranges
@@ -1624,7 +1823,7 @@ mod tests {
         assert!(planner.allocate_pending_chunk(100..500, 1));
 
         // Mark as failed (simulating connection failure)
-        let unfinished = planner.mark_failed(1).unwrap();
+        let unfinished = planner.mark_failed(1).unwrap().range;
         assert_eq!(unfinished, 100..500);
 
         // Chunk should be removed
@@ -1688,5 +1887,211 @@ mod tests {
         let state = planner.get_runner_state(1).unwrap();
         assert_eq!(state.downloaded, 0..300);
         assert_eq!(state.status, ChunkStatus::Running);
+    }
+
+    // === Backoff of failed ranges (design §8.1) ===
+
+    const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+    const NANO: std::time::Duration = std::time::Duration::from_nanos(1);
+
+    /// Fail runner `runner_id` at `now` and back its range off for `delay`.
+    fn fail(
+        planner: &mut ChunkPlanner,
+        runner_id: RunnerId,
+        now: Instant,
+        delay: std::time::Duration,
+    ) -> Released {
+        let released = planner.mark_failed(runner_id).unwrap();
+        planner.cool_down(released.range.clone(), released.attempts, now + delay);
+        released
+    }
+
+    fn cooldown(end: u64, attempts: u32, not_before: Instant) -> Cooldown {
+        Cooldown {
+            end,
+            attempts,
+            not_before,
+        }
+    }
+
+    #[test]
+    fn test_failed_range_is_claimable_only_after_its_cooldown() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        assert!(planner.allocate_chunk(0..100, Some(1)));
+        planner.mark_running(1).unwrap();
+        planner.update_progress(1, 30).unwrap();
+        assert_eq!(
+            fail(&mut planner, 1, now, SECOND),
+            Released {
+                range: 30..100,
+                attempts: 1
+            }
+        );
+
+        let end = now + SECOND;
+        // Available, but not claimable yet.
+        assert_eq!(planner.get_available_ranges(), vec![30..1000]);
+        assert_eq!(planner.get_eligible_ranges(end - NANO), vec![100..1000]);
+        assert_eq!(planner.cooling_until(&(30..100), end - NANO), Some(end));
+        assert_eq!(planner.cooling_until(&(50..60), now), Some(end));
+        assert_eq!(planner.cooling_until(&(0..31), now), Some(end));
+        assert_eq!(planner.cooling_until(&(100..1000), now), None);
+        assert_eq!(planner.next_cooldown_end(now), Some(end));
+        // Its cooldown over, it merges with the fresh bytes after it.
+        assert_eq!(planner.get_eligible_ranges(end), vec![30..1000]);
+        assert_eq!(planner.cooling_until(&(30..100), end), None);
+        assert_eq!(planner.next_cooldown_end(end), None);
+    }
+
+    #[test]
+    fn test_claimed_range_counts_on_from_its_attempts() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        assert!(planner.allocate_chunk(0..1000, Some(1)));
+        assert_eq!(planner.get_runner_state(1).unwrap().attempts, 0);
+        fail(&mut planner, 1, now, SECOND);
+        assert!(planner.allocate_chunk(0..1000, Some(2)));
+        assert_eq!(planner.get_runner_state(2).unwrap().attempts, 1);
+        assert!(planner.cooldowns().is_empty());
+        assert_eq!(fail(&mut planner, 2, now, SECOND).attempts, 2);
+        assert!(planner.allocate_chunk(0..1000, Some(3)));
+        assert_eq!(fail(&mut planner, 3, now, SECOND).attempts, 3);
+        assert_eq!(
+            planner.cooldowns(),
+            vec![(0..1000, cooldown(1000, 3, now + SECOND))]
+        );
+    }
+
+    /// A claim of part of a cooldown carries its attempts; the rest keeps
+    /// backing off.
+    #[test]
+    fn test_partial_claim_leaves_the_rest_backing_off() {
+        let now = Instant::now();
+        let end = now + SECOND;
+        let mut planner = ChunkPlanner::new(1000);
+        planner.cool_down(100..400, 2, end);
+        assert!(planner.allocate_chunk(200..300, Some(1)));
+        assert_eq!(planner.get_runner_state(1).unwrap().attempts, 2);
+        assert_eq!(
+            planner.cooldowns(),
+            vec![
+                (100..200, cooldown(200, 2, end)),
+                (300..400, cooldown(400, 2, end))
+            ]
+        );
+        // Fresh bytes and part of a cooldown: the cooldown's attempts.
+        assert!(planner.allocate_chunk(0..150, Some(2)));
+        assert_eq!(planner.get_runner_state(2).unwrap().attempts, 2);
+        // Fresh bytes only.
+        assert!(planner.allocate_chunk(400..1000, Some(3)));
+        assert_eq!(planner.get_runner_state(3).unwrap().attempts, 0);
+        assert_eq!(
+            planner.cooldowns(),
+            vec![
+                (150..200, cooldown(200, 2, end)),
+                (300..400, cooldown(400, 2, end))
+            ]
+        );
+    }
+
+    /// Adjacent failed ranges merge into one, with the larger attempts and
+    /// the later end of their cooldowns.
+    #[test]
+    fn test_adjacent_cooldowns_merge() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        assert!(planner.allocate_chunk(100..200, Some(1)));
+        // Runner 2 counts on from two failed attempts.
+        planner.cool_down(200..300, 2, now);
+        assert!(planner.allocate_chunk(200..300, Some(2)));
+        fail(&mut planner, 1, now, 3 * SECOND);
+        fail(&mut planner, 2, now, SECOND);
+        planner.cool_down(400..500, 1, now + SECOND);
+        assert_eq!(
+            planner.cooldowns(),
+            vec![
+                (100..300, cooldown(300, 3, now + 3 * SECOND)),
+                (400..500, cooldown(500, 1, now + SECOND))
+            ]
+        );
+        // Filling the gap merges all three.
+        planner.cool_down(300..400, 1, now);
+        assert_eq!(
+            planner.cooldowns(),
+            vec![(100..500, cooldown(500, 3, now + 3 * SECOND))]
+        );
+        assert_eq!(
+            planner.get_eligible_ranges(now + 2 * SECOND),
+            vec![0..100, 500..1000]
+        );
+        assert_eq!(planner.get_eligible_ranges(now + 3 * SECOND), vec![0..1000]);
+        assert!(planner.allocate_chunk(100..500, Some(3)));
+        assert_eq!(planner.get_runner_state(3).unwrap().attempts, 3);
+    }
+
+    /// A split hands its new range over without attempts; the freed bytes
+    /// next to a cooldown stay fresh.
+    #[test]
+    fn test_split_range_starts_without_attempts() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        planner.cool_down(0..500, 2, now);
+        assert!(planner.allocate_chunk(0..500, Some(1)));
+        assert!(planner.allocate_chunk(500..1000, Some(2)));
+        planner.mark_running(1).unwrap();
+        fail(&mut planner, 2, now, SECOND);
+
+        // As the loop splits: shrink runner 1, then hand the tail over.
+        planner.resize_runner_state(1, 250).unwrap();
+        assert_eq!(planner.get_eligible_ranges(now), vec![250..500]);
+        assert!(planner.allocate_chunk(250..500, Some(3)));
+        assert_eq!(planner.get_runner_state(3).unwrap().attempts, 0);
+        assert_eq!(planner.get_runner_state(1).unwrap().attempts, 2);
+        assert_eq!(
+            planner.cooldowns(),
+            vec![(500..1000, cooldown(1000, 1, now + SECOND))]
+        );
+
+        planner.split_chunk(1, 125, 4).unwrap();
+        assert_eq!(planner.get_runner_state(4).unwrap().attempts, 0);
+        assert_eq!(planner.get_runner_state(1).unwrap().attempts, 2);
+    }
+
+    /// A range backing off is no split candidate: running chunks are split
+    /// instead.
+    #[test]
+    fn test_split_candidates_skip_ranges_backing_off() {
+        let now = Instant::now();
+        let half = 2 * DEFAULT_MIN_CHUNK_SIZE;
+        let mut planner = ChunkPlanner::new(2 * half);
+        assert!(planner.allocate_chunk(0..half, Some(1)));
+        assert!(planner.allocate_chunk(half..2 * half, Some(2)));
+        planner.mark_running(1).unwrap();
+        fail(&mut planner, 2, now, SECOND);
+
+        assert!(matches!(
+            planner.find_chunk_to_split(100, now),
+            Some(SplitCandidate::Running { runner: 1, .. })
+        ));
+        assert_eq!(
+            planner.find_chunk_to_split(100, now + SECOND),
+            Some(SplitCandidate::Unassigned(half..half + 100))
+        );
+    }
+
+    #[test]
+    fn test_guard_drop_restores_cooldowns() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        planner.cool_down(0..500, 1, now + SECOND);
+        {
+            let mut guard = PlannerGuard::new(&mut planner);
+            assert!(guard.planner().allocate_chunk(0..1000, Some(1)));
+        }
+        assert_eq!(
+            planner.cooldowns(),
+            vec![(0..500, cooldown(500, 1, now + SECOND))]
+        );
     }
 }

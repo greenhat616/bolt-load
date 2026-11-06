@@ -138,6 +138,11 @@ pub enum RangeFault {
     /// Answer range requests with 503 and `Retry-After`
     /// ([`CONGESTED_RETRY_AFTER_SECS`]).
     Congested,
+    /// Answer the second range request other than the probe with 503 and
+    /// `Retry-After` ([`CONGESTED_RETRY_AFTER_SECS`]). Send the other range
+    /// responses at [`THROTTLED_BYTES_PER_SEC`], so that a task splits its
+    /// first range while that one is still streaming.
+    CongestedOnce,
     /// Mark range responses `Content-Encoding: gzip`; the body stays plain.
     Gzip,
     /// Serve the gzip-encoded resource to every request, despite
@@ -154,16 +159,21 @@ pub enum RangeFault {
     ReplacedAfterShortRange,
 }
 
-/// The `Retry-After` seconds of [`RangeFault::Congested`].
+/// The `Retry-After` seconds of [`RangeFault::Congested`] and
+/// [`RangeFault::CongestedOnce`].
 pub const CONGESTED_RETRY_AFTER_SECS: u64 = 2;
 
+/// The rate of the range responses of [`RangeFault::CongestedOnce`].
+pub const THROTTLED_BYTES_PER_SEC: u64 = 4 << 20;
+
 impl RangeFault {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::IgnoreRange,
         Self::ShiftedStart,
         Self::WrongTotal,
         Self::Unsatisfiable,
         Self::Congested,
+        Self::CongestedOnce,
         Self::Gzip,
         Self::EncodedRepresentation,
         Self::Truncated,
@@ -178,6 +188,7 @@ impl RangeFault {
             Self::WrongTotal => "/wrong-total",
             Self::Unsatisfiable => "/unsatisfiable",
             Self::Congested => "/congested",
+            Self::CongestedOnce => "/congested-once",
             Self::Gzip => "/gzip",
             Self::EncodedRepresentation => "/encoded-representation",
             Self::Truncated => "/truncated",

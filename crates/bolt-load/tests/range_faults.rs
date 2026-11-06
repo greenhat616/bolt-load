@@ -46,7 +46,11 @@ fn outcome(fault: RangeFault, client: Client) -> Outcome {
         (RangeFault::Gzip | RangeFault::EncodedRepresentation, _) => Outcome::Completes {
             fallback: Some(FallbackReason::ContentCoded),
         },
-        (RangeFault::Truncated, _) => Outcome::Completes { fallback: None },
+        // A small file never gets to the second range, which would be
+        // rejected.
+        (RangeFault::Truncated | RangeFault::CongestedOnce, _) => {
+            Outcome::Completes { fallback: None }
+        }
         _ => Outcome::Fails,
     }
 }
