@@ -265,10 +265,12 @@
 
 ## T8 — 容量安全的切分（C8）
 
-- [ ] `RunnerManager` 新增 `try_reserve_slot()` 和 `release(slot)`。`split()` 改为三步：先占槽位，再 resize，最后 spawn；任何一步失败都回滚（design §7.2）。
-- [ ] `spawn_runner`（`strategy_tick.rs:93-99`）删掉 `expect`，槽位不足时记一条 `trace` 后跳过。
-- [ ] `find_chunk_to_split` 改为返回 `SplitCandidate`；删掉 `strategy/mod.rs:88` 的 `expect`。
-- [ ] `dynamic_strategy.rs:77,90` 的闸门改为 `current + n <= max`。
+- [x] `RunnerManager` 新增 `try_reserve_slot()` 和 `release(slot)`。`split()` 改为三步：先占槽位，再 resize，最后 spawn（design §7.2、§14.11）。
+  - 占不到槽位，或者 resize 失败：原 runner 的区间不变，占到的槽位立即释放。
+  - resize 之后失败：原 runner 不再恢复，保持缩小后的区间。后半段分配不到时，槽位立即释放；spawn 被 runtime 拒绝时，下载循环之后处理这次失败，收回新槽位。两种情况下，后半段都重新变成可分配的区间。
+- [x] `spawn_runner`（`strategy_tick.rs:93-99`）删掉 `expect`，槽位不足时记一条 `trace` 后跳过。`SplitGivenTask` 找不到 runner 时也跳过。
+- [x] `find_chunk_to_split` 改为返回 `SplitCandidate`；删掉 `strategy/mod.rs:88` 的 `expect`。
+- [x] `dynamic_strategy.rs:77,90` 的闸门改为 `current + n <= max`。
 
 **验证**
 
