@@ -541,6 +541,26 @@ impl RunnerManager {
         self.chunk_planner.find_chunk_to_split(required_size, now)
     }
 
+    /// The running runner with the most left to download, see
+    /// [`ChunkPlanner::largest_running_chunk`]
+    #[inline]
+    pub fn largest_running_chunk(&self) -> Option<(RunnerId, Range<u64>)> {
+        self.chunk_planner.largest_running_chunk()
+    }
+
+    /// The smallest chunk the planner hands out
+    #[inline]
+    pub fn min_chunk_size(&self) -> u64 {
+        self.chunk_planner.min_chunk_size
+    }
+
+    /// The chunks of the connecting and the running runners
+    pub(super) fn active_chunks(&self) -> impl Iterator<Item = &ChunkState> {
+        self.chunk_planner
+            .iter_chunks()
+            .filter(|chunk| chunk.status.is_active())
+    }
+
     /// Gets incomplete states
     #[inline]
     pub fn get_incomplete_states(

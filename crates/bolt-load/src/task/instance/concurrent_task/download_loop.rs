@@ -21,8 +21,11 @@ use std::{
 use smol_cancellation_token::CancellationToken;
 
 use self::{
-    cancel::CancelSource, completion::check_completions, deadline::DeadlineSource,
-    strategy_tick::StrategyTick, throughput::ThroughputSampler,
+    cancel::CancelSource,
+    completion::check_completions,
+    deadline::DeadlineSource,
+    strategy_tick::StrategyTick,
+    throughput::{RunnerRates, ThroughputSampler},
 };
 use super::{
     RunnerManager, RunnerSpawner,
@@ -70,6 +73,9 @@ pub(super) struct DownloadLoop {
     deadline: DeadlineSource,
     strategy_tick: StrategyTick,
     throughput: ThroughputSampler,
+    /// Each runner's rate at the strategy ticks; only the doubling
+    /// strategy samples it.
+    rates: Option<RunnerRates>,
     /// Every strategy action applied, in order.
     #[cfg(test)]
     applied: Vec<String>,
@@ -88,7 +94,12 @@ impl DownloadLoop {
         let mut manager = RunnerManager::new(total, max_concurrency);
         *manager.admission_mut() =
             AdmissionEvidence::with_streak_gap(streak_gap(options.connect_timeout));
-        let strategy = StrategyControl::new(max_concurrency, options.connect_timeout);
+        let strategy = StrategyControl::new(
+            max_concurrency,
+            options.connect_timeout,
+            options.resolved_growth_strategy(),
+        );
+        let rates = strategy.is_doubling().then(RunnerRates::default);
         let policy = FailurePolicy::new(options, Instant::now());
         let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),
@@ -113,6 +124,7 @@ impl DownloadLoop {
             deadline,
             strategy_tick: StrategyTick::new(strategy_timer.into()),
             throughput: ThroughputSampler::new(throughput_timer.into()),
+            rates,
             #[cfg(test)]
             applied: Vec::new(),
         }

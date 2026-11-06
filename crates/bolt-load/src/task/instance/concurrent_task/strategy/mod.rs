@@ -8,6 +8,7 @@ use bolt_load_utils::telemetry::*;
 mod admission_evidence;
 mod backoff;
 mod concurrency_control_strategy;
+mod doubling_strategy;
 mod dynamic_strategy;
 mod failure_policy;
 
@@ -19,11 +20,16 @@ pub use backoff::Backoff;
 pub use backoff::MIN_RANGE_BACKOFF;
 pub use concurrency_control_strategy::ConcurrencyControlConfig;
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
+use doubling_strategy::{DoublingStrategy, DoublingStrategyContext};
+#[cfg(test)]
+pub use doubling_strategy::{GROW_INTERVAL, MIN_GROWTH_GAIN};
+pub use doubling_strategy::{TickSample, planned_split_size};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
 pub(super) use failure_policy::charges_range;
 
 use super::chunk_planner::SplitCandidate;
+use crate::task::GrowthStrategy;
 
 pub const DEFAULT_STRATEGY_TICK_INTERVAL: Duration = Duration::from_millis(1500); // 1.5 seconds
 
@@ -40,6 +46,10 @@ pub enum StrategyAction {
     /// This is used to create background runners for specific range
     /// to speed up the download process
     CreateTask(Range<u64>),
+    /// Add up to this many runners, each splitting the running chunk with
+    /// the most left to download (design §9.2). The loop reports what it
+    /// added with [`StrategyControl::on_grown`].
+    Grow(usize),
 }
 
 /// What the loop knows at a strategy step besides the runners.
@@ -65,17 +75,26 @@ pub trait Strategy {
 }
 
 pub struct StrategyControl {
-    dynamic_strategy: DynamicStrategy,
+    growth: Growth,
     concurrency_control_strategy: ConcurrencyControlStrategy,
     max_connections: usize,
 }
 
+/// The strategy that adds runners, see [`GrowthStrategy`].
+enum Growth {
+    Legacy(DynamicStrategy),
+    Doubling(DoublingStrategy),
+}
+
 impl StrategyControl {
     /// Strategies for at most `max_connections` runners, which may take
-    /// `connect_timeout` to connect.
-    pub fn new(max_connections: usize, connect_timeout: Duration) -> Self {
+    /// `connect_timeout` to connect, growing by `growth`.
+    pub fn new(max_connections: usize, connect_timeout: Duration, growth: GrowthStrategy) -> Self {
         Self {
-            dynamic_strategy: DynamicStrategy::default(),
+            growth: match growth {
+                GrowthStrategy::Legacy => Growth::Legacy(DynamicStrategy::default()),
+                GrowthStrategy::Doubling => Growth::Doubling(DoublingStrategy::default()),
+            },
             concurrency_control_strategy: ConcurrencyControlStrategy::new(
                 ConcurrencyControlConfig::with_connect_timeout(connect_timeout),
                 max_connections,
@@ -103,6 +122,12 @@ impl StrategyControl {
         self.concurrency_control_strategy.state()
     }
 
+    /// Whether the doubling strategy adds the runners, which needs a
+    /// [`TickSample`] at every tick.
+    pub fn is_doubling(&self) -> bool {
+        matches!(self.growth, Growth::Doubling(_))
+    }
+
     /// Step the strategies at `now`.
     ///
     /// While `signals.congested`, no action opens a connection: no runner
@@ -110,6 +135,10 @@ impl StrategyControl {
     /// backing off (design §8.1). Nothing is added while the active runners
     /// reach `min(max_concurrency, cap)`, see
     /// [`ConcurrencyControlStrategy::refill_cap`].
+    ///
+    /// The doubling strategy steps on `tick`, the runners over the tick
+    /// that ends at `now`; without one it does not step.
+    #[expect(clippy::too_many_arguments, reason = "the loop's state, by field")]
     pub fn execute(
         &mut self,
         max_concurrency: usize,
@@ -118,6 +147,7 @@ impl StrategyControl {
         runner_manager: &mut super::RunnerManager,
         now: Instant,
         signals: LoopSignals,
+        tick: Option<&TickSample>,
     ) -> Option<(&'static str, Vec<StrategyAction>)> {
         let congested = signals.congested;
         let want = self.want();
@@ -131,6 +161,33 @@ impl StrategyControl {
             return Some((ConcurrencyControlStrategy::name(), actions));
         }
 
+        // Growth adds runners up to `cap`, never above it: the limit
+        // controller's cap, short of a running step's trial once a refusal
+        // marked it (design §8.3).
+        let cap = self
+            .concurrency_control_strategy
+            .refill_cap(want, runner_manager.admission_mut())
+            .min(max_concurrency);
+        let dynamic_strategy = match &mut self.growth {
+            Growth::Legacy(dynamic_strategy) => dynamic_strategy,
+            Growth::Doubling(doubling_strategy) => {
+                let tick = tick?;
+                let mut context = DoublingStrategyContext {
+                    now,
+                    active_runners,
+                    max_concurrency: cap,
+                    congested,
+                    all_delivering: tick.all_delivering,
+                    speed: tick.speed,
+                    // No speed limit before design §10.
+                    speed_limit: None,
+                };
+                trace!("[STRATEGY] Doubling strategy context: {context:?}");
+                let actions = doubling_strategy.step(&mut context);
+                return (!actions.is_empty()).then(|| (DoublingStrategy::name(), actions));
+            }
+        };
+
         if congested {
             trace!("[STRATEGY] Congested, not splitting");
             return None;
@@ -138,10 +195,6 @@ impl StrategyControl {
 
         // TODO: move this to dynamic strategy inner?
         let planned_chunk_size = (current_speed * 2.0) as u64;
-        let cap = self
-            .concurrency_control_strategy
-            .refill_cap(want, runner_manager.admission_mut())
-            .min(max_concurrency);
 
         // An unassigned range is left to the concurrency control, which
         // creates runners for it.
@@ -162,13 +215,20 @@ impl StrategyControl {
                 planned_chunk_size,
             };
             trace!("[STRATEGY] Dynamic strategy context: {strategy_context:?}");
-            let actions = self.dynamic_strategy.step(&mut strategy_context);
+            let actions = dynamic_strategy.step(&mut strategy_context);
             if !actions.is_empty() {
                 return Some((DynamicStrategy::name(), actions));
             }
         }
 
         None
+    }
+
+    /// The loop added `added` runners for a [`StrategyAction::Grow`].
+    pub fn on_grown(&mut self, added: usize) {
+        if let Growth::Doubling(doubling_strategy) = &mut self.growth {
+            doubling_strategy.on_grown(added);
+        }
     }
 
     /// The runners to create between ticks, for ranges whose backoff, or

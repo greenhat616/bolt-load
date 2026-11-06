@@ -32,6 +32,11 @@ pub struct ChunkState {
     /// after the attempt delivered bytes, is never charged, and neither is
     /// a congestion rejection (429/503).
     pub charged: u32,
+    /// Which attempt holds the chunk: a fresh number for every chunk the
+    /// planner hands out, so a runner ID that claims the same start again
+    /// is a new attempt. A chunk keeps its own when it shrinks; the chunk
+    /// split off it gets a new one.
+    pub generation: u64,
 }
 
 /// The backoff of an available range that failed runners gave back
@@ -150,6 +155,7 @@ impl ChunkState {
             status,
             attempts: 0,
             charged: 0,
+            generation: 0,
         }
     }
 
@@ -208,6 +214,8 @@ pub struct ChunkPlanner {
     /// never overlap a chunk or each other, and keep their attempts after
     /// `not_before` until claimed.
     cooldowns: BTreeMap<u64, Cooldown>,
+    /// The [`ChunkState::generation`] of the next chunk.
+    next_generation: u64,
 }
 
 impl ChunkPlanner {
@@ -220,7 +228,15 @@ impl ChunkPlanner {
             runner_to_chunk: HashMap::new(),
             accepted_bytes: 0,
             cooldowns: BTreeMap::new(),
+            next_generation: 0,
         }
+    }
+
+    /// A generation no chunk has had.
+    fn take_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        generation
     }
 
     /// Get current number of chunks
@@ -299,6 +315,7 @@ impl ChunkPlanner {
         let chunk_state = ChunkState {
             attempts,
             charged,
+            generation: self.take_generation(),
             ..ChunkState::new(range, runner_id, status)
         };
         self.chunks.insert(start, chunk_state);
@@ -570,7 +587,10 @@ impl ChunkPlanner {
         first_chunk.allocated = first_range.clone();
 
         // Second chunk starts fresh
-        let second_chunk = ChunkState::from_runner_id(second_range.clone(), Some(new_runner_id));
+        let second_chunk = ChunkState {
+            generation: self.take_generation(),
+            ..ChunkState::from_runner_id(second_range.clone(), Some(new_runner_id))
+        };
 
         // Insert both chunks
         self.chunks.insert(first_range.start, first_chunk);
@@ -717,6 +737,19 @@ impl ChunkPlanner {
                 runner,
                 range: chunk.downloaded.end..chunk.downloaded.end + required_size,
             })
+    }
+
+    /// The running runner with the most left to download, and its
+    /// incomplete range; `None` when no running chunk is incomplete.
+    ///
+    /// A connecting runner is left alone, as by
+    /// [`Self::get_incomplete_states`].
+    pub fn largest_running_chunk(&self) -> Option<(RunnerId, Range<u64>)> {
+        self.chunks
+            .values()
+            .filter(|c| c.status == ChunkStatus::Running && !c.is_complete())
+            .max_by_key(|c| c.remaining())
+            .and_then(|c| Some((c.runner_id?, c.incomplete_range())))
     }
 
     /// Get state of a specific runner
@@ -1702,6 +1735,30 @@ mod tests {
         assert!(planner.split_chunk(1, 40, 2).is_err());
         assert_eq!(snapshot(&planner), before);
         assert!(planner.get_runner_state(2).is_none());
+    }
+
+    /// Every chunk handed out is a new generation, the same ID claiming the
+    /// same start again included; a chunk keeps its own when it shrinks or
+    /// is split.
+    #[test]
+    fn test_every_claim_is_a_new_generation() {
+        let mut planner = ChunkPlanner::new(100);
+        assert!(planner.allocate_chunk(0..50, Some(0)));
+        let generation =
+            |planner: &ChunkPlanner, id| planner.get_runner_state(id).unwrap().generation;
+        let first = generation(&planner, 0);
+        planner.resize_runner_state(0, 25).unwrap();
+        assert_eq!(generation(&planner, 0), first);
+        planner.split_chunk(0, 10, 1).unwrap();
+        assert_eq!(generation(&planner, 0), first);
+        let split = generation(&planner, 1);
+        assert_ne!(split, first);
+
+        // Failed before a byte: its range is free, and claimed again.
+        assert_eq!(planner.mark_failed(0).unwrap().range, 0..10);
+        assert!(planner.allocate_chunk(0..10, Some(0)));
+        let retry = generation(&planner, 0);
+        assert!(retry != first && retry != split, "{retry}");
     }
 
     #[test]
