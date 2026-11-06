@@ -75,6 +75,19 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   error. The one exception is `Congestion` (429/503) while other
   attempts are still in flight: it is a concurrency signal for the
   concurrency strategy, still bounded by the no-progress deadline.
+- **Backoff** (concurrent mode): the range of a failed attempt is not
+  retried before a backoff of 0.5 s for its first failure, doubling up
+  to 30 s, plus jitter. A range counts on from its failures when it is
+  retried; a range split off a running one starts at none. A
+  `Congestion` failure waits for its `Retry-After` when that is longer,
+  at most 120 s, and holds back every new connection of the task until
+  then, splits included. The end of a backoff wakes the task, which then
+  creates runners only as the concurrency strategy would: into free
+  slots, and after an unretryable failure only once the strategy has
+  lowered the concurrency. A range it cannot retry then waits for the
+  next strategy tick. A `Retry-After` longer than
+  `no_progress_timeout` ends the task with `NoProgress` unless other
+  runners keep making progress.
 - **Idle streams**: a runner whose upstream yields no non-empty data
   for [`TaskOptions::stream_idle_timeout`] fails with the retryable
   `TaskError::Timeout`. In singleton mode there is no retry, so this
@@ -221,4 +234,7 @@ The concurrent download path includes several sub-systems:
 | `DEFAULT_MAX_CONNECTIONS` | 8 | Default of `TaskOptions::max_connections` |
 | `DEFAULT_SAMPLE_INTERVAL` | 250 ms | Speed measurement period |
 | `DEFAULT_STRATEGY_TICK_INTERVAL` | 1.5 s | Strategy evaluation period |
+| `MIN_RANGE_BACKOFF` | 500 ms | Backoff of a range after its first failure |
+| `MAX_RANGE_BACKOFF` | 30 s | Longest backoff of a range, jitter included |
+| `MAX_CONGESTION_BACKOFF` | 120 s | Longest wait for a `Retry-After` |
 | `FILE_WRITER_QUEUE_SIZE` | 2048 | Pending write queue depth |
