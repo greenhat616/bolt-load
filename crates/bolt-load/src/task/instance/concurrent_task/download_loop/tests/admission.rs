@@ -158,8 +158,11 @@ async fn admission_loop(
         spawner
     };
     let (reporter, _status) = ProgressReporter::for_test();
-    let options =
-        TaskOptions::default().max_connections(NonZeroUsize::new(max_connections).unwrap());
+    // These tests are about the connection limit; the range budget is
+    // left out of the way.
+    let options = TaskOptions::default()
+        .max_connections(NonZeroUsize::new(max_connections).unwrap())
+        .max_attempts_per_range(std::num::NonZeroU32::MAX);
     let mut download = DownloadLoop::new(
         TOTAL,
         spawner,

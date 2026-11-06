@@ -184,13 +184,8 @@ impl RunnerManager {
             return RunnerTick::downloading();
         }
         self.record_attempt_end(AttemptPhase::Streaming, &kind);
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            retryable: is_attempt_retryable(&kind),
-            error: kind,
-            range: released.range,
-            attempts: released.attempts,
-        })
+        let retryable = is_attempt_retryable(&kind);
+        RunnerTick::with_failure(AttemptFailure::new(runner_id, kind, retryable, released))
     }
 
     /// Handle a runner that stopped before it connected; its range is
@@ -207,13 +202,7 @@ impl RunnerManager {
         error!("runner {runner_id} failed to connect: {error:?}");
         self.record_attempt_end(AttemptPhase::Connecting, &error);
         let retryable = is_attempt_retryable(&error);
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            error,
-            retryable,
-            range: released.range,
-            attempts: released.attempts,
-        })
+        RunnerTick::with_failure(AttemptFailure::new(runner_id, error, retryable, released))
     }
 
     /// Handle a runner whose spawn was rejected.
@@ -252,13 +241,12 @@ impl RunnerManager {
         if self.chunk_planner.is_complete() {
             return RunnerTick::finished();
         }
-        RunnerTick::with_failure(AttemptFailure {
+        RunnerTick::with_failure(AttemptFailure::new(
             runner_id,
-            error: TaskError::ChannelClosed,
-            retryable: true,
-            range: released.range,
-            attempts: released.attempts,
-        })
+            TaskError::ChannelClosed,
+            true,
+            released,
+        ))
     }
 
     fn handle_lifecycle_stream_event(&mut self, event: LifecycleStreamEvent) -> RunnerTick {

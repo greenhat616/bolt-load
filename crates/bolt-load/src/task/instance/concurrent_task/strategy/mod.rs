@@ -19,6 +19,7 @@ pub use concurrency_control_strategy::ConcurrencyControlConfig;
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
+pub(super) use failure_policy::charges_range;
 
 use super::chunk_planner::SplitCandidate;
 
