@@ -38,11 +38,16 @@ impl Emission {
         }
     }
 
-    /// Priority: cancel > control > data vacancy.
+    /// Priority: cancel > stop > control > data vacancy.
+    ///
+    /// `stopped` is the runner's own stop, when it may interrupt this
+    /// emission. It does not once a control error was deferred: the runner
+    /// ends with that error after the push.
     pub(super) fn poll(
         &mut self,
         runner: &mut TaskRunner,
         cancelled: &mut Cancelled,
+        mut stopped: Option<&mut Cancelled>,
         cx: &mut Context<'_>,
     ) -> Poll<EmitResult> {
         if runner.data_tx.is_none() {
@@ -50,6 +55,12 @@ impl Emission {
         }
         loop {
             if let Poll::Ready(()) = cancelled.as_mut().poll(cx) {
+                return Poll::Ready(Err(TaskRunError::Cancelled));
+            }
+            if self.deferred.is_none()
+                && let Some(stopped) = stopped.as_deref_mut()
+                && let Poll::Ready(()) = stopped.as_mut().poll(cx)
+            {
                 return Poll::Ready(Err(TaskRunError::Cancelled));
             }
             if self.control_open
@@ -107,17 +118,23 @@ impl RunnerLoop<'_> {
         let Phase::Streaming(state) = &mut self.phase else {
             unreachable!("not streaming");
         };
-        let emission = state.staged_mut().expect("a buffer was staged");
-        emission.poll(self.runner, &mut self.cancelled, cx)
+        let (emission, stoppable) = state.staged_mut().expect("a buffer was staged");
+        let stopped = self.stopped.as_mut().filter(|_| stoppable);
+        emission.poll(self.runner, &mut self.cancelled, stopped, cx)
     }
 }
 
 #[cfg(test)]
 impl TaskRunner {
-    /// Push `data` the way a running runner does.
+    /// Push `data` the way a running runner does, more of its item
+    /// following.
     pub(in crate::runner) async fn emit(&mut self, data: Bytes) -> EmitResult {
         let mut cancelled = Box::pin(self.cancel_token.clone().cancelled_owned());
+        let mut stopped = self
+            .stop_token
+            .clone()
+            .map(|stop| Box::pin(stop.cancelled_owned()));
         let mut emission = Emission::new(data);
-        std::future::poll_fn(|cx| emission.poll(self, &mut cancelled, cx)).await
+        std::future::poll_fn(|cx| emission.poll(self, &mut cancelled, stopped.as_mut(), cx)).await
     }
 }
