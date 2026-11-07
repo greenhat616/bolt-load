@@ -21,7 +21,7 @@ use super::{
             chunk_planner::{ChunkState, ChunkStatus, DEFAULT_MIN_CHUNK_SIZE, Side, SideFailure},
             file_writer::WrittenRanges,
             runner_manager::RunnerChannels,
-            strategy::SLOW_WINDOW,
+            strategy::{SLOW_WINDOW, StrategyAction},
         },
         hedge::HEDGE_IDLE,
     },
@@ -920,6 +920,103 @@ async fn a_reused_id_is_a_new_runner() {
     assert_eq!(h.chunk(reused).downloaded, MIB..MIB + KIB);
     assert_eq!(h.chunk(hd).downloaded, 0..KIB);
     assert_eq!(h.chunk(hd).runner_id, Some(hd));
+}
+
+/// The sequence the split property test shrank to (design §14.18), run to
+/// the end: 4 connections, the first runner split twice, then left with
+/// a byte under `2 × min_chunk_size`, silent since its spawn 2 s ago,
+/// while neither tail is worth splitting, so the tick hedges it. The
+/// original then delivers first and wins; the hedge, a real runner
+/// parked at its spawn, is stopped and confirms; the original finishes.
+/// Every slot is held by a runner and reclaimed once, and the IDs are
+/// reused.
+#[tokio::test]
+async fn a_hedge_after_two_splits_runs_to_the_end() {
+    const TOTAL: u64 = 64 * MIB;
+    let t0 = Instant::now();
+    let mut h = Harness::new(TOTAL, &options(4));
+    // The first runner keeps its limits, so that splits can shrink it.
+    let slot = h.download.manager.try_reserve_slot().unwrap();
+    let o = slot.runner_id;
+    let (mut eo, channels) = Ends::new();
+    let mut limits = None;
+    assert!(
+        h.download
+            .manager
+            .spawn_in(slot, 0..TOTAL, t0, |_, receiver| {
+                limits = Some(receiver);
+                Ok(channels)
+            })
+    );
+    eo.start();
+    h.go(t0);
+    let now = t0 + Duration::from_secs(2);
+    h.download.apply(StrategyAction::SplitAllTask(0), now);
+    for bytes in [5_701_224, 16_462_322, 7_196_583] {
+        h.download.manager.update_progress(o, bytes).unwrap();
+    }
+    h.download.apply(StrategyAction::SplitGivenTask(o), now);
+    // The two tails, real runners parked at their spawn; kept alive.
+    let tails = h.rt.take_parked();
+    assert_eq!(tails.len(), 2);
+    assert_eq!(h.slots(), 3);
+    assert_eq!(h.chunk(o).remaining(), 2 * MIN - 1);
+
+    let active = h.download.manager.get_active_runners_count();
+    h.download.throughput.speed = 50_331_650.0;
+    h.download.throughput.per_runner_speed = 50_331_650.0 / active as f64;
+    h.download.on_strategy_tick(now);
+    assert_eq!(h.slots(), 4, "the hedge holds a slot");
+    let hd = (0..4)
+        .find(|&id| id != o && h.undecided(id) && h.download.manager.get_runner_state(id).is_none())
+        .expect("a hedge without a chunk of its own");
+    assert!(h.undecided(o));
+    assert_eq!(h.download.manager.get_active_runners_count(), 4);
+
+    // The original delivers first: it wins, the hedge is stopped.
+    eo.send(32 * KIB);
+    h.go(now);
+    assert!(!h.undecided(o) && !h.undecided(hd));
+    assert!(h.download.manager.is_stopping(hd));
+    assert_eq!(h.slots(), 4, "the loser holds its slot until it confirms");
+    assert_eq!(h.download.manager.get_active_runners_count(), 3);
+
+    // The hedge, polled at last, sees its stop and confirms.
+    for parked in h.rt.take_parked() {
+        tokio::time::timeout(Duration::from_secs(10), parked)
+            .await
+            .expect("a parked future completes");
+    }
+    h.drain(now);
+    assert_eq!(h.slots(), 3);
+    assert!(!h.download.manager.is_stopping(hd));
+    assert!(h.chunk_of_none(hd));
+
+    // The original finishes its chunk, which ends the hedge record, and
+    // stops; the tails still hold the rest of the file.
+    eo.send(2 * MIN - 1 - 32 * KIB);
+    h.go(now);
+    let chunk = h.chunk(o);
+    assert_eq!((chunk.status, chunk.hedge), (ChunkStatus::Finished, None));
+    eo.end(LifecycleEvent::finished());
+    assert!(h.step(now).unwrap().is_continue());
+    assert_eq!(h.slots(), 2);
+    assert!(!h.undecided(o) && !h.download.manager.is_stopping(o));
+
+    // Both IDs are free again, for new runners.
+    let first = h.download.manager.try_reserve_slot().unwrap();
+    let second = h.download.manager.try_reserve_slot().unwrap();
+    let mut reused = [first.runner_id, second.runner_id];
+    reused.sort_unstable();
+    let mut expected = [o, hd];
+    expected.sort_unstable();
+    assert_eq!(reused, expected);
+    assert!(h.download.manager.try_reserve_slot().is_none());
+    h.download.manager.release(first);
+    h.download.manager.release(second);
+    assert_eq!(h.slots(), 2);
+    drop(h);
+    drop((tails, limits));
 }
 
 // ── Errors and budget ────────────────────────────────────────────────
