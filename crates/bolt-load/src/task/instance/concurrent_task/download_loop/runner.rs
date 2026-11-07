@@ -7,7 +7,7 @@ use std::{
 use super::{
     super::{
         file_writer::WriterFullError,
-        runner_manager::{DownloadedChunk, TaskState},
+        runner_manager::{DownloadedChunk, SideFailed, TaskState},
     },
     DownloadLoop, LoopEvent, RunnerTick,
 };
@@ -30,20 +30,23 @@ impl DownloadLoop {
 
     /// Handle a runner event at `now`; a failure the task survives backs
     /// its range off.
+    ///
+    /// The other attempts in flight are counted once the failed runner is
+    /// released, without the runners the loop stopped (design §9.6, M3).
     pub(super) fn on_runner(&mut self, tick: RunnerTick, now: Instant) -> Result<ControlFlow<()>> {
         // The manager recorded the event without a clock.
         self.manager.admission_mut().stamp(now);
         if let Some(chunk) = tick.downloaded {
             self.accept_chunk(chunk, now)?;
         }
+        if let Some(failure) = tick.side_failure {
+            self.on_side_failure(&failure, now)?;
+        }
         if let Some(failure) = tick.failure {
             if let Some(e) = range_unsupported(&failure.error) {
                 return Err(e);
             }
-            if let Some(e) = self
-                .policy
-                .on_failure(&failure, self.manager.allocated_runner_count())
-            {
+            if let Some(e) = self.policy.on_failure(&failure, self.manager.in_flight()) {
                 return Err(DownloadError::transfer(e));
             }
             self.back_off(&failure, now);
@@ -55,7 +58,8 @@ impl DownloadLoop {
         })
     }
 
-    /// Write a chunk the planner accepted; a non-empty one is progress.
+    /// Write a chunk the planner accepted; a non-empty one is progress,
+    /// and ends its runner's silence.
     fn accept_chunk(&mut self, chunk: DownloadedChunk, now: Instant) -> Result<()> {
         let progressed = !chunk.range.is_empty();
         self.writer
@@ -63,6 +67,28 @@ impl DownloadLoop {
             .map_err(writer_full)?;
         if progressed {
             self.policy.on_progress(now);
+            self.manager.note_delivery(chunk.runner_id, now);
+        }
+        Ok(())
+    }
+
+    /// A side of an undecided pair failed at `now` while the other runs on
+    /// (design §9.6): nothing is released or backed off, but the task
+    /// falls back or ends as for any runner, and a congestion holds new
+    /// connections back.
+    fn on_side_failure(&mut self, failure: &SideFailed, now: Instant) -> Result<()> {
+        if let Some(e) = range_unsupported(&failure.error) {
+            return Err(e);
+        }
+        if let Some(e) = self.policy.on_side_failure(failure) {
+            return Err(DownloadError::transfer(e));
+        }
+        if self
+            .backoff
+            .hold_congestion(&failure.error, failure.attempts, now)
+            && let Some(at) = self.next_retry(now)
+        {
+            self.deadline.wake_by(at);
         }
         Ok(())
     }

@@ -27,7 +27,7 @@ pub use doubling_strategy::{GROW_INTERVAL, MIN_GROWTH_GAIN};
 pub use doubling_strategy::{TickSample, planned_split_size};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
-pub(super) use failure_policy::charges_range;
+pub(super) use failure_policy::{charges_range, is_restart};
 pub use slow_restart::{JudgedRunner, SLOW_WINDOW, SlowRestartContext, slow_runner};
 
 use super::chunk_planner::SplitCandidate;
@@ -108,6 +108,13 @@ impl StrategyControl {
     /// The connections the growth side wants open.
     fn want(&self) -> usize {
         self.max_connections
+    }
+
+    /// The connections new runners may take now, see
+    /// [`ConcurrencyControlStrategy::refill_cap`].
+    pub fn refill_cap(&self, admission: &AdmissionEvidence) -> usize {
+        self.concurrency_control_strategy
+            .refill_cap(self.want(), admission)
     }
 
     /// The connections the runners may take now, see

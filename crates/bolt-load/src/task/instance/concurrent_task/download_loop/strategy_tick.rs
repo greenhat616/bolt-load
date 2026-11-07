@@ -42,10 +42,12 @@ impl DownloadLoop {
         }
     }
 
-    /// Restart a slow runner, then step the strategies at `now`.
+    /// Restart a slow runner, step the strategies, then hedge a stalled
+    /// runner at `now`.
     ///
     /// The restart comes first, so the growth of the same tick leaves the
-    /// stopped runner alone.
+    /// stopped runner alone. The hedge comes last: the runners the
+    /// strategies create take the free slots first (design §9.6).
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(super) fn on_strategy_tick(&mut self, now: Instant) {
         // Every tick, so each sample spans one tick.
@@ -53,6 +55,11 @@ impl DownloadLoop {
             rates.sample(&self.manager, now);
         }
         self.restart_slow_runner(now);
+        self.step_strategies(now);
+        self.hedge_stalled_runner(now);
+    }
+
+    fn step_strategies(&mut self, now: Instant) {
         let signals = self.signals(now);
         let tick = self.rates.as_ref().map(|rates| rates.tick());
         let Some((strategy_name, actions)) = self.strategy.execute(
@@ -192,6 +199,7 @@ impl DownloadLoop {
         self.spawn_in(
             slot,
             incomplete_range.start + half_size..incomplete_range.end,
+            now,
         )
     }
 
@@ -214,17 +222,17 @@ impl DownloadLoop {
             trace!("[TASK] skip spawning a runner for {range:?}: no runner slot is free");
             return;
         };
-        self.spawn_in(slot, range);
+        self.spawn_in(slot, range, now);
     }
 
     /// Returns whether a runner was spawned, see [`RunnerManager::spawn_in`].
     ///
     /// [`RunnerManager::spawn_in`]: super::super::RunnerManager::spawn_in
-    fn spawn_in(&mut self, slot: RunnerSlot, range: Range<u64>) -> bool {
+    fn spawn_in(&mut self, slot: RunnerSlot, range: Range<u64>, now: Instant) -> bool {
         let spawner = &self.spawner;
         let spawned = self
             .manager
-            .spawn_in(slot, range.clone(), |runner_id, limits| {
+            .spawn_in(slot, range.clone(), now, |runner_id, limits| {
                 spawner.spawn(range.clone(), runner_id, limits)
             });
         if !spawned {

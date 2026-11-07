@@ -182,21 +182,25 @@ async fn admission_loop(
     (download, file_writer)
 }
 
-/// Complete the parked `writes`, hand their completions to the loop, and
+/// Complete the parked `writes`, hand their completions to the loop at
+/// `now`, and
 /// complete the writes that dispatches in turn, until the writer is idle.
 fn drain(
     download: &mut DownloadLoop,
     rt: &ScriptedRuntime,
     writes: &mut Vec<FutureObj<'static, ()>>,
+    now: Instant,
 ) {
     while !download.writer.is_idle() {
         for write in writes.drain(..) {
             futures::executor::block_on(write);
         }
-        while let Some(LoopEvent::WriterCompleted(Some(completions))) =
+        while let Some(LoopEvent::WriterCompleted(Some(completions), was_full)) =
             std::future::poll_fn(|cx| download.poll_writer(cx)).now_or_never()
         {
-            download.record_completions(completions).unwrap();
+            download
+                .record_completions(completions, was_full, now)
+                .unwrap();
         }
         // The write the writer held back, dispatched once a slot freed.
         writes.extend(rt.take_parked());
@@ -415,7 +419,7 @@ impl Sim {
 
     /// Complete the parked writes, and hand their completions to the loop.
     fn drain_writer(&mut self) {
-        drain(&mut self.download, &self.rt, &mut self.writes);
+        drain(&mut self.download, &self.rt, &mut self.writes, self.now);
     }
 
     /// Drop the admitted runners: their streams close.
@@ -1298,7 +1302,7 @@ mod admission_properties {
                     true
                 }
                 Op::DrainWriter => {
-                    drain(&mut self.download, &self.rt, &mut self.writes);
+                    drain(&mut self.download, &self.rt, &mut self.writes, self.now);
                     true
                 }
                 Op::Tick(speed) => {

@@ -135,7 +135,15 @@ pub enum FileRangeWriterImpl {
     Compio(self::compio_writer::CompioWriter),
     #[cfg(test)]
     Slow(self::slow::SlowWriter),
+    /// Records the range of every write, and discards the data.
+    #[cfg(test)]
+    Recording(WrittenRanges),
 }
+
+/// The ranges a [`FileRangeWriterImpl::Recording`] writer was asked to
+/// write, in order.
+#[cfg(test)]
+pub type WrittenRanges = Arc<std::sync::Mutex<Vec<Range<u64>>>>;
 
 impl FileRangeWriter for FileRangeWriterImpl {
     #[inline]
@@ -149,6 +157,11 @@ impl FileRangeWriter for FileRangeWriterImpl {
             FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
             #[cfg(test)]
             FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Recording(ranges) => {
+                ranges.lock().unwrap().push(range);
+                Ok(())
+            }
         }
     }
 
@@ -163,6 +176,8 @@ impl FileRangeWriter for FileRangeWriterImpl {
             FileRangeWriterImpl::Compio(writer) => writer.finalize().await,
             #[cfg(test)]
             FileRangeWriterImpl::Slow(writer) => writer.finalize().await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Recording(_) => Ok(()),
         }
     }
 }
@@ -178,6 +193,11 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
             FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
             #[cfg(test)]
             FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Recording(ranges) => {
+                ranges.lock().unwrap().push(range);
+                Ok(())
+            }
         }
     }
 
@@ -345,6 +365,20 @@ impl FileWriter {
             kind,
             inner: Arc::new(inner),
         })
+    }
+}
+
+impl FileWriter {
+    /// A writer that only records the range of every write: through
+    /// spawned tasks, as it has no worker queue.
+    #[cfg(test)]
+    pub fn recording() -> (Self, WrittenRanges) {
+        let ranges = WrittenRanges::default();
+        let writer = Self {
+            kind: FileRangeWriterKind::Null,
+            inner: Arc::new(FileRangeWriterImpl::Recording(ranges.clone())),
+        };
+        (writer, ranges)
     }
 }
 
