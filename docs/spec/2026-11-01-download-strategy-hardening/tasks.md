@@ -46,7 +46,8 @@
 | | C12 `feat(task): restart slow runners under the doubling strategy` | T13 | |
 | | C27 `feat(task): hedge a stalled range at the endgame under the doubling strategy` | T27 | |
 | | C13 `bench(task): compare the growth strategies` | T14 | |
-| PR-7b 切换默认值 | C14 `feat(task)!: make doubling the default growth strategy` | T15 | PR-7，且 G7 达标 |
+| PR-7c 上限处的翻倍 | C28 `feat(task): judge the doubling at the connection cap` | T28 | PR-7 |
+| PR-7b 切换默认值 | C14 `feat(task)!: make doubling the default growth strategy` | T15 | PR-7、PR-7c、重启静默 runner 的 PR（下一个，任务待加），且 G7 达标 |
 | PR-8 跨任务限额（D4） | C15 `feat(task): admit tasks and cap connections per host through shared limits` | T16 | PR-5 |
 | | C16 `feat(runner): shape throughput with a shared token bucket` | T17 | |
 | | C17 `feat(task): remember hosts that ignore ranges` | T18 | PR-3 |
@@ -465,6 +466,29 @@
 
 - `cargo bench -p bolt-load --features unstable-strategy --bench growth_strategy` 能跑完。
 - 对照 G7 判断是否达标，并在 PR 描述里写明结论。
+
+## T28 — 上限处的翻倍（C28）
+
+维护者 2026-11-08 对 T14（design §14.17）待决定事项 1、4 的决定：改 G7，修 `Doubling` 在上限处的判断。
+
+- [x] design §2 的 G7 改为：完成时间不比 `Legacy` 差（逐轮差的中位数不超过 `Legacy` 中位数的 5%），峰值连接数不超过用满带宽所需连接数的两倍；所需连接数是每个场景的参照值，s1、s3 按构造确定，s2 按观察确定。
+- [x] `doubling_strategy.rs` 的 `runners_to_add`：到了上限，只要这个 tick 通过别的检查（间隔、拥塞、全部交数据、有速度、限速），上一次完整的翻倍照样判断，没有增益就停滞。翻倍时记下它有没有翻到当时的上限（按做出翻倍那个 tick 的上限，不按判断时的）：翻到上限、还没判断的翻倍，在活跃数回到翻倍后的数之前不扩张，所以 runner 下完不补位；上限以下的翻倍少了 runner 时不下结论、照常扩张（C11 的做法）。被截断的扩张仍不判断（design §14.14）。实现、现在哪些扩张会被判断和变异检查见 design §14.18。
+- [x] bench：场景声明用满带宽所需的连接数，打印逐轮差的中位数占 `Legacy` 中位数的百分比和每个场景的 G7 结论；s1_max32、s1_max8、s2、s3 各重跑 10 次。
+
+**验证**
+
+- 单元测试（显式传入 `now`）：
+  - 到上限的翻倍在上限处判断：没有增益就停滞，上限之后恢复也不再扩张；有增益时上限拦住，runner 下完之后补位；上限被降到翻倍后的数以下时也判断；
+  - 翻到上限、没判断的翻倍：runner 下完时不补位，活跃数回来之后再判；
+  - 上限以下的翻倍少了 runner：不下结论，照常扩张；
+  - 翻倍有没有到上限，按做出翻倍时的上限算，之后上限变了也不变；
+  - 被截断的扩张仍不判断，在上限处反复补位（保留的盲区）。
+- 下载循环测试：翻倍到上限、没有增益，一个 runner 下完之后不再切分补位；判断之前就有 runner 下完、别的 chunk 还有大量可切的活时，上限以下照常扩张，到了上限不补位。
+- 变异检查：上限处跳过判断、上限处也照样补位、上限以下也等着不扩张、判断时才读上限，各有测试失败。
+- 性质测试 `splits_stay_within_the_limit_and_cover_the_file` 把对冲中的 H（没有 chunk、在未分胜负的一对里）和正在停止的 runner 也算作占着槽位：它找到的一个序列在 C13 上也报“a slot leaked”，是测试漏算了 H（design §14.18）。这个序列另写成确定的测试，一直走到败方确认停止、胜方下完，检查槽位、一对和停止状态都清掉、ID 能再用。
+- bench 的 G7 结论写进 design §14.18 和 PR 描述。
+
+---
 
 ## T15 — 切换默认值（C14，G7 达标之后）
 

@@ -3,6 +3,11 @@
 //! by splitting the largest running chunks, until a growth gains less than
 //! [`MIN_GROWTH_GAIN`].
 //!
+//! A full doubling is judged at the first tick that measures it, the
+//! connection limit included. One that reached the limit holds the growth
+//! until then, so runners that finish are not replaced after it; one below
+//! the limit that loses runners first is not judged (design §14.18).
+//!
 //! It only adds runners: [`ConcurrencyControlStrategy`] lowers the limit,
 //! and the growth never goes past it.
 //!
@@ -12,6 +17,8 @@ use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
+
+use bolt_load_utils::telemetry::*;
 
 use super::{Strategy, StrategyAction};
 use crate::task::RunnerId;
@@ -91,6 +98,9 @@ struct Growth {
     speed_before: f64,
     /// The active runners right after it.
     runners: usize,
+    /// Whether it reached the concurrency limit of the tick that decided
+    /// it.
+    at_limit: bool,
 }
 
 /// What a step asked for, until the loop reports what it added.
@@ -99,13 +109,16 @@ struct Proposal {
     at: Instant,
     speed: f64,
     active_runners: usize,
+    /// The concurrency limit of the tick, kept: the limit may change
+    /// before the growth is judged.
+    max_concurrency: usize,
 }
 
 #[derive(Debug, Default)]
 pub struct DoublingStrategy {
     /// When a growth last added a runner.
     last_grow: Option<Instant>,
-    /// The last growth, until its gain is judged.
+    /// The last full doubling, until a tick measures its gain.
     unjudged: Option<Growth>,
     proposal: Option<Proposal>,
     /// A growth gained too little: no more growth in this download.
@@ -124,7 +137,7 @@ impl DoublingStrategy {
             return 0;
         }
         let active = context.active_runners;
-        if active == 0 || active >= context.max_concurrency {
+        if active == 0 {
             return 0;
         }
         // Splits open connections (design §8.1).
@@ -143,20 +156,43 @@ impl DoublingStrategy {
         {
             return 0;
         }
-        // Judged once, in the first tick that passes the gates above.
+        // Judged once, in the first tick that passes the gates above, at
+        // the limit too (design §14.18).
         if let Some(growth) = self.unjudged.take() {
             // With fewer runners than the growth made, the tick does not
-            // measure it: no verdict.
-            if active >= growth.runners && speed < growth.speed_before * MIN_GROWTH_GAIN {
+            // measure it. A doubling to the limit waits for them, and
+            // nothing refills meanwhile; one below the limit has no
+            // verdict, and the strategy grows on.
+            if active < growth.runners {
+                if growth.at_limit {
+                    self.unjudged = Some(growth);
+                    return 0;
+                }
+            } else if speed < growth.speed_before * MIN_GROWTH_GAIN {
+                debug!(
+                    "[STRATEGY] doubling to {} runners gained too little: {speed:.0} B/s after, \
+                     {:.0} B/s before; no more growth",
+                    growth.runners, growth.speed_before
+                );
                 self.plateau = true;
                 return 0;
+            } else {
+                debug!(
+                    "[STRATEGY] doubling to {} runners gained: {speed:.0} B/s after, {:.0} B/s \
+                     before",
+                    growth.runners, growth.speed_before
+                );
             }
+        }
+        if active >= context.max_concurrency {
+            return 0;
         }
         let target = active.saturating_mul(2).min(context.max_concurrency);
         self.proposal = Some(Proposal {
             at: context.now,
             speed,
             active_runners: active,
+            max_concurrency: context.max_concurrency,
         });
         target - active
     }
@@ -178,9 +214,11 @@ impl DoublingStrategy {
         }
         self.last_grow = Some(proposal.at);
         if added >= proposal.active_runners {
+            let runners = proposal.active_runners + added;
             self.unjudged = Some(Growth {
                 speed_before: proposal.speed,
-                runners: proposal.active_runners + added,
+                runners,
+                at_limit: runners >= proposal.max_concurrency,
             });
         }
     }
@@ -335,48 +373,124 @@ mod tests {
         );
     }
 
-    /// Runners that stopped since the growth leave the tick short of it:
-    /// no verdict, and the strategy grows on.
+    /// A doubling to the limit that loses runners before a tick measures
+    /// it waits for them: no verdict and no growth, so nothing refills; it
+    /// is judged once a tick has its runners again (design §14.18).
     #[test]
-    fn test_a_tick_with_fewer_runners_does_not_judge_the_growth() {
+    fn test_a_doubling_to_the_limit_waits_for_its_runners() {
+        let t0 = Instant::now();
+        let at = |n: u32, runners: usize, speed: f64| DoublingStrategyContext {
+            max_concurrency: 8,
+            ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
+        };
+        for (speed, refill) in [(40.0, 0), (80.0, 1)] {
+            let mut strategy = DoublingStrategy::default();
+            assert_eq!(grow(&mut strategy, at(0, 4, 40.0)), 4);
+            // Two of the eight finished: not measured, not refilled.
+            assert_eq!(grow(&mut strategy, at(1, 6, 30.0)), 0);
+            assert_eq!(grow(&mut strategy, at(2, 7, 35.0)), 0);
+            // Eight again, a retried range claimed: judged, at the limit.
+            assert_eq!(grow(&mut strategy, at(3, 8, speed)), 0);
+            // A plateau refills nothing; a gain refills a stopped runner.
+            assert_eq!(
+                grow(&mut strategy, at(4, 7, 100.0)),
+                refill,
+                "{speed} MiB/s"
+            );
+        }
+    }
+
+    /// A doubling below the limit that loses runners before a tick
+    /// measures it gets no verdict, and the strategy grows on (design
+    /// §14.14, §14.18): runners that finished leave no range for a new
+    /// runner to claim, so only a split brings their slots back.
+    #[test]
+    fn test_a_doubling_below_the_limit_that_loses_runners_is_not_judged() {
         let mut strategy = DoublingStrategy::default();
         let t0 = Instant::now();
         let at = |n: u32, runners: usize, speed: f64| DoublingStrategyContext {
             max_concurrency: 16,
-            ..context(t0 + GROW_INTERVAL * n, runners, speed)
+            ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
         };
-        assert_eq!(grow(&mut strategy, at(0, 4, 40.0 * MIB)), 4);
-        // Two of the eight finished; the six are slower than the four were.
-        assert_eq!(grow(&mut strategy, at(1, 6, 30.0 * MIB)), 6);
+        assert_eq!(grow(&mut strategy, at(0, 4, 40.0)), 4);
+        // Two of the eight finished; the six are no faster than the four.
+        assert_eq!(grow(&mut strategy, at(1, 6, 30.0)), 6);
         // The growth to twelve is judged: no gain, a plateau.
-        assert_eq!(grow(&mut strategy, at(2, 12, 30.0 * MIB)), 0);
-        assert_eq!(
-            grow(&mut strategy, at(3, 10, 30.0 * MIB)),
-            0,
-            "the plateau holds"
-        );
+        assert_eq!(grow(&mut strategy, at(2, 12, 30.0)), 0);
+        assert_eq!(grow(&mut strategy, at(3, 10, 30.0)), 0, "the plateau holds");
     }
 
-    /// A growth up to the limit is not judged while the limit holds; once
-    /// runners stopped, the tick no longer measures it, so the strategy
-    /// adds runners back up to the limit.
+    /// Whether a doubling reached the limit is the limit of the tick that
+    /// decided it, not the limit when it is judged: the concurrency
+    /// control may move it in between.
     #[test]
-    fn test_runners_that_stopped_at_the_limit_are_replaced() {
+    fn test_the_limit_of_a_doubling_is_the_one_it_was_made_under() {
+        let t0 = Instant::now();
+        let at = |n: u32, runners: usize, limit: usize| DoublingStrategyContext {
+            max_concurrency: limit,
+            ..context(t0 + GROW_INTERVAL * n, runners, runners as f64 * MIB)
+        };
+        // Below a limit of 16, which then drops to 8: no hold, a refill.
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, at(0, 4, 16)), 4);
+        assert_eq!(grow(&mut strategy, at(1, 7, 8)), 1);
+
+        // Up to a limit of 8, which then rises to 16: held.
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, at(0, 4, 8)), 4);
+        assert_eq!(grow(&mut strategy, at(1, 7, 16)), 0);
+        assert_eq!(grow(&mut strategy, at(2, 7, 16)), 0);
+        // Judged once eight deliver, and the risen limit lets it grow.
+        assert_eq!(grow(&mut strategy, at(3, 8, 16)), 8);
+    }
+
+    /// A loop that reports more runners than asked, past the limit of the
+    /// tick, still records a doubling that reached that limit: it holds
+    /// while runners are missing, then is judged.
+    #[test]
+    fn test_a_doubling_reported_past_the_limit_reached_it() {
         let mut strategy = DoublingStrategy::default();
         let t0 = Instant::now();
-        assert_eq!(grow(&mut strategy, context(t0, 4, 40.0 * MIB)), 4);
-        // No faster with eight, but at the limit.
-        assert_eq!(
-            grow(&mut strategy, context(t0 + GROW_INTERVAL, 8, 40.0 * MIB)),
-            0
-        );
-        assert_eq!(
-            grow(
-                &mut strategy,
-                context(t0 + GROW_INTERVAL * 2, 7, 35.0 * MIB)
-            ),
-            1
-        );
+        let at = |n: u32, runners: usize, limit: usize| DoublingStrategyContext {
+            max_concurrency: limit,
+            ..context(t0 + GROW_INTERVAL * n, runners, runners as f64 * MIB)
+        };
+        assert_eq!(asked(&mut strategy, &mut at(0, 4, 6)), 2);
+        strategy.on_grown(4);
+        // Seven of the eight, under a limit since risen: held.
+        assert_eq!(grow(&mut strategy, at(1, 7, 16)), 0);
+        // Eight: judged, a gain, and the risen limit lets it grow.
+        assert_eq!(grow(&mut strategy, at(2, 8, 16)), 8);
+    }
+
+    /// A doubling up to the limit is judged there. Without a gain it is a
+    /// plateau, which holds when the limit rises again; with one, the limit
+    /// stops it, and a runner that finishes is replaced.
+    #[test]
+    fn test_a_doubling_to_the_limit_is_judged_there() {
+        let t0 = Instant::now();
+        let at = |n: u32, runners: usize, speed: f64, limit: usize| DoublingStrategyContext {
+            max_concurrency: limit,
+            ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
+        };
+        // No faster with eight: a plateau, even once the limit rises.
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, at(0, 4, 40.0, 8)), 4);
+        assert_eq!(grow(&mut strategy, at(1, 8, 40.0, 8)), 0);
+        assert_eq!(grow(&mut strategy, at(2, 8, 80.0, 16)), 0);
+        assert_eq!(grow(&mut strategy, at(3, 7, 70.0, 8)), 0, "no refill");
+
+        // Faster with eight: judged, held by the limit, then refilled.
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, at(0, 4, 40.0, 8)), 4);
+        assert_eq!(grow(&mut strategy, at(1, 8, 80.0, 8)), 0);
+        assert_eq!(grow(&mut strategy, at(2, 7, 70.0, 8)), 1);
+
+        // Past a lowered limit, the doubling is judged all the same.
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, at(0, 4, 40.0, 8)), 4);
+        assert_eq!(grow(&mut strategy, at(1, 8, 40.0, 6)), 0);
+        assert_eq!(grow(&mut strategy, at(2, 8, 80.0, 16)), 0, "a plateau");
     }
 
     /// No growth while a runner connects or delivers nothing; the gain of
@@ -529,27 +643,24 @@ mod tests {
         assert_eq!(grow(&mut strategy, at(5, 32, 64)), 0);
     }
 
-    /// The accepted blind spot (design §14.14): at the limit, a runner that
-    /// stops and the one split to refill it, 8, 7, 8 again and again, are
-    /// never judged, so even a task no faster with eight finds no plateau
-    /// and refills every time.
+    /// The accepted blind spot (design §14.14, §14.18): a growth cut short
+    /// by the limit is not judged, so at the limit a runner that stops and
+    /// the one split to refill it, 6, 5, 6 again and again, find no plateau
+    /// even when the task is no faster.
     #[test]
-    fn test_refills_at_the_limit_are_never_judged() {
+    fn test_refills_after_a_truncated_growth_are_never_judged() {
         let mut strategy = DoublingStrategy::default();
         let t0 = Instant::now();
-        assert_eq!(grow(&mut strategy, context(t0, 4, 40.0 * MIB)), 4);
+        let at = |now: Instant, runners: usize| DoublingStrategyContext {
+            max_concurrency: 6,
+            ..context(now, runners, 40.0 * MIB)
+        };
+        // Four to six: cut short by the limit.
+        assert_eq!(grow(&mut strategy, at(t0, 4)), 2);
         for cycle in 1..10 {
-            let at = t0 + GROW_INTERVAL * (2 * cycle);
-            assert_eq!(
-                grow(&mut strategy, context(at - TICK, 8, 40.0 * MIB)),
-                0,
-                "at the limit"
-            );
-            assert_eq!(
-                grow(&mut strategy, context(at, 7, 40.0 * MIB)),
-                1,
-                "refill {cycle}"
-            );
+            let now = t0 + GROW_INTERVAL * (2 * cycle);
+            assert_eq!(grow(&mut strategy, at(now - TICK, 6)), 0, "at the limit");
+            assert_eq!(grow(&mut strategy, at(now, 5)), 1, "refill {cycle}");
         }
     }
 

@@ -364,6 +364,109 @@ async fn doubling_stops_at_a_plateau() {
     file_writer.finalize().await.unwrap();
 }
 
+/// A doubling up to the limit is judged there (design §14.18): two
+/// runners no faster than one are a plateau, so when one finishes, the
+/// other is not split to replace it, however fast it gets.
+#[tokio::test]
+async fn doubling_judges_the_doubling_at_the_limit() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 2).await;
+    let t0 = Instant::now();
+    download.on_strategy_tick(t0);
+    deliver(&mut download, 10 * MIB);
+    download.on_strategy_tick(t0 + TICK);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+
+    // At the limit and no faster: judged at the first tick 2 s later.
+    for n in 2..4 {
+        deliver(&mut download, 5 * MIB);
+        download.on_strategy_tick(t0 + TICK * n);
+    }
+    // Runner 1 finishes and stops.
+    download.manager.update_progress(1, u64::MAX).unwrap();
+    download.manager.release_runner_full(1, true).unwrap();
+    for n in 4..10 {
+        deliver(&mut download, 50 * MIB);
+        download.on_strategy_tick(t0 + TICK * n);
+        assert_eq!(download.manager.get_active_runners_count(), 1, "tick {n}");
+    }
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// Under `Doubling` with `max_connections`, grow 1, 2, 4, 8 through the
+/// real split, each runner 1 MiB a tick; then one of the eight completes
+/// and stops before the tick that would judge the doubling to eight.
+/// Returns the loop, the time of that tick, and the writer.
+async fn eight_then_one_completes(
+    rt: &ScriptedRuntime,
+    max_connections: usize,
+) -> (DownloadLoop, Instant, FileWriter) {
+    let (mut download, file_writer) =
+        growth_loop(rt, GrowthStrategy::Doubling, max_connections).await;
+    let t0 = Instant::now();
+    download.on_strategy_tick(t0);
+    for n in 1..=5 {
+        deliver(&mut download, MIB);
+        download.on_strategy_tick(t0 + TICK * n);
+    }
+    assert_eq!(download.manager.get_active_runners_count(), 8);
+    // Too early to judge the doubling to eight.
+    deliver(&mut download, MIB);
+    download.on_strategy_tick(t0 + TICK * 6);
+    assert_eq!(download.manager.get_active_runners_count(), 8);
+    // The smallest chunk completes; much is left in the others.
+    let running = runners(&download, ChunkStatus::Running);
+    let smallest = *running
+        .iter()
+        .min_by_key(|&&id| download.manager.get_runner_state(id).unwrap().remaining())
+        .unwrap();
+    download
+        .manager
+        .update_progress(smallest, u64::MAX)
+        .unwrap();
+    download
+        .manager
+        .release_runner_full(smallest, true)
+        .unwrap();
+    assert_eq!(download.manager.get_active_runners_count(), 7);
+    assert!(download.manager.get_available_ranges().is_empty());
+    (download, t0 + TICK * 7, file_writer)
+}
+
+/// A doubling below the limit that loses a runner before it is judged
+/// gets no verdict, and the growth goes on (design §14.18): nothing is
+/// left for a new runner to claim, so only a split brings the slot back.
+#[tokio::test]
+async fn doubling_below_the_limit_grows_on_after_a_runner_completes() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judging, file_writer) = eight_then_one_completes(&rt, 16).await;
+    deliver(&mut download, MIB);
+    download.on_strategy_tick(judging);
+    assert_eq!(download.manager.get_active_runners_count(), 14);
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A doubling to the limit that loses a runner before it is judged holds
+/// the growth: the runner is not replaced, however long the download
+/// goes on (design §14.18).
+#[tokio::test]
+async fn doubling_to_the_limit_does_not_refill_before_it_is_judged() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judging, file_writer) = eight_then_one_completes(&rt, 8).await;
+    for n in 0..10 {
+        deliver(&mut download, MIB);
+        download.on_strategy_tick(judging + TICK * n);
+        assert_eq!(download.manager.get_active_runners_count(), 7, "tick {n}");
+    }
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
 /// A chunk is split, at its half, only when it holds at least the planned
 /// size for its runner, 2 s at that runner's own rate: a byte less is not
 /// split, exactly that is.

@@ -89,6 +89,10 @@ struct Scenario {
     /// `Doubling` hedges the stall: every run must show the hedge, its
     /// decision and its loser's end, or the probe no longer reads them.
     hedged: bool,
+    /// The scenario's reference for the connections that fill the
+    /// bandwidth, for a G7 scenario: by construction in s1 and s3, by
+    /// observation in s2 (design §2, §14.18).
+    fills: Option<usize>,
 }
 
 fn limited(size: u64) -> SimpleTestAdapterBuilder {
@@ -115,6 +119,8 @@ fn scenarios() -> Vec<Scenario> {
             adapter: s1,
             stall_at: None,
             hedged: false,
+            // 16 MiB/s in all at 1 MiB/s a connection.
+            fills: Some(16),
         },
         Scenario {
             name: "s1_max8",
@@ -123,6 +129,8 @@ fn scenarios() -> Vec<Scenario> {
             adapter: s1,
             stall_at: None,
             hedged: false,
+            // 16 MiB/s in all at 1 MiB/s a connection.
+            fills: Some(16),
         },
         Scenario {
             name: "s2_unlimited",
@@ -136,6 +144,9 @@ fn scenarios() -> Vec<Scenario> {
             },
             stall_at: None,
             hedged: false,
+            // Observed, not by construction: without a limit, two
+            // connections were no faster than one on this machine.
+            fills: Some(1),
         },
         Scenario {
             name: "s3_429_beyond_4",
@@ -148,6 +159,8 @@ fn scenarios() -> Vec<Scenario> {
             },
             stall_at: None,
             hedged: false,
+            // A fifth concurrent connection gets a 429.
+            fills: Some(4),
         },
         Scenario {
             name: "s4_endgame_stall",
@@ -156,6 +169,7 @@ fn scenarios() -> Vec<Scenario> {
             adapter: s4,
             stall_at: Some(63 * MIB),
             hedged: true,
+            fills: None,
         },
         Scenario {
             name: "s4a_stall_while_splittable",
@@ -164,6 +178,7 @@ fn scenarios() -> Vec<Scenario> {
             adapter: s4a,
             stall_at: Some(31 * MIB),
             hedged: true,
+            fills: None,
         },
         Scenario {
             name: "s4b_two_runners",
@@ -172,6 +187,7 @@ fn scenarios() -> Vec<Scenario> {
             adapter: |size| limited(size).max_per_stream_speed(2 * MIB),
             stall_at: Some(28 * MIB),
             hedged: false,
+            fills: None,
         },
         Scenario {
             name: "s4c_stall_midway",
@@ -180,6 +196,7 @@ fn scenarios() -> Vec<Scenario> {
             adapter: s4,
             stall_at: Some(40 * MIB),
             hedged: false,
+            fills: None,
         },
     ];
     let baselines: Vec<_> = scenarios
@@ -196,6 +213,7 @@ fn scenarios() -> Vec<Scenario> {
                 name,
                 stall_at: None,
                 hedged: false,
+                fills: None,
                 ..scenario.clone()
             })
         })
@@ -630,6 +648,7 @@ fn main() {
          cancel latency ms | stall wait s | slow restarts | unmatched | MiB/s |"
     );
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut verdicts = Vec::new();
     for scenario in scenarios() {
         if names
             .as_ref()
@@ -672,5 +691,57 @@ fn main() {
         for (strategy, runs) in strategies.iter().zip(&results) {
             report(&scenario, *strategy, runs);
         }
+        if let ([legacy, doubling], Some(fills)) = (&results[..], scenario.fills) {
+            verdicts.push(g7_verdict(&scenario, fills, legacy, doubling));
+        }
     }
+    if !verdicts.is_empty() {
+        println!();
+        for verdict in verdicts {
+            println!("{verdict}");
+        }
+    }
+}
+
+/// How much slower `Doubling` may be, as a share of `Legacy`'s median time
+/// (design §2, G7).
+const G7_TOLERANCE: f64 = 0.05;
+
+/// G7 for `scenario` from runs alternated round by round: the median of
+/// the paired differences (`Doubling` − `Legacy`) within 5% of `Legacy`'s
+/// median time, and `Doubling`'s peak at most twice `fills` in every run.
+fn g7_verdict(scenario: &Scenario, fills: usize, legacy: &[Run], doubling: &[Run]) -> String {
+    let sorted = |mut values: Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values
+    };
+    let legacy_median = median(&sorted(legacy.iter().map(|run| run.secs).collect()));
+    let differences = sorted(
+        legacy
+            .iter()
+            .zip(doubling)
+            .map(|(legacy, doubling)| doubling.secs - legacy.secs)
+            .collect(),
+    );
+    let difference = median(&differences);
+    let share = difference / legacy_median;
+    let no_slower = share <= G7_TOLERANCE;
+    let peak = doubling.iter().map(|run| run.peak).max().unwrap_or(0);
+    let few_enough = peak <= 2 * fills;
+    format!(
+        "G7 {}: paired median difference {difference:+.2} s ({:+.1}% of Legacy's median \
+         {legacy_median:.2} s; differences {:.2}..{:.2} s) -> no slower: {}; Doubling's peak \
+         {peak} against 2 x {fills} -> {}; G7 {}",
+        scenario.name,
+        share * 100.0,
+        differences[0],
+        differences[differences.len() - 1],
+        if no_slower { "yes" } else { "no" },
+        if few_enough { "yes" } else { "no" },
+        if no_slower && few_enough {
+            "met"
+        } else {
+            "NOT met"
+        },
+    )
 }
