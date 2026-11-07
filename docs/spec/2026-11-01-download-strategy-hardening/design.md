@@ -1657,3 +1657,84 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - 偶数个时中位数取偏下的中间值：`test_median` 和 `test_the_median_of_an_even_count`；
     - 去掉拥塞门槛、去掉限速门槛：各自都让 `test_no_restart_under_a_speed_limit_or_a_congestion` 失败。
     - 已知会偶发失败的 `test_save_into_rejects_hostile_filenames` 在其中 2 次里也失败了，和这些变异无关。
+
+### 14.16 收尾对冲（PR-7，C27）
+
+- **做法。** 按 §9.6 实现，只在 `Doubling` 下生效。
+  - 记录（§9.6“新增的记录”）：
+    - `ChunkState::hedge: Option<Hedge>` 是这次尝试的对冲记录，含 `fork`、`owner_side`、`first`，从分叉一直留到这次尝试结束：chunk 收满时（`update_progress` 和 `mark_finished`，状态 F），或者 `mark_failed` 退回区间时清掉。收满之后、`Stopped` 之前出错的 runner 按普通 runner 分类：区间已空，不查预算（`a_failure_after_the_last_byte_exhausts_nothing`）。它在，这次尝试就不再对冲。
+    - §9.6 的 `pair` 用同一个记录里的两个字段表示：`undecided`（还没有取到分叉之后的非空帧）和 `partner`（两方都在时的 H，含它是否已报 `Started`）。状态 B 是 `undecided` 且有 `partner`；状态 C 是 `undecided`、没有 `partner`，也就是只剩幸存方的单方记录；第一个非空帧到来时 `undecided` 变成 `false`。
+    - planner 加了 `hedge_of`（H → chunk 起点），只收录活着、不是 owner 的 H。`fork_hedge`、`hand_over`、`drop_partner`、`decide` 在改 owner 之前先删旧项，所以 ID 被回收、重用时，两张表里都没有它的旧项。这些都在 planner 里，`PlannerGuard` 回滚时一起恢复。
+    - `get_active_runners_count` 加上 `hedge_of` 的项数：两方都在时一对算两个。败方不算活跃，但占着槽位。
+    - manager 的 `stopping` 改成 `HashMap<RunnerId, StopReason>`（`Slow` 或 `Loser`）；`last_delivery` 记静默的起点。数据聚合器里的接收端由 `Arc<Mutex<_>>` 共享（`SharedReceiver`）：`StreamGroup` 照常轮询它，仲裁也能通过 `take_first_data` 直接从里面取帧。
+  - 触发（`download_loop/hedge.rs`）：
+    - 每个策略 tick 在低速重启和策略动作之后调用 `hedge_stalled_runner`，所以策略建的 runner 先用槽位。
+    - `hedge_candidate` 每次都重查全部条件：有 `RunnerRates`（只有 `Doubling` 有）、writer 能接数据、不拥塞、活跃数低于 `max_concurrency`、没有可领取的区间；候选的 chunk 没对冲过、剩余量大于 0 且小于 `2 × min_chunk_size`，runner 不在停止中，静默不少于 `HEDGE_IDLE`（2 s），并且除了它自己的 chunk，没有别的 chunk 能切。先按全部条件筛出候选，再取静默最久的，一样久时取 ID 小的；先取静默最久的再查条件，会漏掉合格的候选（`the_longest_silence_among_runners_that_qualify`）。
+    - 别的 chunk 按 C11 的门槛 `planned_split_size` 判断能不能切；Pending 的 chunk 传 `None`，即用 `per_runner_speed`。正在停止的 runner 的 chunk、`hedge` 不为空的 chunk 都不算。
+    - 占到槽位后由 `RunnerManager::spawn_hedge` 发起：planner 的 `fork_hedge` 返回 `[分叉点, chunk 末尾)`，H 从这里请求；`last_delivery[H] = now`。不分配新的区间，不动计数和无进展截止时间。
+  - 静默：
+    - `spawn_in` 和 `spawn_hedge` 多了 `now` 参数，spawn 时写 `last_delivery`。
+    - `DownloadedChunk` 加了 `runner_id`；`accept_chunk` 接受非空帧时用 `handle_event` 的 `now` 调用 `note_delivery`。
+    - `poll_writer` 在调用 `poll_completions` 之前读 `!can_write()`，随 `LoopEvent::WriterCompleted(_, was_full)` 带出；`record_completions` 看到 `was_full` 并且现在可写，就 `restart_silences(now)`。`handle_event` 拆出 `handle_event_at(event, now)`，测试可以传自己的时间。
+  - 仲裁（`runner_manager/data.rs` 的 `on_data_frame`），在 `meters`、planner 和 writer 之前：
+    - 帧来自 `Loser`：丢掉。
+    - 帧来自 H（`partner_chunk` 找得到）：空帧丢掉，不决定胜负；非空帧先看 O——O 已连上（接收端在聚合器里）时，`take_first_data` 从 O 的通道里依次取帧，丢掉空帧，取到第一个非空帧就停：取到了，O 胜，H 这一帧丢掉，O 的这一帧当场照常处理，后面的帧留在通道里按顺序取；没取到，H 胜：`hand_over`、`decide`，再照常处理 H 的帧。
+    - 帧来自 owner：非空、并且 `undecided` 时，有 `partner` 就先让它出局并停掉，再 `decide`；然后照常处理。
+    - “停败方”（`stop_loser`）：拉下停止开关，记 `Loser`，从数据聚合器或 `connecting_data` 拿掉接收端（排着的帧一起丢掉），删掉 `meters`、`last_delivery` 的项；ID、limit sender、生命周期接收端留到确认终止。
+  - 生命周期（`runner_manager/lifecycle.rs`）：
+    - 先看 `Loser`：`Started` 只忽略；`Stopped`、通道关闭、spawn 被拒绝都由 `handle_loser_ended` 回收一次，不报任何东西。
+    - H 的 `Started` 只标记 `partner.running`，并把数据接收端移进聚合器，不调用 planner 的 `mark_running`。
+    - 两方都在时（`has_other_side`），任一方的 `Stopped`、通道关闭、spawn 被拒绝都走 `handle_side_failed`：O 出局时 `hand_over`，H 出局时 `drop_partner`；回收它；`record_side_failure` 记下 `first`；结果采样照常记；返回 `SideFailed`。B 里任一方、C 里幸存方报 `Finished` 都不该出现（`debug_assert`），出现了按 `ChannelClosed` 处理，和状态表一样。
+    - owner 的其它失败都经过 `fail_attempt`：先取 `owner_bytes`（按 `owner_side` 选 `Released::received` 或“已下载末尾 − `fork`”）和 `hedge.first`，再 `mark_failed`，再由 `AttemptFailure::of_attempt`（低速停止是 `slow_of_attempt`）算这一对的 `charged`：`first` 和这一方都不是重启、并且至少一方记预算时加 1；没有 `first` 时就是 `charges_range`。`received` 报这一方自己的字节。
+  - 下载循环（`download_loop/runner.rs`）：
+    - `on_side_failure`：先查 §4.3 的回退；再 `FailurePolicy::on_side_failure`（429/503 容忍，重启不计，其它可重试的失败计入连续失败，其它不可重试的错误终止任务）；429/503 时 `Backoff::hold_congestion`（用 `SideFailed::attempts`，即 `chunk.attempts + 1`）推后 `congestion_until`，并按 `next_retry` 提前唤醒。不退避、不写冷却记录。
+    - `on_failure` 的在途数改成 `RunnerManager::in_flight()`：占着 ID 的 runner 数减去 `stopping` 的项（M3）。失败的 runner 在这之前已经回收。
+  - `FailurePolicy::on_failure` 先查预算：可重试或 429/503、区间非空、`charged` 达到上限时以 `RangeExhausted` 结束；之后才是容忍 429/503、重启和连续失败。
+  - 排除：
+    - `may_restart` 排除 `is_in_undecided_pair` 的 runner，它们也不进中位数；`stop_runner` 拒绝 `undecided` 的 chunk 的 owner。
+    - `largest_running_chunk` 跳过 `hedge` 不为空的 chunk；`resize_runner_state` 和 `split_chunk` 拒绝这样的 chunk。
+  - 测试辅助：`FileWriter::recording()`（只在测试里）记下每次写入的区间，写入通过 spawn 的任务进行，测试决定它们什么时候完成；`RangeFault::StalledOnce`（`bolt-load-tests`）对第一个起点大于 0 的 range 请求只发 body 的前一半，然后既不发也不关闭。它不在 `RangeFault::ALL` 里，`from_name` 另外认它。
+- **与 §9.6 的偏差。**
+  - `pair` 不是独立的记录，而是 `Hedge` 里的 `undecided` 和 `partner`，含义和状态表相同（见做法）。
+  - 预算先查的顺序对所有失败都生效，不只对一对。单个 runner 的重启和 429/503 从不加 `charged`，区间还活着时 `charged` 小于上限，所以对它们没有区别；已有的测试一条都没改。
+  - 看原 runner 的通道用的是 §9.6 给的第二种做法的变体：接收端不移动，仲裁通过共享的句柄直接取 O 的第一个非空帧，空帧不算（只看“通道里有没有帧”的话，排着的空帧也会让 O 胜）。所以没有“转移时丢帧或丢唤醒”的风险；`the_original_wins_a_tie` 验证取到的帧当场写入、后面的帧照常按顺序取走，`queued_empty_frames_do_not_win_a_tie` 验证排着的只有空帧时 H 胜。
+  - 只有经过 `spawn_in` 或 `spawn_hedge` 起的 runner 有 `last_delivery`，没有的不是候选。生产代码只用这两个入口；测试里用 `allocate_runner_with_chunk` 建的 runner 不会被对冲。
+  - 静默一样久的候选取 ID 小的，§9.6 没说。
+- **已知限制。**
+  - 对冲只在策略 tick 上判定，实际在静默满 2 s 之后的第一个 tick，也就是 2–3.5 s。
+  - M1：卡住的小 chunk 旁边还有可切的 chunk 时、或者有完整窗口的 runner 不到 3 个时，对冲和低速重启都不管，只能等空闲超时（T14 第 4 个场景去量）。
+  - M5：冷却中的区间不算“可切的活”；两方都卡住、H 占了最后一个槽位时，这个区间要等一方的计时器（连接超时之后还可以再接一个空闲超时）、别的 runner 停下，或者无进展超时。
+  - 败方在确认终止之前占着槽位，但不算活跃；降级之后实际连接数可能短暂超过新的上限，和已经下完、还没报 `Stopped` 的 runner 一样（§14.11）。
+  - 败方读到的数据会被丢掉，重复下载的字节数由 T14 量。
+  - 每个数据接收端都放在 `Arc<Mutex<_>>` 里，聚合器每取一帧都要加一次锁。锁只在同一个线程里用，不会争用，但热路径上的开销还没量过，留给 T14。
+  - `RunnerRates` 只采样 owner，看不到还在连接的 H，所以 `Doubling` 的检查 5 不会因为它跳过扩张；活跃数却算上了它。收尾阶段没有可切的 chunk，影响很小。
+- **验证。**
+  - 下载循环的测试（`download_loop/tests/hedge.rs`，脚本化的 runtime，显式传入时间；runner 由测试持有通道，触发时 spawn 的 H 是停在 spawn 处的真实 runner；写入用 `FileWriter::recording()` 记录，`Harness::written` 断言没有字节被写两次）：
+    - 触发：`a_runner_silent_for_two_seconds_is_hedged`（差 1 ns 不发起，正好 2 s 发起，H 经 spawner 起在 chunk 剩下的部分，两方都算活跃，无进展截止时间不变）、`legacy_never_hedges`、`a_connecting_runner_is_silent_from_its_spawn`、`the_runner_silent_longest_is_hedged_first`（每次调用只发起一个）、`no_hedge_without_a_free_connection_or_with_a_range_left`（有可领取的区间、没有空闲槽位、到了并发上限、拥塞期间）、`the_candidate_has_less_than_two_minimum_chunks_left`（正好 `2 × min_chunk_size` 不发起，少 1 B 发起）、`no_hedge_while_another_chunk_may_be_split`（别的 chunk 剩余量正好等于它的 `planned_split_size` 不发起，少 1 B 发起）、`a_connecting_chunk_is_judged_by_the_per_runner_speed`（连续采样两次、速率是 `Some(0.0)` 的 Pending chunk 按 `per_runner_speed` 判断）、`a_stopping_runner_is_not_hedged`、`a_full_writer_restarts_every_silence`（真实的 `PendingWriter`：写满时不对冲；一次写入完成后经 `poll_writer` 和 `handle_event_at` 处理，静默从那一刻重算，差 1 ns 不发起）、`a_rejected_hedge_ends_the_task`（H 的 spawn 被拒绝：槽位回收一次，区间不释放，任务以 `TaskError::Other` 结束）。
+    - 仲裁：`the_first_frame_decides_the_pair`（两种胜方；败方停掉，迟到的帧和 `Finished` 被忽略，槽位在它确认时回收一次；写入的区间不重叠，正好覆盖文件）、`the_original_wins_a_tie`（排在前面的空帧被跳过）、`queued_empty_frames_do_not_win_a_tie`、`a_connecting_original_loses_to_the_first_frame`（迟到的 `Started` 被忽略）、`an_empty_frame_decides_nothing`、`a_loser_ends_without_a_trace`（迟到的 `Started` 不回收；`Finished`、`Cancelled`、可重试的错误、503、§4.3 回退错误、其它不可重试的错误、通道关闭都只回收一次，不回退、不终止、不降并发、不改 `congestion_until`、不计连续失败、不记结果采样）、`a_loser_ends_whatever_became_of_the_chunk`（W 在下载、W 已失败、区间已被重新领取、chunk 已收满但任务没完成）、`a_reused_id_is_a_new_runner`（H 先出局、O 输掉，两种 ID 重用）。
+    - 错误与预算：`one_side_fails_and_the_other_runs_on`（重启不计连续失败，没数据的失败计 1；区间不退回、不冷却；之后不再对冲）、`a_congested_side_holds_connections_back`、`an_unretryable_side_ends_the_task`、`the_winner_inherits_the_counts`、`a_pair_is_charged_at_most_once`（§9.6 预算表的五种顺序，加上对冲用自己的 0 字节分类的两种顺序和两方都记预算）、`the_first_failure_outlives_the_survivors_frame`、`the_survivor_fails_after_its_own_data`（状态 C′ 的 `Timeout` 和 `ChannelClosed`，H 的字节从分叉点算）、`the_budget_of_a_pair_comes_first`（临界点的四种情况）、`the_last_side_is_not_in_flight`、`rounds_of_failed_pairs`、`stopping_runners_are_not_in_flight`（`Loser` 和 `Slow`）。
+    - 排除：`a_hedged_chunk_is_neither_restarted_nor_split`（B 里 O 从 Pending 变成 Running 也不切、不停；D 里两种胜方都不切；另一个候选不把它们当成可切的活）、`the_survivor_of_an_undecided_pair_is_not_judged`（状态 C 的 O 不进中位数：算上它，慢 runner 就不够慢）。
+    - 计时：`the_hedge_never_moves_the_no_progress_deadline`、`a_backed_off_range_waits_for_a_side_to_end`（M5 的长路径：O 快到连接超时才连上，再等一个空闲超时；期间区间不被领取，唤醒不空转）。
+  - 集成测试：`a_stalled_connection_is_hedged_in_the_endgame`，需要 `reqwest` 和 `tokio` 两个 feature。真实计时器、reqwest adapter 和 `RangeFault::StalledOnce`：第二个 chunk 的连接发了一半就停住，不断开。顺序由测试决定：测试逐个处理事件，先不处理策略 tick；停住的响应把 body 停在一个 gate 上，等第一个 chunk 完成再放行，再等停住的 runner 交的整块缓冲都被 planner 接受（480 KiB，最后一块留在它的缓冲里），然后才放开策略 tick。所以停顿一定在收尾阶段，之前也不会提前对冲。对冲由循环的状态证明：停住的 runner 还在途时就以 `Loser` 被停，而空闲超时结束的 runner 会是一次失败；服务器的请求记录里，最后一个 chunk 先被请求一次，再从已接受的位置（起点 + 480 KiB）被请求一次。任务完成，hash 正确。不卡墙钟时间，只留一个 120 s 的死锁看门狗。
+    - 另有 `the_longest_silence_among_runners_that_qualify`（触发）和 `a_failure_after_the_last_byte_exhausts_nothing`（预算），见上。
+  - 共享接收端的唤醒：`test_frames_taken_by_the_arbitration_keep_wake_ups_and_order`（数据聚合器，计数的 waker）：从外面取帧时跳过空帧、剩下的帧不动；聚合器发现通道空了返回 `Pending` 之后，新帧照常唤醒它；通道满时等着的生产者，在从外面取走一帧之后被唤醒、写入；帧的内容各不相同，验证顺序不乱。
+  - 单元测试：`test_a_hedge_joins_the_chunk_of_its_original`（planner：分叉、活跃数、拒绝 resize 和切分、`hand_over`、`drop_partner`、`owner_bytes`、`mark_failed` 清掉 `hedge`）；`FailurePolicy` 的 `test_a_pair_is_charged_at_most_once`、`test_a_congestion_charged_for_a_pair_exhausts_its_range`、`test_a_side_failure_counts_only_towards_the_consecutive_limit`。
+  - 已有测试：只有机械改动——`record_completions` 多了两个参数，测试里构造的 `RunnerTick` 和 `DownloadedChunk` 多了新字段。
+  - 变异检查，每种都有测试失败（整个 bolt-load lib，all features）：
+    - 平局判给对冲（不取原 runner 排着的帧）：`the_original_wins_a_tie`；
+    - 排着的空帧也算原 runner 的帧（`take_first_data` 不跳过空帧）：`queued_empty_frames_do_not_win_a_tie` 和 `the_original_wins_a_tie`；
+    - 先取静默最久的、再查“别的 chunk 能不能切”：`the_longest_silence_among_runners_that_qualify`；
+    - 原 runner 的空帧也决定胜负：`an_empty_frame_decides_nothing` 和 `a_stalled_connection_is_hedged_in_the_endgame`；对冲的空帧决定胜负：`an_empty_frame_decides_nothing`；
+    - 败方迟到的帧不丢掉（去掉 `on_data_frame` 里对 `Loser` 的检查）：`the_hedge_never_moves_the_no_progress_deadline`；
+    - 败方的槽位从不回收：`the_first_frame_decides_the_pair`、`a_loser_ends_without_a_trace`、`a_loser_ends_whatever_became_of_the_chunk` 和 `a_reused_id_is_a_new_runner`；分出胜负时就回收（确认终止时再回收一次）：前三个，以及 `a_connecting_original_loses_to_the_first_frame` 和 `stopping_runners_are_not_in_flight`；
+    - 这一对按最后一方自己的 `charged` 算（不看 `first`）：`a_pair_is_charged_at_most_once`、`the_budget_of_a_pair_comes_first` 和 `the_first_failure_outlives_the_survivors_frame`；
+    - 幸存方交来第一帧时清掉 `first`：`the_first_failure_outlives_the_survivors_frame` 和 `test_a_hedge_joins_the_chunk_of_its_original`；
+    - writer 是否满过在 `poll_completions` 之后才读：`a_full_writer_restarts_every_silence`；
+    - Pending 的 chunk 用 `RunnerRates` 的 `Some(0.0)`：`a_connecting_chunk_is_judged_by_the_per_runner_speed`；
+    - 最后一方失败时把它自己算在途（在途数加 1）：`the_last_side_is_not_in_flight` 和 `stopping_runners_are_not_in_flight`；
+    - 正在停止的 runner 算在途：`stopping_runners_are_not_in_flight`；
+    - T13 评判一对中的一方：`the_survivor_of_an_undecided_pair_is_not_judged`；
+    - 扩张切对冲过的 chunk（`largest_running_chunk` 不跳过）：`a_hedged_chunk_is_neither_restarted_nor_split` 和 `test_a_hedge_joins_the_chunk_of_its_original`；
+    - 发起对冲时推迟无进展截止时间：`a_runner_silent_for_two_seconds_is_hedged` 和性质测试 `splits_stay_within_the_limit_and_cover_the_file`；
+    - `Legacy` 也对冲（没有 `RunnerRates` 时用空的速率表）：`legacy_never_hedges` 和性质测试；
+    - 静默的边界 `>=` 改成 `>`：10 个触发、排除和计时的测试，以及性质测试。

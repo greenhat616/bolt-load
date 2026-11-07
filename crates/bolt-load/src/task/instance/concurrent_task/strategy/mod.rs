@@ -23,7 +23,7 @@ pub use doubling_strategy::{GROW_INTERVAL, MIN_GROWTH_GAIN};
 pub use doubling_strategy::{TickSample, planned_split_size};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
-pub(super) use failure_policy::charges_range;
+pub(super) use failure_policy::{charges_range, is_restart};
 pub use runner_outcome_sampler::{FailureKind as RunnerFailureKind, RunnerOutcomeSampler};
 pub use slow_restart::{JudgedRunner, SLOW_WINDOW, SlowRestartContext, slow_runner};
 

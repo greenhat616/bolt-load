@@ -231,7 +231,13 @@ The concurrent download path includes several sub-systems:
     It is stopped alone, unless it is already ending with a result of
     its own, which it then reports, and its
     range retried from the accepted bytes after a backoff; the range's
-    failure budget is charged only when it had none accepted.
+    failure budget is charged only when it had none accepted. In the
+    endgame, when no range is left to claim or split, the runner silent
+    longest, for at least 2 s, with less than twice the minimum chunk
+    size left, is hedged: a second runner requests the rest of its range,
+    the first non-empty frame decides which goes on, and the other is
+    stopped and ignored. The two count as one attempt on the range's
+    budget.
 - **SpeedSampler** — EMA-based speed calculation (α = 0.33,
   interval = 250 ms).
 - **ID Generator** — [`BitVec`]-backed runner ID allocator with

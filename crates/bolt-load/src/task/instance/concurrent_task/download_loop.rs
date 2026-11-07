@@ -3,6 +3,7 @@
 mod cancel;
 mod completion;
 mod deadline;
+mod hedge;
 mod restart;
 mod retry;
 mod runner;
@@ -46,7 +47,9 @@ use crate::{
 enum LoopEvent {
     Cancelled,
     Deadline,
-    WriterCompleted(Option<Vec<WriteCompletion>>),
+    /// Writes completed; `true` when the writer could not take data
+    /// before they did (design §9.6).
+    WriterCompleted(Option<Vec<WriteCompletion>>, bool),
     StrategyTimer,
     ThroughputTimer,
     Runner(RunnerTick),
@@ -157,14 +160,18 @@ impl DownloadLoop {
     /// Handle `event`; the handlers take the time from here, so tests can
     /// pass their own.
     fn handle_event(&mut self, event: LoopEvent) -> Result<ControlFlow<()>> {
-        let now = Instant::now();
+        self.handle_event_at(event, Instant::now())
+    }
+
+    /// Handle `event` at `now`.
+    fn handle_event_at(&mut self, event: LoopEvent, now: Instant) -> Result<ControlFlow<()>> {
         match event {
             LoopEvent::Cancelled => Err(DownloadError::Cancelled),
             LoopEvent::Deadline => self.on_deadline(now).map(ControlFlow::Continue),
-            LoopEvent::WriterCompleted(Some(completions)) => self
-                .record_completions(completions)
+            LoopEvent::WriterCompleted(Some(completions), was_full) => self
+                .record_completions(completions, was_full, now)
                 .map(ControlFlow::Continue),
-            LoopEvent::WriterCompleted(None) => Err(DownloadError::other(
+            LoopEvent::WriterCompleted(None, _) => Err(DownloadError::other(
                 "writer completion channel closed unexpectedly",
             )),
             LoopEvent::StrategyTimer => {

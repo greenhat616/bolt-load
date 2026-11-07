@@ -10,8 +10,8 @@ use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
 use super::{
-    AttemptFailure, RunnerFailureKind, RunnerManager, RunnerTick, SpawnFailed,
-    is_attempt_retryable,
+    AttemptFailure, ChunkState, RunnerFailureKind, RunnerManager, RunnerTick, SideFailed,
+    SideFailure, SpawnFailed, StopReason, charges_range, is_attempt_retryable, is_restart,
     stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem},
 };
 use crate::{
@@ -130,14 +130,30 @@ impl RunnerManager {
 
     fn handle_lifecycle(&mut self, event: RunnerTaggedStreamItem<LifecycleEvent>) -> RunnerTick {
         let runner_id = event.runner_id;
+        // A beaten side is no part of any chunk any more (design §9.6).
+        if self.stop_reason(runner_id) == Some(StopReason::Loser) {
+            return match event.item {
+                LifecycleEvent::Started => {
+                    trace!("runner {runner_id} started after it was beaten");
+                    RunnerTick::downloading()
+                }
+                LifecycleEvent::Stopped(_) => self.handle_loser_ended(runner_id),
+            };
+        }
         let connecting = self.is_connecting(runner_id);
         let reason = match event.item {
             LifecycleEvent::Started => {
                 trace!("runner {runner_id} started");
                 debug_assert!(connecting, "runner {runner_id} started twice");
-                self.chunk_planner
-                    .mark_running(runner_id)
-                    .expect("chunk planner should not fail");
+                if self.chunk_planner.partner_chunk(runner_id).is_some() {
+                    self.chunk_planner
+                        .mark_partner_running(runner_id)
+                        .expect("a hedge runner has a pair");
+                } else {
+                    self.chunk_planner
+                        .mark_running(runner_id)
+                        .expect("chunk planner should not fail");
+                }
                 let data_rx = self
                     .connecting_data
                     .remove(&runner_id)
@@ -147,7 +163,22 @@ impl RunnerManager {
             }
             LifecycleEvent::Stopped(reason) => reason,
         };
-        let stopped_slow = self.stopping.contains(&runner_id);
+        if self.has_other_side(runner_id) {
+            let (error, retryable) = match reason {
+                // A side completes only after its frames were taken, and
+                // the first one decides the pair.
+                StoppedReason::Finished | StoppedReason::Failed(TaskError::ExceededTotalSize) => {
+                    debug_assert!(false, "runner {runner_id} finished undecided");
+                    (TaskError::ChannelClosed, true)
+                }
+                StoppedReason::Failed(error) => {
+                    let retryable = is_attempt_retryable(&error);
+                    (error, retryable)
+                }
+            };
+            return self.handle_side_failed(runner_id, connecting, error, retryable);
+        }
+        let stopped_slow = self.stop_reason(runner_id) == Some(StopReason::Slow);
         self.meters.remove(&runner_id);
         // Remove control channel when runner stops
         self.release_runner(runner_id);
@@ -161,7 +192,19 @@ impl RunnerManager {
             };
             return self.handle_connect_failed(runner_id, error);
         }
+        // The survivor of an undecided pair completes only after its
+        // frames were taken, and the first one decides the pair.
+        let undecided = self
+            .chunk_planner
+            .get_runner_state(runner_id)
+            .is_some_and(ChunkState::is_undecided);
         let kind = match reason {
+            StoppedReason::Finished | StoppedReason::Failed(TaskError::ExceededTotalSize)
+                if undecided =>
+            {
+                debug_assert!(false, "runner {runner_id} finished undecided");
+                TaskError::ChannelClosed
+            }
             StoppedReason::Finished | StoppedReason::Failed(TaskError::ExceededTotalSize) => {
                 trace!("runner {runner_id} finished");
                 return if self.mark_runner_completed(runner_id) {
@@ -176,15 +219,15 @@ impl RunnerManager {
             return self.handle_stopped_slow(runner_id);
         }
         error!("runner {runner_id} failed: {kind:?}");
-        let released = self
-            .chunk_planner
-            .mark_failed(runner_id)
-            .expect("chunk planner should not fail");
-        trace!(
-            "runner {runner_id} failed, released range: {:?}",
-            released.range
-        );
         if kind.is_cancelled() {
+            let released = self
+                .chunk_planner
+                .mark_failed(runner_id)
+                .expect("chunk planner should not fail");
+            trace!(
+                "runner {runner_id} cancelled, released range: {:?}",
+                released.range
+            );
             return RunnerTick::downloading();
         }
         self.runner_outcome_sampler
@@ -194,7 +237,124 @@ impl RunnerManager {
                 RunnerFailureKind::Unretryable
             });
         let retryable = is_attempt_retryable(&kind);
-        RunnerTick::with_failure(AttemptFailure::new(runner_id, kind, retryable, released))
+        RunnerTick::with_failure(self.fail_attempt(runner_id, kind, retryable, false))
+    }
+
+    /// Release the chunk of `runner_id`, which ended its attempt with
+    /// `error`, and describe the failure; `slow` when the loop stopped it.
+    ///
+    /// The runner's own bytes classify it: of a hedged attempt, those of
+    /// its side only, and the side that failed first counts too (design
+    /// §9.6).
+    fn fail_attempt(
+        &mut self,
+        runner_id: RunnerId,
+        error: TaskError,
+        retryable: bool,
+        slow: bool,
+    ) -> AttemptFailure {
+        let own = self.chunk_planner.owner_bytes(runner_id);
+        let first = self
+            .chunk_planner
+            .get_runner_state(runner_id)
+            .and_then(|state| state.hedge.as_ref())
+            .and_then(|hedge| hedge.first);
+        let released = self
+            .chunk_planner
+            .mark_failed(runner_id)
+            .expect("chunk planner should not fail");
+        trace!(
+            "runner {runner_id} failed, released range: {:?}",
+            released.range
+        );
+        let own = own.unwrap_or(released.received);
+        if slow {
+            AttemptFailure::slow_of_attempt(runner_id, released, own, first)
+        } else {
+            AttemptFailure::of_attempt(runner_id, error, retryable, released, own, first)
+        }
+    }
+
+    /// Whether `runner_id` is a side of an undecided pair whose other side
+    /// still runs (design §9.6).
+    fn has_other_side(&self, runner_id: RunnerId) -> bool {
+        self.chunk_planner.partner_chunk(runner_id).is_some()
+            || self
+                .chunk_planner
+                .get_runner_state(runner_id)
+                .is_some_and(|state| state.partner().is_some())
+    }
+
+    /// A side of an undecided pair failed with `error` while the other side
+    /// runs on (design §9.6): the other side keeps the chunk, nothing is
+    /// released or backed off, and the pair's budget waits for the other
+    /// side. The side's slot is reclaimed.
+    fn handle_side_failed(
+        &mut self,
+        runner_id: RunnerId,
+        connecting: bool,
+        error: TaskError,
+        retryable: bool,
+    ) -> RunnerTick {
+        // The original side delivered every byte accepted so far.
+        let own = self.chunk_planner.owner_bytes(runner_id).unwrap_or(0);
+        let survivor = if self.chunk_planner.partner_chunk(runner_id).is_some() {
+            self.chunk_planner.drop_partner(runner_id)
+        } else {
+            self.chunk_planner.hand_over(runner_id)
+        }
+        .expect("a side of an undecided pair has a pair");
+        self.meters.remove(&runner_id);
+        self.release_runner(runner_id);
+        if error.is_cancelled() {
+            trace!("runner {runner_id} cancelled while hedged");
+            self.chunk_planner
+                .record_side_failure(survivor, SideFailure::default());
+            return RunnerTick::downloading();
+        }
+        warn!("hedged runner {runner_id} failed, runner {survivor} runs on: {error:?}");
+        self.chunk_planner.record_side_failure(
+            survivor,
+            SideFailure {
+                restart: retryable && is_restart(&error, own),
+                charged: charges_range(&error, retryable, own),
+            },
+        );
+        if connecting {
+            self.runner_outcome_sampler
+                .record_connect_failed(if retryable {
+                    RunnerFailureKind::Retryable
+                } else {
+                    RunnerFailureKind::Unretryable
+                });
+        } else {
+            self.runner_outcome_sampler
+                .record_stream_closed(if error.is_retryable() {
+                    RunnerFailureKind::Retryable
+                } else {
+                    RunnerFailureKind::Unretryable
+                });
+        }
+        let attempts = self
+            .chunk_planner
+            .get_runner_state(survivor)
+            .map_or(1, |state| state.attempts.saturating_add(1));
+        RunnerTick::with_side_failure(SideFailed {
+            runner_id,
+            error,
+            retryable,
+            received: own,
+            attempts,
+        })
+    }
+
+    /// A beaten side confirmed it ended: only its slot is reclaimed, once
+    /// (design §9.6). Nothing of it is reported, whatever it ended with.
+    fn handle_loser_ended(&mut self, runner_id: RunnerId) -> RunnerTick {
+        trace!("beaten runner {runner_id} ended");
+        self.meters.remove(&runner_id);
+        self.release_runner(runner_id);
+        RunnerTick::downloading()
     }
 
     /// Handle a runner that stopped on [`RunnerManager::stop_runner`]: its
@@ -220,25 +380,21 @@ impl RunnerManager {
                 RunnerTick::downloading()
             };
         }
-        let released = self
-            .chunk_planner
-            .mark_failed(runner_id)
-            .expect("chunk planner should not fail");
+        let failure = self.fail_attempt(runner_id, TaskError::Timeout, true, true);
         debug!(
             "runner {runner_id} stopped for being slow, released range: {:?}",
-            released.range
+            failure.range
         );
-        RunnerTick::with_failure(AttemptFailure::slow(runner_id, released))
+        RunnerTick::with_failure(failure)
     }
 
     /// Handle a runner that stopped before it connected; its range is
     /// released and it never counts as finished.
     fn handle_connect_failed(&mut self, runner_id: RunnerId, error: TaskError) -> RunnerTick {
-        let released = self
-            .chunk_planner
-            .mark_failed(runner_id)
-            .expect("chunk planner should not fail");
         if error.is_cancelled() {
+            self.chunk_planner
+                .mark_failed(runner_id)
+                .expect("chunk planner should not fail");
             trace!("runner {runner_id} cancelled while connecting");
             return RunnerTick::downloading();
         }
@@ -250,31 +406,39 @@ impl RunnerManager {
             } else {
                 RunnerFailureKind::Unretryable
             });
-        RunnerTick::with_failure(AttemptFailure::new(runner_id, error, retryable, released))
+        RunnerTick::with_failure(self.fail_attempt(runner_id, error, retryable, false))
     }
 
     /// Handle a runner whose spawn was rejected.
     #[cold]
     fn handle_spawn_failed(&mut self, runner_id: RunnerId, failed: SpawnFailed) -> RunnerTick {
         error!("failed to spawn runner {runner_id}: {}", failed.message);
+        let error = TaskError::Other {
+            message: failed.message,
+        };
+        if self.stop_reason(runner_id) == Some(StopReason::Loser) {
+            return self.handle_loser_ended(runner_id);
+        }
+        if self.has_other_side(runner_id) {
+            // An unretryable connect failure, as for any runner (design
+            // §9.6, M4).
+            return self.handle_side_failed(runner_id, true, error, false);
+        }
         self.release_runner(runner_id);
-        self.handle_connect_failed(
-            runner_id,
-            TaskError::Other {
-                message: failed.message,
-            },
-        )
+        self.handle_connect_failed(runner_id, error)
     }
 
     /// Handle a runner whose stream closed without sending `Stopped`.
     fn handle_runner_lost(&mut self, runner_id: RunnerId) -> RunnerTick {
         warn!("runner {runner_id} lifecycle stream closed unexpectedly");
+        if self.stop_reason(runner_id) == Some(StopReason::Loser) {
+            return self.handle_loser_ended(runner_id);
+        }
         let connecting = self.is_connecting(runner_id);
+        if self.has_other_side(runner_id) {
+            return self.handle_side_failed(runner_id, connecting, TaskError::ChannelClosed, true);
+        }
         self.meters.remove(&runner_id);
-        let released = self
-            .chunk_planner
-            .mark_failed(runner_id)
-            .expect("chunk planner should not fail");
         if connecting {
             self.runner_outcome_sampler
                 .record_connect_failed(RunnerFailureKind::Retryable);
@@ -282,20 +446,16 @@ impl RunnerManager {
             self.runner_outcome_sampler
                 .record_stream_closed(RunnerFailureKind::Retryable);
         }
+        let failure = self.fail_attempt(runner_id, TaskError::ChannelClosed, true, false);
         self.release_runner(runner_id);
         trace!(
             "runner {runner_id} lost, released range: {:?}",
-            released.range
+            failure.range
         );
         if self.chunk_planner.is_complete() {
             return RunnerTick::finished();
         }
-        RunnerTick::with_failure(AttemptFailure::new(
-            runner_id,
-            TaskError::ChannelClosed,
-            true,
-            released,
-        ))
+        RunnerTick::with_failure(failure)
     }
 
     fn handle_lifecycle_stream_event(&mut self, event: LifecycleStreamEvent) -> RunnerTick {
