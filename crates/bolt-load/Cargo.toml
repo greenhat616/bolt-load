@@ -178,3 +178,8 @@ harness = false
 [[bench]]
 name = "runner_loop"
 harness = false
+
+[[bench]]
+name = "growth_strategy"
+harness = false
+required-features = ["unstable-strategy", "tracing", "tokio"]

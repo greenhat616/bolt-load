@@ -227,8 +227,14 @@ pub struct CounterGuard(Arc<AtomicUsize>);
 
 impl CounterGuard {
     pub fn new(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(counter.clone())
+        Self::counted(counter).0
+    }
+
+    /// [`new`](Self::new), also returning the count this guard's own
+    /// increment made, whatever other guards do afterwards.
+    pub fn counted(counter: &Arc<AtomicUsize>) -> (Self, usize) {
+        let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        (Self(counter.clone()), count)
     }
 }
 
@@ -288,5 +294,20 @@ mod tests {
         drop(a);
         drop(b);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// The count is the one the increment made, not a later read: a guard
+    /// dropped in between does not lower it.
+    #[test]
+    fn test_counter_guard_counts_its_own_increment() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let a = CounterGuard::new(&counter);
+        let (b, count) = CounterGuard::counted(&counter);
+        drop(a);
+        assert_eq!(count, 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(b);
+        let (_c, count) = CounterGuard::counted(&counter);
+        assert_eq!(count, 1);
     }
 }
