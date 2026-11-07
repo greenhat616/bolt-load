@@ -158,9 +158,11 @@ struct FaultState {
     /// The range requests other than the probe that
     /// [`RangeFault::CongestedOnce`] answered.
     congested_once: Arc<AtomicUsize>,
-    /// Where the first range response of [`RangeFault::CongestedOnce`]
-    /// holds its body.
+    /// Where the first range response of [`RangeFault::CongestedOnce`],
+    /// and the one [`RangeFault::StalledOnce`] stalls, hold their body.
     hold: Option<Gate>,
+    /// Whether [`RangeFault::StalledOnce`] already stalled a response.
+    stalled: Arc<AtomicBool>,
     log: RequestLog,
 }
 
@@ -205,8 +207,9 @@ pub async fn create_range_fault_server(
 /// it answers.
 ///
 /// With `hold`, the first range response of [`RangeFault::CongestedOnce`]
-/// other than the probe sends its headers, then holds its body at the gate
-/// until the gate is released.
+/// other than the probe, and the response [`RangeFault::StalledOnce`]
+/// stalls, send their headers, then hold their body at the gate until the
+/// gate is released.
 pub async fn create_range_fault_server_with_log(
     content: Bytes,
     hold: Option<Gate>,
@@ -220,6 +223,7 @@ pub async fn create_range_fault_server_with_log(
         content,
         truncated: Arc::new(AtomicBool::new(false)),
         replaced: Arc::new(AtomicBool::new(false)),
+        stalled: Arc::new(AtomicBool::new(false)),
         congested_once: Arc::new(AtomicUsize::new(0)),
         hold,
         log: log.clone(),
@@ -293,6 +297,26 @@ fn truncated(content: &Bytes, first: u64, last: u64, total: u64) -> Response {
         // before the failure drops them.
         tokio::task::yield_now().await;
         yield Err(std::io::Error::other("truncated by the fault server"));
+    };
+    (
+        StatusCode::PARTIAL_CONTENT,
+        partial_headers(first, last, total),
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// A 206 for `first..=last` that sends the first half of its body, then
+/// nothing more, without closing. With `hold`, the body waits at the gate
+/// first; the headers are sent before.
+fn stalled(content: &Bytes, first: u64, last: u64, total: u64, hold: Option<Gate>) -> Response {
+    let body = content.slice(first as usize..=last as usize);
+    let stream = async_stream::stream! {
+        if let Some(gate) = hold {
+            gate.pass().await;
+        }
+        yield Ok::<_, std::io::Error>(body.slice(..body.len() / 2));
+        std::future::pending::<()>().await;
     };
     (
         StatusCode::PARTIAL_CONTENT,
@@ -434,6 +458,11 @@ fn fault_response(
                 if !is_probe && !state.replaced.swap(true, Ordering::SeqCst) =>
             {
                 partial(content, first, first + (last - first) / 2, len)
+            }
+            (RangeFault::StalledOnce, Some((first, last)))
+                if first > 0 && !state.stalled.swap(true, Ordering::SeqCst) =>
+            {
+                stalled(content, first, last, len, state.hold.clone())
             }
             (_, Some((first, last))) => partial(content, first, last, len),
         }

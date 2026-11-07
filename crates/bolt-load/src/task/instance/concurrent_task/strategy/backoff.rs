@@ -93,6 +93,29 @@ impl Backoff {
         let Some(retry_after) = congestion_retry_after(error) else {
             return now + backoff;
         };
+        self.hold(retry_after, backoff, now)
+    }
+
+    /// Hold every new connection back after a congestion rejection
+    /// (429/503) at `now`, as [`Self::on_failure`] does, without backing a
+    /// range off: a side of a hedged pair was rejected while the other runs
+    /// on (design §9.6). `attempts` sets the backoff without a
+    /// `Retry-After`: the failed attempts of the range should it fail now.
+    ///
+    /// Returns whether `error` was a congestion rejection.
+    pub fn hold_congestion(&mut self, error: &TaskError, attempts: u32, now: Instant) -> bool {
+        let Some(retry_after) = congestion_retry_after(error) else {
+            return false;
+        };
+        let backoff = self.delay(attempts);
+        self.hold(retry_after, backoff, now);
+        true
+    }
+
+    /// Hold new connections back for `retry_after`, or `backoff` when it is
+    /// longer or missing, at most [`MAX_CONGESTION_BACKOFF`]; returns when
+    /// the range may connect again.
+    fn hold(&mut self, retry_after: Option<Duration>, backoff: Duration, now: Instant) -> Instant {
         let delay = retry_after
             .map_or(backoff, |retry_after| retry_after.max(backoff))
             .min(MAX_CONGESTION_BACKOFF);
