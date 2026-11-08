@@ -30,6 +30,15 @@ async fn run_runner_and_collect(
     stream: AnyBytesStream,
     total: Option<u64>,
 ) -> (Vec<u8>, bool, Option<TaskError>) {
+    run_runner_and_collect_with(stream, total, None).await
+}
+
+/// [`run_runner_and_collect`], the runner also advancing `activity`.
+async fn run_runner_and_collect_with(
+    stream: AnyBytesStream,
+    total: Option<u64>,
+    activity: Option<ReadActivity>,
+) -> (Vec<u8>, bool, Option<TaskError>) {
     let (_control_tx, control_rx) = async_channel::bounded(1);
     let token = CancellationToken::new();
     let mut builder = TaskRunner::builder()
@@ -39,6 +48,9 @@ async fn run_runner_and_collect(
         .cancel_token(token);
     if let Some(total) = total {
         builder = builder.total(total);
+    }
+    if let Some(activity) = activity {
+        builder = builder.read_activity(activity);
     }
 
     let (mut runner, lifecycle_rx, data_rx) = builder.build().unwrap();
@@ -91,6 +103,181 @@ async fn run_runner_and_collect(
 
     runner_handle.await.unwrap();
     (received, finished, failed)
+}
+
+/// The read activity is stamped at every non-empty item and at the end of
+/// every push, and reads as active while the runner pushes; an empty item
+/// does not stamp it (design §14.19). The bytes come through as without it.
+#[tokio::test]
+async fn test_read_activity_follows_the_body() {
+    use std::time::Instant;
+
+    let (items, stream) = async_channel::unbounded::<Bytes>();
+    let activity = ReadActivity::default();
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let (mut runner, mut lifecycle_rx, mut data_rx) = TaskRunner::builder()
+        .stream(stream.map(Ok::<_, AdapterError>).boxed())
+        .runner_id(1)
+        .total(1000 * BUFFER_SIZE as u64)
+        .control_signal(control_rx)
+        .cancel_token(CancellationToken::new())
+        .read_activity(activity.clone())
+        .build()
+        .unwrap();
+    let handle = tokio::spawn(async move { runner.run().await });
+    let settle = || sleep(Duration::from_millis(50));
+    settle().await;
+    assert!(matches!(
+        lifecycle_rx.try_pop(),
+        Some(LifecycleEvent::Started)
+    ));
+    let far = Instant::now() + Duration::from_secs(3600);
+    assert_eq!(activity.last_active(far), None, "nothing read yet");
+
+    items.try_send(Bytes::new()).unwrap();
+    settle().await;
+    assert_eq!(activity.last_active(far), None, "an empty item");
+
+    let before = Instant::now();
+    items.try_send(patterned_frame(100)).unwrap();
+    settle().await;
+    let read = activity.last_active(far).expect("a non-empty item");
+    assert!(read >= before && read < far);
+
+    // Fill the data channel, so that the next push waits for the loop.
+    let mut pushes = 0;
+    while activity.last_active(far) != Some(far) {
+        items.try_send(patterned_frame(BUFFER_SIZE)).unwrap();
+        settle().await;
+        pushes += 1;
+        assert!(
+            pushes <= DATA_FRAME_CHANNEL_CAPACITY + 2,
+            "the runner never waited for the loop"
+        );
+    }
+    // Waiting for the loop: active now, whatever now is.
+    let now = Instant::now();
+    assert_eq!(activity.last_active(now), Some(now));
+    let before = Instant::now();
+    assert!(data_rx.try_pop().is_some());
+    settle().await;
+    let pushed = activity.last_active(far).expect("a push ended");
+    assert!(
+        pushed >= before && pushed < far,
+        "stamped at the end of its push"
+    );
+
+    drop(items);
+    drop(data_rx);
+    handle.abort();
+}
+
+/// A runner that pushed against backpressure, then reads on, is never
+/// seen silent: every state a tick could read, after the loop took a frame,
+/// has the runner pushing or stamped since (design §14.19). A tick between
+/// two changes, with the push over and no stamp yet, would see it silent
+/// since before its push.
+#[tokio::test]
+async fn test_a_resumed_runner_is_never_seen_silent() {
+    use std::time::Instant;
+
+    let (items, stream) = async_channel::unbounded::<Bytes>();
+    let activity = ReadActivity::default();
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let (mut runner, _lifecycle_rx, mut data_rx) = TaskRunner::builder()
+        .stream(stream.map(Ok::<_, AdapterError>).boxed())
+        .runner_id(1)
+        .total(1000 * BUFFER_SIZE as u64)
+        .control_signal(control_rx)
+        .cancel_token(CancellationToken::new())
+        .read_activity(activity.clone())
+        .build()
+        .unwrap();
+    let handle = tokio::spawn(async move { runner.run().await });
+    let settle = || sleep(Duration::from_millis(50));
+    items.try_send(patterned_frame(100)).unwrap();
+    let far = Instant::now() + Duration::from_secs(3600);
+    let mut pushes = 0;
+    while activity.last_active(far) != Some(far) {
+        items.try_send(patterned_frame(BUFFER_SIZE)).unwrap();
+        settle().await;
+        pushes += 1;
+        assert!(pushes <= DATA_FRAME_CHANNEL_CAPACITY + 2, "never waited");
+    }
+    let waiting = activity.seen().len();
+    let taken = Instant::now();
+    assert!(data_rx.try_pop().is_some());
+    settle().await;
+    let seen = activity.seen();
+    assert!(seen.len() > waiting, "it read on");
+    for (n, &(last, emitting)) in seen[waiting..].iter().enumerate() {
+        // A tick at `taken` or later, reading this state.
+        let since = if emitting { Some(far) } else { last };
+        assert!(
+            since.is_some_and(|since| since >= taken),
+            "state {n} after the take: {last:?}, emitting {emitting}"
+        );
+    }
+    drop(items);
+    drop(data_rx);
+    handle.abort();
+}
+
+/// A push that ends the runner's idle time is no read: the activity keeps
+/// the time of the last item (design §14.19).
+#[tokio::test]
+async fn test_a_forced_push_is_no_read() {
+    use std::time::Instant;
+
+    let (items, stream) = async_channel::unbounded::<Bytes>();
+    let activity = ReadActivity::default();
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let (mut runner, mut lifecycle_rx, mut data_rx) = TaskRunner::builder()
+        .stream(stream.map(Ok::<_, AdapterError>).boxed())
+        .runner_id(1)
+        .total(1000)
+        .control_signal(control_rx)
+        .cancel_token(CancellationToken::new())
+        .idle_timeout(Duration::from_millis(200))
+        .read_activity(activity.clone())
+        .build()
+        .unwrap();
+    let handle = tokio::spawn(async move { runner.run().await });
+    items.try_send(patterned_frame(100)).unwrap();
+    sleep(Duration::from_millis(50)).await;
+    let far = Instant::now() + Duration::from_secs(3600);
+    let read = activity.last_active(far).expect("an item");
+    // Idle: the 100 bytes are pushed, and the runner times out.
+    let (received, reason) = drain_until_stopped(&mut lifecycle_rx, &mut data_rx).await;
+    handle.await.unwrap();
+    assert_eq!(received, 100);
+    assert!(
+        matches!(reason, StoppedReason::Failed(TaskError::Timeout)),
+        "got {reason:?}"
+    );
+    assert_eq!(activity.last_active(far), Some(read), "the push is no read");
+    drop(items);
+}
+
+/// The bytes come through with a read activity as without it.
+#[tokio::test]
+async fn test_read_activity_keeps_the_bytes() {
+    let activity = ReadActivity::default();
+    let big = patterned_frame(2 * BUFFER_SIZE + 10);
+    let items = [
+        Bytes::new(),
+        patterned_frame(100),
+        Bytes::new(),
+        big.clone(),
+    ];
+    let expected: Vec<u8> = items.iter().flat_map(|item| item.to_vec()).collect();
+    let stream = Box::pin(futures::stream::iter(items.map(Ok)));
+    let (received, finished, failed) =
+        run_runner_and_collect_with(stream, Some(expected.len() as u64), Some(activity.clone()))
+            .await;
+    assert!(finished && failed.is_none(), "{failed:?}");
+    assert_eq!(received, expected);
+    assert!(activity.last_active(std::time::Instant::now()).is_some());
 }
 
 #[tokio::test]

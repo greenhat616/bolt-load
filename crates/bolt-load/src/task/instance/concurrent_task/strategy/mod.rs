@@ -28,7 +28,9 @@ pub use doubling_strategy::{TickSample, planned_split_size};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
 pub(super) use failure_policy::{charges_range, is_restart};
-pub use slow_restart::{JudgedRunner, SLOW_WINDOW, SlowRestartContext, slow_runner};
+pub use slow_restart::{
+    JudgedRunner, SILENT_RESTART_AFTER, SLOW_WINDOW, SlowRestartContext, slow_runner,
+};
 
 use super::chunk_planner::SplitCandidate;
 use crate::task::GrowthStrategy;
@@ -187,6 +189,7 @@ impl StrategyControl {
                     max_concurrency: cap,
                     congested,
                     all_delivering: tick.all_delivering,
+                    silent_runners: tick.silent,
                     speed: tick.speed,
                     // No speed limit before design §10.
                     speed_limit: None,
@@ -231,6 +234,13 @@ impl StrategyControl {
         }
 
         None
+    }
+
+    /// The loop stopped a runner to restart its range (design §9.5).
+    pub fn on_restarted(&mut self) {
+        if let Growth::Doubling(doubling_strategy) = &mut self.growth {
+            doubling_strategy.on_restarted();
+        }
     }
 
     /// The loop added `added` runners for a [`StrategyAction::Grow`].

@@ -19,7 +19,7 @@ use super::{
     super::super::{
         chunk_planner::{ChunkStatus, Cooldown},
         runner_manager::{RunnerChannels, RunnerSlot},
-        strategy::{MIN_RANGE_BACKOFF, SLOW_WINDOW},
+        strategy::{MIN_RANGE_BACKOFF, SILENT_RESTART_AFTER},
     },
     *,
 };
@@ -154,9 +154,11 @@ async fn start(download: &mut DownloadLoop, runner: &mut FutureObj<'static, ()>)
 }
 
 /// A real runner delivers 64 KiB and stalls, while three others deliver
-/// 0.6 MiB/s each. Its window is full 10 s after the tick it first ran at:
-/// a nanosecond before, nothing happens; then the loop stops it through its
-/// own stop, and its slot is held until it reports `Stopped`.
+/// 0.6 MiB/s each. Silent since it last read, at the first tick, and
+/// running there, it is silent for 4.5 s at the third (design §14.19), before its
+/// slow window is full: a nanosecond before, nothing happens; then the
+/// loop stops it through its own stop, and its slot is held until it
+/// reports `Stopped`.
 ///
 /// Its range comes back from the accepted bytes as a restart: one attempt
 /// and nothing charged. One consecutive failure or one charged failure
@@ -175,26 +177,31 @@ async fn a_slow_runner_is_stopped_and_its_range_retried() {
         StallingAdapter::stalls_after(96 * KIB),
     )
     .await;
-    let t0 = Instant::now();
-    download.spawn_runner(3 * QUARTER..TOTAL, t0);
+    download.spawn_runner(3 * QUARTER..TOTAL, Instant::now());
     let mut runner = single_parked(&rt);
     start(&mut download, &mut runner).await;
-    download.on_strategy_tick(t0);
     // Two full buffers; the rest stays in the runner's buffer.
     for frame in 0..2 {
         let tick = download.manager.tick().await;
         let start = 3 * QUARTER + frame * 32 * KIB;
         assert_eq!(tick.downloaded.unwrap().range, start..start + 32 * KIB);
     }
+    // It stamped its reads by the clock; the test's clock starts after.
+    let t0 = Instant::now();
+    download.manager.read_activity(JUDGED).unwrap().note_at(t0);
+    download.on_strategy_tick(t0);
 
-    for n in 1..=6 {
+    // Silent since `t0`, running at the sample there: stopped as silent,
+    // before its slow window is full (design §14.19).
+    for n in 1..=2 {
         feed(&mut download, MIB);
         download.on_strategy_tick(t0 + TICK * n);
         assert!(!download.manager.is_stopping(JUDGED), "tick {n}");
     }
-    download.on_strategy_tick(t0 + SLOW_WINDOW - NANO);
+    download.on_strategy_tick(t0 + SILENT_RESTART_AFTER - NANO);
     assert!(!download.manager.is_stopping(JUDGED));
-    let stopped_at = t0 + SLOW_WINDOW;
+    let stopped_at = t0 + SILENT_RESTART_AFTER;
+    feed(&mut download, MIB);
     download.on_strategy_tick(stopped_at);
     assert!(download.manager.is_stopping(JUDGED));
     assert_eq!(download.manager.allocated_runner_count(), 4);
@@ -249,8 +256,8 @@ async fn a_slow_runner_is_stopped_and_its_range_retried() {
     file_writer.finalize().await.unwrap();
 }
 
-/// A runner that never delivers is charged at every stop, as a timeout
-/// without data is: the third stop exhausts its range's budget of three,
+/// A runner that never delivers, stopped as silent, is charged at every
+/// stop, as a timeout without data is: the third stop exhausts its range's budget of three,
 /// with the timeout as its last error. Consecutive failures are allowed
 /// plenty, so only the budget ends the task.
 #[tokio::test]
@@ -273,14 +280,15 @@ async fn a_slow_runner_without_data_exhausts_its_range() {
         start(&mut download, &mut runner).await;
         let started = now;
         download.on_strategy_tick(started);
-        // At 1.5 s ticks, the window is full at the seventh.
-        for n in 1..=7 {
+        // At 1.5 s ticks, it is silent for 4.5 s at the third (design
+        // §14.19).
+        for n in 1..=3 {
             feed(&mut download, MIB);
             now = started + TICK * n;
             download.on_strategy_tick(now);
             assert_eq!(
                 download.manager.is_stopping(JUDGED),
-                n == 7,
+                n == 3,
                 "attempt {attempt}, tick {n}"
             );
         }
@@ -349,6 +357,8 @@ async fn spawn_test_runner(download: &mut DownloadLoop) -> TestRunner {
                 lifecycle_rx,
                 data_rx,
                 stop: stop.clone(),
+
+                reads: Default::default(),
             })
         })
         .unwrap();
@@ -369,6 +379,41 @@ fn run_ticks(download: &mut DownloadLoop, t0: Instant, ticks: u32) {
         feed(download, MIB);
         download.on_strategy_tick(t0 + TICK * n);
     }
+}
+
+/// A runner that still delivers, a frame every tick, is never silent; over
+/// a full window it is slow next to the fast ones, and the slow path stops
+/// it once the window is full (design §9.5, §14.19).
+#[tokio::test]
+async fn a_slow_runner_that_delivers_is_stopped_on_its_window() {
+    const FRAME: u64 = crate::runner::BUFFER_SIZE as u64;
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, file_writer, _fast) = restart_loop(
+        &rt,
+        GrowthStrategy::Doubling,
+        TaskOptions::default(),
+        StallingAdapter::stalls_after(0),
+    )
+    .await;
+    let runner = spawn_test_runner(&mut download).await;
+    let t0 = Instant::now();
+    download.manager.note_delivery(JUDGED, t0);
+    let reads = download.manager.read_activity(JUDGED).unwrap().clone();
+    reads.note_at(t0);
+    download.on_strategy_tick(t0);
+    // At 1.5 s ticks, the window is full at the seventh.
+    for n in 1..=7 {
+        let now = t0 + TICK * n;
+        feed(&mut download, MIB);
+        download.manager.update_progress(JUDGED, FRAME).unwrap();
+        download.manager.note_delivery(JUDGED, now);
+        reads.note_at(now);
+        download.on_strategy_tick(now);
+        assert_eq!(download.manager.is_stopping(JUDGED), n == 7, "tick {n}");
+    }
+    assert!(runner.stop.is_cancelled());
+    drop(download);
+    file_writer.finalize().await.unwrap();
 }
 
 /// A runner that completes its chunk after the loop decided to stop it,
@@ -427,7 +472,7 @@ async fn a_runner_that_completes_while_stopping_is_no_failure() {
 }
 
 /// The same stalled runner among the same fast ones is stopped under
-/// `Doubling` once its window is full, and never under `Legacy`, which
+/// `Doubling`, as silent (design §14.19), and never under `Legacy`, which
 /// does not even sample the rates.
 #[tokio::test]
 async fn legacy_never_restarts() {
@@ -458,9 +503,10 @@ async fn legacy_never_restarts() {
 
 /// The stop does not replace an error the runner already holds. Its stream
 /// fails with an unretryable error after 96 KiB, while its frames still
-/// wait to be taken; the loop then stops it for being slow. It goes on
-/// waiting for its frames, then reports its own error, which ends the
-/// task: not a slow attempt, retried after a backoff.
+/// wait to be taken; the loop then stops it for being slow (frames queued
+/// keep it from the silent restart, design §14.19, not from the slow one).
+/// It goes on waiting for its frames, then reports its own error, which
+/// ends the task: not a slow attempt, retried after a backoff.
 #[tokio::test]
 async fn a_stop_keeps_the_error_a_runner_holds() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
@@ -475,8 +521,17 @@ async fn a_stop_keeps_the_error_a_runner_holds() {
     let mut runner = single_parked(&rt);
     // It fails at once and waits for its three frames to be taken.
     start(&mut download, &mut runner).await;
-    run_ticks(&mut download, t0, 7);
-    assert!(download.manager.is_stopping(JUDGED));
+    run_ticks(&mut download, t0, 6);
+    assert!(
+        !download.manager.is_stopping(JUDGED),
+        "not silent: frames queued"
+    );
+    feed(&mut download, MIB);
+    download.on_strategy_tick(t0 + TICK * 7);
+    assert!(
+        download.manager.is_stopping(JUDGED),
+        "slow, at its full window"
+    );
 
     assert!(futures::poll!(&mut runner).is_pending(), "still draining");
     for _ in 0..3 {
@@ -584,6 +639,15 @@ async fn runners_at_the_same_low_rate_are_never_restarted() {
         }
         for runner in &mut runners {
             assert!(futures::poll!(runner).is_pending());
+        }
+        // They stamped their reads by the clock, a tick of the test's
+        // clock behind; they read during the tick.
+        for runner_id in 0..3 {
+            download
+                .manager
+                .read_activity(runner_id)
+                .unwrap()
+                .note_at(t0 + TICK * n);
         }
         while let Poll::Ready(tick) = futures::poll!(pin!(download.manager.tick())) {
             assert!(tick.failure.is_none(), "{tick:?}");
