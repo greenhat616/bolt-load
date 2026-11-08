@@ -52,7 +52,7 @@
 | PR-8 跨任务限额（D4） | C15 `feat(task): admit tasks and cap connections per host through shared limits` | T16 | PR-5 |
 | | C16 `feat(runner): shape throughput with a shared token bucket` | T17 | |
 | | C17 `feat(task): remember hosts that ignore ranges` | T18 | PR-3 |
-| PR-9 续传 | C18 `feat(task): track written ranges separately from received ranges` | T19 | PR-1、PR-2 |
+| PR-9 续传 | C18 `feat(task)!: track written ranges separately from received ranges` | T19 | PR-1、PR-2 |
 | | C19 `feat(core)!: carry validators in adapter meta and send If-Range` | T20 | |
 | | C20 `feat(task): resume from a checked state file` | T21 | |
 
@@ -577,12 +577,16 @@
 
 ## T19 — 双位点（C18，P3）
 
-- [ ] `ChunkPlanner` 增加 `written` 位点，只有收到 `WriteCompletion` 之后才推进。`Progress.downloaded_chunks` 改为上报 `written`。
-- [ ] 进度先于写入更新（`runner_manager/data.rs:154`）的行为保持不变，但在注释里写明：只有 `downloaded` 位点受它影响。
+提交：`feat(task)!: track written ranges separately from received ranges`。`Progress.downloaded_chunks` 的含义变了（已接收 → 写入成功），是 breaking change，迁移方式见 design §14.21。
+
+- [x] `ChunkPlanner` 增加 `written` 位点，只有收到 `WriteCompletion` 之后才推进。`Progress.downloaded_chunks` 改为上报 `written`。实现是一组合并过的区间（写会乱序完成，design §14.21）；一批里失败的写之外，成功的照样记，结束时冲刷完成的写也记。
+- [x] 进度先于写入更新（`runner_manager/data.rs` 的 `handle_data_frame`，原来写的是 `:154`）的行为保持不变，但在注释里写明：只有 `downloaded` 位点受它影响。
+- 不在这里：`durable` 位点（`fsync` 之后）跟状态文件一起在 C20 做。
 
 **验证**
 
 - 单元测试：写入还没完成时，`written` 落后于 `downloaded`；写入失败时，`written` 不前进。
+- 结束时冲刷完成的写算进最后的进度；回退到单连接之后不留并发那一次的区间（design §14.21）。
 
 ## T20 — 验证器与 `If-Range`（C19，P3）
 
