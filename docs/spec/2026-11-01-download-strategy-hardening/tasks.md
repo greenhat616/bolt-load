@@ -53,6 +53,7 @@
 | | C16 `feat(runner): shape throughput with a shared token bucket` | T17 | |
 | | C17 `feat(task): remember hosts that ignore ranges` | T18 | PR-3 |
 | PR-9 续传 | C18 `feat(task)!: track written ranges separately from received ranges` | T19 | PR-1、PR-2 |
+| PR-9a 性质测试的失败 | C30 `test(task): fail runners in the split property test as the loop does` | design §14.22 | PR-9 的 C18 |
 | | C19 `feat(core)!: carry validators in adapter meta and send If-Range` | T20 | |
 | | C20 `feat(task): resume from a checked state file` | T21 | |
 
