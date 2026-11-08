@@ -2185,3 +2185,32 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `a_cancelled_task_counts_its_flushed_writes`：取消的任务，冲刷时完成的写照样算，任务的结果仍是 `Cancelled`；
     - `a_failed_task_keeps_its_error_over_the_flush`：任务已经因为 `Timeout` 失败，冲刷里一个写失败、一个成功：结果仍是 `Timeout`，成功的区间算，失败的不算（`[0..32 KiB, 64..96 KiB]`）；
     - `the_first_failed_write_of_the_flush_is_the_error`：冲刷里两个写都失败，后面那个区间先完成：任务的错误是先完成的那个（`64..96 KiB`），不是偏移小的那个；两个都不算。
+
+### 14.22 性质测试里的失败按循环的方式处理（PR-9a，C30）
+
+- **起因。** 性质测试 `splits_stay_within_the_limit_and_cover_the_file` 找到一个序列（`max_connections = 8`，缩到 15 步），在 `ChunkPlanner::mark_failed` 的 `debug_assert`（“一对里先失败的一方不该走这里”）上失败。最后几步是：一个还在连接的 runner（7）静默满 2 s、没有可切或可领取的区间，被对冲（对冲 2，§9.6 允许对冲连接中的 runner）；接着测试的 `Op::Fail` 挑中 7，直接调 `RunnerManager::mark_failed(7)`。
+- **出现在哪些提交上**（同一序列写成确定的测试，在各提交上跑）：C27（`4391ed0`）和 C13（`9bc7766`）上更早一步就失败了，是 C28 修掉的那个预言误报（对冲 H 没算占着槽位）；C28（`5d9fac6`）、C29（`823497c`）、C14（`ea69115`）和 C18 上都在这个 `debug_assert` 上失败。也就是说，这个状态从 C27 加入对冲起就能到达，C28 修好预言之后才显出来；C14 把 `SplitAll`、`SplitGiven` 换成 `Grow(n)`（一步就开出好几个连接中的 runner），让 256 个随机用例碰上它的概率大了很多。
+- **不是产品的问题。** 真实的循环里，一对中任何一方失败，都先经过 `has_other_side`，走 `handle_side_failed`：另一方留下 chunk，什么也不释放、不退避。所有收到失败的路径都先查这一条：`Stopped`（`lifecycle.rs`）、spawn 被拒、生命周期流断开。`chunk_planner.mark_failed` 的其它调用者都在这个检查之后（`fail_attempt`、`handle_connect_failed`、取消），或者到不了一对中的一方：低速和静默重启不判一对中的一方（`may_restart`），对冲不挑正在停止的 runner；`release_runner_full` 只在测试里编译。所以 release 构建里（`debug_assert` 关掉时）没有一条路径会对一对中的一方调 `mark_failed`。问题在测试的驱动：`Op::Fail` 绕过了循环的处理。
+- **做法**（lead 的决定：单独一个 PR，放在 C18 之后、C19 之前；dev 上没有对冲、`Grow` 和 C28 的预言，放不上去）：
+  - `RunnerManager::report_stopped(runner_id, reason)` 和 `fail_runner(runner_id, error)`（只在测试里编译）：把一个 `Stopped` 事件交给生命周期的处理（`handle_lifecycle`），和 runner 的生命周期通道报上来时一样，包括对一对的处理、对被打败一方的处理。
+  - `Op::Fail` 改为对 runner 调 `fail_runner`，再把得到的 `RunnerTick` 交给 `download.on_runner(tick, now)`，和循环一样。能失败的 runner 除了连接中、运行中的 chunk 主人，还加上未分胜负的对冲和被打败的一方。断言分两种：
+    - 普通的失败：尝试数加 1，计费按错误分类（`ChannelClosed` 记 1、有数据后的 `Timeout` 不记、拥塞不记），退回的区间进入退避，冷却不早于 `MIN_RANGE_BACKOFF`；
+    - 一对中的一方或被打败的一方：没有 `failure`（一对中的一方有 `side_failure`），冷却不变，另一方留下同一个 chunk、不再有伙伴，槽位收回。
+  - `Op::Progress` 改为把一帧交给 `RunnerManager::on_data_frame`（循环从通道取帧时走的路，第一帧决定一对的胜负），不写入：循环的 writer 在测试里停着。`Op::Finish` 先用 `on_data_frame` 交完剩下的字节，再 `report_stopped(Finished)`，结果交给 `on_runner`。
+  - `on_runner` 可能因为失败策略结束任务；步骤这时返回 `ControlFlow::Break`，序列停下。为了让序列不太早结束，性质测试的 `max_consecutive_failures` 设为 2^20，`max_attempts_per_range` 设为最大值：这个性质关心的是循环的状态，不是什么时候放弃。
+  - 缩出来的序列写成确定的测试 `the_first_side_of_a_pair_fails_as_a_side`：先到达“7 连接中、被 2 对冲、未分胜负”，再分别让 7 和 2 失败，另一方都留下同一个区间、没有伙伴、冷却不变。不提交 `proptest-regressions` 文件。
+- **验证。** 改完之后用 4096 个用例跑了一次性质测试（临时改 `with_cases`，跑完改回 256：显式的 `with_cases` 不看 `PROPTEST_CASES`），没有新的失败，5.4 s。另加日志数了一次：4096 个用例里有 3629 次失败，其中被打败的一方 1 次，一对中的一方 0 次，第一帧决定胜负 1 次。也就是说，随机序列很少走到未分胜负的一对，一对的失败主要靠上面的确定测试覆盖。让性质测试更常到达一对（比如更小的 `TOTAL` 或更偏向 `Advance` 的分布）留作以后的事，这里没有做。
+- **第一轮评审之后（lead 的决定：针对一对的确定测试代替偏置生成器，偏置不进这个 PR）。**
+  - 一对的最后一方：第一方失败之后，留下的一方没有伙伴了，走普通失败的断言，但它带着这一对的计费（§9.6，`hedge.first`）：两方都不是重启、并且至少一方记预算时，这一对记一次。原来的断言按最后一方单独算，比如 7 先以 `Retryable` 失败、2 再以 `Congestion` 失败，产品记 1，断言要 0。现在 `fail()` 用 `hedge.first` 和最后一方的分类算期望值；一方的分类（是不是重启、记不记预算）按 design §8.2 写成测试自己的表（`Failure::class`，丢失记、超时有自己的字节就是重启否则记、拥塞都不），不调产品的 `charges_range`、`is_restart`。一方失败时还核对留下的一方记下的 `hedge.first` 和表一致。
+  - `a_pair_is_charged_once_for_both_sides`：一个运行中、自己交过字节的 runner（0）被对冲（1，连接中），两方各自先失败，三种失败（`Retryable`、`Timeout`、`Congestion`）两两组合，共 18 种：这一对算 1 次尝试，按上面的规则最多记 1 次。原始一方的 `Timeout` 是重启，对冲一方的 `Timeout` 记预算。`the_first_side_of_a_pair_fails_as_a_side` 也走到第二次失败：先 `Retryable` 再 `Congestion`，记 1 次。
+  - 结束的一步也查：一步让循环结束时，照样跑 `check()` 和“已接收的字节不减少”，再停。能让生成的序列结束的只有两种：`Finish` 把文件下完（`on_runner` 返回 `Break`），和没有别的尝试在路上时的拥塞（产品按设计结束任务）；别的 `Err` 都算失败。
+  - `Progress` 和 `Finish` 收下非空的区间时，照 `on_runner` 的做法调 `policy.on_progress(now)` 和 `manager.note_delivery`，对冲的静默从这时重新算。仍然不写入。
+  - `Start` 也可以挑连接中的对冲（走真实的 `Started` 处理，`report_started`），`Progress` 也可以挑运行中的对冲，所以对冲一方也能交帧、赢下一对。
+  - 变异检查：产品里一对的计费不看第一方、一方失败不记分类，各让 7 个和 6 个测试失败（包括上面两个确定测试）；测试里按最后一方单独算，让两个确定测试失败。
+  - 4096 个用例再跑一次：没有失败，5.7 s。计数：3692 次失败里，对冲一方失败 1 次，被打败的一方 0 次，一对的最后一方 0 次；对冲连上 1 次，一对由交帧决定 0 次。随机序列仍然很少到达一对，一对的组合由上面的确定测试覆盖。
+- **第二轮评审之后。** 对冲一方能连上、交帧之后，预言里两处按“主人”记的状态错了：
+  - 接管不是新连接：`Before` 原来只记 chunk 的主人。对冲赢下一对（或原始一方失败、对冲接手）之后，它的 ID 成了新的主人，`check()` 把它当成新开的连接，按切分的尾巴、领取冷却的规则要求计数是 `(0, 0)`，也会在拥塞期间误报“连接”。按 §9.6，接手的一方继承 chunk 的计数。现在 `Before` 也记下每个未分胜负的对冲和它的 chunk（起点、尝试数、记预算的次数）；新主人如果是上一步的对冲、并且 chunk 起点相同，就是接管：计数必须不变，不做新连接的检查。确定测试 `a_hedge_that_wins_keeps_the_counters_of_its_chunk`：一个区间失败一次、记了预算（`(1, 1)`），退避之后重新领取，下到只剩 `MIN - 1` 被对冲，对冲连上、先交 1 个字节赢下：它接手的 chunk 仍是 `(1, 1)`，原来那一方成了被打败的一方，它晚到的帧被丢掉。
+  - 失败的对冲找错伙伴：对冲失败时，原来按“任何一个记了第一方失败、没有伙伴的主人”去找留下的一方，有两对时会找到另一对。现在在 `fail_runner` 之前就定下另一方：主人的另一方是它的对冲，对冲的另一方是 `partner().runner_id` 等于它的那个主人。确定测试 `each_pair_keeps_its_own_first_failure`：两对同时存在，第一对的对冲以 `Timeout` 失败（没有自己的字节，记预算），第二对的以 `Congestion` 失败（都不），各自的原始一方记下各自的分类。
+  - 再查一遍同类的问题，又找到一处：新开的对冲也是一个新连接，原来的“拥塞期间不开新连接”只查新的主人，不查新的对冲。现在 `check()` 也查：上一步没有的对冲，上一步不能处于拥塞中。另外 `Progress` 也可以挑被打败的一方，核对它晚到的帧被丢掉（原来生成器覆盖不到）。其它按主人记的状态没有问题：槽位的计数已经把未分胜负的对冲和正在停止的 runner 算进去了；`Finish` 只挑主人，没分胜负的一方不可能下完。
+  - 变异检查：接管当新连接查（原来的预言），让 `a_hedge_that_wins_keeps_the_counters_of_its_chunk` 失败；按原来的方式找留下的一方，让 `each_pair_keeps_its_own_first_failure` 失败；产品接受被打败一方晚到的帧，让 `a_hedge_that_wins_keeps_the_counters_of_its_chunk` 和已有的 `the_hedge_never_moves_the_no_progress_deadline` 失败；产品在拥塞期间也对冲，让已有的 `no_hedge_without_a_free_connection_or_with_a_range_left` 失败（随机序列很少走到，新加的预言检查在 4096 个用例里没有碰上）。
+  - 4096 个用例再跑一次：没有失败，5.7 s。计数：3700 次失败里，对冲一方 1 次，一对的原始一方 1 次，一对的最后一方 1 次，被打败的一方 0 次；接管 1 次；对冲连上、对冲交帧、被打败一方的晚帧都是 0 次。

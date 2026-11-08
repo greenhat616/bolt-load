@@ -128,6 +128,40 @@ impl RunnerManager {
             })
     }
 
+    /// Handle `runner_id` stopping for `reason`, as its lifecycle channel
+    /// would report it: a test drives the loop's own handling with it.
+    #[cfg(test)]
+    pub(in super::super) fn report_stopped(
+        &mut self,
+        runner_id: RunnerId,
+        reason: StoppedReason,
+    ) -> RunnerTick {
+        self.handle_lifecycle(RunnerTaggedStreamItem {
+            runner_id,
+            item: LifecycleEvent::Stopped(reason),
+        })
+    }
+
+    /// Handle `runner_id` reporting that it connected, as its lifecycle
+    /// channel would report it.
+    #[cfg(test)]
+    pub(in super::super) fn report_started(&mut self, runner_id: RunnerId) -> RunnerTick {
+        self.handle_lifecycle(RunnerTaggedStreamItem {
+            runner_id,
+            item: LifecycleEvent::Started,
+        })
+    }
+
+    /// Handle `runner_id` failing with `error`, see [`Self::report_stopped`].
+    #[cfg(test)]
+    pub(in super::super) fn fail_runner(
+        &mut self,
+        runner_id: RunnerId,
+        error: TaskError,
+    ) -> RunnerTick {
+        self.report_stopped(runner_id, StoppedReason::Failed(error))
+    }
+
     fn handle_lifecycle(&mut self, event: RunnerTaggedStreamItem<LifecycleEvent>) -> RunnerTick {
         let runner_id = event.runner_id;
         // A beaten side is no part of any chunk any more (design §9.6).
