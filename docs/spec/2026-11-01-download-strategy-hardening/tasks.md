@@ -47,7 +47,8 @@
 | | C27 `feat(task): hedge a stalled range at the endgame under the doubling strategy` | T27 | |
 | | C13 `bench(task): compare the growth strategies` | T14 | |
 | PR-7c 上限处的翻倍 | C28 `feat(task): judge the doubling at the connection cap` | T28 | PR-7 |
-| PR-7b 切换默认值 | C14 `feat(task)!: make doubling the default growth strategy` | T15 | PR-7、PR-7c、重启静默 runner 的 PR（下一个，任务待加），且 G7 达标 |
+| PR-7d 重启静默 runner | C29 `feat(task): restart silent runners under the doubling strategy` | T29 | PR-7c |
+| PR-7b 切换默认值 | C14 `feat(task)!: make doubling the default growth strategy` | T15 | PR-7、PR-7c、PR-7d，且 G7 达标 |
 | PR-8 跨任务限额（D4） | C15 `feat(task): admit tasks and cap connections per host through shared limits` | T16 | PR-5 |
 | | C16 `feat(runner): shape throughput with a shared token bucket` | T17 | |
 | | C17 `feat(task): remember hosts that ignore ranges` | T18 | PR-3 |
@@ -487,6 +488,37 @@
 - 变异检查：上限处跳过判断、上限处也照样补位、上限以下也等着不扩张、判断时才读上限，各有测试失败。
 - 性质测试 `splits_stay_within_the_limit_and_cover_the_file` 把对冲中的 H（没有 chunk、在未分胜负的一对里）和正在停止的 runner 也算作占着槽位：它找到的一个序列在 C13 上也报“a slot leaked”，是测试漏算了 H（design §14.18）。这个序列另写成确定的测试，一直走到败方确认停止、胜方下完，检查槽位、一对和停止状态都清掉、ID 能再用。
 - bench 的 G7 结论写进 design §14.18 和 PR 描述。
+
+---
+
+## T29 — 重启静默 runner（C29）
+
+维护者 2026-11-08 对 T14（design §14.17）待决定事项 2、3 的决定：给 T13 加一条重启静默 runner 的路径；`Doubling` 的检查 5 不再因为静默满 `hedge_idle` 的 runner 停止扩张；对冲仍只在收尾，`slow_window`、`slow_ratio` 不变。
+
+- [x] runner 在重置空闲计时器的地方，把当时的时刻记进共享的 `ReadActivity`：读到非空的块时、推送完一个满缓冲接着读同一个块时；推送期间算“此刻在活动”；流结束、空闲超时、出错时推出的最后一帧不算读。静默从 runner 记下的最近一次读算起，没有就是 spawn（`silent_since(id, now)`）；被接受的帧和 writer 恢复不重新算（对冲的静默照旧）。
+- [x] 低速或静默路径停掉 runner 时，`Doubling` 待判断的翻倍不下结论地丢掉，翻到上限的也一样（维护者 2026-11-08 决定，收窄 design §14.18 的已知限制 3）；别的事件不放开。
+- [x] `download_loop/restart.rs`：低速路径没停 runner 时，判静默路径（design §9.5、§14.19）：正在运行、静默满 `SILENT_RESTART_AFTER`（4.5 s，没有读到 body、也不在推送）、连上也至少这么久、剩余量 ≥ `2 × min_chunk_size`、不在一对里、不在停止中、数据通道里没有循环还没取走的帧（只用于静默路径，低速路径不变）；不在拥塞期间、writer 可写。停静默最久的一个，按 `Slow` 停，分类和低速一样。
+- [x] `RunnerRates::sample_at`：检查 5 不算静默满 `hedge_idle`、连上也满这么久的 running runner（同样只按 runner 自己的读和推送算，数据通道里排着帧的不算），writer 满时谁都不算；`TickSample::silent` 记下有没有这样的 runner。`Doubling` 把这样的 tick 当成量不出翻倍：翻到上限的翻倍继续等，上限以下的不下结论、照常扩张。
+- [x] 只在 `Doubling` 下生效。
+- [x] bench 加“静默停止请求”一列；s1–s4c 和对照各重跑 10 次。
+
+**验证**
+
+- 下载循环测试（显式传入 `now`）：
+  - 静默（没有读、不在推送）满 4.5 s 时停，差 1 ns 不停；有数据的是重启、不记预算，没数据的记预算；
+  - 剩余量少 `2 × min_chunk_size` 1 B 不停，正好相等停；一对里的 runner 不停；
+  - 还在连接的不停，连上晚的从它运行的 tick 算；writer 满时不停，恢复后静默仍从最后一次读算（只有对冲的静默重新算）；拥塞期间不停；
+  - 每个 tick 最多停一个，低速和静默共用；`Legacy` 不停；
+  - 检查 5：静默满 2 s、连上也满 2 s 的 runner 不再挡住扩张，连接中、刚连上、还在读 body、writer 满时仍然挡住；
+  - 数据通道排满、循环落后的 runner 既不被放过也不被静默停止，帧最后都被接受、不记预算；一个快 runner 每个 tick 都排着帧，慢 runner 照样按窗口被停；ID 重用之后旧尝试的活动不影响新的；正在推送的 runner 不算静默，推送完接着读时从那时算，两者在一次加锁里改；停住之后 writer 写满又恢复，静默仍从最后一次读算；翻到上限、别的 runner 都下完时，重启的区间被重新领取后扩张照常切它；低速路径停掉 runner 时同样放开；
+  - 读得慢、4.5 s 内攒不满一帧的 runner 从不被停，不记预算，帧照常进来；别的 runner 都下完、采样也早已滚出窗口之后才连上的 runner，卡住时照样在 4.5 s 后被停；
+  - 翻倍在上限以下、有一个剩得少的 runner 卡住、别的 chunk 还可切：扩张照常（不再冻结）；
+  - 原来 T13 的两个测试，卡住的 runner 现在按静默在 4.5 s 停；另加一个慢但一直在交数据的 runner 按窗口被停的测试。
+- runner 的单元测试：时刻在非空的块和推送完接着读时记，空块和空闲超时推出的最后一帧不记；推送期间读作“此刻在活动”；数据照常。
+- 单元测试：重启丢掉待判断的翻倍（上限处和上限以下），runner 下完时上限处的翻倍照样等着。
+- 单元测试：“连上至少多久”、静默的 tick 对翻倍的处理（上限以下丢掉、到上限继续等）。
+- 集成测试：真实的下载里一个连接停住不关，剩 2 MiB，远早于空闲超时被重新请求（冒烟测试，计时由下载循环测试保证）。
+- 变异检查见 design §14.19。
 
 ---
 

@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bolt_load_utils::telemetry::*;
@@ -130,10 +130,13 @@ impl RunnerLoop<'_> {
 
     pub(super) fn on_item(&mut self, item: Bytes) {
         let idle_timeout = self.runner.idle_timeout;
-        let state = self.streaming();
         if !item.is_empty() {
-            state.idle.set_after(idle_timeout);
+            if let Some(activity) = &self.runner.read_activity {
+                activity.note_at(Instant::now());
+            }
+            self.streaming().idle.set_after(idle_timeout);
         }
+        let state = self.streaming();
         state.item = Some(ItemCursor {
             bytes: item,
             offset: 0,
@@ -181,7 +184,7 @@ impl RunnerLoop<'_> {
     /// After a full buffer of the current item was pushed.
     pub(super) fn resume_item(&mut self) {
         let idle_timeout = self.runner.idle_timeout;
-        // Backpressure is not idleness.
+        // Backpressure is not idleness, nor silence (see `on_emitted`).
         self.streaming().idle.set_after(idle_timeout);
         self.buffer_item();
     }
@@ -194,10 +197,23 @@ impl RunnerLoop<'_> {
         }
         let emission = Emission::new(state.buffer.split().freeze());
         state.staged = Some((emission, then));
+        // Waiting for the consumer is not silence either.
+        if let Some(activity) = &self.runner.read_activity {
+            activity.start_emitting();
+        }
     }
 
     pub(super) fn on_emitted(&mut self, result: EmitResult) {
         let (_, then) = self.streaming().staged.take().expect("a buffer was staged");
+        if let Some(activity) = &self.runner.read_activity {
+            // It reads on only past a full buffer of its item, as in
+            // `resume_item`; a push that ends it is no read.
+            if matches!(then, Continuation::ResumeItem) && matches!(result, Ok(None)) {
+                activity.resume_reading(Instant::now());
+            } else {
+                activity.stop_emitting();
+            }
+        }
         self.resume_after_emit(then, result);
     }
 }

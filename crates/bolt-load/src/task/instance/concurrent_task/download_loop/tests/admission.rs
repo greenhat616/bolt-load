@@ -102,6 +102,7 @@ fn spawn_test_runner(download: &mut DownloadLoop, range: Range<u64>) -> TestRunn
                 lifecycle_rx,
                 data_rx,
                 stop: Default::default(),
+                reads: Default::default(),
             })
         })
         .unwrap();

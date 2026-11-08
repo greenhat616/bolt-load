@@ -40,6 +40,7 @@ pub struct TaskRunnerBuilder {
     cancel_token: Option<CancellationToken>,
     /// stops this runner alone
     stop_token: Option<CancellationToken>,
+    read_activity: Option<super::ReadActivity>,
     /// optional override for tests that need to exercise drain timeout paths quickly
     data_drain_timeout: Option<std::time::Duration>,
     /// how long the stream may yield no non-empty data before the runner fails with `Timeout`
@@ -118,6 +119,13 @@ impl TaskRunnerBuilder {
         self
     }
 
+    /// Stamp `activity` as the runner reads its body, see
+    /// [`ReadActivity`](super::ReadActivity).
+    pub(crate) fn read_activity(mut self, activity: super::ReadActivity) -> Self {
+        self.read_activity = Some(activity);
+        self
+    }
+
     /// set the idle timeout of the stream, defaults to [`DEFAULT_IDLE_TIMEOUT`]
     pub fn idle_timeout(mut self, idle_timeout: std::time::Duration) -> Self {
         self.idle_timeout = Some(idle_timeout);
@@ -174,6 +182,7 @@ impl TaskRunnerBuilder {
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
             stop_token: self.stop_token,
+            read_activity: self.read_activity,
         };
         Ok((runner, lifecycle_cons, data_cons))
     }

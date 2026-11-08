@@ -300,6 +300,8 @@ pub(super) struct RunnerChannels {
     /// Cancels this runner alone: a child of the task's cancellation, see
     /// [`RunnerManager::stop_runner`].
     pub stop: CancellationToken,
+    /// Stamped as the runner reads its body (design §14.19).
+    pub reads: crate::runner::ReadActivity,
 }
 
 /// A runner that could not be spawned.
@@ -394,6 +396,8 @@ pub struct RunnerManager {
     /// accepted, or was spawned, or the writer could take data again: the
     /// start of its silence (design §9.6).
     last_delivery: HashMap<RunnerId, Instant>,
+    /// Each spawned runner's read activity (design §14.19).
+    reads: HashMap<RunnerId, crate::runner::ReadActivity>,
 }
 
 impl RunnerManager {
@@ -416,6 +420,7 @@ impl RunnerManager {
             stops: HashMap::with_capacity(max_concurrency),
             stopping: HashMap::new(),
             last_delivery: HashMap::with_capacity(max_concurrency),
+            reads: HashMap::with_capacity(max_concurrency),
         }
     }
 
@@ -494,6 +499,7 @@ impl RunnerManager {
         self.stops.remove(&runner_id);
         self.stopping.remove(&runner_id);
         self.last_delivery.remove(&runner_id);
+        self.reads.remove(&runner_id);
         self.id_generator.release(runner_id);
         self.admission.on_ended(runner_id);
     }
@@ -583,6 +589,7 @@ impl RunnerManager {
         self.connecting_data.remove(&loser);
         self.meters.remove(&loser);
         self.last_delivery.remove(&loser);
+        self.reads.remove(&loser);
     }
 
     // ==================== Silence (design §9.6) ====================
@@ -605,6 +612,40 @@ impl RunnerManager {
     /// loop did not spawn.
     pub(super) fn last_delivery(&self, runner_id: RunnerId) -> Option<Instant> {
         self.last_delivery.get(&runner_id).copied()
+    }
+
+    /// The read activity `runner_id` stamps, for a test to stamp it by
+    /// the test's own clock.
+    #[cfg(test)]
+    pub(super) fn read_activity(
+        &self,
+        runner_id: RunnerId,
+    ) -> Option<&crate::runner::ReadActivity> {
+        self.reads.get(&runner_id)
+    }
+
+    /// Whether `runner_id` has frames queued that the loop has not taken
+    /// yet: it delivers, only the loop has not caught up (design §14.19).
+    pub(super) fn has_queued_data(&self, runner_id: RunnerId) -> bool {
+        self.data_aggregator.has_queued(runner_id)
+            || self
+                .connecting_data
+                .get(&runner_id)
+                .is_some_and(|receiver| !async_ringbuf::traits::Observer::is_empty(receiver))
+    }
+
+    /// When `runner_id` was last active reading its body, by its own
+    /// [`ReadActivity`](crate::runner::ReadActivity), as of `now`, or else
+    /// spawned: the start of its silence for the silent restart and the
+    /// growth (design §14.19). A runner pushing a frame is active at `now`.
+    /// `None` for a runner the loop did not spawn.
+    ///
+    /// The accepted frames and the writer's recovery do not count: the
+    /// runner read those bytes before, and a runner the writer held back
+    /// was pushing. The hedge goes by [`Self::last_delivery`] (design
+    /// §9.6).
+    pub(super) fn silent_since(&self, runner_id: RunnerId, now: Instant) -> Option<Instant> {
+        self.reads.get(&runner_id)?.last_active(now)
     }
 
     /// Gets the number of currently allocated runners
@@ -922,6 +963,9 @@ impl RunnerManager {
             Ok(channels) => {
                 self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx);
                 self.stops.insert(runner_id, channels.stop);
+                // Its silence starts at its spawn.
+                channels.reads.note_at(now);
+                self.reads.insert(runner_id, channels.reads);
             }
             Err(failed) => self.spawn_failures.push_back((runner_id, failed)),
         }
@@ -1236,6 +1280,8 @@ mod tests {
             lifecycle_rx,
             data_rx,
             stop: Default::default(),
+
+            reads: Default::default(),
         };
         (channels, lifecycle_tx, data_tx)
     }
@@ -1760,6 +1806,8 @@ mod tests {
                     lifecycle_rx,
                     data_rx,
                     stop: Default::default(),
+
+                    reads: Default::default(),
                 })
             })
             .unwrap();
@@ -2212,6 +2260,63 @@ mod tests {
     /// then a slow attempt, released from the bytes the planner accepted:
     /// a frame still in its channel is dropped. Its slot is freed then,
     /// and the concurrency strategy does not count it.
+    /// A reused ID's silence goes by the read activity of its new attempt:
+    /// a clone of the old one, stamped, changes nothing (design §14.19).
+    #[test]
+    fn test_a_reused_id_reads_by_its_own_activity() {
+        use std::time::{Duration, Instant};
+
+        use crate::runner::ReadActivity;
+
+        let second = Duration::from_secs(1);
+        let mut manager = RunnerManager::new(1000, 4);
+        let t0 = Instant::now();
+        let spawn = |manager: &mut RunnerManager, range, now, reads: &ReadActivity| {
+            let slot = manager.try_reserve_slot().unwrap();
+            let runner_id = slot.runner_id;
+            let (channels, _lifecycle, _data) = test_channels();
+            let reads = reads.clone();
+            assert!(
+                manager.spawn_in(slot, range, now, |_, _| Ok(RunnerChannels {
+                    reads,
+                    ..channels
+                }))
+            );
+            runner_id
+        };
+        let old = ReadActivity::default();
+        let id = spawn(&mut manager, 0..500, t0, &old);
+        assert_eq!(manager.silent_since(id, t0), Some(t0));
+        old.note_at(t0 + second);
+        assert_eq!(manager.silent_since(id, t0 + second), Some(t0 + second));
+        old.start_emitting();
+        let t1 = t0 + 3 * second / 2;
+        assert_eq!(manager.silent_since(id, t1), Some(t1), "pushing a frame");
+        old.stop_emitting();
+
+        manager.release_runner_full(id, false).unwrap();
+        assert_eq!(manager.silent_since(id, t1), None);
+        let new = ReadActivity::default();
+        let t2 = t0 + 2 * second;
+        assert_eq!(
+            spawn(&mut manager, 500..1000, t2, &new),
+            id,
+            "the ID is reused"
+        );
+        old.note_at(t0 + 3 * second);
+        old.start_emitting();
+        assert_eq!(
+            manager.silent_since(id, t0 + 3 * second),
+            Some(t2),
+            "the old attempt's reads"
+        );
+        new.note_at(t0 + 4 * second);
+        assert_eq!(
+            manager.silent_since(id, t0 + 4 * second),
+            Some(t0 + 4 * second)
+        );
+    }
+
     #[tokio::test]
     async fn test_a_stopped_runner_is_a_slow_attempt() {
         let mut manager = RunnerManager::new(1000, 4);
