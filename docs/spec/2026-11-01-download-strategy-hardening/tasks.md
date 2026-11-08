@@ -504,12 +504,13 @@
 
 ## T15 — 切换默认值（C14，G7 达标之后）
 
-- [ ] 把 `Doubling` 改为默认策略，删掉 `Legacy`、`dynamic_strategy.rs` 和 `unstable-strategy` 这个 feature。
-- [ ] 测试里凡是依赖旧扩张节奏的断言，都按新策略改写。
+- [x] 把 `Doubling` 改为默认策略，删掉 `Legacy`、`dynamic_strategy.rs` 和 `unstable-strategy` 这个 feature（design §14.20）。`GrowthStrategy` 和 options、builder 上的方法一起删掉；只有 `Legacy` 用的 `SplitAllTask`、`SplitGivenTask`、`get_incomplete_states`、`find_chunk_to_split` 也删掉。
+- [x] 测试里凡是依赖旧扩张节奏的断言，都按新策略改写（逐条见 design §14.20）。
+- [x] bench 只跑 `Doubling`，去掉 G7 判定；全部场景重跑 10 次。
 
 **验证**
 
-- `rg "threashold|DynamicStrategy|unstable-strategy" crates` 无结果。
+- `rg "threashold|DynamicStrategy|unstable-strategy" crates` 无结果，`crates/bolt-load/docs/idm-insights.md` 和 `crates/bolt-load/docs/idm-improvement-plan.md` 除外：这两份是 IDM 的分析文档，引用当时的代码，不改（维护者 2026-11-09 决定）。
 
 ---
 

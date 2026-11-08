@@ -877,12 +877,14 @@ async fn test_split_handshaking_runner_keeps_the_latest_limit() {
     file_writer.finalize().await.unwrap();
 }
 
-/// Drive the real strategy with one running runner while every runner it
-/// spawns stays connecting; returns the runners each `SplitAllTask` targeted,
-/// per round.
+/// Grow by as many runners as allowed, a round at a time, with one running
+/// runner while every runner it spawns stays connecting; returns the
+/// runners each round added.
 ///
-/// Every target must be split, and no connecting runner may be sent a limit.
-async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::task::RunnerId>> {
+/// Every split must take runner 0's chunk, the only running one: no
+/// connecting runner may be sent a limit, and there are never more runners
+/// than allowed.
+async fn probe_growth(max_concurrency: usize, rounds: usize) -> Vec<usize> {
     use async_ringbuf::{
         AsyncHeapRb,
         traits::{Producer, Split},
@@ -920,44 +922,25 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
         super::super::chunk_planner::ChunkStatus::Running
     );
 
-    // A steady 2 MiB/s keeps the dynamic strategy in its quick start stage.
-    download.throughput.speed = 2.0 * 1024.0 * 1024.0;
-    download.throughput.per_runner_speed = download.throughput.speed;
-    let mut rounds = Vec::new();
-    for _ in 0..ticks {
-        // `on_strategy_tick`, observing each split.
-        let Some((_, actions)) = download.strategy.execute(
-            download.max_concurrency,
-            download.throughput.speed,
-            download.throughput.per_runner_speed,
-            &mut download.manager,
-            Instant::now(),
-            false,
-            None,
-        ) else {
-            continue;
-        };
-        for action in actions {
-            let StrategyAction::SplitAllTask(planned) = action else {
-                download.apply(action, Instant::now());
-                continue;
-            };
-            let targets = download.manager.get_incomplete_states(Some(planned));
-            download.apply(action, Instant::now());
-            for (runner_id, incomplete) in &targets {
-                let state = download.manager.get_runner_state(*runner_id).unwrap();
-                assert!(
-                    state.allocated.end < incomplete.end,
-                    "runner {runner_id} was not split"
-                );
-            }
-            rounds.push(targets.into_iter().map(|(id, _)| id).collect());
-        }
+    // 2 MiB/s, before runner 0 has a rate of its own: 4 MiB planned.
+    download.throughput.per_runner_speed = 2.0 * 1024.0 * 1024.0;
+    let mut added = Vec::new();
+    for _ in 0..rounds {
+        let before = download.manager.get_active_runners_count();
+        let end = download.manager.get_runner_state(0).unwrap().allocated.end;
+        download.apply(StrategyAction::Grow(max_concurrency), Instant::now());
+        let after = download.manager.get_active_runners_count();
         assert!(
-            download.manager.get_active_runners_count() <= max_concurrency,
-            "{} runners, at most {max_concurrency}",
-            download.manager.get_active_runners_count()
+            after <= max_concurrency,
+            "{after} runners, at most {max_concurrency}"
         );
+        if after > before {
+            assert!(
+                download.manager.get_runner_state(0).unwrap().allocated.end < end,
+                "runner 0 was not split"
+            );
+        }
+        added.push(after - before);
         // The running runner reads its limits.
         limits.try_recv();
         for runner_id in 1..max_concurrency {
@@ -970,38 +953,41 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
     }
     drop(download);
     file_writer.finalize().await.unwrap();
-    rounds
+    added
 }
 
-/// With one connection allowed, the strategy never splits the only runner,
-/// however fast it downloads.
+/// With one connection allowed, growth never splits the only runner.
 #[tokio::test]
 async fn test_one_connection_is_never_split() {
-    let rounds = probe_strategy(1, 64).await;
-    assert!(rounds.is_empty(), "{rounds:?}");
+    let added = probe_growth(1, 64).await;
+    assert!(added.iter().all(|&added| added == 0), "{added:?}");
 }
 
-/// Each quick start round splits every running runner: only runner 0 runs,
-/// so the runners it spawns are left to connect with their whole range.
+/// Growth splits only running runners: only runner 0 runs, so the runners
+/// it spawns are left to connect with their whole range. The first round
+/// splits runner 0 for every free slot, until what it has left is under the
+/// planned 4 MiB: 16 GiB halved 13 times.
 #[tokio::test]
-async fn test_strategy_splits_only_running_runners() {
+async fn test_growth_splits_only_running_runners() {
+    const SPLITS: usize = 13;
     for max_concurrency in [4, 16, 64, 1024] {
-        let rounds = probe_strategy(max_concurrency, 64).await;
-        assert_eq!(rounds[0], [0], "max_concurrency {max_concurrency}");
-        // Until runner 0 is too small to split.
-        for targets in &rounds {
-            assert!(
-                targets.is_empty() || targets == &[0],
-                "max_concurrency {max_concurrency}: {targets:?}"
-            );
-        }
+        let added = probe_growth(max_concurrency, 8).await;
+        assert_eq!(
+            added[0],
+            (max_concurrency - 1).min(SPLITS),
+            "max_concurrency {max_concurrency}"
+        );
+        assert!(
+            added[1..].iter().all(|&added| added == 0),
+            "max_concurrency {max_concurrency}: {added:?}"
+        );
     }
 }
 
 // ── Splitting within the connection limit ───────────────────────────
 
-/// With every runner slot taken, splitting or creating a runner changes
-/// nothing; a freed slot is used again.
+/// With every runner slot taken, growing, splitting or creating a runner
+/// changes nothing; a freed slot is used again.
 #[tokio::test]
 #[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
 async fn test_no_free_slot_skips_splits_and_new_runners() {
@@ -1019,13 +1005,9 @@ async fn test_no_free_slot_skips_splits_and_new_runners() {
         .allocate_runner_with_chunk(HALF..TOTAL)
         .unwrap();
 
-    download.apply(StrategyAction::SplitAllTask(1), Instant::now());
-    download.apply(
-        StrategyAction::SplitGivenTask(first.runner_id),
-        Instant::now(),
-    );
-    // Not a runner: skipped too.
-    download.apply(StrategyAction::SplitGivenTask(7), Instant::now());
+    download.throughput.per_runner_speed = 1.0;
+    download.apply(StrategyAction::Grow(2), Instant::now());
+    assert!(!download.split(first.runner_id, 0..HALF, Instant::now()));
     let allocated = |download: &DownloadLoop, runner_id| {
         download
             .manager
@@ -1059,10 +1041,12 @@ async fn test_no_free_slot_skips_splits_and_new_runners() {
     file_writer.finalize().await.unwrap();
 }
 
-/// A runner whose chunk is complete keeps its slot until it stops, so the
-/// strategy may see room that the slots do not have.
+/// A runner whose chunk is complete keeps its slot until it stops, so
+/// growth may see room that the slots do not have.
 #[tokio::test]
 async fn test_strategy_tick_while_finished_runners_keep_their_slots() {
+    use super::super::strategy::StrategyAction;
+
     const TOTAL: u64 = 1 << 34;
     const QUARTER: u64 = TOTAL / 4;
     let (mut download, file_writer) = parked_loop(TOTAL, 4).await;
@@ -1082,13 +1066,12 @@ async fn test_strategy_tick_while_finished_runners_keep_their_slots() {
             .unwrap();
     }
     assert_eq!(download.manager.get_active_runners_count(), 2);
-    // 4 MiB/s, a quarter of it from each runner.
-    download.throughput.speed = 4.0 * 1024.0 * 1024.0;
-    download.throughput.per_runner_speed = download.throughput.speed / 4.0;
+    // 1 MiB/s from each runner.
+    download.throughput.per_runner_speed = 1024.0 * 1024.0;
 
-    // Two active runners of four allowed: the strategy splits, but no
-    // slot is free.
-    download.on_strategy_tick(Instant::now());
+    // Two active runners of four allowed: growth splits, but no slot is
+    // free.
+    download.apply(StrategyAction::Grow(2), Instant::now());
     for (runner_id, slot) in slots.iter_mut().enumerate() {
         assert_eq!(
             download
@@ -1104,7 +1087,7 @@ async fn test_strategy_tick_while_finished_runners_keep_their_slots() {
 
     // Runner 3 stops: one split takes its slot, the next finds none.
     download.manager.release_runner_full(3, true).unwrap();
-    download.on_strategy_tick(Instant::now());
+    download.apply(StrategyAction::Grow(2), Instant::now());
     let split = |download: &DownloadLoop, runner_id: usize| {
         download
             .manager
@@ -1114,10 +1097,13 @@ async fn test_strategy_tick_while_finished_runners_keep_their_slots() {
             .end
             < (runner_id as u64 + 1) * QUARTER
     };
-    assert!(split(&download, 0));
-    assert!(slots[0].limits.try_recv().is_some());
-    assert!(!split(&download, 1));
-    assert_eq!(slots[1].limits.try_recv(), None);
+    // Runners 0 and 1 have as much left: one of them is split.
+    assert_ne!(split(&download, 0), split(&download, 1));
+    let limits: Vec<_> = slots[..2]
+        .iter_mut()
+        .map(|slot| slot.limits.try_recv())
+        .collect();
+    assert_eq!(limits.iter().filter(|limit| limit.is_some()).count(), 1);
     assert_eq!(download.manager.allocated_runner_count(), 4);
     assert_eq!(download.manager.get_available_ranges(), []);
     drop(download);
@@ -1203,7 +1189,7 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
     assert_eq!(download.manager.allocated_runner_count(), 2);
 
     // Meanwhile another split takes the last slot.
-    download.apply(StrategyAction::SplitGivenTask(0), Instant::now());
+    assert!(download.split(0, 0..HALF, Instant::now()));
     assert_eq!(limits.try_recv(), Some(QUARTER));
     assert_eq!(
         state(&download, 2),
@@ -1262,7 +1248,7 @@ mod retry;
 mod silent;
 
 /// Random sequences of the loop's steps, including failures that back their
-/// range off, congestion and time passing, under either growth strategy.
+/// range off, congestion, growth and time passing.
 mod split_properties {
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
@@ -1275,7 +1261,7 @@ mod split_properties {
         },
         *,
     };
-    use crate::{adapter::UnretryableError, task::GrowthStrategy};
+    use crate::adapter::UnretryableError;
 
     const TOTAL: u64 = 64 << 20;
     const MAX_CONNECTIONS: usize = 8;
@@ -1324,8 +1310,10 @@ mod split_properties {
         /// The `n`th connecting or running runner fails, and the loop
         /// backs its range off.
         Fail(usize, Failure),
-        SplitAll(u64),
-        /// Split runner `id`, which may not exist.
+        /// Grow by up to `n` runners.
+        Grow(usize),
+        /// Split runner `id`, which may not exist, at the half of what it
+        /// has left.
         SplitGiven(usize),
         ChangeMaxConcurrency(usize),
         /// A strategy tick at `speed` bytes per second.
@@ -1351,7 +1339,7 @@ mod split_properties {
             (any::<usize>(), 0..TOTAL / 4).prop_map(|(n, bytes)| Op::Progress(n, bytes)),
             any::<usize>().prop_map(Op::Finish),
             (any::<usize>(), failure()).prop_map(|(n, failure)| Op::Fail(n, failure)),
-            (0..TOTAL).prop_map(Op::SplitAll),
+            (0..2 * MAX_CONNECTIONS).prop_map(Op::Grow),
             (0..2 * MAX_CONNECTIONS).prop_map(Op::SplitGiven),
             (1..=2 * MAX_CONNECTIONS).prop_map(Op::ChangeMaxConcurrency),
             (0..TOTAL).prop_map(Op::Tick),
@@ -1457,16 +1445,18 @@ mod split_properties {
                 assert!(cooldown.charged >= failure.charged);
                 assert!(cooldown.not_before >= *now + MIN_RANGE_BACKOFF);
             }
-            Op::SplitAll(planned) => download.apply(StrategyAction::SplitAllTask(planned), *now),
+            Op::Grow(n) => download.apply(StrategyAction::Grow(n), *now),
             Op::SplitGiven(runner_id) => {
-                download.apply(StrategyAction::SplitGivenTask(runner_id), *now);
+                if let Some(state) = download.manager.get_runner_state(runner_id) {
+                    let incomplete = state.incomplete_range();
+                    download.split(runner_id, incomplete, *now);
+                }
             }
             Op::ChangeMaxConcurrency(n) => {
                 download.apply(StrategyAction::ChangeMaxConcurrency(n), *now);
             }
             Op::Tick(speed) => {
                 let active = download.manager.get_active_runners_count().max(1);
-                download.throughput.speed = speed as f64;
                 download.throughput.per_runner_speed = speed as f64 / active as f64;
                 download.on_strategy_tick(*now);
             }
@@ -1623,12 +1613,10 @@ mod split_properties {
         #[test]
         fn splits_stay_within_the_limit_and_cover_the_file(
             max_connections in 1..=MAX_CONNECTIONS,
-            growth in prop_oneof![Just(GrowthStrategy::Legacy), Just(GrowthStrategy::Doubling)],
             ops in prop::collection::vec(op(), 1..64),
         ) {
             let options = TaskOptions::default()
-                .max_connections(NonZeroUsize::new(max_connections).unwrap())
-                .growth_strategy(growth);
+                .max_connections(NonZeroUsize::new(max_connections).unwrap());
             let (mut download, _file_writer) = futures::executor::block_on(loop_with_options(
                 ThreadedRuntimeImpl::new_other_rt(ScriptedRuntime::new(TimerKind::Scripted)),
                 DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),

@@ -74,9 +74,9 @@ pub(super) struct DownloadLoop {
     deadline: DeadlineSource,
     strategy_tick: StrategyTick,
     throughput: ThroughputSampler,
-    /// Each runner's rate at the strategy ticks; only the doubling
-    /// strategy samples it, and restarts slow runners on it.
-    rates: Option<RunnerRates>,
+    /// Each runner's rate at the strategy ticks, for the doubling
+    /// strategy, the restarts and the hedge.
+    rates: RunnerRates,
 }
 
 impl DownloadLoop {
@@ -90,8 +90,8 @@ impl DownloadLoop {
     ) -> Self {
         let max_concurrency = options.max_connections.get();
         let manager = RunnerManager::new(total, max_concurrency);
-        let strategy = StrategyControl::new(max_concurrency, options.resolved_growth_strategy());
-        let rates = strategy.is_doubling().then(RunnerRates::default);
+        let strategy = StrategyControl::new(max_concurrency);
+        let rates = RunnerRates::default();
         let policy = FailurePolicy::new(options, Instant::now());
         let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),

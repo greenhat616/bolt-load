@@ -40,10 +40,8 @@ impl DownloadLoop {
     ///
     /// [`RunnerManager::stop_runner`]: super::super::RunnerManager::stop_runner
     pub(super) fn restart_slow_runner(&mut self, now: Instant) -> bool {
-        let Some(rates) = &self.rates else {
-            return false;
-        };
-        let runners = rates
+        let runners = self
+            .rates
             .window_bytes()
             .into_iter()
             .filter(|&(runner_id, _)| self.may_restart(runner_id))
@@ -106,7 +104,7 @@ impl DownloadLoop {
     /// The runner [`Self::restart_silent_runner`] stops at `now`: the one
     /// silent the longest, the lower ID first.
     fn silent_runner(&self, now: Instant) -> Option<RunnerId> {
-        let rates = self.rates.as_ref()?;
+        let rates = &self.rates;
         // No speed limit before design §10.
         if self.backoff.is_congested(now) || !self.writer.can_write() {
             return None;

@@ -191,16 +191,6 @@ pub enum Error {
     PartnerNotFound { runner_id: RunnerId },
 }
 
-/// A range the strategy may hand to a new runner, see
-/// [`ChunkPlanner::find_chunk_to_split`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SplitCandidate {
-    /// A range no chunk covers yet.
-    Unassigned(Range<u64>),
-    /// The part of a running runner's chunk after its downloaded bytes.
-    Running { runner: RunnerId, range: Range<u64> },
-}
-
 /// The outcome of [`ChunkPlanner::resize_runner_state`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resize {
@@ -764,81 +754,12 @@ impl ChunkPlanner {
         self.accepted_bytes
     }
 
-    /// Get the incomplete ranges of running runners, which may be split.
-    ///
-    /// A connecting runner is left alone: its request already covers its
-    /// whole range.
-    pub fn get_incomplete_states(
-        &self,
-        min_chunk_size: Option<u64>,
-    ) -> Vec<(RunnerId, Range<u64>)> {
-        self.chunks
-            .values()
-            .filter(|c| {
-                c.status == ChunkStatus::Running
-                    && c.downloaded.end < c.allocated.end
-                    && c.remaining() // For split check
-                        >= min_chunk_size
-                            .map(|v| v.max(2 * self.min_chunk_size))
-                            .unwrap_or(2 * self.min_chunk_size)
-            })
-            .map(|c| {
-                (
-                    c.runner_id
-                        .expect("runner id should be some if not finished"),
-                    c.downloaded.end..c.allocated.end,
-                )
-            })
-            .collect::<Vec<_>>()
-    }
-
-    /// Find a chunk to split or evict based on download progress
-    ///
-    /// A range backing off at `now` is no candidate: it does not stop
-    /// running chunks from being split.
-    pub fn find_chunk_to_split(&self, required_size: u64, now: Instant) -> Option<SplitCandidate> {
-        // If there are still range that is not being asigned to a runner
-        let mut available_range: Option<Range<u64>> = None;
-        // First try to find a suitable available range
-        for range in self.get_eligible_ranges(now) {
-            if range.end - range.start >= required_size {
-                available_range = Some(range.start..range.start + required_size);
-                break;
-            } else if let Some(previous_available_range) = available_range {
-                available_range = if previous_available_range.end - previous_available_range.start
-                    > range.end - range.start
-                {
-                    Some(previous_available_range)
-                } else {
-                    Some(range)
-                }
-            } else {
-                available_range = Some(range)
-            }
-        }
-
-        if let Some(available_range) = available_range {
-            return Some(SplitCandidate::Unassigned(available_range));
-        }
-
-        // Find the chunk with the most remaining work
-        self.chunks
-            .values()
-            .filter(|c| c.status == ChunkStatus::Running && c.remaining() >= self.min_chunk_size)
-            .filter_map(|c| Some((c.runner_id?, c)))
-            .max_by_key(|(_, c)| c.remaining())
-            .map(|(runner, chunk)| SplitCandidate::Running {
-                runner,
-                range: chunk.downloaded.end..chunk.downloaded.end + required_size,
-            })
-    }
-
     /// The running runner with the most left to download, and its
     /// incomplete range; `None` when no running chunk is incomplete.
     ///
-    /// A connecting runner is left alone, as by
-    /// [`Self::get_incomplete_states`], and so is every runner `skip`
-    /// names, and every chunk hedged in this attempt (design §9.6).
+    /// A connecting runner is left alone: its request already covers its
+    /// whole range. So is every runner `skip` names, and every chunk hedged
+    /// in this attempt (design §9.6).
     pub fn largest_running_chunk(
         &self,
         skip: impl Fn(RunnerId) -> bool,
@@ -1769,114 +1690,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_chunk_to_split() {
-        let mut planner = ChunkPlanner::new(10 * 1024 * 1024); // 10MB total
-
-        // When no chunks exist, entire file is available, should return available range
-        let Some(SplitCandidate::Unassigned(range)) =
-            planner.find_chunk_to_split(100, Instant::now())
-        else {
-            panic!("the whole file is unassigned");
-        };
-        assert!(range.end - range.start >= 100);
-
-        // Allocate some chunks, leaving gaps
-        let chunk_size = 3 * 1024 * 1024; // 3MB
-        assert!(planner.allocate_chunk(0..chunk_size, Some(1)));
-        assert!(planner.mark_running(1).is_ok());
-        assert!(planner.allocate_chunk(2 * chunk_size..3 * chunk_size, Some(2)));
-        assert!(planner.mark_running(2).is_ok());
-
-        // Should return available range when available ranges exist
-        let Some(SplitCandidate::Unassigned(range)) =
-            planner.find_chunk_to_split(100, Instant::now())
-        else {
-            panic!("a gap is unassigned");
-        };
-        // Check if range is reasonable, exact match not required
-        assert!(range.end - range.start >= 100);
-
-        // Allocate all available space
-        assert!(planner.allocate_chunk(chunk_size..2 * chunk_size, Some(3)));
-        assert!(planner.mark_running(3).is_ok());
-        assert!(planner.allocate_chunk(3 * chunk_size..10 * 1024 * 1024, Some(4)));
-        assert!(planner.mark_running(4).is_ok());
-
-        // Add small download progress, retain large space for splitting
-        assert!(planner.update_progress(1, 500 * 1024).is_ok()); // 500KB
-        assert!(planner.update_progress(2, 600 * 1024).is_ok()); // 600KB
-        assert!(planner.update_progress(4, 700 * 1024).is_ok()); // 700KB
-
-        // Should now find chunk with most remaining work: runner 3 has not
-        // downloaded anything of its 3MB.
-        assert_eq!(
-            planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE, Instant::now()),
-            Some(SplitCandidate::Running {
-                runner: 3,
-                range: chunk_size..chunk_size + DEFAULT_MIN_CHUNK_SIZE,
-            })
-        );
-
-        // Test edge case: required chunk size close to minimum but insufficient remaining space
-        // Complete all chunks first, so no splittable chunks remain
-        assert!(
-            planner
-                .update_progress(1, 3 * 1024 * 1024 - 500 * 1024)
-                .is_ok()
-        );
-        assert!(
-            planner
-                .update_progress(2, 3 * 1024 * 1024 - 600 * 1024)
-                .is_ok()
-        );
-        assert!(planner.update_progress(3, 3 * 1024 * 1024).is_ok());
-        assert!(
-            planner
-                .update_progress(4, 3 * 1024 * 1024 + 1024 * 1024 - 700 * 1024)
-                .is_ok()
-        );
-
-        // Should now have no chunks large enough to split
-        let result = planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE, Instant::now());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_get_incomplete_states() {
-        let mut planner = ChunkPlanner::new(10 * 1024 * 1024); // 10MB total size
-        let large_chunk_size = 3 * 1024 * 1024; // 3MB per chunk
-
-        // Allocate some large chunks to meet splitting conditions
-        assert!(planner.allocate_chunk(0..large_chunk_size, Some(1)));
-        assert!(planner.allocate_chunk(large_chunk_size..2 * large_chunk_size, Some(2)));
-        assert!(planner.allocate_chunk(2 * large_chunk_size..3 * large_chunk_size, Some(3)));
-        // Still connecting, so never split.
-        assert!(planner.allocate_chunk(3 * large_chunk_size..10 * 1024 * 1024, Some(4)));
-        for runner_id in 1..=3 {
-            planner.mark_running(runner_id).unwrap();
-        }
-
-        // Add some download progress, but retain sufficient remaining space for splitting
-        assert!(planner.update_progress(1, 500 * 1024).is_ok()); // 500KB downloaded
-        assert!(planner.update_progress(2, 1024 * 1024).is_ok()); // 1MB downloaded
-
-        // Mark one as finished
-        assert!(planner.update_progress(3, large_chunk_size).is_ok());
-        assert!(planner.mark_finished(3).is_ok());
-
-        // Get incomplete states
-        let incomplete = planner.get_incomplete_states(None);
-        assert_eq!(incomplete.len(), 2);
-
-        // Check results
-        let incomplete_ids: Vec<_> = incomplete.iter().map(|(id, _)| *id).collect();
-        assert!(incomplete_ids.contains(&1));
-        assert!(incomplete_ids.contains(&2));
-        assert!(!incomplete_ids.contains(&3));
-        assert!(!incomplete_ids.contains(&4));
-    }
-
-    #[test]
     fn test_try_arrange_chunk_by_length() {
         let mut planner = ChunkPlanner::new(1000);
 
@@ -2425,28 +2238,6 @@ mod tests {
         planner.split_chunk(1, 125, 4).unwrap();
         assert_eq!(planner.get_runner_state(4).unwrap().attempts, 0);
         assert_eq!(planner.get_runner_state(1).unwrap().attempts, 2);
-    }
-
-    /// A range backing off is no split candidate: running chunks are split
-    /// instead.
-    #[test]
-    fn test_split_candidates_skip_ranges_backing_off() {
-        let now = Instant::now();
-        let half = 2 * DEFAULT_MIN_CHUNK_SIZE;
-        let mut planner = ChunkPlanner::new(2 * half);
-        assert!(planner.allocate_chunk(0..half, Some(1)));
-        assert!(planner.allocate_chunk(half..2 * half, Some(2)));
-        planner.mark_running(1).unwrap();
-        fail(&mut planner, 2, now, SECOND);
-
-        assert!(matches!(
-            planner.find_chunk_to_split(100, now),
-            Some(SplitCandidate::Running { runner: 1, .. })
-        ));
-        assert_eq!(
-            planner.find_chunk_to_split(100, now + SECOND),
-            Some(SplitCandidate::Unassigned(half..half + 100))
-        );
     }
 
     /// The charged failures follow the attempts' rules on their own: the

@@ -35,6 +35,8 @@
 
 ## 1. 现状事实（已核对源码）
 
+本节是写这份设计时（2026-11-01）的代码，留作记录。其中 `dynamic_strategy.rs`、`SplitAllTask` 和任务速度的切分尺寸已在 C14 删除，见 §14.20。
+
 ### 1.1 adapter 与 core
 
 | 事实 | 位置 |
@@ -437,7 +439,7 @@ split(candidate):
   }
   ```
 
-  这样就去掉了 `strategy/mod.rs:88` 的 `expect`。
+  这样就去掉了 `strategy/mod.rs:88` 的 `expect`。（`find_chunk_to_split` 和 `SplitCandidate` 只给 `Legacy` 用，C14 已随它删除，见 §14.20；扩张走 `largest_running_chunk`。）
 - 所有闸门都改成 `current + n <= max` 的形式，让最后一个槽位也能用上。
 - 不变量：任何时刻 `active_runners <= max_connections`，并且所有区间之和正好覆盖 `[0, total)`、互不重叠。T8 用性质测试来验证。
 
@@ -485,6 +487,7 @@ struct AvailableRange {
 - 新增 crate 内部的 `GrowthStrategy { Legacy, Doubling }`。默认是 `Legacy`。
 - 在 `#[cfg(any(test, feature = "unstable-strategy"))]` 下，通过 `TaskOptions::growth_strategy` 暴露出来，供测试和基准测试使用。
 - 基准测试满足 G7 之后，另开一个 PR 把默认值切换为 `Doubling`，并删除 `Legacy` 和开关。
+- 已完成（PR-7b，C14，§14.20）：`Doubling` 是唯一的策略，`GrowthStrategy`、`TaskOptions::growth_strategy`、`TaskBuilder::growth_strategy`、这个 feature 和 `Legacy` 都已删除。上面三条是当时的做法，留作记录。
 
 ### 9.2 `Doubling` 控制器
 
@@ -513,12 +516,14 @@ every grow_interval (2 s, aligned with the strategy tick):
 ### 9.3 切分尺寸（S1）
 
 ```text
-planned = clamp(donor_speed × split_window, min_chunk_size, remaining / 2)
+planned = max(donor_speed × split_window, min_chunk_size)
 donor_speed = 被切 runner 自己的速率，拿不到时用 throughput.per_runner_speed
 split_window = 2 s
 ```
 
-依据：IDM 的切分候选值，是由被切连接**自己的**速率推出来的（改进方案 §8 A1）。现在的 `current_speed × 2` 用的是任务总速率。按推理（还没有基准测试验证），它会让门槛随连接数近似线性增长。`Legacy` 模式保持原来的公式不变。
+`planned` 是门槛，不是切下来的大小：剩余量 ≥ `planned` 的运行中 chunk 才切，切在一半处（`planned_split_size`，§14.14；原来的上界 `remaining / 2` 去掉了，理由见 §14.14）。
+
+依据：IDM 的切分候选值，是由被切连接**自己的**速率推出来的（改进方案 §8 A1）。原来的 `current_speed × 2` 用的是任务总速率。按推理（还没有基准测试验证），它会让门槛随连接数近似线性增长。（`Legacy` 保留原公式直到 C14，§14.20 起已删除。）
 
 ### 9.4 超时（P1-6）
 
@@ -848,7 +853,7 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
   - B、C 里切分会缩小 O 的上限，H 的请求却仍到原来的末尾，多下的部分会被截掉。
   - W 是 H 时，`resize_runner_state` 按 chunk 起点算上限，比 H 能收的多出“分叉点 − chunk 起点”。新上限不小于 H 当前的上限时，H 报 `ExceededTotalSize`，manager 把它当完成，chunk 没收满就被标成 `Finished`，数据就丢了。
   - 这样的 chunk 分叉时剩余量就不到 `2 × min_chunk_size`，只会越来越小，不切的损失不大。
-  - `Legacy` 的 `SplitAllTask`、`SplitGivenTask` 和 `find_chunk_to_split` 不用改：`Legacy` 从不对冲。planner 的 `resize_runner_state` 对 `hedge` 不为空的 chunk 直接拒绝，再兜一层。
+  - （C27 时：`Legacy` 的 `SplitAllTask`、`SplitGivenTask` 和 `find_chunk_to_split` 不用改，`Legacy` 从不对冲。它们在 C14 已随 `Legacy` 删除，见 §14.20。）planner 的 `resize_runner_state` 对 `hedge` 不为空的 chunk 直接拒绝，再兜一层。
 - 和 C11 对齐（触发条件 1）：
   - §9.6 原来要求所有未完成的 chunk，包括候选自己的，剩余量都 < `2 × min_chunk_size`。C11 实际的切分门槛是 `planned = max(donor_rate × 2 s, min_chunk_size)`，剩余量 ≥ `planned` 才切（`strategy_tick.rs` 的 `grow` 和 `planned_split_size`）。两者有两处不一致：
     - donor 快时，`planned` 大于 `2 × min_chunk_size`。比如 donor 10 MiB/s 时 `planned` 是 20 MiB：一个剩 5 MiB 的 chunk，C11 不会切（它 0.5 s 就下完），原写法却算“还有活”，挡住了对冲。
@@ -987,7 +992,7 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 | P0-2 和 P0-1 改动了公开的错误类型，下游的 `match` 会编译失败 | 在同一个 PR 里加上 `#[non_exhaustive]`，以后再扩展就不会破坏兼容；CHANGELOG 标明 breaking |
 | 有些服务器的 `Content-Range` 写得不规范（比如省略 `bytes` 前缀、带多余空格），会被严格校验拒掉 | 解析器容忍空白和大小写差异，其它格式偏差一律拒收。宁可回退到单连接，也不能写坏文件 |
 | `max_consecutive_failures` 的默认值在多核机器上会变小（例如 32 核机器从 64 降到 16） | 加了每区间预算之后，连续失败计数只是最后一道保险，影响有限；写进 CHANGELOG |
-| `Doubling` 在某些网络环境下可能比 `Legacy` 差 | 默认值切换以 T14 的基准测试数据为准，在那之前 `Legacy` 一直是默认 |
+| `Doubling` 在某些网络环境下可能比 `Legacy` 差 | 默认值切换以 T14 的基准测试数据为准，在那之前 `Legacy` 一直是默认。G7 按 §14.18 的判据达标后已切换（§14.19、§14.20），`Legacy` 已删除，没有退路 |
 | 令牌桶粒度是一帧（emit 每次推送的大小），低限速时可能有抖动 | 桶深设下限；G8 的误差判据按 2 s 窗口计算 |
 | HTTP 客户端自动解压时会删掉 `Content-Encoding`，§4.1 的编码检查看不到（见 §14.2） | 所有请求都带 `Accept-Encoding: identity`；adapter 关闭 ureq 的 `gzip`；`limit_range_body` 要求 body 长度等于 `Content-Range`，不符就报 `RangeBodyTooLong` 或 `RangeBodyTooShort`；解不开的 body 不重试。这些只保证任务失败而不写错。T5 起，会解压的客户端回退到单连接后能下完；C22 起，不解压的客户端由引擎解码后也能下完 |
 | 服务器把 `.tar.gz` 这类压缩包标成 `Content-Encoding: gzip`，解码后用户拿到的是解压后的文件 | §4.4 的例外：`Content-Type` 本身就是这种压缩格式时，按原样写入 |
@@ -2068,3 +2073,74 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - 排着的帧也挡住低速路径（放进 `may_restart`）：`queued_frames_do_not_hide_a_slow_runner` 和 `a_stop_keeps_the_error_a_runner_holds`；
     - C12 的 `may_restart` 变异照样被抓住：评判一对中的一方，`the_survivor_of_an_undecided_pair_is_not_judged`；评判正在停止的 runner，`one_silent_runner_is_stopped_a_tick`。
     - 其中两次（阈值边界、空块也记时刻）已知会偶发失败的 `test_save_into_rejects_hostile_filenames` 也失败了，和变异无关。
+
+### 14.20 `Doubling` 成为唯一的策略（PR-7b，C14）
+
+- **决定。** 2026-11-09 实施时对 T15 未写明的几点的决定（实施负责人定的，维护者没有另外指示）：
+  - bench 保留，只跑 `Doubling`（场景、探针、无停顿的对照），去掉 `Legacy` 一列和 G7 的判定；最后一次两种策略的对比以 §14.19 为准。
+  - §14.14–§14.19 留作历史；README 和 `docs/task.md` 只讲 `Doubling`。
+  - 保留 `Strategy` trait 和 `StrategyControl`，只删 `Growth` 这个枚举。
+  - 只有 `Legacy` 用的切分动作和 planner 方法一起删掉（`SplitAllTask`、`SplitGivenTask`、`get_incomplete_states`、`find_chunk_to_split`），它们的测试改走 `split()` 或 `Grow`；删掉的覆盖逐条写明。
+  - `GrowthStrategy` 和 options、builder 上的方法整个删掉；破坏性改动写进 README 和提交信息的 `BREAKING CHANGE` 脚注。
+  - `idm-*.md` 两份分析文档不改，T15 的 `rg` 检查排除它们。
+  - `tests/silent_restart.rs` 只要求 `tokio`。
+  - 端到端测试暴露的真问题在这个 PR 里修；只断言 `Legacy` 节奏的测试改写，并列出新旧断言；要改设计的问题先报告，不在这里修。
+- **做法。**
+  - `StrategyControl` 直接持有 `DoublingStrategy`；`execute` 去掉 `Legacy` 分支和两个速度参数（任务速度、平均每 runner 速度只喂给 `Legacy`），tick 的采样改为必有（`&TickSample`）。`is_doubling()`、`Growth`、`dynamic_strategy.rs`（`DynamicStrategy`、阈值和它的两个单元测试）删掉。
+  - `DownloadLoop::rates` 从 `Option<RunnerRates>` 改为 `RunnerRates`，`Legacy` 不采样的分支（低速重启、静默重启、对冲、`planned_split_size`）随之去掉。
+  - `ThroughputSampler::speed` 删掉：只有 `Legacy` 读它；`per_runner_speed` 留着，对冲和切分的计划大小还要用（§9.3）。吞吐计时器和进度事件不变。
+  - `StrategyAction::SplitAllTask`、`SplitGivenTask` 和 `apply` 里的分支删掉，`ChunkPlanner` 和 `RunnerManager` 的 `get_incomplete_states`、`find_chunk_to_split`，以及 `SplitCandidate` 一起删掉。`largest_running_chunk` 的文档原来引用 `get_incomplete_states`，改为直接说明“连接中的 runner 不切”。
+  - `Cargo.toml` 删掉 `unstable-strategy`；bench 的 `required-features` 只剩 `tracing`、`tokio`（都是默认 feature），运行命令是 `cargo bench -p bolt-load --bench growth_strategy`。
+  - bench：去掉策略一维（`GROWTH_STRATEGIES`、表里的策略一列、交替运行）和 G7 判定（`fills`、`g7_verdict`、`G7_TOLERANCE`）；“应当对冲”的检查对每次运行都做。
+  - `tests/silent_restart.rs` 改为 `#![cfg(feature = "tokio")]`，不再设策略。
+- **破坏性改动。**
+  - 打开 `unstable-strategy` 的 crate 不再能编译（cargo 报找不到 feature）。
+  - `GrowthStrategy`、`TaskOptions::growth_strategy`（字段和方法）、`TaskBuilder::growth_strategy` 删除；这几个原来都要打开那个 feature 才有，默认用户的 API 不变。
+  - 默认用户的行为变了：扩张改为翻倍（§9.2），并且有低速重启、静默重启（§9.5）和收尾对冲（§9.6）。
+  - 仓库没有 CHANGELOG，破坏性改动写在 crate 的 README 和提交信息里。
+- **测试的变化。** lib 测试（all features）从 573 个变为 563 个。
+  - 删掉，没有替代（行为不存在了）：
+    - `dynamic_strategy.rs` 的 `test_every_slot_up_to_the_limit_is_used`、`test_legacy_thresholds_and_abs`：`Legacy` 自己的阈值和用满槽位。用满槽位由 `doubling_strategy.rs` 的 `test_steady_growth_doubles_up_to_the_limit` 和下面的 `test_growth_splits_only_running_runners` 覆盖。
+    - `options.rs`、`builder.rs` 的 `test_growth_strategy_sets_the_option`；`test_default_options_are_valid` 去掉对 `growth_strategy` 的两条断言。
+    - `legacy_never_hedges`（`hedge.rs`）、`legacy_never_restarts_a_silent_runner`（`silent.rs`）：`Legacy` 不采样、不对冲、不重启。
+    - `legacy_never_restarts`（`restart.rs`）：`Legacy` 一半同上；`Doubling` 一半（真实 runner 停住后被静默停止，chunk 仍是 Running）由 `a_slow_runner_is_stopped_and_its_range_retried` 和 `a_slow_runner_without_data_exhausts_its_range` 覆盖。
+    - `chunk_planner.rs` 的 `test_find_chunk_to_split`、`test_get_incomplete_states`、`test_split_candidates_skip_ranges_backing_off`：方法删掉了。它们守的性质：连接中的 runner 不切，由 `largest_running_chunk` 保证（`test_growth_splits_only_running_runners` 每轮都查连接中的 runner 没收到上限）；退避中的区间不妨碍切分，`Grow` 只切运行中的 chunk、根本不看未分配的区间，所以这条在结构上成立，不再单独测；“挑剩得最多的 chunk”由 `runner_manager.rs` 里 `largest_running_chunk` 的已有测试覆盖。
+  - 改写（旧断言 → 新断言）：
+    - `legacy_is_the_default_and_unchanged` → `doubling_is_the_default`（`growth.rs`）：旧：默认和 `Legacy` 都不采样，1.5 MiB/s 时 `SplitAllTask(3 MiB)`，降到 0.5 MiB/s 时 `SplitAllTask(1 MiB)`；新：默认 options 的循环在每个 runner 都交数据的 tick 上发出 `("doubling", [Grow(1)])`。
+    - `probe_strategy` → `probe_growth`，`test_strategy_splits_only_running_runners` → `test_growth_splits_only_running_runners`（`tests.rs`）：旧：`Legacy` 每轮 quick start 的 `SplitAllTask` 只切 runner 0；新：每轮 `Grow(上限)`，第一轮从 runner 0 切出 `min(上限 − 1, 13)` 个（16 GiB 对半切 13 次后剩下的不到计划的 4 MiB），之后各轮不再切；每轮都查连接中的 runner 没收到上限、runner 数不超过上限。`test_one_connection_is_never_split`：旧：64 个 `Legacy` tick 没有切分；新：64 轮 `Grow(1)` 一个也没加。
+    - `test_no_free_slot_skips_splits_and_new_runners`：旧：`SplitAllTask(1)`、`SplitGivenTask(第一个)`、`SplitGivenTask(7)`（不存在的 runner）都不变；新：`Grow(2)` 不变，`split(第一个)` 返回 false。去掉的覆盖：按 ID 切一个不存在的 runner，现在没有动作按 ID 选 runner。
+    - `test_strategy_tick_while_finished_runners_keep_their_slots`：旧：4 MiB/s 的 `Legacy` tick 先不切（没有空槽位），runner 3 停下后切了 runner 0；新：`Grow(2)` 先不切，runner 3 停下后 runner 0、1 中正好一个被切（两者剩的一样多，切哪个取决于 planner 的顺序），另一个没收到上限。
+    - `test_rejected_split_spawn_reclaims_its_slot_once`：`SplitGivenTask(0)` 换成同样的调用 `split(0, 0..HALF)`。
+    - `retry_after_holds_back_every_new_connection`（`retry.rs`）：旧：拥塞期间 `SplitGivenTask(0)`、`SplitAllTask(1)`、2 MiB/s 的 `Legacy` tick 都不切；新：`split(0)` 返回 false、`Grow(2)` 和 `Doubling` 的 tick 都不切；拥塞结束时 `split(0)` 切。`retry_after_holds_back_the_requests_to_the_server`：`SplitGivenTask(0)` 换成 `split(0, 剩下的)`。
+    - `a_hedge_after_two_splits_runs_to_the_end`（`hedge.rs`）：`SplitAllTask(0)` 和 `SplitGivenTask(o)` 换成两次 `split(o, 剩下的)`，切分序列不变。
+    - 性质测试 `splits_stay_within_the_limit_and_cover_the_file`：不再随机选策略；`Op::SplitAll(planned)` 换成 `Op::Grow(n)`，`Op::SplitGiven(id)` 直接调 `split`；`Op::Tick` 不再设任务速度。
+    - 其余测试只有机械改动：去掉 `growth_strategy(Doubling)`，`rates` 不再是 `Option`，`execute` 少两个参数。
+  - 端到端测试（`range_faults`、`empty_body`、`custom_adapter`、`custom_timer`、`silent_restart`、`bolt-load-tests` 和各 crate 的测试）第一次在默认的 `Doubling` 下跑，全部通过，没有要改的。
+- **T15 的检查。** `rg "threashold|DynamicStrategy|unstable-strategy" crates -g '!crates/bolt-load/docs/idm-insights.md' -g '!crates/bolt-load/docs/idm-improvement-plan.md'` 无结果。排除的两份是 IDM 的分析文档，引用的是当时的代码。
+- **结果。** 切换之后全部场景各跑 10 次（`cargo bench -p bolt-load --bench growth_strategy`），中位数 / p90，和 §14.19 的 `Doubling` 对比。
+
+  | 场景 | 完成时间 s | §14.19 | 峰值连接 | 对冲 | 停顿等待 s | 重启 / 静默停止请求 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | s1_max32 | 15.95 / 16.01 | 15.94 / 16.01 | 32 | 0 | n/a | 0 / 0 |
+  | s1_max8 | 21.10 / 21.12 | 21.08 / 21.09 | 8 | 0 | n/a | 0 / 0 |
+  | s2 | 5.56 / 6.95 | 4.74 / 5.40 | 2 | 0 | n/a | 0 / 0 |
+  | s3 | 15.57 / 15.58 | 15.61 / 15.63 | 4 | 0 | n/a | 0 / 0 |
+  | s4 | 11.07 / 12.56 | 11.80 / 12.55 | 8 | 1 | 2.08 / 3.56 | 0 / 0 |
+  | s4_nostall | 9.08 / 9.09 | 9.09 / 9.10 | 8 | 0 | n/a | 0 / 0 |
+  | s4a | 12.36 / 12.38 | 12.36 / 12.37 | 8 | 1 | 6.96 / 6.98 | 0 / 0 |
+  | s4a_nostall | 11.78 / 11.79 | 11.78 / 11.78 | 6 | 0 | n/a | 0 / 0 |
+  | s4b | 13.75 / 13.96 | 13.84 / 13.99 | 2 | 0 | 6.11 / 6.32 | 1 / 1 |
+  | s4b_nostall | 8.73 / 8.74 | 8.73 / 8.74 | 2 | 0 | n/a | 0 / 0 |
+  | s4c | 13.14 / 13.18 | 13.23 / 13.29 | 8 | 0 | 6.62 / 6.69 | 1 / 1 |
+
+  - 除 s2 外都在 §14.19 的范围里；所有运行的 `unmatched` 都是 0，s1、s2、s3 和无停顿的对照没有重启。
+  - s2 慢了 0.8 s（中位数），是 s2 已知的噪声，不是默认路径的变化：
+    - 行为没变：10 次的峰值都是 2，没有 429、对冲、重启，重复字节 0–48 KiB，和 §14.19 一样。变的只有时间，而且是逐次漂移：前 7 次 5.30–5.75 s，后 3 次 6.43–7.11 s。
+    - 紧接着只跑 s2 再跑 10 次，代码不变：4.83 / 6.58 s（3.81–7.38），中位数回到 §14.19 附近，同样是前几次快（3.81–4.19 s）、最后几次慢（5.87–7.38 s）。§14.18 已经记过 s2 很不稳；§14.19 那一轮的 `Legacy` 是 4.82 / 5.30，上一轮（C29 的第二版）`Doubling` 是 5.18 / 6.53。s2 每次往磁盘写 4 GiB、约 800 MiB/s，受机器当时的写回和内存情况影响（这次跑的时候机器内存紧张）。
+    - `Doubling` 走的代码没有变：它原来就采样（`rates` 一直是 `Some`），`execute` 里 `Doubling` 的分支原样保留，删掉的只有 `Legacy` 的分支和只给 `Legacy` 用的任务速度。
+- **检查。** fmt；clippy 四种配置（workspace all-features all-targets、workspace 默认 all-targets、`-p bolt-load --lib --no-default-features --features smol`、`-p bolt-load --lib --no-default-features --features tokio`；原来的第三种要 `unstable-strategy`，换成了 smol 这一种）都只有原有的三个“未使用依赖”警告；`cargo test --workspace --all-features --locked`（lib 563）和 `cargo test --workspace --locked`（lib 532）全过；`RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps --all-features -p bolt-load` 是 18 个错误（17 个链接解析不了、1 个链接到私有项），比原来少 1 个：`docs/task.md` 里指向 `DynamicStrategy` 的链接没了。
+- **变异检查**（整个 bolt-load lib，all features）：
+  - 扩张也切连接中的 runner（`largest_running_chunk` 改为看所有活跃的 chunk）：`test_growth_splits_only_running_runners`；
+  - 扩张不看计划的切分大小：`doubling_splits_only_a_chunk_of_the_planned_size`、`test_growth_splits_only_running_runners` 和性质测试；
+  - 拥塞时也切：`retry_after_holds_back_every_new_connection` 和性质测试；
+  - 每个 tick 不再采样（`rates` 不再必有之后的关键一步）：34 个测试失败。

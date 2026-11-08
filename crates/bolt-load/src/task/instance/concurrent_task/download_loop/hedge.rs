@@ -49,7 +49,7 @@ impl DownloadLoop {
     /// least [`HEDGE_IDLE`], when another connection may be opened and
     /// nothing is left to split (design §9.6, trigger).
     fn hedge_candidate(&self, now: Instant) -> Option<RunnerId> {
-        let rates = self.rates.as_ref()?;
+        let rates = &self.rates;
         // While the writer is full, no runner's data is taken, so no
         // runner is silent.
         if !self.writer.can_write()
