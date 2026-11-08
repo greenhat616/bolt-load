@@ -953,6 +953,7 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 - `ChunkPlanner` 在 `downloaded`（已接收）之外，再维护一个 `written`：只有收到 `WriteCompletion` 之后才推进它。
 - `Progress.downloaded_chunks` 改为上报 `written`。
 - 需要持久化的时候，还要有第三个位点 `durable`（`fsync` 之后才推进），并且保证“先同步数据，再写检查点”。
+- 实现（C18，§14.21）：`written` 是一组合并过的字节区间，不是每个 chunk 一个位点；`durable` 留给 C20 的状态文件。
 
 ### 11.2 资源身份
 
@@ -2144,3 +2145,43 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 扩张不看计划的切分大小：`doubling_splits_only_a_chunk_of_the_planned_size`、`test_growth_splits_only_running_runners` 和性质测试；
   - 拥塞时也切：`retry_after_holds_back_every_new_connection` 和性质测试；
   - 每个 tick 不再采样（`rates` 不再必有之后的关键一步）：34 个测试失败。
+
+### 14.21 已写入的区间（PR-9，C18）
+
+- **决定。** 实现时 lead 对 T19 未写明的几点的决定：
+  - `written` 用一组合并过的区间，不用每个 chunk 一个位点（下面“做法”说明原因）。
+  - 一批完成里有失败的写，其余成功的照样记下，再返回第一个失败；`writer.finish()` 冲刷时完成的写，任务失败或取消也照样记下。
+  - `Progress.downloaded` 仍是已接收的字节，`downloaded_chunks` 改为已写入的区间，两者的差别写进 `Progress` 的文档。
+  - 单连接任务不变，仍报 `0..downloaded`。
+  - 回退到单连接时照旧丢掉并发那一次的进度。
+  - 任务失败或取消时，最后的 `downloaded_chunks` 是 teardown 之前写入成功的部分（原来是已接收的部分）。这是有意的行为变化。
+  - 提交类型原定 `feat(task)`，在提交信息里写明含义的变化。第一轮评审之后，lead 改为 `feat(task)!`：一个公开字段的含义变了，使用者看得到不同的结果却不会有编译错误，按 tasks.md §0 第 3 条要加 `!` 并写清迁移方式。
+- **做法。**
+  - `ChunkPlanner::written`（`WrittenSet`）：排好序、互不重叠也不相邻的区间。`note_written(range)` 把一个写完的区间并进去，空区间不算。只在 `DownloadLoop::record_completions` 里、按 writer 的 `WriteCompletion` 推进（`RunnerManager::note_written`）。
+  - 为什么是区间集合而不是 §11.1 说的“位点”：`PendingWriter` 同时有最多 `max_connections` 个写在后台运行，同一个 chunk 的写会乱序完成；`WriteCompletion` 只带区间，不带 runner 或 chunk。每个 chunk 一个位点就得另外缓存“前面还没写完”的完成。集合也不受 chunk 怎么切、重试、对冲的影响。
+  - `debug_assert`：写完的区间必须落在已接收的区间里（`written ⊆ downloaded`）。已接收的字节从不丢（`accepted_bytes` 只增不减，切分、失败、退避、对冲都保留 `downloaded`），所以生产路径上它不会失败。唯一失败的是一个测试：`test_custom_timer_survives_other_events` 绕过 planner 直接往 writer 写 `0..1`。测试改为先让 planner 接收这 1 个字节，再反复写它（集合对同一区间是幂等的），并把 spawn 的区间从 `0..LOOP_TOTAL` 改为 `1..LOOP_TOTAL`。断言没有放宽。
+  - `completion.rs`：`check_completions` 改为 `settle_completions(completions, on_written)`，每个成功的完成都交给 `on_written`，第一个失败作为任务的 `TaskError::Write` 返回，后面的成功照样交出去。
+  - 进度：`publish_progress` 报 `written` 的区间；`finish()` 在丢掉 manager 之前把 `written` 拿出来，`writer.finish()` 冲刷完成的写并进去，再报出去。所以完成的任务仍报 `[0..total]`，失败或取消的任务报 teardown 之前写入成功的区间。
+  - `runner_manager/data.rs` 的 `handle_data_frame`（T19 写的 `:154`，现在在 `update_progress` 那里）加了注释：进度先于写入，只有 `downloaded` 跑在前面，`written` 跟着 writer 的完成走。
+  - `RunnerManager::get_downloaded_ranges` 没有调用者了，删掉；`ChunkPlanner::get_downloaded_ranges` 留着（`debug_assert` 和测试用）。
+- **各种情况和 `written` 的关系。**
+  - 切分：总在被切 runner 的 `downloaded.end` 或之后切，而 `written ⊆ downloaded`，所以切分点之后没有写过的字节。
+  - 对冲（§9.6）：败方的帧，包括晚到的，在 `on_data_frame` 里就丢掉了，到不了 planner 和 writer，不会有完成；两方只按 planner 接收的区间写同一个 chunk，没有字节写两次。`hedge.rs` 测试的 `Harness::written` 现在每次都核对 planner 的 `written` 和 writer 实际写过的区间一致。
+  - 重启、停止：区间从 `downloaded.end` 退回；之前的字节要么写完了，要么还在路上，它们的完成在区间退回之后照样记进集合；重试从 `downloaded.end` 开始，不重叠。
+  - 合并、领取冷却中的区间：集合和 chunk 怎么排没关系。
+  - 回退到单连接、从头再来：`downloaded` 从不在一个 `ChunkPlanner` 里清零或丢掉；唯一丢掉它的是回退，这时整个并发那一次（`DownloadLoop`、它的 `ChunkPlanner` 和 `written`）随之丢掉，单连接从自己的计数从零开始报。没有别的“从头再来”的路径（`ResourceChanged` 是 C19 的事）。所以重置是结构上的：没有一行重置代码，也就没有可以漏掉的一行。`test_a_fallback_starts_with_nothing_written`（`status_contract.rs`）：range 先正常下 3 MiB（越过 adapter 1 s 的突发），然后报 `RangeIgnored`；并发那一次报过已写入的区间，回退之后单连接的每个状态都是 `[0..downloaded]`，而且 `downloaded` 从零单调增长，最后是 `[0..SIZE]`。
+- **`downloaded_chunks` 保证什么、不保证什么。** 它是 teardown 之前 writer 确认写入成功的区间，偏保守：
+  - 一个失败的写可能已经把一部分字节写进了文件（`pool_writer.rs` 的 `test_write_all_at_fails_when_nothing_is_written`：1 个字节落盘之后才报 `WriteZero`），这部分不报；
+  - 不保证持久：没有 `fsync`（那是 C20 的 `durable`）；
+  - 不保证文件还在：失败或取消的任务会删掉临时文件。
+- **迁移。** 原来并发任务的 `downloaded_chunks` 是已接收的区间。要已接收的字节总数，用 `Progress.downloaded`；`downloaded_chunks` 当作“确认写入成功的区间”来读。`Progress` 的文档里写了同样的说明。
+- **不在 C18。** §11.1 的第三个位点 `durable`（`fsync` 之后才推进）和状态文件一起在 C20 做。C18 的回退没有重置代码（见上），真正的“重置之后不留旧区间”的测试，跟着 C20 的状态文件一起写：那时重置是实际的代码（丢弃或重写状态文件）。
+- **测试。**
+  - `chunk_planner.rs`：`test_written_ranges_merge_in_any_order`（乱序、重复、空区间的合并）；`test_written_lags_downloaded`（写完之前 `written` 落后于 `downloaded`；后完成的写先记；切分、失败、退避之后再完成的写照样记，`downloaded` 不变）。
+  - `completion.rs`：`a_failed_write_keeps_its_range_and_io_error` 加上“失败的写不记、它前后的写都记”（`[0..4, 8..12]`）；`successful_writes_count_their_bytes` 核对交出的区间；`a_closed_writer_queue_is_a_broken_pipe` 核对什么也没交出。
+  - `download_loop/tests/written.rs`：`written_lags_downloaded_until_the_write_completes`（两帧接收了、写还停着：planner 和发布的进度都是“已接收 64 KiB、已写入空”；写完之后都是 `[0..64 KiB]`）；`the_final_flush_counts_its_writes`（第二个写完成了但循环还没处理，`finish()` 的冲刷把它算进最后的进度）。`Harness` 现在留着状态的接收端，循环才会发布进度。
+  - `hedge.rs` 的 `Harness::written` 每次核对 planner 和 writer 一致（对冲的各个测试都经过它）。
+  - 第一轮评审之后加的，结束时没成功的几种（`written.rs`，`Harness::failing` 用一个让指定区间写失败的记录 writer，`FileWriter::recording_failing`）：
+    - `a_cancelled_task_counts_its_flushed_writes`：取消的任务，冲刷时完成的写照样算，任务的结果仍是 `Cancelled`；
+    - `a_failed_task_keeps_its_error_over_the_flush`：任务已经因为 `Timeout` 失败，冲刷里一个写失败、一个成功：结果仍是 `Timeout`，成功的区间算，失败的不算（`[0..32 KiB, 64..96 KiB]`）；
+    - `the_first_failed_write_of_the_flush_is_the_error`：冲刷里两个写都失败，后面那个区间先完成：任务的错误是先完成的那个（`64..96 KiB`），不是偏移小的那个；两个都不算。

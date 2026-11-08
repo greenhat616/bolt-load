@@ -259,6 +259,9 @@ impl RunnerManager {
         let bytes_len = data_frame.len();
         *self.meters.entry(runner_id).or_insert(0) += bytes_len;
 
+        // The progress comes before the write, which the loop dispatches
+        // next: only `downloaded` runs ahead. The written bytes follow the
+        // writer's completions (design §11.1).
         let fixed_downloaded_range = self
             .chunk_planner
             .update_progress(runner_id, bytes_len as u64)
