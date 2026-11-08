@@ -32,19 +32,25 @@ impl StrategyTick {
 }
 
 impl DownloadLoop {
-    /// Restart a slow runner, step the strategies, then hedge a stalled
-    /// runner at `now`.
+    /// Restart a slow or silent runner, step the strategies, then hedge a
+    /// stalled runner at `now`.
     ///
     /// The restart comes first, so the growth of the same tick leaves the
     /// stopped runner alone. The hedge comes last: the runners the
     /// strategies create take the free slots first (design §9.6).
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(super) fn on_strategy_tick(&mut self, now: Instant) {
-        // Every tick, so each sample spans one tick.
+        // Every tick, so each sample spans one tick. While the writer is
+        // full, no runner's data is taken, so none is silent.
+        let silent_since = self
+            .writer
+            .can_write()
+            .then(|| now.checked_sub(super::hedge::HEDGE_IDLE))
+            .flatten();
         if let Some(rates) = self.rates.as_mut() {
-            rates.sample(&self.manager, now);
+            rates.sample_at(&self.manager, now, silent_since);
         }
-        self.restart_slow_runner(now);
+        self.restart_runner(now);
         self.step_strategies(now);
         self.hedge_stalled_runner(now);
     }

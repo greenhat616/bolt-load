@@ -492,9 +492,10 @@ struct AvailableRange {
 every grow_interval (2 s, aligned with the strategy tick):
   if congestion_until > now                             -> skip
   if any runner is Connecting or has no data this tick  -> skip
+    (a running one silent for hedge_idle does not count, see below)
   if limits.speed_limit is set and speed >= 0.85 × limit -> skip
   if the last full doubling is not judged yet:
-    if allowed < the runners right after it:
+    if allowed < the runners right after it, or a running runner was let off as silent:
       if it reached max_connections when it was made    -> skip, keep it unjudged
       else                                              -> drop it, no verdict
     else if speed_window_after < speed_window_before × 1.10
@@ -504,7 +505,8 @@ every grow_interval (2 s, aligned with the strategy tick):
   repeat (target − allowed): split(largest remaining) via §7.2
 ```
 
-- 上限处的规则（C28，2026-11-08 维护者决定，§14.18）：到了上限，上一次完整的翻倍照样判断。翻到了上限（按做出翻倍那个 tick 的上限算）、还没判断的翻倍，在活跃数回到翻倍后的数之前不扩张，所以 runner 下完不会补位；上限以下的翻倍少了 runner 时不下结论，照常扩张（C11 的做法）。
+- 上限处的规则（C28，2026-11-08 维护者决定，§14.18）：到了上限，上一次完整的翻倍照样判断。翻到了上限（按做出翻倍那个 tick 的上限算）、还没判断的翻倍，在活跃数回到翻倍后的数之前不扩张，所以 runner 下完不会补位；只有低速或静默重启停掉一个 runner 时，待判断的翻倍不下结论、直接丢掉（C29，2026-11-08 维护者决定，§14.19），重启的区间被重新领取后可以再切；上限以下的翻倍少了 runner 时不下结论，照常扩张（C11 的做法）。
+- 静默的 runner 不再挡住扩张（C29，2026-11-08 维护者决定，§14.19）：一个正在运行的 runner 已经静默满 `hedge_idle`（2 s），并且它连上也至少这么久了，检查 5 就不算它。静默指 runner 没有读到 body，起点取 runner 自己记下的最近一次读（没有就是 spawn），正在推送一帧的 runner 不算静默（§9.5）；数据通道里有循环还没取走的帧的 runner 不算静默（它在交数据，只是循环落后了）；writer 满的时候谁都不算静默。静默的 runner 不贡献速度，这样的 tick 量不出翻倍的效果，所以和活跃数不够时一样处理：翻到上限的翻倍继续等，上限以下的不下结论、照常扩张。
 - 降速交给 `ConcurrencyControlStrategy` 处理，扩张控制器只负责增加连接。
 - 增益的判断用扩张前后各一个稳定窗口的总速率来比较，不用每连接速率，因为 `per_runner_speed` 本身就是由总速率算出来的。
 
@@ -534,6 +536,16 @@ split_window = 2 s
 4. 没有启用限速。
 
 处理：从已经收到的位置停掉这个 runner，区间退回可用池，`attempts += 1`，走退避。默认参数先按上面的值实现，再通过 T14 的基准测试校准，**不照搬** IDM 的 1.3、50 ms 这些常量。
+
+静默的路径（C29，2026-11-08 维护者决定，§14.19）：一个正在运行的 runner 满足下面全部条件时，不需要完整窗口，也不需要 3 个 runner，同样从已经收到的位置停掉（`Slow`）：
+
+1. 已经静默满 `silent_restart_after`（4.5 s，3 个 tick）：没有读到 body。runner 攒满 32 KiB 才交一帧，读得慢的 runner 可能很久不交帧，但它在读，不是卡住。所以 runner 在重置自己的空闲计时器的地方记下当时的时刻：每读到一个非空的块，以及推送完一个满缓冲、接着读同一个块时；正在推送（等循环取走数据）时算“此刻在活动”，和空闲计时器一样，等下游不算空闲（`ReadActivity`，和下载循环共享）。流结束、空闲超时、出错时最后推出去的那一帧不算读。静默的起点就是 runner 记下的最近一次读，没有就是 spawn；被接受的帧、writer 恢复可写都不重新算（读那些字节在前；被 writer 挡住的 runner 在推送，本来就算在活动）。writer 满的时候不判。
+2. 它连上（`Started`）也至少这么久了：在 4.5 s 之前的某次采样里它已经在运行。还在连接的 runner 归连接超时管。
+3. 剩余量 ≥ `2 × min_chunk_size`：剩得更少的交给收尾对冲（§9.6），对冲中的一对也不判。
+4. 它的数据通道里没有循环还没取走的帧：有的话它在交数据，只是循环落后了，这时停它会把那些帧连同接收端一起丢掉。这一条只用于静默路径；低速路径照旧，排着帧的 runner 仍然算进中位数。
+5. 不在拥塞期间，没有启用限速。
+
+两条路径停掉 runner 时，`Doubling` 待判断的翻倍不下结论、直接丢掉，翻到上限的也一样（§9.2、§14.19）。低速和静默两条路径合起来每个 tick 最多停一个：先判低速，低速没停才判静默；静默的有多个时停静默最久的，一样久停 ID 小的。分类和低速一样：这次尝试有字节被接受就是重启，不记预算；没有就记预算。`slow_window`、`slow_ratio` 不变。
 
 ### 9.6 收尾对冲（D5，跟随 `Doubling`）
 
@@ -865,8 +877,8 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
 已决定（2026-11-07，用户确认）：
 
 - **M1 收尾版的范围：保持 D5，不放宽。** 有两种情况，对冲和 T13 都不管，只能等 runner 的空闲超时（默认 30 s）。两种都写进 T14 的第 4 个场景去量：
-  - 静默的 runner 剩不到 `2 × min_chunk_size`，但别的 chunk 还“可切”。这时 `Doubling` 也不扩张，因为它要求每个 runner 在这个 tick 都有数据（检查 5），所以一个卡住的小 chunk 会让扩张也停到空闲超时。
-  - 静默的 runner 剩不少于 `2 × min_chunk_size`，但有完整窗口的 runner 不到 3 个，T13 不评判。收尾时常常只剩两三个 runner。
+  - 静默的 runner 剩不到 `2 × min_chunk_size`，但别的 chunk 还“可切”。这时 `Doubling` 也不扩张，因为它要求每个 runner 在这个 tick 都有数据（检查 5），所以一个卡住的小 chunk 会让扩张也停到空闲超时。C29 起检查 5 不算静默满 `hedge_idle` 的 runner，扩张照常，别的 chunk 更快下完，收尾一到就对冲（§14.19）；这个 runner 本身仍只归对冲管。
+  - 静默的 runner 剩不少于 `2 × min_chunk_size`，但有完整窗口的 runner 不到 3 个，T13 不评判。收尾时常常只剩两三个 runner。C29 起由 T13 的静默路径重启（§9.5、§14.19）。
   - 理由：先按 D5 做收尾版，量出代价再决定放不放宽。放宽的方向是去掉条件 1 里“其它 chunk”那一条，或者去掉候选的剩余量上限。
 - **M2 败方迟到的错误一律忽略。** 包括 §4.3 回退错误、其它不可重试的错误（比如 404、`RangeMismatch`）和 429/503：都不回退、不终止任务、不降并发、不推后 `congestion_until`。理由：这是不变量的要求；胜方正在同一个服务器上正常下载，败方的数据也没有写入。
 - **M3 传给 `on_failure` 的在途数减去所有正在停止的 runner，`Loser` 和 C12 的 `Slow` 都减。** 理由：正在停止的 runner 不会再交数据，不是在途的尝试；不减的话，一个快要停下的 runner 就能让别的 runner 的 429/503 被容忍，之后只剩 `no_progress_timeout` 兜底。
@@ -1484,7 +1496,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 停滞之后不再扩张，下完的 runner 也不补。收尾阶段，连接数会随着 runner 下完逐渐减少。没停滞时，下完的 runner 会通过正常的扩张补上。
   - 只判断完整的翻倍，所以扩张如果一直只是部分的，就永远不会下结论：比如上限一格一格地恢复，或者在上限处反复 8 → 7 → 8（一个 runner 下完、再切一个补上）。这时即使真的停滞了（总速度不再变化）也发现不了，循环会一直切分补位。这是接受了的盲区：连接数不超过当前上限，每次补位之间至少隔 2 s。T14 要量它的代价。`test_refills_at_the_limit_are_never_judged` 和 `doubling_refills_a_step_at_a_time_without_any_gain` 把这个行为固定下来。C28 起，到上限的完整翻倍会被判断，盲区只剩被截断的扩张，前一个测试改为 `test_refills_after_a_truncated_growth_are_never_judged`（§14.18）。
   - 剩余最多的 chunk 优先：它不到自己的门槛就停下，不再看别的 chunk。别的 chunk 剩得少一些、但 runner 更慢，门槛更低，本来可以切，也不会被选上。T14 要测连接速度不一的场景。
-  - 速率只看一个 tick（1.5 s）。runner 攒满 32 KiB 才交一帧，所以慢于约 21 KiB/s（32 KiB ÷ 1.5 s）的 runner，有的 tick 里看起来没有数据，那个 tick 就不扩张。
+  - 速率只看一个 tick（1.5 s）。runner 攒满 32 KiB 才交一帧，所以慢于约 21 KiB/s（32 KiB ÷ 1.5 s）的 runner，有的 tick 里看起来没有数据，那个 tick 就不扩张。C29 起静默满 2 s 的 runner 不再挡住扩张，但这样的 tick 不判断翻倍（§14.19）。
   - writer 满的时候，下载循环不取 runner 的数据，这个 tick 看起来也没有数据，不扩张。这是有意的：瓶颈在写入时，加连接没有用。
   - `planned` 的下限是 `min_chunk_size`，所以剩余量在 `min_chunk_size` 到 `2 × min_chunk_size` 之间、donor 又慢的 chunk 也会被切，两半都小于 `min_chunk_size`。`Legacy` 的 `SplitGivenTask` 也是这样（只要求剩余量 ≥ `min_chunk_size`）。T27 的“没有可切的活”原来按 `2 × min_chunk_size` 定义，和这里的门槛不一样；§9.6 的触发条件 1 已经改为对齐（见 §9.6 的“排除”）。
 - **验证。**
@@ -1845,8 +1857,8 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - `slow_ratio`（0.25）：没有数据。这里的停顿都是“完全不发”，没有“慢但还在发”的连接；要校准它，需要再加一个场景（比如一条连接限在别人的 10%–30%）。
 - **待决定的事项。**
   1. G7 在 s1 不达标（连接数），s2 无法判定，见上。已决定（2026-11-08）：改 G7，见 §2 和 §14.18。
-  2. 已决定（2026-11-08）：给 T13 加一条重启静默 runner 的路径，`Doubling` 的检查 5 不再因为静默满 `hedge_idle` 的 runner 停止扩张，另开 PR；对冲仍只在收尾。原来的说明：M1 的两种情况代价都很大：第一种 +56%，并且停住的 runner 让 `Doubling` 停止扩张；第二种 +29.8 s（4.4 倍），等于空闲超时。§9.6 写过放宽的方向（去掉条件 1 里“其它 chunk”那一条，或者去掉候选的剩余量上限）。另一个和第一种相关的改法：`Doubling` 的检查 5 不再因为一个已经静默满 `hedge_idle` 的 runner 跳过扩张。
-  3. `slow_window` 的缩短，见校准建议。已决定（2026-11-08）：`slow_window` 和 `slow_ratio` 不变，改用第 2 项的静默路径。
+  2. 已决定（2026-11-08）：给 T13 加一条重启静默 runner 的路径，`Doubling` 的检查 5 不再因为静默满 `hedge_idle` 的 runner 停止扩张，另开 PR（C29，§14.19）；对冲仍只在收尾。原来的说明：M1 的两种情况代价都很大：第一种 +56%，并且停住的 runner 让 `Doubling` 停止扩张；第二种 +29.8 s（4.4 倍），等于空闲超时。§9.6 写过放宽的方向（去掉条件 1 里“其它 chunk”那一条，或者去掉候选的剩余量上限）。另一个和第一种相关的改法：`Doubling` 的检查 5 不再因为一个已经静默满 `hedge_idle` 的 runner 跳过扩张。
+  3. `slow_window` 的缩短，见校准建议。已决定（2026-11-08）：`slow_window` 和 `slow_ratio` 不变，改用第 2 项的静默路径（§14.19）。
   4. 已决定（2026-11-08）：修上限处的判断，见 §14.18。原来的说明：在上限处的翻倍不被判断：s1_max32 里 16 到 32 的翻倍没有增益，但活跃数等于上限时控制器不判断；降到上限以下时活跃数又少于翻倍刚完成时的数，判断作废、按两倍补位。长一些的下载里，连接数会一直被补回上限。可以接受（连接数不超过 `max_connections`），也可以改成在上限处也判断，或者停滞之后收回多开的那一步。
 - **已知限制。**
   - 服务器在进程内，没有网络、TCP 慢启动和连接建立的延迟；HTTP 的情况（`reqwest`、`ureq2`）没有量。
@@ -1879,7 +1891,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 判断时打一条 debug 日志（有增益、停滞两种），`GROWTH_TRACE` 能看到。
 - **现在哪些扩张会被判断。**
   - 完整的翻倍：在之后第一个通过第 2、4 步、并且活跃数不少于翻倍后的数的 tick 判断，到了上限也判断，并发控制把上限降到翻倍后的数以下时也判断。
-  - 翻到上限、还没判断时活跃数降下来（runner 下完、失败、被 T13 停掉、对冲败方让出）：不判断，也不扩张，直到活跃数回来。失败或被停掉的 runner 的区间冷却结束、被重新领取后，活跃数就回来了；下完的 runner 不会回来，所以这样的下载此后不再扩张，连接数随 runner 下完逐渐减少。
+  - 翻到上限、还没判断时活跃数降下来（runner 下完、失败、对冲败方让出）：不判断，也不扩张，直到活跃数回来。被 T13 停掉时例外，见 §14.19（C29）。失败或被停掉的 runner 的区间冷却结束、被重新领取后，活跃数就回来了；下完的 runner 不会回来，所以这样的下载此后不再扩张，连接数随 runner 下完逐渐减少。
   - 上限以下的完整翻倍、判断前活跃数降下来：不下结论，丢掉，照常扩张，和 C11 一样。下完的 chunk 没有留下可领取的区间，只有切分能把连接数补回来，这一步不能挡。
   - 被上限或拒绝的切分截断的扩张：仍然不判断（§14.14，`on_grown` 没改），之后照样补位。§14.14 的盲区只剩这一种：比如上限 6 时从 4 扩到 6，或者上限一格一格地恢复。
   - 判断过、有增益的翻倍：之后在上限处有 runner 下完，照样补位。
@@ -1887,7 +1899,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
 - **已知限制。**
   - 翻倍是先开连接再判断，所以峰值仍可能是用满带宽所需的两倍（s1_max32 的 16 到 32）。新的 G7 正好允许两倍。
   - 判断要等 2 s：翻到上限之后不到 2 s 下载就结束，这次翻倍就不会被判断（见下面的 s1_max32）。
-  - 翻到上限、待判断时活跃数回不到翻倍后的数，就再也不扩张，上限恢复了也一样。这是“到了上限不补位”的代价。
+  - 翻到上限、待判断时活跃数回不到翻倍后的数，就再也不扩张，上限恢复了也一样。这是“到了上限不补位”的代价。2026-11-08 维护者决定（C29，§14.19）收窄了这一条：低速或静默重启停掉 runner 时，待判断的翻倍直接丢掉，重启的区间可以再切；runner 正常下完、失败、对冲败方让出时仍按这一条等着。
   - 被截断的扩张仍不判断，盲区还在（见上）。
 - **结果。** s1_max32、s1_max8、s2、s3 各 10 次，两种策略交替，中位数 / p90（最小–最大）。G7 一栏是 bench 打印的：逐轮差（`Doubling` − `Legacy`）的中位数、它占 `Legacy` 中位数的百分比，以及 `Doubling` 所有运行里的最大峰值对“两倍所需连接数”。
 
@@ -1909,7 +1921,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - s1_max8：7.6 s 从 4 翻到 8（上限），10.6 s 在上限处判断，有增益（7.9 对 4.0 MiB/s）。C13 的代码在上限处不判断，这次翻倍一直待判断。之后 8 个 runner 在 21.0 s 一起下完，中间没有 runner 下完，所以两种代码都不会补位，量出来的一样，内部状态不同。
     - s3：7.5 s 从 4 翻到 8（上限 8），loop 报回加了 4 个，`on_grown` 记下一次翻到上限的完整翻倍；这 4 个新 runner 随即都拿到 429，并发控制把上限降到 4。之后活跃数是 4，少于 8：这次翻倍一直等着，不判断；C13 的代码会丢掉它，按 `min(4 × 2, 4)` 也加不了 runner。两种代码都不扩张，量出来的一样，内部状态不同。
     - s2：两种策略都没有扩张（第一个 1.5 s 跑得快，剩下的不到 2 s 的量，切分被拒绝，§14.17），没有翻倍。
-- **G7 结论（新判据）。** 四个 G7 场景都达标。按 tasks.md，PR-7b（切换默认值）还依赖 PR-7c 和重启静默 runner 的 PR（下一个），要等它们合入。
+- **G7 结论（新判据）。** 四个 G7 场景都达标。按 tasks.md，PR-7b（切换默认值）还依赖 PR-7c 和 PR-7d（C29，重启静默 runner，§14.19），要等它们合入。
 - **验证。**
   - `doubling_strategy.rs` 的单元测试，显式传入 `now`：
     - `test_a_doubling_to_the_limit_is_judged_there`：上限 8，从 4 翻到 8 没有增益，在上限处停滞；之后上限升到 16、速度翻倍，也不再扩张；有 runner 下完也不补。有增益时上限拦住，有 runner 下完之后补 1 个。上限被降到 6（活跃数 8 高于上限）时同样判断，没有增益就停滞。
@@ -1932,3 +1944,127 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - 上限检查的 `>=` 改成 `>`：没有测试失败，因为这是等价变异。活跃数等于上限时，`target = min(活跃数 × 2, 上限)` 就是活跃数本身，要加的 runner 数是 0，`step` 不发出 `Grow`；留下的提议在下一个 `step` 开头被清掉。活跃数高于上限时两种写法都提前返回。
   - 性质测试 `splits_stay_within_the_limit_and_cover_the_file` 的修正：第一次变异检查时，它在没有变异的代码上也找到一个失败的序列（`max_connections = 4`、`Doubling`，两次切分之后一个 runner 剩不到 2 MiB 且静默满 2 s、别的 chunk 不到门槛，下一个 tick 发起了对冲），报“a slot leaked”。C13 的提交（`9bc7766`）上用同一个序列也失败。原因在测试：它只把拥有 chunk 的 runner 算作占着槽位，对冲 runner H 在分出胜负之前不拥有 chunk，被算成泄漏。对冲本身是对的（§9.6 的触发条件都满足）。现在把“没有 chunk、但在未分胜负的一对里或者正在停止”的 runner 也算作占着槽位，这个序列通过。另把这个序列写成确定的测试 `a_hedge_after_two_splits_runs_to_the_end`（`download_loop/tests/hedge.rs`），一直走到结束：对冲发起后槽位 4 个；原 runner 先交帧、胜出，H 被停、还占着槽位；H（停在 spawn 处的真实 runner）被轮询后报告停止，槽位回收到 3 个，不再“正在停止”、也不在一对里；原 runner 收满、结束，对冲记录清掉，槽位 2 个；两个 ID 都能再分给新的 runner。
   - bench：`cargo bench -p bolt-load --features unstable-strategy --bench growth_strategy` 打印每个 G7 场景的逐轮差中位数、它占 `Legacy` 中位数的百分比、`Doubling` 的最大峰值对两倍所需连接数，以及结论。所需连接数写在场景上（`fills`）。
+
+### 14.19 重启静默 runner（PR-7d，C29）
+
+- **决定。** 2026-11-08 维护者对 §14.17 待决定事项 2、3 的决定：给 T13 加一条重启静默 runner 的路径，不需要 3 个完整窗口；`Doubling` 的检查 5 不再因为静默满 `hedge_idle` 的 runner 停止扩张。对冲仍只在收尾，`slow_window`、`slow_ratio` 不变。§9.6 的不变量和 M1–M5 都没有动。
+- **做法。**
+  - 活动的信号（`runner::ReadActivity`）：runner 和下载循环共享的一个小状态（`Arc<Mutex<…>>`：最近一次读的 `Instant`，和“正在推送”的标记；每次改动都在一次加锁里做完，循环要么看到改之前、要么看到改之后）。runner 在重置空闲计时器的地方记下时刻：读到非空的块（`on_item`）时，和推送完一个满缓冲、接着读同一个块时；开始推送一帧（`flush` 把一帧交给 `Emission`）时置上“正在推送”。推送结束（`on_emitted`）时：接着读同一个块的，在同一次加锁里记下时刻、清掉“正在推送”（`resume_reading`）；否则只清掉标记。分两次做的话，循环的 tick 可能正好落在两次之间，看到一个既不在推送、也没有新时刻的 runner，把推送了 4.5 s 以上的健康 runner 当成静默停掉（第四轮评审）。空块不记；流结束、空闲超时、出错时推出的最后一帧也不记（这些推送之后 runner 不再读）。`note_at` 取已记时刻和新时刻中较晚的。spawner 给每个 runner 一个，经 `RunnerChannels::reads` 交给 manager，manager 收下时记上 spawn 的时刻。runner 的其余行为不变。
+  - `RunnerManager::silent_since(id, now)` 就是 runner 记下的最近一次读（没有读过就是 spawn）；正在推送的 runner 是 `now`。被接受的帧和 writer 恢复都不算：runner 读那些字节在前，被 writer 挡住的 runner 在推送。循环不在 tick 上记什么。对冲的静默仍只按帧算（`last_delivery`，writer 恢复时重新算，§9.6 不变）。
+  - 重启放开上限处的翻倍（2026-11-08 维护者决定）：低速或静默路径停掉一个 runner 时，循环调 `StrategyControl::on_restarted`，`Doubling` 把待判断的翻倍不下结论地丢掉，翻到上限的和上限以下的都一样。翻到上限的翻倍原来要等活跃数回来（C28），s4c 那样别的 runner 都下完时，重启的区间被重新领取后只有一个 runner 下；现在它被重新领取后，扩张照常切它。上限以下的翻倍原本在活跃数不够时也会丢掉，但被停的 runner 在停下来之前还占着活跃数，低速重启时它还在交数据，这样的 tick 会用一个被放弃的 runner 判断翻倍，所以也一起丢掉。别的事件（runner 正常下完、失败、对冲败方让出）不放开，仍按 C28。
+  - 静默的路径（`download_loop/restart.rs` 的 `restart_silent_runner`），只在 `Doubling` 下（`Legacy` 没有 `RunnerRates`），每个策略 tick 在低速路径没停 runner 时才判。候选要同时满足：
+    1. 状态是 Running，剩余量 ≥ `2 × min_chunk_size`，不在停止中，不在未分胜负的一对里（`may_restart`，C12 的条件，没有改）；数据通道里没有循环还没取走的帧（`RunnerManager::has_queued_data`，只看不取）；
+    2. `silent_since` 不晚于 `now − SILENT_RESTART_AFTER`（4.5 s）：这么久 runner 没有读到 body，也不在推送；
+    3. 在 `now − 4.5 s` 或更早的最近一次采样里，它已经在运行同一次尝试（`RunnerRates::running_since`）；
+    - 另外：不在拥塞期间，writer 可写，没有限速（P2 之前恒为真）。
+    - 有多个候选时停 `silent_since` 最早的，一样早停 ID 小的。按 `Slow` 停（`stop_runner`），之后和低速停止完全一样：`AttemptFailure::slow`，有数据是重启、不记预算，没数据记预算，退避，M3 里不算在途。
+  - 每个 tick 最多停一个：`restart_runner` 先判低速，低速停了就不判静默。
+  - 检查 5（`RunnerRates::sample_at`）：一个 running runner 这个 tick 没有字节被接受，但 `silent_since` 不晚于 `now − hedge_idle`（2 s），并且在 `now − 2 s` 或更早的采样里已经在运行，就不算它“没交数据”；`TickSample::silent` 记下有这样的 runner。writer 满时谁都不放过，数据通道里有没取走的帧的也不放过。连接中的 runner 照样挡住扩张。和静默路径用同一个信号：在读、只是还没攒满一帧的 runner 是在交数据，不放过它；什么都没读满 2 s 的才算静默。
+  - `Doubling`（`runners_to_add`）：有静默 runner 的 tick 和“活跃数少于翻倍后的数”一样处理，都是量不出待判断的翻倍：翻到上限的翻倍继续等、不扩张（C28 的规则）；上限以下的不下结论、丢掉，照常扩张。
+  - 判断出静默停止时打 debug 日志 `stopping silent runner`，丢掉翻倍时打 `a restart drops the doubling`；bench 的探针多读这一条，表里多一列“静默停止请求”。
+- **设计上的取舍。**
+  - 阈值 4.5 s（3 个 tick），比 `hedge_idle`（2 s）长：收尾时对冲先到。更主要的是结构上的隔离：对冲的候选剩余量都 < `2 × min_chunk_size`，而静默路径只看 ≥ `2 × min_chunk_size` 的，对冲中的一对也排除，所以两者从不争同一个 runner。
+  - 对冲因为没有空闲槽位发不出去时：这个 runner 剩余量 < `2 × min_chunk_size`，静默路径不碰它；对冲每个 tick 重试，槽位空出来就发；一直没有槽位就等空闲超时（30 s）。这和 M1 的决定一致：剩得少的只归对冲管。
+  - 为什么要读的信号：manager 只看得到整帧（32 KiB），runner 没有按时间把缓冲交出来的机制。只看帧，“读得慢”和“卡住”分不开：一个 5 KiB/s 的 runner 要 6.4 s 才攒满第一帧，4.5 s 时被停、缓冲丢掉，每次都没有字节被接受，每次都记预算，最后 `RangeExhausted`。上一版用“参照速率”猜（自己的、别人的中位数、任务平分的速率，按 5 帧算），评审指出两处会错：快慢混在一起时，慢的那个被别人的中位数判成卡住；别的 runner 下完、采样滚出窗口之后才连上的 runner，三种参照都是 0，卡住了也只能等空闲超时。读的信号从源头上把两者分开，参照速率整个去掉了。
+  - 为什么由 runner 自己记：runner 本来就有这个信号，它的空闲计时器在非空块和推送之后重置，等下游时不算空闲（`emit.rs:25`）。上一版由循环从副作用里推：一个计数，循环每个 tick 看它动没动、记成这个 tick 的时刻。评审几轮的问题大多出在这里：读的时刻最多晚一个 tick（1.5 s，s4b 的停止跟着晚）；取 `now` 和读计数的先后会把读记早（上一轮改成先读后取时间）；背压时 runner 不读也不交帧，要另外看数据通道是不是空的。现在 runner 在重置空闲计时器的同一个地方记下 `Instant::now()`，推送期间直接报“此刻在活动”，循环只拿来比，这几处都不用推了。
+    - 也不再取 `last_delivery`。上一版取它和 runner 的时刻中较晚的，s4b、s4c 的停止被推后了：一次扩张让 writer 短暂写满，恢复时 `restart_silences` 把所有 runner 的帧静默重新算（§9.6），停住的 runner 也跟着重新算（加日志看了一次：s4b、s4c 里停住的 runner 的 `silent since` 都正好是最后一次 writer 恢复的时刻；它在停住之后没有交过帧，切分也没有逼出帧：runner 只在读到块、流结束、空闲超时、出错时推送）。writer 恢复对 runner 的读没有影响：被 writer 挡住的 runner 在推送，算在活动；没被挡住的照常读、照常记。所以静默路径和检查 5 只看 runner 的读，writer 恢复只重新算对冲的静默。writer 满的时候仍然不判（第 2 条）。
+    - 推送之后只在接着读同一个块时（`resume_item`，空闲计时器也在这里重置）记时刻：流结束、空闲超时、出错时推出的最后一帧不是新的读，记了会让静默晚算。
+    - 时刻是 runner 的 `Instant`，和循环的 `now` 同一个时钟；循环的 `now` 在 tick 开始时取，runner 在那之后记的时刻会晚于 `now`，只会让静默算短。
+    - 测试里时间是显式传入的：`Harness` 的 runner 由测试持有共享的 `ReadActivity`，按测试的时钟调 `note_at`、`start_emitting`、`emitted_at`；`restart.rs` 里的真实 runner 按真实时钟记，测试用 `RunnerManager::read_activity`（仅测试）按测试的时钟补记（`note_at` 只取较晚的，真实时钟记下的更早的时刻不起作用）。
+  - 数据通道里有没取走的帧时不判。runner 卡在等通道腾位置时报“此刻在活动”，这一种情况由 runner 自己的信号覆盖了。但还剩一种：runner 读完、推完几帧，之后流停住，而循环一直没取走那几帧；最后一次读之后 4.5 s 它看起来是静默的，这时停它，`Stopped` 会先于排着的帧被处理（生命周期在数据之前），帧随接收端丢掉，没有字节被接受的尝试还会记预算。writer 满时不判；writer 可写时循环会取数据，所以剩下的只有循环本身 4.5 s 没取数据，很少见，但会丢数据、错记预算，而检查只是看一眼通道（不取），所以静默路径和检查 5 仍然先看通道是不是空的。writer 恢复只重新算对冲的静默（§9.6）。低速路径不加这一条：它按窗口字节和中位数比，把排着帧的快 runner 排除掉会让被评判的 runner 不到 3 个，低速重启就被压住了；被评判的慢 runner 本身一直在交数据，不会是这种情况。对冲不受影响：败方的帧按设计就是丢掉的；对冲的触发只看帧，一个通道里排着帧的 runner 被对冲时，仲裁先取原 runner 排着的帧，原 runner 胜，只浪费一次连接，没有改。
+  - 背压算活动：runner 在等数据通道腾出位置时没有读，但这不是卡住（runner 自己的空闲计时器这时也不走）。推送期间是“此刻在活动”，推送完接着读时记下时刻。
+  - 静默从 `silent_since` 算：writer 满的时候不判；writer 恢复不重新算（见上），writer 满时 runner 多半在推送，本来就算在活动。
+  - 还在连接的 runner 不算：连接超时（默认 30 s）管它；在这里停它一定是“没数据”，每次都记预算，连接慢的服务器会被耗尽预算而失败。连上之后的静默也只从它运行的那次采样算（第 3 条），连接用的时间不算进去。代价是对齐到 tick：连上后最多再晚 1.5 s。
+  - 有数据之后的静默停止不记预算：这次尝试有字节被接受，退回的区间严格变短，和 §14.13 的重启一样不会没有进展地循环。没数据就记预算，所以一个总是一连上就停住的区间，最多 `max_attempts_per_range` 次（每次约 4.5 s 加退避）就以 `RangeExhausted` 结束（`a_slow_runner_without_data_exhausts_its_range`），而不是每次等 30 s。
+  - 检查 5 与判断：静默的 runner 不贡献速度。如果在这样的 tick 判断翻倍，1 到 2 这一步里新 runner 一停住，增益就是 1.0，会被误判为停滞，此后再也不扩张。所以这样的 tick 不判断。上一版让翻倍一律等着，评审指出上限以下会重现 M1 的冻结：一个剩得少、静默路径不管、对冲又因为别的 chunk 还可切而不发的 runner，会让扩张一直停着。现在和 C28 的活跃数规则一致：只有翻到上限的翻倍等着（它本来就不能再扩张），上限以下的直接丢掉、照常扩张。在有静默 runner 的 tick 决定的翻倍，翻倍前的速度少算了静默的那份：判断时它若已恢复，增益偏高，最多多翻一次；链路已经饱和时，两边都是同一带宽，不会误判出增益。
+- **与 §9.5、§9.2 的偏差。** 两节已经按上面改写。读的信号是实现时加的，维护者的决定里只说“静默”。
+- **已知限制。**
+  - 读的信号是“流有没有给出非空的块”。适配器自己缓冲、或者 TCP 层有字节但流不交出来的时候看不到；流一直给空块也不算读。
+  - 读的信号来自 runner 自己的时钟，tick 只看已经记下的时刻。runner 读到一块、还没记下就被调度走时，这期间的 tick 看到的仍是上一次读；如果那之前确实已经静默满 4.5 s，它会被停，哪怕这一块刚到。同样，采样之后才到的读也赶不上这次停止。这只发生在正好卡在阈值上的读，那之前的静默是真的，和已修好的推送竞态不同。
+  - 剩余量 < `2 × min_chunk_size` 的卡住 runner 仍然只靠对冲：M1 的第一种（s4a）里它本身不会被重启，只是检查 5 不再冻结扩张，别的 chunk 下得更快，收尾更早到来、更早对冲。
+  - 阈值没有在真实网络上校准；HTTP 没有量。
+- **结果。** 静默只按 runner 自己记的读、重启放开上限处的翻倍之后，s1、s2、s3、s4、s4a、s4b、s4c 和三个无停顿的对照全部重跑，每组 10 次，两种策略交替，中位数 / p90。“重启”是按低速停止、区间退回的 runner 数（低速和静默路径合计），“静默停止请求”是静默路径发出的停止请求数；被要求停止的 runner 可能在注意到之前就下完或失败，所以后者不一定包含在前者里。“重复 KiB”是 adapter 发出的超过文件大小的字节。
+
+  | 场景 | 策略 | 完成时间 s | 峰值连接 | 对冲 | 重复 KiB | 停顿等待 s | 重启 / 静默停止请求 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | s1_max32 | Legacy | 35.19 / 38.04 | 6.5 / 7.0 | 0 | 30 / 32 | n/a | 0 / 0 |
+  | s1_max32 | Doubling | 15.94 / 16.01 | 32 / 32 | 0 | 160 / 224 | n/a | 0 / 0 |
+  | s1_max8 | Legacy | 33.86 / 36.15 | 6.5 / 7.0 | 0 | 32 / 48 | n/a | 0 / 0 |
+  | s1_max8 | Doubling | 21.08 / 21.09 | 8 / 8 | 0 | 32 / 48 | n/a | 0 / 0 |
+  | s2 | Legacy | 4.82 / 5.30 | 2.0 / 2.0 | 0 | 40 / 48 | n/a | 0 / 0 |
+  | s2 | Doubling | 4.74 / 5.40 | 2.0 / 2.0 | 0 | 32 / 48 | n/a | 0 / 0 |
+  | s3 | Legacy | 16.10 / 16.12 | 4 / 4 | 0 | 21 / 34 | n/a | 0 / 0 |
+  | s3 | Doubling | 15.61 / 15.63 | 4 / 4 | 0 | 32 / 48 | n/a | 0 / 0 |
+  | s4 | Legacy | 42.47 / 42.62 | 5 / 5 | 0 | 10 / 12 | 30.71 / 30.88 | 0 / 0 |
+  | s4 | Doubling | 11.80 / 12.55 | 8 / 8 | 1 | 50 / 60 | 2.81 / 3.56 | 0 / 0 |
+  | s4_nostall | Legacy | 12.07 / 12.09 | 5 / 5 | 0 | 10 / 20 | n/a | 0 / 0 |
+  | s4_nostall | Doubling | 9.09 / 9.10 | 8 / 8 | 0 | 16 / 16 | n/a | 0 / 0 |
+  | s4a | Legacy | 65.87 / 65.96 | 2 / 2 | 0 | 0 / 0 | 30.81 / 30.93 | 0 / 0 |
+  | s4a | Doubling | 12.36 / 12.37 | 8 / 8 | 1 | 32 / 32 | 6.95 / 6.97 | 0 / 0 |
+  | s4a_nostall | Legacy | 35.27 / 35.29 | 2 / 2 | 0 | 0 / 0 | n/a | 0 / 0 |
+  | s4a_nostall | Doubling | 11.78 / 11.78 | 6 / 6 | 0 | 0 / 0 | n/a | 0 / 0 |
+  | s4b | Legacy | 37.78 / 37.92 | 2 / 2 | 0 | 0 / 0 | 30.63 / 30.79 | 0 / 0 |
+  | s4b | Doubling | 13.84 / 13.99 | 2 / 2 | 0 | 16 / 32 | 6.20 / 6.34 | 1 / 1 |
+  | s4b_nostall | Legacy | 8.73 / 8.74 | 2 / 2 | 0 | 0 / 0 | n/a | 0 / 0 |
+  | s4b_nostall | Doubling | 8.73 / 8.74 | 2 / 2 | 0 | 0 / 0 | n/a | 0 / 0 |
+  | s4c | Legacy | 35.67 / 35.75 | 5 / 5 | 0 | 8 / 8 | 30.67 / 30.75 | 0 / 0 |
+  | s4c | Doubling | 13.23 / 13.29 | 8 / 8 | 0 | 49 / 58 | 6.78 / 6.87 | 1 / 1 |
+
+  - 所有运行的 `unmatched` 都是 0。
+  - 误重启：s1、s2、s3 和三个无停顿的对照，两种策略的每一次运行，重启和静默停止请求都是 0。
+  - 和读的时刻按 tick 记的那一版（s4a 13.11、s4b 16.87、s4c 12.78 s）、以及只把信号交给 runner 的那一版（s4a 12.36、s4b 15.26、s4c 17.19 s）比（`Doubling`）：
+    - s4b 13.84 s，停顿等待 6.20 s（9.25、7.60 s）：静默从停住的那一刻算，writer 恢复不再把它推后。
+    - s4c 13.23 s，停顿等待 6.78 s（7.36、9.61 s）：`GROWTH_TRACE` 看了一次，停住的 runner 约 6.1 s 停住，10.58 s（停住后 4.5 s 的第一个 tick）被静默停止，同一个 tick 丢掉翻到 8 的待判断翻倍；区间退避 0.8 s 后在 11.38 s 被重新领取，12.08 s 扩张把它切成两半，13.17 s 下完。10 次都由静默路径收尾（每次 1 次静默停止，0 次对冲）。比对照（s4_nostall）慢 4.1 s；按 tick 记的那一版有 6 次靠对冲收尾，中位数 12.78 s 略快，但那一版的快来自切分恰好把停住的 chunk 切得够小，不是静默路径本身。
+    - s4c 的重复字节 49 / 58（32–58）KiB，上一版 46 / 52（28–56）。每次至少 32 KiB：停住的 runner 缓冲里正好满一缓冲（32 KiB）还没推出去，停止时丢掉，区间重新请求时再发一次。多出来的是切分的超读：被切的 runner 在收到新上限之前已经从流里多读了一点，超过新上限的部分丢掉，对冲和切分都会这样。放开翻倍之后，重新领取的区间在尾部多被切一次（这次的 trace 里 32 + 26 KiB），所以中位数略升，在预期之内。
+    - s4a 12.36 s 不变（对冲收尾）；s4 11.80 / 12.55 s，1 次对冲，在原来的范围里（11.03–12.56）。
+    - s1、s2、s3：时间和峰值都在原来的范围里；`Legacy` 不变。
+  - 和 §14.17、§14.18 比（`Doubling`）：s4a 12.36 对 18.32 s；s4b 13.84 对 38.49 s；s4c 13.23 对 38.72 s。
+  - G7（bench 打印的，§14.18 的判据）：s1_max32 −54.8%、峰值 32 ≤ 32；s1_max8 −37.9%、8 ≤ 32；s2 +0.6%（逐轮差 −0.89 到 +0.63 s）、2 ≤ 2；s3 −3.1%、4 ≤ 8。四个都达标。
+- **验证。**
+  - runner 的单元测试 `test_read_activity_follows_the_body`：开始时没有时刻；空块不记；非空块记下当时的时刻；把数据通道推满之后，runner 等循环取，`last_active(now)` 就是 `now`；取走一帧后，runner 接着读同一个块，记下时刻。`test_a_resumed_runner_is_never_seen_silent`：推满数据通道、等循环取，取走一帧之后，`ReadActivity` 记下的每一个循环可能读到的状态（测试时记下每次加锁改完的状态）都是“在推送”或者“取走之后记过时刻”，没有一个会让这时的 tick 把它算成从推送之前就静默。`test_a_forced_push_is_no_read`：读到 100 B 后空闲超时，最后一帧推出去，记下的仍是读到那一块的时刻。`test_read_activity_keeps_the_bytes`：空块、100 B、空块、两个缓冲多 10 B 的块，数据照常。
+  - 下载循环测试（`download_loop/tests/silent.rs`，用 hedge 测试的 `Harness`，runner 由测试持有通道和共享的 `ReadActivity`，按测试的时钟记活动，显式传入时间）：
+    - `a_silent_runner_is_restarted`：静默差 1 ns 到 4.5 s 时不停，正好 4.5 s 停；交过 64 KiB 的 `attempts = 1`、`charged = 0`，没交过的 `charged = 1`；
+    - `a_slow_runner_that_reads_is_never_silent`：5 KiB/s，每 5 个 tick 才攒满一帧，旁边一个快的；30 s 里从不被停，没有冷却记录，4 帧都进来了，`charged = 0`；
+    - `a_pushing_runner_is_never_silent`：一直在推送的 runner 7 个 tick（10.5 s）都不停；推送在某一时刻结束，从那时起差 1 ns 到 4.5 s 不停，正好 4.5 s 停；
+    - `a_late_runner_alone_is_restarted`：别的 runner 1.5 s 就下完了，它 21 s 才连上（早先的采样都已滚出窗口），什么都不读：25.5 s 差 1 ns 不停，25.5 s 停；
+    - `a_runner_near_its_end_is_left_to_the_hedge`：剩余量 `2 × min_chunk_size − 1` 不停，正好 `2 × min_chunk_size` 停；
+    - `a_hedged_runner_is_not_restarted`、`a_runner_is_silent_from_the_tick_it_runs_at`、`a_full_writer_is_no_silence`、`no_silent_restart_while_congested`、`one_silent_runner_is_stopped_a_tick`、`the_slow_and_the_silent_restart_share_a_tick`、`legacy_never_restarts_a_silent_runner`；
+    - `a_stall_is_measured_from_the_last_read`：runner 读完一帧后停住，接着 writer 写满又恢复；它在最后一次读之后 4.5 s 停，差 1 ns 不停，比“writer 恢复之后 4.5 s”早；
+    - `a_slow_restart_releases_the_doubling_at_the_limit`：上限 4，从 2 翻到 4，一个 runner 下完，翻倍等着；慢的 runner 在窗口满时被低速路径停下，同一个 tick 扩张就为空出的槽位切了一次（它的区间还在退避），活跃数比 A、C 多一个；
+    - `a_restart_releases_the_doubling_at_the_limit`（s4c 的形状）：上限 4，从 2 翻到 4，翻到上限、待判断；别的 runner 都下完，活跃数 1，扩张等着；停住的 runner 被静默停止，区间退避后被重新领取，新 runner 交数据的那个 tick，扩张把它切开，活跃数 2；
+    - `a_silent_runner_does_not_hold_the_growth_back`：静默 1.5 s 时仍挡住扩张，2 s 时放行，扩张到上限并且切了静默 runner 的 chunk；连接中、刚连上、连上 1.5 s 的仍挡住；在两个 tick 之间读过的，从读的时刻算，差 1 ns 到 2 s 仍挡住，满 2 s 放行；正在推送的一直挡住，推送结束后差 1 ns 到 2 s 仍挡住，满 2 s 放行；writer 满时谁都不放行。
+  - `download_loop/tests/growth.rs` 的 `a_small_stalled_chunk_does_not_freeze_the_growth`：上限 8，翻到 4（上限以下，待判断），一个 runner 剩 1 MiB 时停住（静默路径不管，别的 chunk 还可切，对冲也不发）；判断的 tick 是静默的 tick，丢掉这次翻倍，照常翻到 8，那个 runner 没被停。
+  - `queued_frames_are_no_silence`（`silent.rs`）：一个 runner 的数据通道排满 32 帧（循环落后了），之后没有活动，writer 空闲；2 s 时不放过它，下一个 tick 晚到 8 s 也不停它；之后循环把 32 帧都取走，全部被接受，`charged = 0`，没有冷却记录。
+  - `doubling_strategy.rs` 的 `test_a_restart_drops_the_doubling_it_waits_for`：翻到上限的翻倍在一个 runner 下完后等着；`on_restarted` 之后不下结论、照常补位；上限以下、runner 数够、没有增益时，`on_restarted` 之后也不判断，照常扩张。
+  - `test_a_reused_id_reads_by_its_own_activity`（`runner_manager.rs`）：spawn 时 `silent_since` 是 spawn 的时刻；旧尝试推送时是 `now`；留着旧尝试的 `ReadActivity`，ID 释放、再分给新的 runner 之后，在旧的上记时刻、置“正在推送”，静默都不变；在新的上记才更新。
+  - `a_full_writer_is_no_silence` 改了含义：writer 满时照样不停；恢复之后，从 spawn 起就停住的 runner 在第一个 tick 就被停（它的静默是它自己的，和 writer 无关），对冲的静默照样从恢复时重新算（`last_delivery` 是恢复的时刻）。
+  - 测试里交数据的 runner 也要记读：`Harness::deliver` 和 `growth.rs`、`restart.rs` 里模拟交数据的地方，在 `note_delivery` 之外按测试的时钟调 `note_at`（`growth.rs` 的 `deliver` 没有时间参数，置“正在推送”，表示一直在交）。
+  - T13 原有测试（`download_loop/tests/restart.rs`）：两个卡住的 runner 按静默在 4.5 s 停；`a_stop_keeps_the_error_a_runner_holds` 里的 runner 带着错误、帧还排着：静默路径不碰它，窗口满时低速路径照旧停它，停止不盖掉它拿着的错误；
+  - `queued_frames_do_not_hide_a_slow_runner`（`silent.rs`）：三个 runner，一个快的在每个 tick 都有一帧排着没取走；它照样算进中位数，慢的那个在窗口满时（10.5 s）被低速路径停下，快的不被停。
+  - `a_slow_runner_is_stopped_and_its_range_retried`：真实 runner 读完 96 KiB 之后才取测试的 `t0`，并按 `t0` 补记活动，所以静默从 `t0` 算，和原来一样在 4.5 s 停。`a_slow_runner_without_data_exhausts_its_range` 就是“一连上就停住的区间，第 3 次以 `RangeExhausted` 结束”；`runners_at_the_same_low_rate_are_never_restarted` 照样通过（靠读的信号；三个真实 runner 每个 tick 读 3 KiB，测试按 tick 的时刻补记）；`a_slow_runner_that_delivers_is_stopped_on_its_window` 覆盖低速路径。
+  - 单元测试：`test_running_since`（`throughput.rs`）；`test_a_tick_with_a_silent_runner_judges_nothing`（`doubling_strategy.rs`：上限以下，有静默 runner 的 tick 不判断，即使没有增益也不停滞，照常扩张；翻到上限的翻倍在静默的 tick 一直等，没有静默的 tick 才判断，停滞就不补位，有增益就补位）。
+  - 集成测试 `tests/silent_restart.rs`（需要 `unstable-strategy` 和 `tokio`）：真实的下载，8 MiB，每条连接 2 MiB/s，上限 2，一个连接读到 6 MiB 停住、剩 2 MiB；停住的位置在 25 s 内被重新请求（空闲超时要 30 s），文件内容正确。这是冒烟测试，计时由上面的下载循环测试保证。
+  - 变异检查（整个 bolt-load lib，all features，每次之前删掉 `proptest-regressions`），共 28 组，每组都有测试失败：
+    - 阈值边界 `<=` 改成 `<`：`a_silent_runner_is_restarted`、`a_full_writer_is_no_silence`、`one_silent_runner_is_stopped_a_tick`、`a_pushing_runner_is_never_silent` 和 T13 的两个测试；
+    - 对冲的候选也重启（去掉 `2 × min_chunk_size`）：`a_runner_near_its_end_is_left_to_the_hedge`；
+    - writer 满的时间算作静默（去掉 writer 可写的条件）：`a_full_writer_is_no_silence`；检查 5 在 writer 满时也放行：`a_silent_runner_does_not_hold_the_growth_back`；
+    - 一个 tick 停两个（低速和静默都判）：`the_slow_and_the_silent_restart_share_a_tick`；
+    - 拥塞期间也停：`no_silent_restart_while_congested` 和性质测试 `splits_stay_within_the_limit_and_cover_the_file`；
+    - 检查 5 仍然挡住扩张：`a_small_stalled_chunk_does_not_freeze_the_growth` 和 `a_silent_runner_does_not_hold_the_growth_back`；
+    - `Legacy` 也采样（于是也重启）：`legacy_never_restarts_a_silent_runner`、`legacy_never_restarts`、`legacy_never_hedges` 和 `legacy_is_the_default_and_unchanged`；
+    - 有数据之后的静默停止也记预算：`a_silent_runner_is_restarted`、`a_slow_runner_is_stopped_and_its_range_retried`，以及 C12 的两个单元测试；
+    - 静默从 spawn 算（去掉“连上至少 4.5 s”）：`a_runner_is_silent_from_the_tick_it_runs_at`、`a_late_runner_alone_is_restarted`、`the_slow_and_the_silent_restart_share_a_tick` 和 `doubling_waits_for_every_runner_and_the_congestion`；
+    - 静默仍取 `last_delivery` 和读中较晚的（被接受的帧、writer 恢复重新算静默）：`a_full_writer_is_no_silence` 和 `a_stall_is_measured_from_the_last_read`；
+    - 每次推送结束都记时刻（流结束、空闲超时推出的帧也算读）：`test_a_forced_push_is_no_read`；
+    - 推送完接着读时不记：`test_read_activity_follows_the_body`；
+    - 不记 spawn 的时刻：`a_silent_runner_is_restarted`、`a_late_runner_alone_is_restarted`、`a_full_writer_is_no_silence` 等十个测试；
+    - 静默路径停止时不放开翻倍：`a_restart_releases_the_doubling_at_the_limit`；低速路径停止时不放开：`a_slow_restart_releases_the_doubling_at_the_limit`；
+    - 推送结束、接着读时分两次加锁（先清标记、再记时刻）：`test_a_resumed_runner_is_never_seen_silent`；
+    - 忽略活动的信号（只按帧算静默）：`a_slow_runner_that_reads_is_never_silent`、`runners_at_the_same_low_rate_are_never_restarted`、`a_pushing_runner_is_never_silent`、`a_silent_runner_does_not_hold_the_growth_back` 和 `test_a_reused_id_reads_by_its_own_activity`；
+    - 循环不把“正在推送”当成此刻在活动：`a_pushing_runner_is_never_silent`、`a_silent_runner_does_not_hold_the_growth_back`、`test_a_reused_id_reads_by_its_own_activity` 和 `test_read_activity_follows_the_body`；runner 不报“正在推送”：`test_read_activity_follows_the_body`；
+    - 空块也记时刻：`test_read_activity_follows_the_body`；
+    - 有静默 runner 的 tick 也判断翻倍：`test_a_tick_with_a_silent_runner_judges_nothing`；上限以下的翻倍在静默的 tick 也等着：`a_small_stalled_chunk_does_not_freeze_the_growth` 和 `test_a_tick_with_a_silent_runner_judges_nothing`；
+    - 静默路径不看排着的帧：`queued_frames_are_no_silence` 和 `a_stop_keeps_the_error_a_runner_holds`；检查 5 不看排着的帧：`queued_frames_are_no_silence`；
+    - 排着的帧也挡住低速路径（放进 `may_restart`）：`queued_frames_do_not_hide_a_slow_runner` 和 `a_stop_keeps_the_error_a_runner_holds`；
+    - C12 的 `may_restart` 变异照样被抓住：评判一对中的一方，`the_survivor_of_an_undecided_pair_is_not_judged`；评判正在停止的 runner，`one_silent_runner_is_stopped_a_tick`。
+    - 其中两次（阈值边界、空块也记时刻）已知会偶发失败的 `test_save_into_rejects_hostile_filenames` 也失败了，和变异无关。

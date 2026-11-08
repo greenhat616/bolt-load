@@ -43,37 +43,42 @@ const NANO: Duration = Duration::from_nanos(1);
 const TICK: Duration = DEFAULT_STRATEGY_TICK_INTERVAL;
 
 /// The ends of a runner the test drives, and its stop.
-struct Ends {
+pub(super) struct Ends {
     lifecycle: LifecycleSender,
     data: DataFrameSender,
-    stop: CancellationToken,
+    pub(super) stop: CancellationToken,
+    /// The runner's read activity, which the test advances.
+    pub(super) reads: crate::runner::ReadActivity,
 }
 
 impl Ends {
-    fn new() -> (Self, RunnerChannels) {
+    pub(super) fn new() -> (Self, RunnerChannels) {
         let (lifecycle, lifecycle_rx) =
             AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY).split();
         let (data, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
         let stop = CancellationToken::new();
+        let reads = crate::runner::ReadActivity::default();
         let ends = Self {
             lifecycle,
             data,
             stop: stop.clone(),
+            reads: reads.clone(),
         };
         let channels = RunnerChannels {
             lifecycle_rx,
             data_rx,
             stop,
+            reads: reads.clone(),
         };
         (ends, channels)
     }
 
-    fn start(&mut self) {
+    pub(super) fn start(&mut self) {
         self.lifecycle.try_push(LifecycleEvent::Started).unwrap();
     }
 
     /// Queue a frame of `len` bytes.
-    fn send(&mut self, len: u64) {
+    pub(super) fn send(&mut self, len: u64) {
         self.data
             .try_push(DataFrame {
                 data: Bytes::from(vec![0; len as usize]),
@@ -81,11 +86,11 @@ impl Ends {
             .unwrap();
     }
 
-    fn end(&mut self, event: LifecycleEvent) {
+    pub(super) fn end(&mut self, event: LifecycleEvent) {
         self.lifecycle.try_push(event).unwrap();
     }
 
-    fn fail(&mut self, error: TaskError) {
+    pub(super) fn fail(&mut self, error: TaskError) {
         self.end(LifecycleEvent::failed(error));
     }
 }
@@ -138,21 +143,21 @@ fn is_congestion(error: &TaskError) -> bool {
     )
 }
 
-fn options(max_connections: usize) -> TaskOptions {
+pub(super) fn options(max_connections: usize) -> TaskOptions {
     TaskOptions::default()
         .max_connections(NonZeroUsize::new(max_connections).unwrap())
         .growth_strategy(GrowthStrategy::Doubling)
 }
 
 /// A loop over a file of `total` bytes whose writes are recorded.
-struct Harness {
-    download: DownloadLoop,
-    rt: ScriptedRuntime,
+pub(super) struct Harness {
+    pub(super) download: DownloadLoop,
+    pub(super) rt: ScriptedRuntime,
     written: WrittenRanges,
 }
 
 impl Harness {
-    fn new(total: u64, options: &TaskOptions) -> Self {
+    pub(super) fn new(total: u64, options: &TaskOptions) -> Self {
         Self::on(ScriptedRuntime::new(TimerKind::Scripted), total, options)
     }
 
@@ -183,7 +188,7 @@ impl Harness {
     }
 
     /// Spawn a runner for `range` at `now`.
-    fn spawn(&mut self, range: Range<u64>, now: Instant) -> (RunnerId, Ends) {
+    pub(super) fn spawn(&mut self, range: Range<u64>, now: Instant) -> (RunnerId, Ends) {
         let slot = self.download.manager.try_reserve_slot().unwrap();
         let runner_id = slot.runner_id;
         let (ends, channels) = Ends::new();
@@ -196,7 +201,7 @@ impl Harness {
     }
 
     /// Spawn a running runner for `range` at `now`.
-    fn spawn_running(&mut self, range: Range<u64>, now: Instant) -> (RunnerId, Ends) {
+    pub(super) fn spawn_running(&mut self, range: Range<u64>, now: Instant) -> (RunnerId, Ends) {
         let (runner_id, mut ends) = self.spawn(range, now);
         ends.start();
         self.go(now);
@@ -205,7 +210,7 @@ impl Harness {
     }
 
     /// Hedge the chunk of `owner` at `now`.
-    fn hedge(&mut self, owner: RunnerId, now: Instant) -> (RunnerId, Ends) {
+    pub(super) fn hedge(&mut self, owner: RunnerId, now: Instant) -> (RunnerId, Ends) {
         let slot = self.download.manager.try_reserve_slot().unwrap();
         let runner_id = slot.runner_id;
         let (ends, channels) = Ends::new();
@@ -218,7 +223,7 @@ impl Harness {
     }
 
     /// Handle the next runner event at `now`, which must be ready.
-    fn step(&mut self, now: Instant) -> Result<ControlFlow<()>> {
+    pub(super) fn step(&mut self, now: Instant) -> Result<ControlFlow<()>> {
         let tick = self
             .download
             .manager
@@ -237,7 +242,7 @@ impl Harness {
 
     /// Handle the next runner event at `now`, which must be ready and
     /// must not end the task.
-    fn go(&mut self, now: Instant) {
+    pub(super) fn go(&mut self, now: Instant) {
         assert!(self.step(now).unwrap().is_continue());
     }
 
@@ -252,15 +257,19 @@ impl Harness {
     }
 
     /// `runner_id` delivers `bytes` at `now`, without a write.
-    fn deliver(&mut self, runner_id: RunnerId, bytes: u64, now: Instant) {
+    /// `runner_id` read `bytes` at `now`, and the loop accepted them then.
+    pub(super) fn deliver(&mut self, runner_id: RunnerId, bytes: u64, now: Instant) {
         self.download
             .manager
             .update_progress(runner_id, bytes)
             .unwrap();
         self.download.manager.note_delivery(runner_id, now);
+        if let Some(reads) = self.download.manager.read_activity(runner_id) {
+            reads.note_at(now);
+        }
     }
 
-    fn chunk(&self, runner_id: RunnerId) -> ChunkState {
+    pub(super) fn chunk(&self, runner_id: RunnerId) -> ChunkState {
         self.download.manager.chunk_of(runner_id).unwrap().clone()
     }
 
@@ -269,16 +278,16 @@ impl Harness {
         self.download.manager.chunk_of(runner_id).is_none()
     }
 
-    fn undecided(&self, runner_id: RunnerId) -> bool {
+    pub(super) fn undecided(&self, runner_id: RunnerId) -> bool {
         self.download.manager.is_in_undecided_pair(runner_id)
     }
 
-    fn slots(&self) -> usize {
+    pub(super) fn slots(&self) -> usize {
         self.download.manager.allocated_runner_count()
     }
 
     /// Complete the writes, and account for them at `now`.
-    fn settle_writes(&mut self, now: Instant) {
+    pub(super) fn settle_writes(&mut self, now: Instant) {
         for mut write in self.rt.take_parked() {
             assert!((&mut write).now_or_never().is_some(), "a write completes");
         }

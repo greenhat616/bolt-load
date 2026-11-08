@@ -907,6 +907,8 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
                 lifecycle_rx,
                 data_rx,
                 stop: Default::default(),
+
+                reads: Default::default(),
             })
         })
         .unwrap();
@@ -1171,6 +1173,8 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
                 lifecycle_rx,
                 data_rx,
                 stop: Default::default(),
+
+                reads: Default::default(),
             })
         })
         .unwrap();
@@ -1255,6 +1259,7 @@ mod growth;
 mod hedge;
 mod restart;
 mod retry;
+mod silent;
 
 /// Random sequences of the loop's steps, including failures that back their
 /// range off, congestion and time passing, under either growth strategy.
