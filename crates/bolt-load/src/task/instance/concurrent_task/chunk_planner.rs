@@ -288,6 +288,9 @@ pub struct ChunkPlanner {
     hedge_of: HashMap<RunnerId, u64>,
     /// Bytes accepted into all chunks; no operation ever drops accepted bytes.
     accepted_bytes: u64,
+    /// The accepted bytes written to the file, as the writer's completions
+    /// reported them (design §11.1, §14.21).
+    written: WrittenSet,
     /// Available ranges backing off after a failure, keyed by start. They
     /// never overlap a chunk or each other, and keep their attempts after
     /// `not_before` until claimed.
@@ -306,6 +309,7 @@ impl ChunkPlanner {
             runner_to_chunk: HashMap::new(),
             hedge_of: HashMap::new(),
             accepted_bytes: 0,
+            written: WrittenSet::default(),
             cooldowns: BTreeMap::new(),
             next_generation: 0,
         }
@@ -766,6 +770,29 @@ impl ChunkPlanner {
         merge_adjacent_ranges(ranges)
     }
 
+    /// The write of `range` completed: its bytes are in the file (design
+    /// §11.1). Only bytes the planner accepted are ever written; a frame it
+    /// did not accept, a hedge loser's among them, never reaches the writer.
+    pub fn note_written(&mut self, range: Range<u64>) {
+        debug_assert!(
+            range.is_empty()
+                || self
+                    .get_downloaded_ranges()
+                    .iter()
+                    .any(
+                        |downloaded| downloaded.start <= range.start && range.end <= downloaded.end
+                    ),
+            "written {range:?} was never accepted"
+        );
+        self.written.insert(range);
+    }
+
+    /// The accepted bytes written to the file, see [`Self::note_written`].
+    #[inline]
+    pub fn written(&self) -> &WrittenSet {
+        &self.written
+    }
+
     /// Get total downloaded bytes
     #[inline]
     pub fn get_total_downloaded(&self) -> u64 {
@@ -1046,6 +1073,45 @@ impl Drop for PlannerGuard<'_> {
 }
 
 /// Merge adjacent ranges
+/// Byte ranges, sorted, neither overlapping nor adjacent: the bytes written
+/// to the file (design §11.1).
+///
+/// A set rather than an offset per chunk: the writer completes the writes
+/// of one chunk out of order, and the set does not depend on how the
+/// chunks are split, retried or hedged (design §14.21).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WrittenSet(Vec<Range<u64>>);
+
+impl WrittenSet {
+    /// Add `range`, merging it with the ranges it overlaps or touches.
+    pub fn insert(&mut self, range: Range<u64>) {
+        if range.is_empty() {
+            return;
+        }
+        // The ranges from `first` on end at or after `range` starts; those
+        // before `last` start at or before it ends.
+        let first = self.0.partition_point(|r| r.end < range.start);
+        let last = self.0.partition_point(|r| r.start <= range.end);
+        let merged = if first < last {
+            self.0[first].start.min(range.start)..self.0[last - 1].end.max(range.end)
+        } else {
+            range
+        };
+        self.0.splice(first..last, [merged]);
+    }
+
+    /// The ranges, in order.
+    #[inline]
+    pub fn ranges(&self) -> &[Range<u64>] {
+        &self.0
+    }
+
+    #[inline]
+    pub fn into_ranges(self) -> Vec<Range<u64>> {
+        self.0
+    }
+}
+
 fn merge_adjacent_ranges(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
     if ranges.is_empty() {
         return ranges;
@@ -1071,6 +1137,44 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::*;
+
+    /// The written ranges merge whatever order the writes complete in, a
+    /// range written again included.
+    #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "lists holding one range")]
+    fn test_written_ranges_merge_in_any_order() {
+        let mut set = WrittenSet::default();
+        for range in [8..12, 0..4, 20..24, 4..8, 0..0, 2..6, 12..16, 30..31] {
+            set.insert(range);
+        }
+        assert_eq!(set.ranges(), [0..16, 20..24, 30..31]);
+        set.insert(16..30);
+        assert_eq!(set.ranges(), [0..31]);
+    }
+
+    /// The written bytes lag the accepted ones until their writes complete,
+    /// and a split, a failure or a retry leaves them as they are.
+    #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "lists holding one range")]
+    fn test_written_lags_downloaded() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        assert!(planner.allocate_chunk(0..1000, Some(1)));
+        planner.mark_running(1).unwrap();
+        let first = planner.update_progress(1, 100).unwrap();
+        let second = planner.update_progress(1, 100).unwrap();
+        assert_eq!(planner.get_downloaded_ranges(), [0..200]);
+        assert_eq!(planner.written().ranges(), []);
+
+        // The second write completes first.
+        planner.note_written(second);
+        assert_eq!(planner.written().ranges(), [100..200]);
+        planner.split_chunk(1, 600, 2).unwrap();
+        fail(&mut planner, 1, now, std::time::Duration::from_secs(1));
+        planner.note_written(first);
+        assert_eq!(planner.written().ranges(), [0..200]);
+        assert_eq!(planner.get_downloaded_ranges(), [0..200]);
+    }
 
     // === Basic functionality tests ===
 

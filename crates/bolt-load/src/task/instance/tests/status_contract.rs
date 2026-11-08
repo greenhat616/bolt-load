@@ -20,7 +20,7 @@ use crate::{
         UnretryableError,
     },
     task::{
-        DownloadError, DownloadMode, FallbackReason, TaskState,
+        DownloadError, DownloadMode, FallbackReason, TaskState, TaskStatus,
         test_support::{assert_transitions, record, spawn, tmp_path, watchdog},
     },
 };
@@ -261,6 +261,113 @@ async fn test_unusable_ranges_fall_back_to_one_connection() {
         assert_eq!(output.progress.total, Some(SIZE as u64), "{reason:?}");
         assert_eq!(std::fs::read(&dest).unwrap().len(), SIZE, "{reason:?}");
     }
+}
+
+/// Answers ranges for a while, then shows that it ignores them: each range
+/// stream sends `after` bytes, then fails with `RangeIgnored`.
+#[derive(Clone)]
+struct LateRangeIgnoredAdapter {
+    inner: SimpleTestAdapter,
+    after: usize,
+}
+
+impl BoltLoadAdapter for LateRangeIgnoredAdapter {
+    async fn is_range_stream_available(&self) -> bool {
+        true
+    }
+
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
+        self.inner.retrieve_meta().await
+    }
+
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
+        self.inner.full_stream().await
+    }
+
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
+        use futures::StreamExt;
+
+        let stream = self.inner.range_stream(start, end).await?;
+        let ignored = futures::stream::once(async { Err(UnretryableError::RangeIgnored.into()) });
+        let after = self.after;
+        // By bytes: the adapter paces its stream with empty items too.
+        Ok(stream
+            .scan(0, move |sent, item| {
+                let next = (*sent < after).then(|| {
+                    if let Ok(bytes) = &item {
+                        *sent += bytes.len();
+                    }
+                    item
+                });
+                futures::future::ready(next)
+            })
+            .chain(ignored)
+            .boxed())
+    }
+}
+
+/// The fallback to one connection starts from nothing written: the bytes
+/// the concurrent attempt wrote are reported while it runs, and never
+/// after it, whatever the one connection reports (design §11.1).
+#[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::single_range_in_vec_init, reason = "lists holding one range")]
+async fn test_a_fallback_starts_with_nothing_written() {
+    const SIZE: usize = 8 << 20;
+    const CHUNK: usize = 16 << 10;
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("late.bin");
+    let token = CancellationToken::new();
+    let adapter = LateRangeIgnoredAdapter {
+        inner: SimpleTestAdapterBuilder::new()
+            .content_size(SIZE)
+            .support_range(true)
+            .chunk_size(CHUNK)
+            .max_per_stream_speed(1 << 20)
+            .build()
+            .unwrap(),
+        // Past the adapter's burst of a second at 1 MiB/s.
+        after: 3 << 20,
+    };
+    let task = spawn(DownloadMode::Concurrent, adapter, &dest, &token);
+
+    let statuses = record(task.status()).await;
+    let output = watchdog(task).await.unwrap();
+
+    assert_transitions(&statuses);
+    let mode = |status: &TaskStatus| status.info.as_ref().map(|info| info.mode);
+    assert!(
+        statuses.iter().any(|status| {
+            mode(status) == Some(DownloadMode::Concurrent)
+                && status
+                    .progress
+                    .downloaded_chunks
+                    .iter()
+                    .any(|range| !range.is_empty())
+        }),
+        "the concurrent attempt reports what it wrote"
+    );
+    // From nothing on: the one connection's bytes only grow.
+    let mut downloaded = 0;
+    for status in statuses
+        .iter()
+        .filter(|status| mode(status) == Some(DownloadMode::Singleton))
+    {
+        assert!(
+            status.progress.downloaded >= downloaded,
+            "{:?}",
+            status.state
+        );
+        downloaded = status.progress.downloaded;
+        assert_eq!(
+            status.progress.downloaded_chunks,
+            [0..status.progress.downloaded],
+            "{:?}",
+            status.state
+        );
+    }
+    assert_eq!(output.mode, DownloadMode::Singleton);
+    assert_eq!(output.progress.downloaded_chunks, [0..SIZE as u64]);
+    assert_eq!(std::fs::read(&dest).unwrap().len(), SIZE);
 }
 
 /// Codes its full response with `content_encoding`, while the metadata
