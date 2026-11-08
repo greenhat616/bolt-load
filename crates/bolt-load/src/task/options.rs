@@ -91,32 +91,6 @@ impl MetaRetry {
     }
 }
 
-mod growth {
-    /// How a concurrent task adds connections. Unstable: the
-    /// `unstable-strategy` feature exposes it for tests and benchmarks, and
-    /// it goes away once one strategy becomes the default.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-    #[non_exhaustive]
-    pub enum GrowthStrategy {
-        /// Split on changes of the task's speed, by fixed thresholds.
-        #[default]
-        Legacy,
-        /// Double the connections every 2 s while all of them deliver data,
-        /// until the gain falls under 10%. A split needs at least 2 s of
-        /// work at the split runner's own rate.
-        #[cfg_attr(
-            not(any(test, feature = "unstable-strategy")),
-            expect(dead_code, reason = "only the unstable-strategy feature selects it")
-        )]
-        Doubling,
-    }
-}
-
-#[cfg(feature = "unstable-strategy")]
-pub use growth::GrowthStrategy;
-#[cfg(not(feature = "unstable-strategy"))]
-pub(crate) use growth::GrowthStrategy;
-
 /// Connection limit and termination policy of a download task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -163,10 +137,6 @@ pub struct TaskOptions {
     pub connect_timeout: Duration,
     /// Retry policy of the metadata request, see [`MetaRetry`].
     pub meta_retry: MetaRetry,
-    /// How the concurrent task adds connections; `Legacy` by default.
-    /// Unstable, behind the `unstable-strategy` feature.
-    #[cfg(any(test, feature = "unstable-strategy"))]
-    pub growth_strategy: GrowthStrategy,
 }
 
 impl Default for TaskOptions {
@@ -179,8 +149,6 @@ impl Default for TaskOptions {
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             meta_retry: MetaRetry::default(),
-            #[cfg(any(test, feature = "unstable-strategy"))]
-            growth_strategy: GrowthStrategy::Legacy,
         }
     }
 }
@@ -229,26 +197,6 @@ impl TaskOptions {
         self
     }
 
-    /// Set [`Self::growth_strategy`]. Unstable.
-    #[cfg(any(test, feature = "unstable-strategy"))]
-    pub fn growth_strategy(mut self, strategy: GrowthStrategy) -> Self {
-        self.growth_strategy = strategy;
-        self
-    }
-
-    /// The growth strategy in effect: `Legacy` unless the
-    /// `unstable-strategy` feature lets the options choose.
-    pub(crate) fn resolved_growth_strategy(&self) -> GrowthStrategy {
-        #[cfg(any(test, feature = "unstable-strategy"))]
-        {
-            self.growth_strategy
-        }
-        #[cfg(not(any(test, feature = "unstable-strategy")))]
-        {
-            GrowthStrategy::Legacy
-        }
-    }
-
     pub(crate) fn validate(&self) -> Result<(), BuildError> {
         let reason = if self.no_progress_timeout.is_zero() {
             "no_progress_timeout must be greater than zero"
@@ -283,18 +231,6 @@ mod tests {
         assert_eq!(options.stream_idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT);
         assert_eq!(options.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
         assert_eq!(options.meta_retry, MetaRetry::default());
-        assert_eq!(options.growth_strategy, GrowthStrategy::Legacy);
-        assert_eq!(options.resolved_growth_strategy(), GrowthStrategy::Legacy);
-    }
-
-    #[test]
-    fn test_growth_strategy_sets_the_option() {
-        let options = TaskOptions::default().growth_strategy(GrowthStrategy::Doubling);
-        assert_eq!(options.growth_strategy, GrowthStrategy::Doubling);
-        assert_eq!(options.resolved_growth_strategy(), GrowthStrategy::Doubling);
-        // The derived traits see the field.
-        assert_ne!(options, TaskOptions::default());
-        assert_eq!(options.clone(), options);
     }
 
     #[test]

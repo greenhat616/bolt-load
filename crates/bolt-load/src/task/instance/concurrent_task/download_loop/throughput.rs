@@ -234,7 +234,6 @@ pub(super) struct ThroughputSampler {
     write_sampler: SpeedSampler,
     /// Bytes written since the last sample.
     written_bytes: usize,
-    pub(super) speed: f64,
     pub(super) per_runner_speed: f64,
 }
 
@@ -245,7 +244,6 @@ impl ThroughputSampler {
             sampler: SpeedSampler::new(),
             write_sampler: SpeedSampler::new(),
             written_bytes: 0,
-            speed: 0.0,
             per_runner_speed: 0.0,
         }
     }
@@ -266,7 +264,6 @@ impl ThroughputSampler {
         let MeterSnapshot { runners, mut bytes } = meters;
         let (_, speed) = self.sampler.sample(&mut bytes);
         let (_, write_speed) = self.write_sampler.sample(&mut self.written_bytes);
-        self.speed = speed;
         self.per_runner_speed = if runners == 0 {
             0.0
         } else {

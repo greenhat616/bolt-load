@@ -77,12 +77,16 @@ pub(super) struct DownloadLoop {
     deadline: DeadlineSource,
     strategy_tick: StrategyTick,
     throughput: ThroughputSampler,
-    /// Each runner's rate at the strategy ticks; only the doubling
-    /// strategy samples it, and restarts slow runners on it.
-    rates: Option<RunnerRates>,
+    /// Each runner's rate at the strategy ticks, for the doubling
+    /// strategy, the restarts and the hedge.
+    rates: RunnerRates,
     /// Every strategy action applied, in order.
     #[cfg(test)]
     applied: Vec<String>,
+    /// Whether the endgame hedge runs; tests of other mechanisms turn it
+    /// off.
+    #[cfg(test)]
+    hedging: bool,
 }
 
 impl DownloadLoop {
@@ -98,12 +102,8 @@ impl DownloadLoop {
         let mut manager = RunnerManager::new(total, max_concurrency);
         *manager.admission_mut() =
             AdmissionEvidence::with_streak_gap(streak_gap(options.connect_timeout));
-        let strategy = StrategyControl::new(
-            max_concurrency,
-            options.connect_timeout,
-            options.resolved_growth_strategy(),
-        );
-        let rates = strategy.is_doubling().then(RunnerRates::default);
+        let strategy = StrategyControl::new(max_concurrency, options.connect_timeout);
+        let rates = RunnerRates::default();
         let policy = FailurePolicy::new(options, Instant::now());
         let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),
@@ -131,6 +131,8 @@ impl DownloadLoop {
             rates,
             #[cfg(test)]
             applied: Vec::new(),
+            #[cfg(test)]
+            hedging: true,
         }
     }
 

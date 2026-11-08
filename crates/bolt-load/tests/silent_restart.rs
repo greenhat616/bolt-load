@@ -1,16 +1,13 @@
 //! A connection that stops sending without closing, with plenty left, is
-//! recovered under `Doubling` long before the runner's idle timeout (design
+//! recovered long before the runner's idle timeout (design
 //! §14.19), through the silent restart, or the growth it no longer holds
 //! back and the endgame hedge.
 
-#![cfg(all(feature = "unstable-strategy", feature = "tokio"))]
+#![cfg(feature = "tokio")]
 
 use std::{num::NonZeroUsize, time::Duration};
 
-use bolt_load::{
-    runtime::ThreadedRuntimeImpl,
-    task::{GrowthStrategy, Task},
-};
+use bolt_load::{runtime::ThreadedRuntimeImpl, task::Task};
 use bolt_load_tests::adapter::simple::SimpleTestAdapterBuilder;
 
 const MIB: u64 = 1 << 20;
@@ -33,7 +30,6 @@ async fn a_stalled_connection_recovers_before_the_idle_timeout() {
         .runtime(ThreadedRuntimeImpl::new_tokio_rt())
         .save_to(dir.path().join("download.bin"))
         .max_connections(NonZeroUsize::new(2).unwrap())
-        .growth_strategy(GrowthStrategy::Doubling)
         .spawn()
         .unwrap();
     // A deadlock watchdog only; the idle timeout alone would take 30 s.

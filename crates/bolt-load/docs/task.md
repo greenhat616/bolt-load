@@ -144,7 +144,6 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 | `stream_idle_timeout` | 30 s |
 | `connect_timeout` | 30 s |
 | `meta_retry` | 3 retries, 200 ms – 2 s per wait |
-| `growth_strategy` | `Legacy`; only with the unstable `unstable-strategy` feature |
 
 Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a
 stalled stream ends the task with `NoProgress` before its runner can time
@@ -217,23 +216,29 @@ The concurrent download path includes several sub-systems:
   Wrapped in [`PendingWriter`] for backpressure queuing.
 - **StrategyControl** — dynamic optimization:
   - [`ConcurrencyControlStrategy`] — adjusts runner count based on load.
-  - [`DynamicStrategy`] — splits slow runners' remaining ranges. A
-    split reserves the new runner's slot first: without a free one it
-    changes nothing, so a task never runs more than
-    `max_connections` runners.
-  - `DoublingStrategy` — unstable, chosen by `growth_strategy` with the
-    `unstable-strategy` feature. At the first strategy tick at least
-    2 s after its last growth, while no runner connects, every runner
-    had bytes accepted in the tick and no 429 or 503 holds the task
-    back, it doubles the runners up to the current limit. Each new
+  - `DoublingStrategy` — adds the runners. At the first strategy tick
+    at least 2 s after its last growth, while no runner connects, every
+    running runner had bytes accepted in the tick and no 429 or 503
+    holds the task back, it doubles the runners up to the current limit.
+    A running runner silent for 2 s, and running at least that long,
+    does not count against it: silent means it read nothing of its body
+    and is not pushing a frame. None is while the writer is full, nor is
+    a runner with frames the loop has not taken yet. Each new
     runner splits the running range with the most left, if that range
-    holds at least 2 s of work at its runner's own rate. A doubling that
+    holds at least 2 s of work at its runner's own rate; a split reserves
+    the new runner's slot first, so a task never runs more than
+    `max_connections` runners. A doubling that
     gains less than 10% in speed stops it for the rest of the task. It
     only adds runners; lowering the limit stays with the concurrency
     strategy. At most one runner a strategy tick is restarted: one that
     delivered under a quarter of the median of at least three runners
     over the last 10 s, allowing one 32 KiB buffer either way, with at
-    least twice the minimum chunk size left, outside a 429 or 503 hold.
+    least twice the minimum chunk size left, outside a 429 or 503 hold;
+    or else, without three runners or a full window, the one silent the
+    longest, for at least 4.5 s, and running at least that long, with at
+    least twice the minimum chunk size left, outside a hedged pair, with
+    no frames the loop has not taken yet, while the writer can write
+    and outside a 429 or 503 hold.
     It is stopped alone, unless it is already ending with a result of
     its own, which it then reports, and its
     range retried from the accepted bytes after a backoff; the range's
