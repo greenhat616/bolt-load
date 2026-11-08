@@ -28,7 +28,7 @@ use crate::{
         DATA_FRAME_CHANNEL_CAPACITY, DataFrame, DataFrameSender, LIFECYCLE_CHANNEL_CAPACITY,
         LifecycleEvent, LifecycleSender,
     },
-    task::{GrowthStrategy, RunnerId},
+    task::RunnerId,
 };
 
 const TOTAL: u64 = 1 << 30;
@@ -91,17 +91,14 @@ impl crate::adapter::BoltLoadAdapter for StallingAdapter {
     }
 }
 
-/// A loop with `growth`, four connections and `options`, whose runners
-/// connect through `body`; runners 0 to 2 run on the first three quarters.
+/// A loop with four connections and `options`, whose runners connect
+/// through `body`; runners 0 to 2 run on the first three quarters.
 async fn restart_loop(
     rt: &ScriptedRuntime,
-    growth: GrowthStrategy,
     options: TaskOptions,
     body: StallingAdapter,
 ) -> (DownloadLoop, FileWriter, Vec<RunnerSlot>) {
-    let options = options
-        .max_connections(NonZeroUsize::new(4).unwrap())
-        .growth_strategy(growth);
+    let options = options.max_connections(NonZeroUsize::new(4).unwrap());
     let (mut download, file_writer) = loop_with_options(
         ThreadedRuntimeImpl::new_other_rt(rt.clone()),
         DynBoltLoadAdapter::new_arc(body),
@@ -170,13 +167,8 @@ async fn a_slow_runner_is_stopped_and_its_range_retried() {
     let options = TaskOptions::default()
         .max_consecutive_failures(1)
         .max_attempts_per_range(NonZeroU32::new(1).unwrap());
-    let (mut download, file_writer, _fast) = restart_loop(
-        &rt,
-        GrowthStrategy::Doubling,
-        options,
-        StallingAdapter::stalls_after(96 * KIB),
-    )
-    .await;
+    let (mut download, file_writer, _fast) =
+        restart_loop(&rt, options, StallingAdapter::stalls_after(96 * KIB)).await;
     download.spawn_runner(3 * QUARTER..TOTAL, Instant::now());
     let mut runner = single_parked(&rt);
     start(&mut download, &mut runner).await;
@@ -266,13 +258,8 @@ async fn a_slow_runner_without_data_exhausts_its_range() {
     let options = TaskOptions::default()
         .max_consecutive_failures(100)
         .max_attempts_per_range(NonZeroU32::new(3).unwrap());
-    let (mut download, file_writer, _fast) = restart_loop(
-        &rt,
-        GrowthStrategy::Doubling,
-        options,
-        StallingAdapter::stalls_after(0),
-    )
-    .await;
+    let (mut download, file_writer, _fast) =
+        restart_loop(&rt, options, StallingAdapter::stalls_after(0)).await;
     let mut now = Instant::now();
     download.spawn_runner(3 * QUARTER..TOTAL, now);
     for attempt in 1..=3 {
@@ -390,7 +377,6 @@ async fn a_slow_runner_that_delivers_is_stopped_on_its_window() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
     let (mut download, file_writer, _fast) = restart_loop(
         &rt,
-        GrowthStrategy::Doubling,
         TaskOptions::default(),
         StallingAdapter::stalls_after(0),
     )
@@ -427,7 +413,6 @@ async fn a_runner_that_completes_while_stopping_is_no_failure() {
         let rt = ScriptedRuntime::new(TimerKind::Scripted);
         let (mut download, file_writer, _fast) = restart_loop(
             &rt,
-            GrowthStrategy::Doubling,
             TaskOptions::default(),
             StallingAdapter::stalls_after(0),
         )
@@ -471,36 +456,6 @@ async fn a_runner_that_completes_while_stopping_is_no_failure() {
     }
 }
 
-/// The same stalled runner among the same fast ones is stopped under
-/// `Doubling`, as silent (design §14.19), and never under `Legacy`, which
-/// does not even sample the rates.
-#[tokio::test]
-async fn legacy_never_restarts() {
-    for growth in [GrowthStrategy::Legacy, GrowthStrategy::Doubling] {
-        let rt = ScriptedRuntime::new(TimerKind::Scripted);
-        let (mut download, file_writer, _fast) = restart_loop(
-            &rt,
-            growth,
-            TaskOptions::default(),
-            StallingAdapter::stalls_after(0),
-        )
-        .await;
-        let runner = spawn_test_runner(&mut download).await;
-        // 30 s of ticks.
-        run_ticks(&mut download, Instant::now(), 20);
-        let doubling = growth == GrowthStrategy::Doubling;
-        assert_eq!(download.rates.is_some(), doubling);
-        assert_eq!(runner.stop.is_cancelled(), doubling, "{growth:?}");
-        assert_eq!(download.manager.is_stopping(JUDGED), doubling, "{growth:?}");
-        assert_eq!(
-            download.manager.get_runner_state(JUDGED).unwrap().status,
-            ChunkStatus::Running
-        );
-        drop(download);
-        file_writer.finalize().await.unwrap();
-    }
-}
-
 /// The stop does not replace an error the runner already holds. Its stream
 /// fails with an unretryable error after 96 KiB, while its frames still
 /// wait to be taken; the loop then stops it for being slow (frames queued
@@ -514,8 +469,7 @@ async fn a_stop_keeps_the_error_a_runner_holds() {
         first: (96 * KIB) as usize,
         fail: true,
     };
-    let (mut download, file_writer, _fast) =
-        restart_loop(&rt, GrowthStrategy::Doubling, TaskOptions::default(), body).await;
+    let (mut download, file_writer, _fast) = restart_loop(&rt, TaskOptions::default(), body).await;
     let t0 = Instant::now();
     download.spawn_runner(3 * QUARTER..TOTAL, t0);
     let mut runner = single_parked(&rt);
@@ -604,9 +558,7 @@ async fn runners_at_the_same_low_rate_are_never_restarted() {
         bodies.insert(range.start, body);
     }
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let options = TaskOptions::default()
-        .max_connections(NonZeroUsize::new(3).unwrap())
-        .growth_strategy(GrowthStrategy::Doubling);
+    let options = TaskOptions::default().max_connections(NonZeroUsize::new(3).unwrap());
     let (mut download, file_writer) = loop_with_options(
         ThreadedRuntimeImpl::new_other_rt(rt.clone()),
         DynBoltLoadAdapter::new_arc(FedAdapter {
@@ -654,7 +606,7 @@ async fn runners_at_the_same_low_rate_are_never_restarted() {
         }
         download.on_strategy_tick(t0 + TICK * n);
         if n == 7 {
-            let rates = download.rates.as_ref().unwrap();
+            let rates = &download.rates;
             let mut bytes: Vec<_> = rates.window_bytes().into_iter().map(|(_, b)| b).collect();
             bytes.sort_unstable();
             assert_eq!(bytes, [0, FRAME, FRAME]);
