@@ -68,9 +68,7 @@ pub async fn create_http_server_with_file_size(
     let holder = FileHolder(Arc::new(tokio::sync::Mutex::new(
         tokio::fs::File::from_std(file),
     )));
-    let port =
-        portpicker::pick_unused_port().ok_or(anyhow::anyhow!("Failed to pick an unused port"))?;
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let (listener, port) = bind_local().await?;
 
     /// a handler send without range
     async fn no_range_handler(
@@ -223,9 +221,7 @@ pub async fn create_range_fault_server_with_log(
     content: Bytes,
     hold: Option<Gate>,
 ) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>, RequestLog)> {
-    let port =
-        portpicker::pick_unused_port().ok_or(anyhow::anyhow!("Failed to pick an unused port"))?;
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let (listener, port) = bind_local().await?;
     let log = RequestLog::default();
     let state = FaultState {
         encoded: Arc::default(),
@@ -247,6 +243,17 @@ pub async fn create_range_fault_server_with_log(
             .unwrap()
     });
     Ok((port, handle, log))
+}
+
+/// A listener on a loopback port the OS assigns, and that port.
+///
+/// The OS picks the port as it binds, so no other process can take it in
+/// between, as it could when a free port was picked first and bound later
+/// (`os error 10048` on Windows).
+async fn bind_local() -> std::io::Result<(TcpListener, u16)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
 }
 
 /// `content` as a gzip stream.
@@ -941,11 +948,11 @@ pub async fn create_limited_range_server(
     mode: LimitMode,
     bytes_per_sec: u64,
 ) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>, ConnectionLog)> {
-    let port =
-        portpicker::pick_unused_port().ok_or(anyhow::anyhow!("Failed to pick an unused port"))?;
+    let inner = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = inner.local_addr()?.port();
     let log = ConnectionLog::default();
     let listener = LimitedListener {
-        inner: TcpListener::bind(("127.0.0.1", port)).await?,
+        inner,
         limit,
         mode,
         log: log.clone(),

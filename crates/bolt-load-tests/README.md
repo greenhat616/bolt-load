@@ -56,7 +56,7 @@ let (port, handle) = create_http_server().await?;
 // GET http://127.0.0.1:{port}/no_range — ignores Range headers (200)
 ```
 
-- Auto-selects an unused port via `portpicker`
+- Binds `127.0.0.1:0` and reads the OS-assigned port from the listener
 - Serves random file content of configurable size (default 1 MB)
 - `/range` endpoint uses `axum-range` for proper HTTP 206 responses
 - `/no_range` endpoint always returns the full file
