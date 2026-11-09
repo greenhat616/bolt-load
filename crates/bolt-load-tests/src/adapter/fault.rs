@@ -163,7 +163,80 @@ pub enum RangeFault {
     /// idle timeout by requesting the rest again, so it is not in
     /// [`RangeFault::ALL`].
     StalledOnce,
+    /// Serve the resource with validators (see [`RangeFault::VALIDATED`]):
+    /// `ETag: "v1"`, and a `Last-Modified` long before `Date`. Answer the
+    /// first range request other than the probe with the first half of
+    /// its range; from then on, serve [`RangeFault::replacement`] as `"v2"`.
+    /// A range request whose `If-Range` names another version gets 200 and
+    /// the whole current version.
+    ///
+    /// Every response of these faults sends `Date`, `ETag` and
+    /// `Last-Modified` from one snapshot: `Date` is
+    /// [`VALIDATED_DATE`], and `Last-Modified` long before it unless the
+    /// fault says otherwise. `If-Range` is evaluated as RFC 9110 §13.1.5
+    /// says, with dates compared as dates.
+    ChangedMidDownload,
+    /// [`RangeFault::ChangedMidDownload`], but once replaced, the server
+    /// ignores ranges: it answers every request with 200 and the whole
+    /// replacement, `"v2"`.
+    ChangedThenIgnoresRange,
+    /// Answer range requests with 200 and the whole resource, with the
+    /// validators of `"v1"`, whatever `If-Range` names.
+    IgnoreRangeWithValidators,
+    /// A weak `ETag: W/"w1"`, and a `Last-Modified` long before `Date`;
+    /// `If-Range` is evaluated against that date.
+    WeakEtag,
+    /// No `ETag`, and a `Last-Modified` equal to `Date`, so no strong
+    /// validator.
+    RecentLastModified,
+    /// No `ETag`, and a `Last-Modified` exactly one second before `Date`.
+    LastModifiedOneSecondOld,
+    /// No `ETag`, and a `Last-Modified` one second after `Date`.
+    FutureLastModified,
+    /// No `ETag`; `Date` in the asctime format, and `Last-Modified` in the
+    /// RFC 850 format, except on a range response other than the probe,
+    /// which sends the same date as an IMF-fixdate.
+    ObsoleteDateFormats,
+    /// [`RangeFault::ChangedMidDownload`] with [`RangeFault::changed`],
+    /// which has the same size, but the server ignores `If-Range`: it
+    /// answers every range request with 206 and the current version, with
+    /// its `ETag`.
+    ChangedIgnoringIfRange,
+    /// [`RangeFault::ChangedIgnoringIfRange`] without an `ETag`: the
+    /// versions differ in their `Last-Modified`.
+    ChangedByDateIgnoringIfRange,
+    /// The validators of [`RangeFault::ChangedMidDownload`], but range
+    /// responses other than the probe carry neither `ETag` nor
+    /// `Last-Modified`; the resource does not change.
+    PartsWithoutValidators,
+    /// A HEAD gets `ETag: "h1"`, a GET `ETag: "v1"`; the resource does not
+    /// change.
+    HeadValidatorsDiffer,
+    /// [`RangeFault::HeadValidatorsDiffer`], changed as
+    /// [`RangeFault::ChangedMidDownload`] is: a HEAD then gets `"h2"`.
+    HeadValidatorsDifferThenChanged,
+    /// [`RangeFault::IgnoreRangeWithValidators`], but a HEAD gets
+    /// `ETag: "h1"`.
+    IgnoreRangeWithHeadValidators,
+    /// Two `ETag` field lines, `"v1"` and `"x1"`, so no entity tag, and a
+    /// `Last-Modified` long before `Date`.
+    RepeatedEtag,
+    /// One `ETag` field line holding a list, `"v1", "x1"`, so no entity
+    /// tag, and a `Last-Modified` long before `Date`.
+    ListEtag,
+    /// The validators of [`RangeFault::ChangedMidDownload`], but the
+    /// `bytes=0-0` probe gets 403; other range requests are answered. The
+    /// resource does not change.
+    RejectedProbe,
+    /// A HEAD names a size 16 bytes larger than the resource; a GET, and
+    /// the `Content-Range` of its 206, the real one. The resource does not
+    /// change.
+    HeadSizeDiffers,
 }
+
+/// The `Date` of every response of the faults of
+/// [`RangeFault::VALIDATED`]: 2027-01-15T08:00:00Z.
+pub const VALIDATED_DATE: std::time::Duration = std::time::Duration::from_secs(1_800_000_000);
 
 /// The `Retry-After` seconds of [`RangeFault::Congested`] and
 /// [`RangeFault::CongestedOnce`].
@@ -186,6 +259,31 @@ impl RangeFault {
         Self::ReplacedAfterShortRange,
     ];
 
+    /// The faults that send validators and evaluate `If-Range`. Not in
+    /// [`RangeFault::ALL`]: they answer a conditional range request, which
+    /// the faults there ignore. A server holds one version for all of them,
+    /// so a test uses one of them per server.
+    pub const VALIDATED: [Self; 18] = [
+        Self::ChangedMidDownload,
+        Self::ChangedThenIgnoresRange,
+        Self::IgnoreRangeWithValidators,
+        Self::WeakEtag,
+        Self::RecentLastModified,
+        Self::LastModifiedOneSecondOld,
+        Self::FutureLastModified,
+        Self::ObsoleteDateFormats,
+        Self::ChangedIgnoringIfRange,
+        Self::ChangedByDateIgnoringIfRange,
+        Self::PartsWithoutValidators,
+        Self::HeadValidatorsDiffer,
+        Self::HeadValidatorsDifferThenChanged,
+        Self::IgnoreRangeWithHeadValidators,
+        Self::RepeatedEtag,
+        Self::ListEtag,
+        Self::RejectedProbe,
+        Self::HeadSizeDiffers,
+    ];
+
     /// The URL path that serves this fault.
     pub fn path(self) -> &'static str {
         match self {
@@ -200,7 +298,32 @@ impl RangeFault {
             Self::Truncated => "/truncated",
             Self::ReplacedAfterShortRange => "/replaced-after-short-range",
             Self::StalledOnce => "/stalled-once",
+            Self::ChangedMidDownload => "/changed-mid-download",
+            Self::ChangedThenIgnoresRange => "/changed-then-ignores-range",
+            Self::IgnoreRangeWithValidators => "/ignore-range-with-validators",
+            Self::WeakEtag => "/weak-etag",
+            Self::RecentLastModified => "/recent-last-modified",
+            Self::LastModifiedOneSecondOld => "/last-modified-one-second-old",
+            Self::FutureLastModified => "/future-last-modified",
+            Self::ObsoleteDateFormats => "/obsolete-date-formats",
+            Self::ChangedIgnoringIfRange => "/changed-ignoring-if-range",
+            Self::ChangedByDateIgnoringIfRange => "/changed-by-date-ignoring-if-range",
+            Self::PartsWithoutValidators => "/parts-without-validators",
+            Self::HeadValidatorsDiffer => "/head-validators-differ",
+            Self::HeadValidatorsDifferThenChanged => "/head-validators-differ-then-changed",
+            Self::IgnoreRangeWithHeadValidators => "/ignore-range-with-head-validators",
+            Self::RepeatedEtag => "/repeated-etag",
+            Self::ListEtag => "/list-etag",
+            Self::RejectedProbe => "/rejected-probe",
+            Self::HeadSizeDiffers => "/head-size-differs",
         }
+    }
+
+    /// The second version of [`RangeFault::ChangedIgnoringIfRange`] and the
+    /// faults like it: every byte of `content` plus one, so it has the same
+    /// size and differs everywhere.
+    pub fn changed(content: &[u8]) -> bytes::Bytes {
+        content.iter().map(|byte| byte.wrapping_add(1)).collect()
     }
 
     /// What [`RangeFault::ReplacedAfterShortRange`] serves once replaced:
@@ -217,6 +340,7 @@ impl RangeFault {
         Self::ALL
             .into_iter()
             .chain([Self::StalledOnce])
+            .chain(Self::VALIDATED)
             .find(|fault| fault.path().strip_prefix('/') == Some(name))
     }
 }

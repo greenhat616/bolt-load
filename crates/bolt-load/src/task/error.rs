@@ -89,6 +89,12 @@ pub enum DownloadError {
         reason: FallbackReason,
         source: AdapterError,
     },
+    /// The resource changed during the download: a range request made
+    /// conditional with `If-Range` got another version of it, or a part of
+    /// one. The task removed what it wrote; download it again to get the
+    /// new version (design §11.2, §14.23).
+    #[snafu(display("the resource changed during the download: {source}"))]
+    ResourceChanged { source: AdapterError },
     /// A file operation failed. A full disk or an exceeded quota adds a
     /// hint to the message.
     #[snafu(display("failed to {op} {}: {source}{}", path.display(), storage_hint(source)))]

@@ -36,6 +36,31 @@ a `Box<AnyAdapter>` implements the trait itself.
 The erased adapter implements the trait rather than inherent methods, so
 calling its methods through `AnyAdapter` needs `BoltLoadAdapter` in scope.
 
+## Validators
+
+The HTTP adapters read the validators of the resource from a GET when
+they retrieve its metadata ([`BoltLoadAdapterMeta::etag`],
+[`BoltLoadAdapterMeta::last_modified`]) and send one in `If-Range` with
+every range request: the strong `ETag`, or else the `Last-Modified` when
+it is at least a second older than the response's `Date`. With only a
+weak `ETag` none is sent, and a field that occurs more than once counts
+as missing. A 200 with another validator than the one sent, or none, and
+a 206 with a validator that conflicts with it, are
+`UnretryableError::ResourceChanged`: the task removes what it wrote and
+fails with `DownloadError::ResourceChanged`. A 206 without a validator
+passes. A custom adapter that sends no `If-Range` does not notice a
+changed resource.
+
+The validator comes from the adapter's `bytes=0-0` probe. When that
+probe fails or is rejected, the adapter keeps metadata without one, and
+its ranges carry no `If-Range` for its whole life.
+
+The adapters probe once and keep the result. After `ResourceChanged`,
+download again with a fresh adapter: a cloned adapter or builder shares
+the cached probe, so a task on it fails again against the old validator.
+Restarting automatically is tracked in
+[#195](https://github.com/greenhat616/bolt-load/issues/195).
+
 `full_stream` returns the body with the `Content-Encoding` and
 `Content-Type` of the response, in a [`FullResponse`]. The task decodes a
 content-coded body as it writes it, so a source without codings returns
