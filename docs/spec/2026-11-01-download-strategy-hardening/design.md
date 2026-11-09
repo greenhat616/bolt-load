@@ -113,6 +113,11 @@
 | D12 | 下载途中资源变了（`ResourceChanged`） | **已修订（2026-11-09，维护者）：引擎只检测，以 `DownloadError::ResourceChanged` 失败（临时文件照常删掉，不回退）；从头重来移到引擎之上（客户端或 job 层），见 #195。** 原决定：任务内从头重来一次，和 §4.3 的回退一样：丢掉已写的数据、截断、刷新 adapter、重新探测，用新的 meta 再下一次；同一个任务里再变一次，就以 `DownloadError::ResourceChanged` 失败。T20 的“文件被替换 → 从头下载、hash 与新文件一致”在 C19 里以“下载途中被替换”端到端验证，“续传之前被替换”留给 C20（§11.2） | 已修订（2026-11-09，维护者），见 #195 |
 | D13 | adapter 的缓存怎么刷新 | **已修订（2026-11-09，维护者）：C19 不加 `refresh`；重来要的新 meta 怎么取，和重来一起在 #195 里定。** 原决定：`BoltLoadAdapter` 新增 `fn refresh(&self) {}`，默认什么也不做；reqwest 和 ureq2 覆盖它，丢掉缓存的探测结果。引擎在 D12 的从头重来之前调用，C20 在续传之前调用（§11.2） | 已修订（2026-11-09，维护者），见 #195 |
 | D14 | 验证器绑在哪 | **已移到 #195（2026-11-09，lead 按维护者对 D12、D13 的修订一并移走）：C19 不加 `range_stream_if`；没有 `refresh`，adapter 缓存的验证器不会变，共享 adapter 的任务看到的是同一个。** 原决定：绑在每个任务上，随每个请求传：`BoltLoadAdapter` 新增可选的 `range_stream_if(start, end, expected)`，默认调用 `range_stream`，所以自定义 adapter 照常工作，只是看不出资源变了。引擎从自己的 meta 取验证器和总长，传给每个 range 请求；reqwest 和 ureq2 实现它，`If-Range` 和响应检查都用传进来的验证器，不用 adapter 的缓存。`refresh()` 只影响调用者下一次 `retrieve_meta`，从不改变别的任务的 range（§14.23） | 已移到 #195（2026-11-09，维护者） |
+| D15 | 续传的公开 API | `TaskBuilder::resume(Resume)`；状态文件是 `<dest>.boltload`，所有 I/O 都在 `Initializing` 里。按 D16 的修订（2026-11-09），`Resume` 是 `Off`（默认）和 `On`，没有 `Auto`、`Required`（§11.5.2） | 已确认（2026-11-09，维护者），已按 D16 修订 |
+| D16 | 续传时不一致（验证器不同、没有可用的验证器、`total`、`source` 不同、头部坏了等） | **已修订（2026-11-09，维护者，和 #195 同一原则）：任务只提供机制，要么续上，要么以 `DownloadError::ResumeRejected { reason }` 失败，不改动文件；从头来、问用户、清理都由客户端或 job 层决定。** 原决定：丢掉旧的状态和部分文件、从头下载，`Required` 时失败（§11.5.1、§11.5.10） | 已修订（2026-11-09，维护者） |
+| D17 | 同一个目标的并发任务 | 整个任务期间对状态文件加独占的建议锁，`Off` 的任务也加，修 #152；批准新增一个锁的依赖（`fs4` 或 `fd-lock`，选哪个由实现定，§11.5.4 选了 `fs4`） | 已确认（2026-11-09，维护者） |
+| D18 | 状态文件的序列化 | **已修订（2026-11-09，维护者）：二进制格式，带 CRC，不用 `serde`、`serde_json`。头部有 magic、版本、`total`、选定的验证器（种类和值）、可选的 `source` 和头部 CRC；记录定长、各带 CRC，写到一半的残片按记录边界截掉；批准一个小的 CRC32C crate（§11.5.5 选了 `crc32c`）。** 原决定：`resume` feature，默认打开，用 `serde` 和 `serde_json` | 已修订（2026-11-09，维护者） |
+| D19 | 数据完整性 | 像磁盘或 ECC 内存那样：部分文件按定长的块各存一个 CRC32C；续传时重读每个保留的块并校验，对不上的块丢掉、重新下载（像坏扇区），校验过的块保留，每个丢掉的块都报告，原因是 `CrcMismatch`。不防篡改（§11.5.1、§11.5.6） | 已确认（2026-11-09，维护者） |
 | D20 | 带着数据断开的流是否还降并发 | 不降：只有 `Started` 之前失败的尝试和 429/503 是证据（§8.3） | 已确认（2026-11-13） |
 | D21 | 连续拒绝之后降到多少 | 降到已连接的 runner 数（§8.3） | 已确认（2026-11-13） |
 | D22 | 服务器明确限连（429/503）之后是否继续试探 | 继续，按退避拉开间隔（§8.3） | 已确认（2026-11-13） |
@@ -1071,13 +1076,13 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
   - 返回 `206`：继续下载；`206` 带的验证器和发出去的冲突时，返回 `ResourceChanged`。
   - 返回 `200`：验证器和发出去的相同，是忽略 Range（§4.3 的回退）；不同或没有，说明资源已经变了，返回 `ResourceChanged`。这种情况**不**走 §4.3 的单连接回退。
 - 维护者的决定（2026-11-09，§3 的 D12、D13、D14 已修订）：引擎只检测，任务丢掉已写的数据（删掉临时文件），以 `DownloadError::ResourceChanged` 失败。从头重来、刷新 adapter 缓存、共享 adapter 时每个任务的验证器，都移到引擎之上，见 #195。实现见 §14.23。
-- C20 续传之前也要比对验证器，要和 #195 一起设计（新的 meta、同一套验证器规则）。
+- C20 续传之前也要比对验证器（§11.5.7）：续传用新的 adapter 取新的 meta，比对头部存的验证器（种类和值），不一致就以 `ResumeRejected` 失败（D16 修订）；#195 定下 adapter 刷新的办法后一起改。
 
 ### 11.3 状态文件
 
 `<file>.boltload` 采用逐行追加的 JSON Lines 格式：
 
-- 第一行是头部：`{v, url, total, etag, last_modified}`；
+- 第一行是头部：`{v, url, total, etag, last_modified}`（C20 改成二进制格式，去掉了 `url`，换成调用方给的可选 `source`，见 §11.5.5）；
 - 之后每一行记录一个已写入并 `fsync` 过的区间。
 
 **不使用**注册表或其它 KV 存储。
@@ -1093,6 +1098,344 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 5. 可选：没有验证器（ETag、Last-Modified）时，用一个小的 range 请求取回前 2 KiB，和本地内容比对。
 
 依据：IDM 在续传前重建分片时，会把超长的分片文件截短（改进方案 §8 A4）。
+
+### 11.5 续传入口（C20）
+
+> 状态：设计已审过（2026-11-09，codex 设计审查第三轮 90 分通过，之后按它的 Minor 和建议修订），可以开始实现（tasks.md T21）。维护者的决定是 §3 的 D15–D19；其余是 lead 的决定，在下文标明，11.5.12 汇总了 lead 对第二版遗留问题的决定。
+
+#### 11.5.1 现状、约束和不做的事
+
+- 临时文件（下文叫“部分文件”）是 `<dest>.downloading`，只由 `OutputFile::new` 推导（`output_file.rs:61`）。失败、取消时 teardown 删掉它（`commit` → `discard`，改名失败也删），成功时改名成目标文件。单连接模式以 `truncate(true)` 打开它（`singleton_task.rs:70`），并发模式的 writer 以 `create(true)` 打开并 `set_len(total)`（`file_writer.rs:280`）。
+- 已写入的区间：C18 的 `ChunkPlanner::written`（§11.1、§14.21），只在 `WriteCompletion` 之后推进；writer 只在 `finalize` 时同步一次，没有中途的同步操作。`WriteCompletion` 只带区间（`pending_writer.rs:40`）。
+- 资源身份：meta 的 `etag`（强）和 `last_modified`，取自探测的 GET（§11.2、§14.23）。真正用于 `If-Range` 的验证器（`bolt_load_http::Validator`）只存在 adapter 的缓存里，meta 里没有：原样保存的 `last_modified` 不代表它能用（弱 ETag、没有或重复的 `Date`、离 `Date` 不到 1 s 时都不能用）。adapter 只探测一次（§14.23、#195）。
+- task-api-spec 的规则：builder 同步、不做 I/O（BUILD-5）；所有 I/O 都在 `Initializing` 里（§4.3）；一个 `Task` 是一次尝试（RERUN-1）；`TaskInfo` 在 `Initializing` 结束时发布（STATUS-3），回退时替换一次（STATUS-9）；teardown 删掉临时文件之后才发布终态（STATUS-6）；panic 时只发出取消信号、不等 worker（TASK-8）。
+- 引擎不知道 URL，meta 里没有。§11.3 头部的 `url` 改成调用方给的可选 `source`。
+- **不做的事（维护者，2026-11-09）**：续传只需要发现状态文件和部分文件之间的不一致，以及意外的损坏（掉电、写坏、磁盘坏块）。不防篡改：不签名、不混淆、不加 HMAC，这不是下载器的事。以后真要签名，由将来的客户端做，任务读的始终是原始的、不签名的状态。
+- **分层（维护者，2026-11-09，和 #195 同一原则）**：任务只提供机制，“从头来”不由它决定。续传时要么续上，要么以 `DownloadError::ResumeRejected { reason, .. }` 失败；从头来、问用户、清理文件，都是客户端或 job 层的事。
+
+#### 11.5.2 公开 API（D15，按 D16 修订）
+
+```rust
+/// Whether a task keeps what it downloaded when it does not finish, and
+/// continues from what an earlier task kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Resume {
+    /// Start from an empty file; delete it when the task does not finish.
+    #[default]
+    Off,
+    /// Keep the partial file and a state file when the task does not
+    /// finish; continue from them when they are there, or fail with
+    /// `DownloadError::ResumeRejected` when they cannot be continued.
+    On,
+}
+
+impl TaskBuilder {
+    pub fn resume(self, resume: Resume) -> Self;
+    /// An identity of the source, stored in the state file and compared on
+    /// resume: a different one rejects it. Optional.
+    pub fn resume_source(self, source: impl Into<String>) -> Self;
+}
+
+/// Remove what a task kept for `dest`: `<dest>.downloading` and
+/// `<dest>.boltload`. Takes the destination's lock; fails with `InUse`
+/// while a task holds it.
+pub async fn discard_partial(dest: impl AsRef<Path>) -> Result<(), DownloadError>;
+```
+
+```rust
+// A client's retry policy, above the task: resume, and start over only
+// when the kept files cannot be continued.
+let builder = Task::builder(fresh_adapter()).runtime(rt).save_to("big.iso").resume(Resume::On);
+match builder.spawn()?.await {
+    Err(DownloadError::ResumeRejected { reason, .. }) => {
+        warn!("cannot resume: {reason:?}; starting over");
+        bolt_load::task::discard_partial("big.iso").await?;
+        Task::builder(fresh_adapter()).runtime(rt).save_to("big.iso").resume(Resume::On).spawn()?.await?;
+    }
+    other => { other?; }
+}
+```
+
+- `Resume::On`：
+  - 没有状态文件，或者状态文件是这一次加锁时刚建的、或是空的（之前的任务崩在写头部之前）：正常的新开始，不是拒绝（lead 决定）。`TaskInfo::resumed` 是 `None`。
+  - 有状态文件：读入、检查（11.5.6），续上；不能续时以 `ResumeRejected` 失败，不改动任何文件。
+- 状态文件是 `<dest>.boltload`，也是目标的锁文件（11.5.4），只由 `OutputFile` 推导。`save_into` 时目标路径在 `Initializing` 里解析出来，之后一样。
+- builder 不做 I/O：`resume`、`resume_source` 只记下设置。
+- `prefer_mode(Singleton)` 的任务在 `On` 时走并发引擎、只用 1 个连接、带条件的 range 请求（lead 决定，11.5.8）。
+- 续传要新的 meta：用新的 adapter（文档写明，lead 决定）；#195 定下 adapter 刷新的办法后一起改。
+- 曾考虑过、没有采用：`Auto` / `Required`（第一版）——是否从头来是上层的决定（D16 修订）；显式的 `state_file(path)` / `resume_from(path)`；放进 `TaskOptions::resume`。
+
+#### 11.5.3 能续的条件
+
+一次尝试只在下列条件都满足时写状态文件（下文叫“可续”）：`Resume::On`；meta 的总长已知、非零；meta 没有内容编码；adapter 能用 Range；meta 有可用的验证器（11.5.7）；走并发引擎。不满足时，`On` 的任务照常下载，但不写状态、不做检查点，结束时按 `Off` 的规则清理。
+
+- 验证器超过格式的长度上限（11.5.5）也算“没有可用的验证器”：新开始时不可续，续传时 `ResumeRejected(NoValidator)`。这在任何破坏性的初始化之前判定。`resume_source` 的长度上限由 `TaskBuilder::validate` 检查（`BuildError::InvalidOptions`），不进到 `Initializing`。
+- **`TaskInfo::resumable: bool`**（lead 决定，Q1）：这一次是否写状态文件。`Initializing` 结束时设置：可续（新开始的头部已落盘，或者续传的记录已写回，11.5.5）时为 `true`，否则（`Off`、不满足上面的条件）为 `false`。回退到单连接（STATUS-9）替换 `info` 时变成 `false`（11.5.8）。为此，可续的新开始的准备（建部分文件、写头部，11.5.5）在 `Initializing` 里做，在发布 `info` 之前。
+
+#### 11.5.4 锁（D17，修 #152；C31）
+
+- **加锁**（每个任务，`Off` 也一样）：在 `Initializing` 里、解析出目标路径之后：
+  1. 先 `create_new` 打开 `<dest>.boltload`（读写）；已存在就以读写打开已有的。记下 `created`（这次是否新建，lead 决定）。
+  2. `try_lock_exclusive`（`fs4`）。三类失败分开处理（lead 决定，Q3）：
+     - **争用**（Unix `EWOULDBLOCK`，Windows `ERROR_LOCK_VIOLATION` 或打开时 `ERROR_SHARING_VIOLATION`）→ `DownloadError::InUse { path }`，不碰任何文件。
+     - **不支持锁**（Unix `ENOLCK`、`EOPNOTSUPP`/`ENOTSUP`，Windows `ERROR_NOT_SUPPORTED`、`ERROR_INVALID_FUNCTION`；部分网络文件系统）→ `On` 以 `DownloadError::Io { op: IoOp::Lock, .. }` 失败；`Off` 打 `warn!`、不加锁继续（这时 #152 不受保护，也不建锁文件之外的任何东西）。
+     - **权限或其它 I/O 错误**（`EACCES`、`EPERM`，Windows `ERROR_ACCESS_DENIED` 且不是删除挂起）→ 两种模式都以 `Io { op: IoOp::Lock }` 失败。
+  3. 核对：路径现在指向的就是这个句柄打开的文件（`same-file`，已在依赖树里：Unix 比 `dev`+`ino`，Windows 用 `GetFileInformationByHandle` 比卷序列号和文件索引）。不是（锁住的是一个已经被删掉或换掉的文件）就放锁、关掉、重来，最多 3 次，之后按争用处理。Windows 上打开一个“删除挂起”的文件会得到拒绝访问，也按争用重来。
+  4. 已有的文件长度为 0：当作“没有状态”（崩在写头部之前留下的空文件，没人持锁就是遗留物）。
+- **只经这个句柄读写**（lead 决定）：Windows 的 `LockFileEx` 是强制锁，同一进程里另开的句柄也读写不了被锁住的文件。所以状态文件的解析、截断、追加、`set_len` 全部经加锁的读写句柄（`pread` / `pwrite` 式的定位读写），不另开句柄。
+- **持有期间不删、不换**（审查 Major 1）：任务结束之前，状态文件只能经锁住的句柄清空（`set_len(0)` + `fsync`），不能删除或改名替换；否则别的任务可以在原路径上新建一个文件、加锁、核对通过，然后去改同一个部分文件。只在对部分文件的最后一次操作之后才删除它。
+- **结束**：对部分文件的最后一次操作（改名、删除或保留）之后，按 11.5.5 的顺序删除或保留状态文件，然后放锁。
+- **锁的所有权在 unwind 和取消之外**（审查 Major 8，lead 决定，C31 里做）：
+  - 锁放在 `drive::spawn` 的闭包里、`catch_unwind` 之外的一个槽里；`Initializing` 拿到锁后放进槽。attempt panic 时，panic 处理先取消，再**等**所有持有部分文件或状态文件的 worker（runner、writer、检查点）退出——它们各持一个 drain 用的 `WaitGroup` 克隆——然后才按 11.5.9 清理、放锁、发布终态。这改变了 TASK-8 的“只发信号、不等”，task-api-spec 一并改。
+  - 等待没有上限（lead 决定，Q2）：worker 都已被取消，只剩手上这一次文件操作。代价写明：某个 worker 卡死在一次文件操作上时，取消、panic 的收尾和锁都会一直挂着（互斥仍然成立）。drain 只等 `WaitGroup`，不依赖任何可能已在 unwind 中销毁的队列、通道或执行器：worker 在线程池（`blocking`、threaded runtime）上自己跑完，退出时放下自己的克隆。
+  - `Initializing` 里的文件操作（加锁、读、截断、写头部、建部分文件）不和取消赛跑：`async_fs` 的操作落在 `blocking` 线程上，丢掉 future 停不下已经提交的操作。每一步之间检查取消；只有长的 CRC 校验（11.5.6）按块检查取消。
+- **依赖：`fs4`**：`try_lock_exclusive` / `unlock` 作用在 `std::fs::File` 上，锁跟着句柄走，句柄关闭（包括进程崩溃）就释放；不用像 `fd-lock` 那样跨整个任务持有一个借用文件的 guard。只用同步的部分（`default-features = false`，feature 名实现时核对）；底层的 `rustix`、`windows-sys` 已经在依赖树里。标准库的 `File::try_lock` 在 1.89 才稳定，本仓库 MSRV 是 1.88（审查已核实），MSRV 提高之后可以换掉 `fs4`。
+- **`Off` 的要求**：`Off` 现在也要在目标目录里建 `<dest>.boltload`（要能写目标目录，只读目录本来就建不了 `.downloading`，不是新限制）。文件系统不支持锁时 `Off` 不加锁继续（上面第 2 步）；权限错误照常失败。
+
+#### 11.5.5 状态文件格式（D18 修订）和崩溃安全的顺序
+
+**格式**（二进制，小端；`serde`、`serde_json` 不再需要）：
+
+```text
+header:
+  magic        [u8; 8]  = b"BOLTLOAD"
+  version      u16      = 1
+  flags        u16      = 0 (reserved)
+  block_size   u32      (D19, 11.5.6)
+  total        u64
+  validator    u8 kind (1 = strong ETag, 2 = Last-Modified) + u16 len + bytes (len <= 1024)
+  source       u16 len (0xFFFF = none) + bytes (len <= 4096)
+  header_crc   u32      CRC32C of every header byte before it
+record (24 bytes, repeated until EOF):
+  index        u64      block number
+  len          u32      block length: block_size, or less for the last block
+  data_crc     u32      CRC32C of the block's bytes in the partial file
+  kind         u8 = 1 (complete block), [u8; 3] reserved = 0
+  record_crc   u32      CRC32C of the 20 bytes before it
+```
+
+- 头部校验失败 → `ResumeRejected(BadHeader)`：magic、版本不对；`flags` 不为 0（不认识的标志）；验证器种类不是 1 或 2；长度超过上限；`header_crc` 不对；`block_size` 不是本版本支持的。
+- 长度上限：验证器 1024 字节，`source` 4096 字节。写入方不会写出超过上限的头部：验证器超长按“没有可用的验证器”处理（11.5.3），`source` 超长在 `validate` 时就拒绝。
+- 块的偏移一律用检查过的算术（`checked_mul`、`checked_add`）：`index * block_size` 溢出或超出 `total` 的记录按 `OutOfBounds` 丢弃，不会进到减法或 planner。
+- 记录定长、各带 CRC：文件末尾不足 24 字节的残片（写到一半掉电）按记录边界截掉（审查 Major 4）；`record_crc` 不对、`kind`/保留字节不对、`index` 越界、`len` 和该块应有的长度不符（包括 0）的记录丢弃，报告带位置（11.5.10）。
+- 同一块的完全相同的记录去重（正常情况下不会出现，见下面的检查点）。同一块出现 `data_crc` 不同的有效记录时，这一块在整个扫描里都标为冲突：已经接受的那条撤掉，之后再出现的任何记录（包括和最早那条相同的）都不接受，都按 `Conflict` 报告（审查第二轮 Minor 6）。块是对齐的，§11.4 第 1 步的“部分重叠”在这个格式里不会出现。
+- 依赖：`crc32c`（维护者批准一个小的 CRC32C crate）。选它：x86_64 用 SSE4.2、aarch64 用 ARMv8 CRC 指令，其余平台软件实现；提供 `crc32c_append` 和 `crc32c_combine`（11.5.6 拼接块的 CRC 要用）；没有运行时依赖。版本和维护状态实现时核对。
+- **不设 `resume` feature**（lead 决定，Q4）：没有了 `serde`，续传只多 `crc32c` 一个很小的依赖；锁（`fs4`）不管开不开续传都要。留一个 feature 只会多出要测的组合。
+
+**顺序**（Unix 上新建、改名、删除之后都 `fsync` 父目录；Windows 没有目录同步，靠 NTFS 的元数据日志，写进已知限制）。下面的“作废”都是：经锁住的句柄 `set_len(0)`，再 `fsync` 状态文件。
+
+- **新开始，可续**（审查 Major 2）：
+  1. 有旧状态（长度非 0）先作废——在动部分文件之前；
+  2. 以 `truncate(true)` 建或打开部分文件，`set_len(total)`，`fsync` 部分文件；
+  3. 经锁住的句柄写头部，`fsync` 状态文件；
+  4. `fsync` 父目录（两个文件的目录项都可能是新的）；
+  5. 之后才开始下载和检查点。
+
+  崩在 1 之前：旧状态还在、部分文件没动，仍然一致。崩在 1、2 之间或 2、3 之间：状态是空的（没状态），部分文件是什么都无所谓。崩在 3、4 之间：头部可能落盘而目录项没有，下次看不到部分文件 → `ResumeRejected(MissingPartial)`，安全。
+- **新开始，不可续**（`Off`，或 `On` 但不满足 11.5.3）：有旧状态先作废；之后部分文件照现在的方式建（单连接 `truncate`，并发 `create` + `set_len`）；不写头部。
+- **检查点**（可续时，见 11.5.6）：串行，同一时刻最多一个；追加位置 `end` 由任务记着（审查 Major 4）：
+  1. 取此刻新完整的块（全部字节都在 `written` 里、还没记过的块）和它们的 CRC；
+  2. writer `sync`（数据）；
+  3. 从 `end` 开始经锁住的句柄写这些记录，`fsync` 状态文件；
+  4. 成功：`end` 前移，这些块记为已记录（`durable`）。
+
+  2 或 3 失败：经锁住的句柄 `set_len(end)` 回滚到上次的位置，再 `fsync` 状态文件，块仍算没记录，下次检查点再试。回滚的截断或它的 `fsync` 失败时，这个任务不再做检查点：状态文件在 `end` 之前仍然有效，之后可能留下的记录要么是残片（读入时按记录边界截掉）、要么 CRC 不对（丢掉）、要么是完整有效的记录——后者描述的块的数据已经在第 2 步同步过（第 2 步失败时第 3 步不会执行），续传时还会逐块校验，所以不会把没落盘的数据当真。检查点失败不让下载失败，只打 `warn!`（lead 决定，Q5）；数据写入本身出错时，writer 照常报 `Write`。
+- **续传**（11.5.6 的检查之后，审查 Major 3、第二轮 Minor 3）：在改动部分文件之前（`set_len(total)`、任何写入），把清理过的记录写回去：
+  1. 经锁住的句柄 `set_len(头部长度)`，`fsync` 状态文件——旧记录先确实没了；
+  2. 按顺序写入接受的记录，`fsync` 状态文件；
+  3. 之后才动部分文件。
+
+  第 1 步改动状态文件之前，任务进入阶段 C（11.5.9）。崩在 1 之后、2 完成之前：状态里只有头部和接受记录的一个前缀，全是校验过的块；被丢的记录不会在下一次续传时又被当真。1 或 2 失败（包括截断成功而它的 `fsync` 失败）：任务以 `Io` 失败；部分文件没动过，状态文件是它实际剩下的样子（头部，加上接受记录的一个前缀）；头部没被改动，所以按 11.5.9 的规则 `kept_for_resume` 指向部分文件。只有第 1 步之前的失败才是 B2 的“两个文件都没动”。
+- **完成**（审查第二轮 Major 1、Major 2）：
+  1. writer `finalize`（同步）；
+  2. 改名部分文件 → 目标文件。成功之后进入“已发布”阶段（P，11.5.9），任务的结果就是 `Finished`，之后的步骤都不改变它；
+  3. `fsync` 目标所在的目录（Unix）；
+  4. 截断状态：经锁住的句柄 `set_len(0)`；
+  5. `fsync` 状态文件；
+  6. 删除状态文件（仍持锁）；
+  7. `fsync` 父目录；
+  8. 放锁。
+
+  第 3–7 步任何一步失败：打 `warn!`，照常做后面的步骤，结果仍是 `Finished`（审查第三轮 Minor 1，分开每一步）。
+
+  **紧接着的下一次 `On`**（没有掉电，看到的是文件系统当前的样子；同步失败不影响它）：
+
+  | 4 截断 | 6 删除 | 下一次 `On` 看到 | 结果 |
+  | --- | --- | --- | --- |
+  | 任意 | 成功 | 没有状态文件 | 新开始 |
+  | 成功 | 失败 | 空的状态文件 | 新开始 |
+  | 失败 | 失败 | 有效的状态，部分文件已改名 | `ResumeRejected(MissingPartial)`，由上层清理（目标文件已经完整） |
+
+  **掉电之后**（没同步的操作可能丢）：
+  - 改名没落盘（3 没完成或失败）：部分文件回到原名、目标文件不在。状态若已落盘作废（4、5 都完成）或已删除 → 新开始；状态仍有效（4 或 5 没完成）→ 正常续传：每块 CRC 都对，全部保留，再走一次完成。
+  - 改名已落盘：状态有效（4 或 5 没完成、删除也没落盘）→ `ResumeRejected(MissingPartial)`；状态是空的 → 新开始；状态不在（删除已落盘）→ 新开始。
+  - 所以下一次 `On` 只可能是：新开始（状态不在或为空）、正常续传（改名回退、状态有效）、`MissingPartial`（改名已生效、状态有效）。三种都安全。
+
+  `Off` 的完成：改名 → 删除锁文件 → 放锁，和现在一样不同步目录（`Off` 没有需要一致的状态）。
+- **回退到单连接**（11.5.8）：回退开始之前作废状态（不删，仍是锁），之后不再写；结束时删除。
+- **丢弃**（不可续的失败、取消，`ResourceChanged`；`discard_partial` 也走这个顺序）：作废状态（`set_len(0)` + `fsync`）→ 删部分文件 → `fsync` 父目录 → 删状态文件 → `fsync` 父目录 → 放锁。
+  - 作废失败：不删部分文件（否则留下一个有效的状态指向不存在的部分文件），任务按原来的错误结束，`warn!`；两个文件都留着，下一次 `On` 照常检查（CRC 会挡住不一致的块）。`discard_partial` 这时返回 `Io` 错误。
+  - 删部分文件失败：`leftover_temp_file` 报告它（阶段 D 的现有规则）；状态已作废，下一次当作没有状态。`discard_partial` 返回 `Io` 错误。
+  - 删状态文件失败：`warn!`，它已是空的，下一次当作没有状态（Q6）。
+
+#### 11.5.6 数据完整性：按块的 CRC（D19）
+
+- **块**：部分文件按 `block_size` 对齐分块，最后一块可以较短。默认 1 MiB（`2^20`），写进头部；续传时头部的 `block_size` 和本版本支持的不同（将来改默认值时）→ `ResumeRejected(BadHeader)`。
+  - 取舍：块越小，坏一块要重下的越少；块越大，记录越少、检查点追加越少。1 MiB 时 1 GiB 文件 1024 条记录（24 KiB），100 GiB 2.4 MB；一个块坏了重下 1 MiB。4 MiB 记录少到四分之一，但崩溃时每个没写满的块最多丢的也变成 4 MiB。
+- **只记完整的块**（lead 决定）：检查点只记全部字节都已写入的块，部分写入的块不记。代价按块算：崩溃时每个没写满的块最多丢 `block_size - 1` 字节已写的数据，要重下（审查第二轮 Minor 4：没写满的块有多少，取决于切分和重试留下的空洞，不只是连接数，这里不给更强的上界）。换来的是记录定长、不需要“部分块的记录被后来的完整记录取代”的规则。另一种做法是给部分写入的区段单独记 CRC，格式和替代规则都更复杂，不采用。
+- **CRC 从内存里的数据算**：提交写入时对这一帧（planner 裁剪之后真正写入的字节）算 CRC32C，跨块边界的帧在边界处拆成几段分别算，随 `WriteCompletion` 带回（`WriteCompletion` 加 CRC 段）；只有成功的写才算，失败的写（包括写了一部分再出错的）一段都不算。对冲中败方的帧在 writer 之前就丢了（§9.6），不会进来。前提是 C18 的不变式：成功写入的区间互不重叠（审查第二轮确认）。
+  - 帧最多 32 KiB（runner 攒满才交），最后一帧、中断时的帧、被 planner 裁剪的帧更小（审查第二轮 Minor 4）。
+  - 每个没写满的块记一组按偏移排好、互不相邻的段 `(offset, len, crc)`；完成的写到达时，和左右相邻的段用 `crc32c_combine` 立刻合并，所以一块里的段数等于其中空洞数加一，按顺序写的块始终只有一段。块写满时只剩一段，就是整块的 CRC。
+  - 上限：每块最多 64 段，全部块合计最多 16384 段。超过时，这一块（合计超了就挑段最多的块）丢掉它的段，改为“回读”：检查点时在数据同步之后从部分文件读出整块算 CRC。内存因此有界，块照样能记。
+  - 不选“一律回读”：每个字节多读一遍；续传时本来就要回读校验。
+- **续传时逐块校验**（维护者）：每个保留下来的块从部分文件读出来算 CRC32C，和记录比对。对不上的块丢掉、重新下载，像坏扇区一样，报告 `CrcMismatch`；对得上的保留。超出部分文件长度的块丢掉（`BeyondFileLength`）。这一步代替了第一版的“文件长度检查”和审查 Major 9 的“部分文件身份”：保留下来的字节本身都校验过了。
+  - 代价：保留的每个字节读一遍（硬件 CRC 很快，瓶颈是磁盘）；大文件要一段时间，在 `Initializing` 里按块检查取消。
+- **保证的范围**：能发现掉电、写坏、坏块、被外部改动过的块（意外的，11.5.1 的不做的事）；CRC32C 不是加密哈希，故意构造的碰撞不在范围内。
+
+#### 11.5.7 验证器（审查 Major 5）
+
+- meta 新增 `validator: Option<Validator>`：adapter 实际用于 `If-Range` 的那个（种类和值），`None` 表示没有可用的。`Validator` 从 `bolt-load-http` 移回 core（http 里留一个 re-export），adapter 探测时设置它（新提交，见 11.5.11）。
+- 头部存这个验证器（种类和值）。续传时和新 meta 的 `validator` 比对：种类相同；强 ETag 逐字节相同；Last-Modified 按日期相同。不同 → `ResumeRejected(ValidatorMismatch)`；新 meta 没有可用的验证器 → `ResumeRejected(NoValidator)`（D16 修订）。不再拿原样保存的 `last_modified` 去比。
+- 比对通过，续传的 range 请求照常带 adapter 的 `If-Range`；续传途中 `ResourceChanged` 照 D12 修订后的规则失败，按 11.5.5 的“丢弃”清理（数据属于旧版本）。
+
+#### 11.5.8 单连接与回退（审查 Major 6）
+
+- `full_stream` 的字节从不进检查点：单连接的响应没有验证器（`FullResponse` 不带），绑定不到头部的验证器上；内容编码也可能只在这个响应里出现。所以单连接模式（包括回退之后）从不写状态。
+- `On` 的单连接下载（`prefer_mode(Singleton)`）改走并发引擎、最多 1 个连接、带 `If-Range` 的 range 请求，满足 11.5.3 时可续；不满足（比如不能用 Range）就照常走单连接、不可续。
+- 回退到单连接：按 11.5.5 作废状态，之后不可续；结束时清理同不可续。
+- 实际的 body 需要解码时（并发引擎里编码的 range 本来就会回退，§4.3），同上，不做检查点。
+
+#### 11.5.9 结束时的文件和报告（审查 Major 7，按所有权的阶段）
+
+阶段：A 还没拿到锁；B1 新开始，拿到锁、头部还没落盘（11.5.5 新开始的第 3 步完成之前）；B2 续传，拿到锁、还在检查（写回改动状态文件之前，这时任务没改动任何文件）；C 可续（新开始的头部落盘之后；续传在写回改动状态文件之前进入——写回不和取消赛跑，中途崩溃也只留下头部和校验过的前缀）；D 不可续（`Off`、不满足 11.5.3、回退之后）；P 已发布（改名成功之后，审查第二轮 Major 2）。
+
+| 结果 | 阶段 | 部分文件和状态文件 | `kept_for_resume` | `leftover_temp_file` |
+| --- | --- | --- | --- | --- |
+| `Finished` | C、D → P | 改名；之后按 11.5.5 的“完成”作废并删除状态 | `None` | `None` |
+| 改名之后的步骤出错（目录同步、截断、状态同步、删除、目录同步） | P | 目标文件保留；`warn!`；结果仍是 `Finished`（11.5.5 的“完成”） | `None` | `None` |
+| `Panicked` | P | 同上；终态是 `Finished`，不是 `Failed(Panicked)` | `None` | `None` |
+| `InUse`、失败、取消、`Panicked` | A | 不碰（还没拥有任何文件） | `None` | `None` |
+| `ResumeRejected` | B2 | 不碰（任务没改动它们） | `None`（这一对续不上） | `None` |
+| 失败、取消、`Panicked`（比如校验时） | B2 | 不碰 | `None`（还没确认可续；两个文件原样留着，下次照常检查） | `None` |
+| 失败、取消、`Panicked` | B1 | 丢弃（11.5.5） | `None` | 删不掉的部分文件 |
+| 写回失败（`Io`） | C | 部分文件没动；状态是实际剩下的（头部加接受记录的前缀，11.5.5 的“续传”） | 部分文件的路径（头部有效） | `None` |
+| 失败、取消、`Panicked`（等 worker 退出后） | C | teardown 先做一次检查点，两者都留 | 部分文件的路径 | `None` |
+| 改名失败（`Io { op: Rename }`） | C | 两者都留（部分文件是完整的，续传会全部校验通过、再改名） | 部分文件的路径 | `None` |
+| `ResourceChanged` | C | 丢弃（数据属于旧版本） | `None` | 删不掉的部分文件 |
+| 失败、取消、`Panicked`、改名失败 | D | 丢弃（和现在一样，`OutputFile::commit` 的各个错误路径不变） | `None` | 删不掉的部分文件 |
+
+- `kept_for_resume` 只在“部分文件存在、状态文件头部有效”的一对上设置（lead 决定）。teardown 的检查点失败不影响它：状态在上次成功的检查点之前仍然有效。
+- `OutputFile::commit` 要按阶段分支：阶段 C 时失败不删部分文件，改名失败也不删。
+- **panic 也按这张表**（审查第三轮 Minor 3）：阶段和清理所需的东西（锁、两个路径、阶段；到了 P 还有任务的输出）放在 `catch_unwind` 之外的槽里，由 `Initializing` 和各个阶段转换时更新。panic 处理取消、等 worker 退出（11.5.4）之后，按槽里的阶段做表里 `Panicked` 那一行：A、B2 不碰任何文件，B1、D 丢弃，C 两者都留（不做 teardown 检查点：状态在上次成功的检查点之前有效），P 保留目标文件、完成剩下的“完成”步骤、终态发布 `Finished`。
+- 状态文件删不掉（丢弃或完成时）：打 `warn!`，不新增状态字段（lead 决定，Q6）；它已经被作废（长度 0），下次加锁时当作没有状态（11.5.4 第 4 步）。作废本身也失败时的结果见 11.5.5 的“完成”和“丢弃”。
+
+#### 11.5.10 续传前的检查和报告（§11.4）
+
+在 `Initializing` 里，取到新的 meta、选好模式、解析出目标路径、拿到锁之后，发出任何 range 请求之前：
+
+0. 状态文件是这次新建的或长度为 0 → 新开始（11.5.2）。部分文件不存在 → `ResumeRejected(MissingPartial)`。
+1. 头部（11.5.5）→ 不对就 `BadHeader`。
+2. 和新 meta 比对：`total`（`TotalMismatch`）、`source`（`SourceMismatch`）、验证器（`ValidatorMismatch`、`NoValidator`）；还有 11.5.3 的其它条件：内容编码（`ContentCoded`）、总长未知（`UnknownSize`）、不能用 Range（`RangeUnsupported`）。任何一条不过 → `ResumeRejected`，不改动文件（D16 修订）。§11.4 把 `total` 排在第 3 步，这里提前，因为它否决整个状态。
+3. 逐条记录（11.5.5）：残片截掉、坏记录丢弃、完全相同的去重、冲突的两条都丢（§11.4 第 1 步：越界的 `index` 在这里丢，`OutOfBounds`）。
+4. 逐块校验数据（11.5.6）：超出部分文件长度的丢（§11.4 第 2 步，`BeyondFileLength`），CRC 不对的丢（`CrcMismatch`）。
+5. 写回清理过的记录（11.5.5），然后 `set_len(total)`，`ChunkPlanner` 以保留的块作为已下载、已写入、已持久化，只规划其余部分。
+6. 报告（§11.4 第 4 步），不静默：
+
+```rust
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ResumeReport {
+    pub state_file: PathBuf,
+    /// The ranges continued from, merged.
+    pub kept: Vec<Range<u64>>,
+    pub kept_bytes: u64,
+    /// The records dropped, in file order.
+    pub dropped: Vec<DroppedRecord>,
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DroppedRecord {
+    /// The byte offset of the record in the state file.
+    pub position: u64,
+    pub reason: DropReason,
+    /// The block the record names, when it could be read.
+    pub range: Option<Range<u64>>,
+}
+
+#[non_exhaustive]
+pub enum DropReason { TornTail, BadRecord, Conflict, OutOfBounds, BeyondFileLength, CrcMismatch }
+
+#[non_exhaustive]
+pub enum RejectReason {
+    MissingPartial, BadHeader, TotalMismatch, SourceMismatch, ValidatorMismatch, NoValidator,
+    ContentCoded, UnknownSize, RangeUnsupported,
+}
+
+// DownloadError::ResumeRejected { reason: RejectReason, state_file: PathBuf }
+```
+
+- 记录在构造时就拒绝空的、反向的区间（`len == 0`、越界），不会进到减法或 planner 里（审查 Minor 10）。
+- `TaskInfo::resumed: Option<ResumeReport>`：续上了才是 `Some`（哪怕所有记录都被丢了、`kept` 为空）；新开始、`Off` 时是 `None`。每个丢弃都打一条 `warn!`。放在 `TaskInfo` 里，是因为它发布之后每个快照都带着，不会因为状态通道合并而丢。
+- 拒绝发生在 `Initializing`，不发布 `Downloading`：原因在 `ResumeRejected` 里（审查 Minor 11）。
+- 回退（STATUS-9）替换 `info` 时 `resumed` 变成 `None`、`resumable` 变成 `false`：保留的区间随回退作废，进度从零开始。
+- `TaskInfo` 新增的两个公开字段：
+
+```rust
+pub struct TaskInfo {
+    // … existing fields …
+    /// Whether this attempt keeps a state file for a later resume
+    /// (design §11.5.3); `false` after a fallback.
+    pub resumable: bool,
+    /// What the task continued from, when it resumed (design §11.5.10).
+    pub resumed: Option<ResumeReport>,
+}
+```
+
+#### 11.5.11 测试（T21）
+
+- **G9**：本地服务器、确定性内容；在随机字节位置（种子决定）取消任务，再用新的 adapter 续传，最终 hash 正确；至少 20 个种子，三种客户端都跑。位置包括：第一次检查点之前、检查点进行中、改名失败之后。
+- **反复续传**：取消、续传、再取消、再续传若干次，hash 正确，每次的 `kept` 不减少（除非有块被丢）。
+- **进程崩溃**：测试进程用 `std::process::Command` 再起一个自己（按环境变量进入“只下载”模式），在随机时刻杀掉，然后在父进程续传，hash 正确。
+- **跨进程的锁**：子进程持锁时，父进程的任务以 `InUse` 失败；子进程被杀之后，父进程能拿到锁。
+- **三种坏状态**（各一个测试，断言报告、`warn!` 和最终 hash）：冲突的记录（同一块不同 CRC）→ `Conflict`；越界的块号 → `OutOfBounds`；部分文件被截短 → `BeyondFileLength`。另加：部分文件里翻转一个字节 → 那一块 `CrcMismatch`、重新下载；残片 → `TornTail`、被截掉，之后的追加正常；坏的记录 CRC → `BadRecord`。
+- **拒绝**：`total` 不同、`source` 不同、验证器不同、没有验证器、头部坏了、部分文件不在、内容编码、不能用 Range，各一个：以 `ResumeRejected` 失败，两个文件都没被改动。
+- **检查点出错**：注入的 writer 让 `sync` 失败、注入的状态文件让追加或 `fsync` 失败：回滚到上次的位置，之后的检查点正常，续传 hash 正确；回滚也失败时不再做检查点，状态在上次之前仍然有效。
+- **顺序**：新开始时，旧状态在部分文件被截断之前已经作废（注入的文件操作记录先后）；续传时，清理过的记录在 `set_len` 和第一次写之前已经写回。
+- **锁（C31）**：同一进程两个任务；删锁文件的竞争（核对文件 ID）；panic 之后，worker 退出之前锁一直被持有（第二个任务 `InUse`），之后才释放；`Initializing` 里取消时锁正常释放；权限错误报 `Io { op: Lock }` 而不是 `InUse`；崩溃留下的空锁文件被当作没有状态。
+- **结束时的文件**：11.5.9 表里每一行一个测试，断言两个文件是否存在、`kept_for_resume`、`leftover_temp_file`。
+- **改名之后的每一步出错**（审查第二轮 Major 1、2，第三轮 Minor 1）：注入 11.5.5“完成”第 3–7 步各自失败，以及截断和删除同时失败；结果都是 `Finished`、目标文件完整、`kept_for_resume` 和 `leftover_temp_file` 都是 `None`；紧接着再跑一个 `On` 任务，按“紧接着的下一次 `On`”那张表断言：删除成功 → 新开始；截断成功、删除失败（包括截断后同步失败）→ 新开始；截断和删除都失败 → `ResumeRejected(MissingPartial)`。掉电后的“改名回退、状态有效”用构造的文件模拟：把目标文件放回部分文件的名字、留着有效的状态，`On` 正常续传、全部块保留、hash 正确。
+- **写回失败**：注入写回的截断成功而 `fsync` 失败、或写记录失败：任务以 `Io` 失败，部分文件没动，状态是头部加接受记录的前缀，`kept_for_resume` 指向部分文件；之后再续传正常。
+- **panic 的每个阶段**：在 A、B1、B2、C、D、P 各注入一次 panic，断言 11.5.9 表里 `Panicked` 那一行（P 的终态是 `Finished`）。
+- **写回和回滚的同步**：注入的状态文件记录 `set_len` 和 `fsync` 的先后：写回时截断的 `fsync` 在第一条记录写入之前；回滚的截断之后有 `fsync`。
+- **冲突的记录**：同一块的记录序列 `A,B,A`、`A,A,B`、`B,A,A`、`A,B,B` 等排列，这一块都不接受，每条都报 `Conflict`（完全相同的重复除外，见 11.5.5）。
+- **格式上限**：不认识的 `flags`、验证器种类 → `BadHeader`；超长的验证器 → 新开始时不可续、续传时 `NoValidator`；超长的 `source` → `validate` 失败；块号乘出溢出 → `OutOfBounds`。
+- **CRC 对文件**（直接比对：任务结束后，用状态文件的每条记录和部分文件逐块算的 CRC 对照）：完成乱序到达；一帧跨两块；写了一部分再出错的写；mmap 后端的 `sync`；被 planner 裁剪、反复切分留下的短帧；对冲败方的帧；段数超过上限后改为回读的块。
+- **锁的三类失败**：争用 → `InUse`；不支持锁（注入）→ `On` 以 `Io { op: Lock }` 失败、`Off` 照常下载并 `warn!`；权限错误 → 两种模式都 `Io { op: Lock }`。
+- **`discard_partial`**：按“丢弃”的顺序；作废失败时不删部分文件、返回错误；有任务持锁时 `InUse`。
+- **`resumable`**：可续的新开始和续传为 `true`；`Off`、没有验证器、不能用 Range 时为 `false`；回退之后为 `false`。
+
+#### 11.5.12 lead 对第二版遗留问题的决定（2026-11-09）
+
+1. **Q1**：新增 `TaskInfo::resumable`（11.5.3、11.5.10）。`On` 但不满足 11.5.3 时照常下载、不可续，不以 `ResumeRejected` 失败——否则 `On` 在不支持 Range 的服务器上下不了文件。
+2. **Q2**：panic 时等 worker 退出才放锁，不设上限（11.5.4，代价写明）；审查发现卡死的风险再议。
+3. **Q3**：不支持锁的文件系统上，`Off` 打 `warn!`、不加锁继续，`On` 失败；争用、不支持锁、权限错误三类分开（11.5.4）。
+4. **Q4**：不设 `resume` feature（11.5.5）。
+5. **Q5**：检查点失败只 `warn!`，回滚或停用检查点，不让下载失败（11.5.5）。
+6. **Q6**：状态文件删不掉只 `warn!`，不新增状态字段（11.5.9）。
+
+#### 11.5.13 提交拆分（建议）
+
+C20 太大，按顺序拆成五个提交，每一步树都是绿的：
+
+1. **PR-9c 锁（#152）**：C31 `fix(task)!: lock a destination for the whole task`。`fs4`、`same-file`；11.5.4 的加锁、核对、`created`、空文件、只经句柄读写、`InUse`、`Io { op: Lock }`；锁槽在 `catch_unwind` 之外，panic 时等 worker 退出（改 TASK-8）；`Initializing` 的文件操作不和取消赛跑；结束时作废并删除锁文件；`Off` 在动部分文件之前作废旧状态。测试：11.5.11 的“锁”，加跨进程的锁。带 `!`：同一目标的第二个任务改为 `InUse` 失败；`Off` 会清掉旧的状态文件；目标旁边多了一个任务期间存在的 `<dest>.boltload`；锁文件的权限错误会让 `Off` 失败（不支持锁时 `Off` 照常继续）。
+2. **PR-9d 续传**，四个提交：
+   1. C34 `feat(core): carry the If-Range validator in adapter meta`。`Validator` 移回 core（http 里 re-export）；`BoltLoadAdapterMeta::validator`；两个 adapter 设置它。不破坏兼容（`#[non_exhaustive]` 的结构体加字段，类型路径保留 re-export）。
+   2. C32 `feat(task): checksum and sync written blocks at checkpoints`。`crc32c`；writer 的 `sync`（三个后端）；`WriteCompletion` 带 CRC；块的 CRC 拼接；已记录的块（`durable`）；串行的检查点调度（8 MiB / 2 s / teardown）和回滚的钩子，交给 crate 内部的接收者；`TaskOptions` 的检查点字段。没有接收者时不调度、不同步。基准：C13 的基准加一组“打开检查点”，测同步和 CRC 的开销，记进 §14。
+   3. C33 `feat(task): write a state file while downloading`。二进制格式；11.5.5 的新开始、检查点追加和回滚、回退、完成、丢弃的顺序；11.5.9 的表；`OutputFile::commit` 按阶段分支；`kept_for_resume`；`discard_partial`（走“丢弃”的顺序）；`On` 的单连接改走并发引擎（11.5.8）；CRC 段的合并和上限（11.5.6）在 C32。`Resume` 先是 crate 内部的（测试打开），只写不读。
+   4. C20 `feat(task): resume from a checked state file`。公开 `Resume`、`resume`、`resume_source`；11.5.10 的读入、比对、逐块校验、写回；`ResumeReport`、`DroppedRecord`、`RejectReason`、`DownloadError::ResumeRejected`、`TaskInfo::resumed`、`TaskInfo::resumable`；STATUS-12、STATUS-13；11.5.11 的其余测试；README 和 `docs/task.md`。
+3. 提交号暂定，冲突时顺延。task-api-spec §4.3 的初始化顺序和 TASK-8 的修改随 C31（锁、阶段槽）和 C33、C20（准备和检查）落地。每一步照常跑 fmt、四种 clippy 配置、两次工作区测试、doc；C32 另跑基准。
 
 ---
 
