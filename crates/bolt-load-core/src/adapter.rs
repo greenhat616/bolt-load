@@ -60,6 +60,11 @@ pub struct BoltLoadAdapterMeta {
     /// not `identity`. The content size then counts encoded bytes, and the
     /// task downloads over one connection until the stream ends.
     pub content_encoding: Option<String>,
+    /// The strong `ETag` of the resource, as the server sent it, quotes
+    /// included; a weak one is not kept.
+    pub etag: Option<String>,
+    /// The `Last-Modified` of the resource, as the server sent it.
+    pub last_modified: Option<String>,
 }
 
 impl BoltLoadAdapterMeta {
@@ -70,6 +75,8 @@ impl BoltLoadAdapterMeta {
             content_size,
             filename: None,
             content_encoding: None,
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -82,6 +89,19 @@ impl BoltLoadAdapterMeta {
     /// Set the content coding; an `identity` value is dropped.
     pub fn with_content_encoding(mut self, content_encoding: Option<String>) -> Self {
         self.content_encoding = content_encoding.filter(|value| !is_identity(value));
+        self
+    }
+
+    /// Set the strong `ETag`. A weak one, `W/"…"`, is dropped: it cannot
+    /// make a range request conditional.
+    pub fn with_etag(mut self, etag: Option<String>) -> Self {
+        self.etag = etag.filter(|value| !value.trim_start().starts_with("W/"));
+        self
+    }
+
+    /// Set the `Last-Modified`.
+    pub fn with_last_modified(mut self, last_modified: Option<String>) -> Self {
+        self.last_modified = last_modified;
         self
     }
 }

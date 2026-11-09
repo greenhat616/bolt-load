@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use axum::{
@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 
 use super::fault::{
     CONGESTED_RETRY_AFTER_SECS, Gate, LimitMode, RangeFault, THROTTLED_BYTES_PER_SEC,
+    VALIDATED_DATE,
 };
 
 /// Create a random file with given size, useful for testing
@@ -167,6 +168,8 @@ struct FaultState {
     hold: Option<Gate>,
     /// Whether [`RangeFault::StalledOnce`] already stalled a response.
     stalled: Arc<AtomicBool>,
+    /// The version the faults of [`RangeFault::VALIDATED`] serve, from 1.
+    version: Arc<AtomicUsize>,
     log: RequestLog,
 }
 
@@ -179,6 +182,8 @@ pub struct RecordedRequest {
     pub fault: Option<RangeFault>,
     /// The requested range as `(first, last)`; `None` without `Range`.
     pub range: Option<(u64, u64)>,
+    /// The `If-Range` the request sent.
+    pub if_range: Option<String>,
     pub status: StatusCode,
 }
 
@@ -229,6 +234,7 @@ pub async fn create_range_fault_server_with_log(
         replaced: Arc::new(AtomicBool::new(false)),
         stalled: Arc::new(AtomicBool::new(false)),
         congested_once: Arc::new(AtomicUsize::new(0)),
+        version: Arc::new(AtomicUsize::new(1)),
         hold,
         log: log.clone(),
     };
@@ -379,6 +385,234 @@ fn congested() -> Response {
         .into_response()
 }
 
+/// What a response of a fault of [`RangeFault::VALIDATED`] says about the
+/// version it serves, from one snapshot: its `Date`, and its validators.
+struct Snapshot {
+    date: SystemTime,
+    /// The `ETag` that `If-Range` is evaluated against, if any.
+    etag: Option<String>,
+    last_modified: SystemTime,
+}
+
+impl Snapshot {
+    fn of(fault: RangeFault, version: usize, head: bool) -> Self {
+        use RangeFault::*;
+
+        let date = SystemTime::UNIX_EPOCH + VALIDATED_DATE;
+        // Long before `Date`, a second apart per version.
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + version as u64);
+        let second = Duration::from_secs(1);
+        let strong = Some(format!("\"v{version}\""));
+        let (etag, last_modified) = match fault {
+            WeakEtag => (Some(format!("W/\"w{version}\"")), old),
+            RecentLastModified => (None, date),
+            LastModifiedOneSecondOld => (None, date - second),
+            FutureLastModified => (None, date + second),
+            ObsoleteDateFormats | ChangedByDateIgnoringIfRange | RepeatedEtag | ListEtag => {
+                (None, old)
+            }
+            HeadValidatorsDiffer
+            | HeadValidatorsDifferThenChanged
+            | IgnoreRangeWithHeadValidators
+                if head =>
+            {
+                (Some(format!("\"h{version}\"")), old)
+            }
+            _ => (strong, old),
+        };
+        Self {
+            date,
+            etag,
+            last_modified,
+        }
+    }
+
+    /// Whether `if_range` names this version, as RFC 9110 §13.1.5
+    /// evaluates it: an entity tag strongly equal to its own, or a date
+    /// equal to its `Last-Modified`, compared as dates.
+    fn holds(&self, if_range: &str) -> bool {
+        if if_range.starts_with('"') || if_range.starts_with("W/") {
+            self.etag
+                .as_deref()
+                .is_some_and(|etag| !etag.starts_with("W/") && etag == if_range)
+        } else {
+            parse_http_date(if_range) == Some(self.last_modified)
+        }
+    }
+}
+
+/// An HTTP-date in any of its three formats (RFC 9110 §5.6.7).
+fn parse_http_date(value: &str) -> Option<SystemTime> {
+    use axum_extra::headers::{Header, LastModified};
+
+    let value = HeaderValue::from_str(value).ok()?;
+    LastModified::decode(&mut std::iter::once(&value))
+        .ok()
+        .map(SystemTime::from)
+}
+
+/// The formats of an HTTP-date.
+#[derive(Clone, Copy)]
+enum DateFormat {
+    /// `Sun, 06 Nov 1994 08:49:37 GMT`
+    Imf,
+    /// `Sunday, 06-Nov-94 08:49:37 GMT`
+    Rfc850,
+    /// `Sun Nov  6 08:49:37 1994`
+    Asctime,
+}
+
+fn http_date(time: SystemTime, format: DateFormat) -> String {
+    use axum_extra::headers::{Header, LastModified};
+
+    let mut values = Vec::new();
+    LastModified::from(time).encode(&mut values);
+    let imf = values[0].to_str().unwrap().to_owned();
+    // `Sun, 06 Nov 1994 08:49:37 GMT`
+    let [weekday, day, month, year, clock, _gmt] = imf
+        .split(' ')
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("an IMF-fixdate");
+    let weekday = weekday.trim_end_matches(',');
+    match format {
+        DateFormat::Imf => imf,
+        DateFormat::Rfc850 => {
+            let long = [
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday",
+                "Sunday",
+            ]
+            .into_iter()
+            .find(|long| long.starts_with(weekday))
+            .unwrap();
+            format!("{long}, {day}-{month}-{} {clock} GMT", &year[2..])
+        }
+        DateFormat::Asctime => {
+            let day = day.trim_start_matches('0');
+            format!("{weekday} {month} {day:>2} {clock} {year}")
+        }
+    }
+}
+
+/// A response of a fault of [`RangeFault::VALIDATED`], with its validators.
+fn validated_response(
+    fault: RangeFault,
+    state: &FaultState,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    use RangeFault::*;
+
+    let head = method == Method::HEAD;
+    let ranged = !head && headers.contains_key(header::RANGE);
+    let version = state.version.load(Ordering::SeqCst);
+    let content_of = |version: usize| match fault {
+        ChangedMidDownload | ChangedThenIgnoresRange | HeadValidatorsDifferThenChanged
+            if version > 1 =>
+        {
+            RangeFault::replacement(&state.content)
+        }
+        ChangedIgnoringIfRange | ChangedByDateIgnoringIfRange if version > 1 => {
+            RangeFault::changed(&state.content)
+        }
+        _ => state.content.clone(),
+    };
+    let probe = requested_range(headers, content_of(version).len() as u64) == Some((0, 0));
+    let changes = matches!(
+        fault,
+        ChangedMidDownload
+            | ChangedThenIgnoresRange
+            | ChangedIgnoringIfRange
+            | ChangedByDateIgnoringIfRange
+            | HeadValidatorsDifferThenChanged
+    );
+    // Only the request that changes it gets a half.
+    let half = ranged
+        && !probe
+        && changes
+        && state
+            .version
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+    let content = content_of(version);
+    let len = content.len() as u64;
+    let snapshot = Snapshot::of(fault, version, head);
+    let if_range = headers
+        .get(header::IF_RANGE)
+        .and_then(|value| value.to_str().ok());
+    let ignores_range = fault == IgnoreRangeWithValidators
+        || fault == IgnoreRangeWithHeadValidators
+        || (fault == ChangedThenIgnoresRange && version > 1 && !half);
+    let ignores_if_range = matches!(fault, ChangedIgnoringIfRange | ChangedByDateIgnoringIfRange);
+    let full = !ranged
+        || ignores_range
+        || (!ignores_if_range && if_range.is_some_and(|value| !snapshot.holds(value)));
+    let mut response = if fault == RejectedProbe && ranged && probe {
+        StatusCode::FORBIDDEN.into_response()
+    } else if fault == HeadSizeDiffers && head {
+        let mut longer = content.to_vec();
+        longer.extend_from_slice(&[0; 16]);
+        Bytes::from(longer).into_response()
+    } else if full {
+        content.into_response()
+    } else {
+        match requested_range(headers, len) {
+            Some((first, last)) if half => {
+                partial(&content, first, first + (last - first) / 2, len)
+            }
+            Some((first, last)) => partial(&content, first, last, len),
+            None => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+            )
+                .into_response(),
+        }
+    };
+    let part = response.status() == StatusCode::PARTIAL_CONTENT && !probe;
+    let date_format = match fault {
+        ObsoleteDateFormats if !part => DateFormat::Rfc850,
+        _ => DateFormat::Imf,
+    };
+    let response_headers = response.headers_mut();
+    let value = |value: String| HeaderValue::from_str(&value).unwrap();
+    if !(fault == PartsWithoutValidators && part) {
+        match fault {
+            RepeatedEtag => {
+                response_headers.append(header::ETAG, value(format!("\"v{version}\"")));
+                response_headers.append(header::ETAG, value(format!("\"x{version}\"")));
+            }
+            ListEtag => {
+                response_headers.insert(
+                    header::ETAG,
+                    value(format!("\"v{version}\", \"x{version}\"")),
+                );
+            }
+            _ => {
+                if let Some(etag) = snapshot.etag {
+                    response_headers.insert(header::ETAG, value(etag));
+                }
+            }
+        }
+        response_headers.insert(
+            header::LAST_MODIFIED,
+            value(http_date(snapshot.last_modified, date_format)),
+        );
+    }
+    let date_format = match fault {
+        ObsoleteDateFormats => DateFormat::Asctime,
+        _ => DateFormat::Imf,
+    };
+    // Sent, so the HTTP stack does not add the time it sends the response.
+    response_headers.insert(header::DATE, value(http_date(snapshot.date, date_format)));
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
+}
+
 async fn fault_handler(
     axum::extract::Path(fault): axum::extract::Path<String>,
     axum::extract::State(state): axum::extract::State<FaultState>,
@@ -394,6 +628,10 @@ async fn fault_handler(
         method,
         fault,
         range: requested_range(&headers, len),
+        if_range: headers
+            .get(header::IF_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         status: response.status(),
     });
     response
@@ -420,6 +658,9 @@ fn fault_response(
     let Some(fault) = fault else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if RangeFault::VALIDATED.contains(&fault) {
+        return validated_response(fault, state, method, headers);
+    }
     let encoded = fault == RangeFault::EncodedRepresentation;
     let content = state.content(fault);
     let len = content.len() as u64;
@@ -1175,5 +1416,44 @@ mod tests {
         assert!(log.turned_away().is_empty());
         assert_eq!(log.max_open(), 1);
         Ok(())
+    }
+
+    /// The validated faults write `Date` in the three HTTP-date formats,
+    /// and their oracle parses dates, so equivalent ones are equal.
+    #[test]
+    fn validated_dates_in_every_format() {
+        let date = SystemTime::UNIX_EPOCH + VALIDATED_DATE;
+        let imf = "Fri, 15 Jan 2027 08:00:00 GMT";
+        let rfc850 = "Friday, 15-Jan-27 08:00:00 GMT";
+        let asctime = "Fri Jan 15 08:00:00 2027";
+        assert_eq!(http_date(date, DateFormat::Imf), imf);
+        assert_eq!(http_date(date, DateFormat::Rfc850), rfc850);
+        assert_eq!(http_date(date, DateFormat::Asctime), asctime);
+        let early = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001);
+        assert_eq!(
+            http_date(early, DateFormat::Asctime),
+            "Tue Nov 14 22:13:21 2023"
+        );
+
+        let snapshot = Snapshot::of(RangeFault::LastModifiedOneSecondOld, 1, false);
+        assert!(snapshot.etag.is_none());
+        let last_modified = snapshot.last_modified;
+        assert_eq!(
+            date.duration_since(last_modified).unwrap(),
+            Duration::from_secs(1)
+        );
+        for format in [DateFormat::Imf, DateFormat::Rfc850, DateFormat::Asctime] {
+            assert!(snapshot.holds(&http_date(last_modified, format)));
+            assert!(!snapshot.holds(&http_date(date, format)));
+        }
+        assert!(!snapshot.holds("\"v1\""));
+        assert!(!snapshot.holds("yesterday"));
+
+        let snapshot = Snapshot::of(RangeFault::ChangedMidDownload, 1, false);
+        assert!(snapshot.holds("\"v1\""));
+        assert!(!snapshot.holds("W/\"v1\""));
+        assert!(!snapshot.holds("\"v2\""));
+        let head = Snapshot::of(RangeFault::HeadValidatorsDiffer, 1, true);
+        assert_eq!(head.etag.as_deref(), Some("\"h1\""));
     }
 }

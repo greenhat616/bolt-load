@@ -65,6 +65,8 @@ reqwest = { version = "0.13", default-features = true, features = [
     "gzip",
 ] }
 tokio = { workspace = true, features = ["full"] }
+# To build responses in the reqwest unit tests.
+http = "1"
 pretty_assertions = { workspace = true }
 n0-tracing-test = { workspace = true }
 bolt-load-tests = { path = "../bolt-load-tests" }
