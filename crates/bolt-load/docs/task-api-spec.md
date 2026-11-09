@@ -207,7 +207,10 @@ resume-related fields can be added later.
   MUST be published only after teardown completes: every runner, writer and
   progress publisher has exited, and the output file has been committed or
   the temporary file removed. If removal fails, `leftover_temp_file` names
-  the file; the error that caused the discard is not replaced.
+  the file; the error that caused the discard is not replaced. With
+  `Resume::On`, a task that can be resumed keeps the temporary file and the
+  state file instead of removing them (STATUS-13; design §11.5.9; draft,
+  C20).
 - **STATUS-7** The watch sender MUST be dropped right after the terminal
   value, so `while rx.changed().await.is_ok()` ends after the receiver has
   seen it (watch delivers unseen values before `Closed`).
@@ -234,6 +237,25 @@ resume-related fields can be added later.
   ([#153](https://github.com/greenhat616/bolt-load/issues/153)). A full
   download accepts any status outside 4xx and 5xx, so `204 No Content` is an
   empty file too.
+- **STATUS-12** Resume (download strategy hardening, design §11.5; draft,
+  C20). `info.resumed` is `Some(ResumeReport)` when the task continued from
+  a state file, even when every record was dropped; it is `None` for a
+  fresh start and with `Resume::Off`. When ranges are continued from, the
+  first `Downloading` status reports `downloaded == kept_bytes` and
+  `downloaded_chunks == kept`, not zero: the only case besides STATUS-9
+  where progress does not start at zero. `info.resumable` says whether the
+  attempt keeps a state file. A fallback (STATUS-9) replaces `info` with
+  `resumed: None` and `resumable: false`, and progress starts at zero
+  again. A state
+  file that cannot be continued fails the task during `Initializing` with
+  `DownloadError::ResumeRejected { reason, .. }`, before any `Downloading`
+  status and without changing either file.
+- **STATUS-13** A terminal status sets `kept_for_resume` to the partial
+  file only when the task leaves a usable pair for a later resume: the
+  partial file exists and the state file has a valid header (design
+  §11.5.9). It is never set together with `leftover_temp_file` for the
+  same file, and never once the temporary file has been renamed to the
+  destination: a failure after the rename leaves the task `Finished`.
 
 Internal: one `pub(crate) StatusPublisher` owns the only `watch::Sender`.
 The driver owns it; transfers and samplers borrow it and never keep a clone
@@ -253,6 +275,23 @@ publishing `Initializing`:
 3. Resolve the destination (§4.4) and check the filesystem.
 4. Publish `info`, then construct the selected transfer from the
    initialized data.
+
+Draft (C31, C33, C20; download strategy hardening, design §11.4-§11.5):
+steps 3 and 4 become these, with everything before `info` is published:
+
+3. Resolve the destination and check the filesystem.
+4. Take the destination's lock on `<dest>.boltload` (design §11.5.4) and
+   register the cleanup ownership outside the unwind boundary (TASK-8)
+   before any file is created or changed.
+5. With `Resume::On`: when a state file is there, inspect it (design
+   §11.5.10) and either fail with `ResumeRejected` or write back the
+   accepted records; a `prefer_mode(Singleton)` task switches to the
+   concurrent engine with one connection (design §11.5.8); a resumable
+   fresh start creates the partial file and writes the state header
+   (design §11.5.5). With `Resume::Off`: invalidate a stale state file
+   before the partial file is touched.
+6. Publish `info`, with `resumable` and `resumed`, then construct the
+   transfer.
 
 - **INIT-1** Mode-specific `prepare` MUST NOT retrieve metadata; mode
   dispatch moves from `build` into the attempt, after step 2.
@@ -363,13 +402,24 @@ impl DownloadError {
   status stream and every public waiting future MUST be `Send + Sync` where
   applicable, checked by static assertions. The nightly attempt probe
   (`probe_send.rs`) is kept.
-- **TASK-8** Panic policy. The attempt runs under `catch_unwind`. On a panic
-  it cancels the attempt's child token (signalling, not joining, the
-  workers), removes the temporary file synchronously on a best-effort basis,
-  and publishes `Failed(Panicked)`. Awaiting the `Task` returns that error
-  instead of resuming the unwind (`blocking` builds its tasks with
-  `propagate_panic(true)`). After a panic STATUS-6 is weakened: workers are
-  signalled but not joined.
+- **TASK-8** Panic policy. The attempt runs under `catch_unwind`. The
+  task's phase and what its cleanup needs (the lock, both paths and, once
+  published, the output) live outside the unwind boundary, updated at each
+  phase change. On a panic it cancels the attempt's child token, waits until
+  every worker that holds the temporary or state file has exited, cleans up
+  as the phase table requires (design §11.5.9: before the lock and while a
+  resume is still being checked, no file is touched; a fresh start that is
+  not yet resumable, and a non-resumable transfer, remove the temporary
+  file; a resumable task keeps both files), releases the destination's lock,
+  and then publishes `Failed(Panicked)`. Once the temporary file has been
+  renamed to the destination, the remaining completion steps run and the
+  terminal status is `Finished` instead. The wait has no bound: a worker
+  stuck in a file operation keeps the cleanup, the lock and the terminal
+  status pending (design §11.5.4). Awaiting the `Task` returns that error instead of
+  resuming the unwind (`blocking` builds its tasks with
+  `propagate_panic(true)`). (Draft, C31; before it, workers were signalled
+  but not joined, and the temporary file was removed on a best-effort
+  basis.)
 - **TASK-9** `drive_progress_bar` runs a dedicated thread that waits with
   `changed_blocking`. It calls `set_length` once the total is known, leaves
   the bar as a spinner while it is unknown, finishes or abandons the bar on
