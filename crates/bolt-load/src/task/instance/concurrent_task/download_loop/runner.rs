@@ -41,7 +41,7 @@ impl DownloadLoop {
             self.on_side_failure(&failure, now)?;
         }
         if let Some(failure) = tick.failure {
-            if let Some(e) = range_unsupported(&failure.error) {
+            if let Some(e) = mode_ending(&failure.error) {
                 return Err(e);
             }
             if let Some(e) = self.policy.on_failure(&failure, self.manager.in_flight()) {
@@ -75,7 +75,7 @@ impl DownloadLoop {
     /// falls back or ends as for any runner, and a congestion holds new
     /// connections back.
     fn on_side_failure(&mut self, failure: &SideFailed, now: Instant) -> Result<()> {
-        if let Some(e) = range_unsupported(&failure.error) {
+        if let Some(e) = mode_ending(&failure.error) {
             return Err(e);
         }
         if let Some(e) = self.policy.on_side_failure(failure) {
@@ -89,6 +89,30 @@ impl DownloadLoop {
             self.deadline.wake_by(at);
         }
         Ok(())
+    }
+}
+
+/// The error that ends the concurrent mode whatever else runs, when
+/// `error` shows that the resource changed (design §11.2, D12) or that
+/// ranges cannot carry the file (§4.3).
+fn mode_ending(error: &TaskError) -> Option<DownloadError> {
+    resource_changed(error).or_else(|| range_unsupported(error))
+}
+
+/// [`DownloadError::ResourceChanged`], when a range request found the
+/// resource changed: the task downloads it again from scratch, not over
+/// one connection (design D12).
+fn resource_changed(error: &TaskError) -> Option<DownloadError> {
+    match error {
+        TaskError::StreamError {
+            source:
+                source @ AdapterError::Unretryable {
+                    source: UnretryableError::ResourceChanged,
+                },
+        } => Some(DownloadError::ResourceChanged {
+            source: source.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -144,6 +168,28 @@ mod tests {
             DownloadError::RangeUnsupported { reason, .. } => Some(reason),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// A changed resource ends the mode as such, never as a fallback
+    /// (design §11.2, D12).
+    #[test]
+    fn a_changed_resource_ends_the_mode_without_a_fallback() {
+        let changed = TaskError::StreamError {
+            source: UnretryableError::ResourceChanged.into(),
+        };
+        assert!(range_unsupported(&changed).is_none());
+        assert!(matches!(
+            mode_ending(&changed),
+            Some(DownloadError::ResourceChanged { .. })
+        ));
+        let ignored = TaskError::StreamError {
+            source: UnretryableError::RangeIgnored.into(),
+        };
+        assert!(matches!(
+            mode_ending(&ignored),
+            Some(DownloadError::RangeUnsupported { .. })
+        ));
+        assert!(mode_ending(&TaskError::Timeout).is_none());
     }
 
     #[test]

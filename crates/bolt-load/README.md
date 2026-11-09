@@ -94,6 +94,25 @@ size is then unknown until the stream ends. A coding the build cannot
 decode fails the task with `ContentCoded`. Range responses are never
 decoded: a coded range makes the task fall back to one connection.
 
+Range requests carry `If-Range` with the validator of the metadata the
+task retrieved: the strong `ETag` of a GET, or else its `Last-Modified`
+when that is at least a second older than its `Date`. With only a weak
+`ETag`, none is sent. Each task passes its own validator with every
+range, so tasks sharing an adapter do not change each other's ranges.
+When the resource changes during the download, the task downloads it
+again from scratch once, with fresh metadata; if it changes again, the
+task fails with `DownloadError::ResourceChanged`.
+
+**Breaking change.** `BoltLoadAdapter` has two new methods with defaults:
+`range_stream_if`, which calls `range_stream`, and `refresh`, which does
+nothing. `UnretryableError::ResourceChanged` and
+`DownloadError::ResourceChanged` are new. A server that answers a
+conditional range request with another version, or a part of another
+version, no longer makes the task fall back to one connection or mix the
+two: the task starts over instead. The ureq2 adapter now also sends a
+`bytes=0-0` GET when it retrieves the metadata, to read the validators of
+a GET.
+
 ## Concurrency Control
 
 The concurrent download engine continuously monitors runner outcomes:

@@ -55,6 +55,11 @@ pub mod unretryable {
         /// The server answered a range request with the whole resource.
         #[snafu(display("server ignored the range request"))]
         RangeIgnored,
+        /// The resource changed since its metadata was retrieved: a range
+        /// request made conditional with `If-Range` got the whole resource,
+        /// with another validator than the one it sent.
+        #[snafu(display("the resource changed since its metadata was retrieved"))]
+        ResourceChanged,
         /// The response does not prove it carries the requested bytes.
         #[snafu(display(
             "range response does not match bytes {}-{}: {}",

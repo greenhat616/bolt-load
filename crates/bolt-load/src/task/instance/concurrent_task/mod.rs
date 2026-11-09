@@ -9,7 +9,7 @@ use super::{
     output_file::{OutputFile, Teardown},
 };
 use crate::{
-    adapter::AnyAdapter,
+    adapter::{AnyAdapter, RangeExpectation},
     runtime::ThreadedRuntimeImpl,
     task::{DownloadError, Progress, TaskOptions, status::ProgressReporter},
 };
@@ -63,6 +63,8 @@ pub(crate) struct ConcurrentTaskInner {
     rt: ThreadedRuntimeImpl,
     output: OutputFile,
     adapter: Arc<AnyAdapter>,
+    /// What every range expects of the resource (design D14).
+    expected: RangeExpectation,
     /// The progress of the task, kept for resumable downloads.
     progress: Progress,
     reporter: ProgressReporter,
@@ -78,20 +80,24 @@ enum RunnerStatus {
 }
 
 impl ConcurrentTaskInner {
-    /// `total` must be non-zero; a zero size selects the singleton mode.
+    /// `expected.total` must be non-zero; a zero size selects the singleton
+    /// mode. Every range is requested with `expected`, built from the
+    /// task's own metadata.
     pub(crate) fn new(
         adapter: Arc<AnyAdapter>,
         output: OutputFile,
-        total: u64,
+        expected: RangeExpectation,
         rt: ThreadedRuntimeImpl,
         options: TaskOptions,
         reporter: ProgressReporter,
     ) -> Self {
+        let total = expected.total;
         debug_assert!(total > 0, "a concurrent task needs a known size");
         Self {
             rt,
             output,
             adapter,
+            expected,
             progress: Progress::new(Some(total), 0, Vec::new()),
             reporter,
             options,
@@ -131,7 +137,8 @@ impl ConcurrentTaskInner {
             runners_cancel_token,
             self.options.stream_idle_timeout,
         )
-        .connect_timeout(self.options.connect_timeout);
+        .connect_timeout(self.options.connect_timeout)
+        .expectation(self.expected.clone());
 
         let mut download = DownloadLoop::new(
             total,

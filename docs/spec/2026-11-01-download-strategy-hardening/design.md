@@ -109,6 +109,9 @@
 | D9 | 解码 crate 的后端 | `compression-codecs`，只在 crate 内部使用；gzip、deflate 默认开启，br、zstd 放在 feature 后面（§4.4） | 已确认（2026-11-03） |
 | D10 | 在哪一层解码 | `full_stream` 把 `Content-Encoding` 和 `Content-Type` 交给引擎，由引擎决定是否解码；adapter 自己不解码（§4.4） | 已确认（2026-11-03） |
 | D11 | HTTP 校验与解析放在哪 | 新 crate `bolt-load-http`，依赖 core：搬入 core 里只有 adapter 调用的函数，以及 utils 的 `http` 模块；新增 `ContentCoding`。core 只留 trait、meta、错误类型和 `ContentRange`（§4.5） | 已确认（2026-11-03） |
+| D12 | 下载途中资源变了（`ResourceChanged`） | 任务内从头重来一次，和 §4.3 的回退一样：丢掉已写的数据、截断、刷新 adapter、重新探测，用新的 meta 再下一次；同一个任务里再变一次，就以 `DownloadError::ResourceChanged` 失败。T20 的“文件被替换 → 从头下载、hash 与新文件一致”在 C19 里以“下载途中被替换”端到端验证，“续传之前被替换”留给 C20（§11.2） | 已确认（2026-11-09，维护者） |
+| D13 | adapter 的缓存怎么刷新 | `BoltLoadAdapter` 新增 `fn refresh(&self) {}`，默认什么也不做；reqwest 和 ureq2 覆盖它，丢掉缓存的探测结果。引擎在 D12 的从头重来之前调用，C20 在续传之前调用（§11.2） | 已确认（2026-11-09，维护者） |
+| D14 | 验证器绑在哪 | 绑在每个任务上，随每个请求传：`BoltLoadAdapter` 新增可选的 `range_stream_if(start, end, expected)`，默认调用 `range_stream`，所以自定义 adapter 照常工作，只是看不出资源变了。引擎从自己的 meta 取验证器和总长，传给每个 range 请求；reqwest 和 ureq2 实现它，`If-Range` 和响应检查都用传进来的验证器，不用 adapter 的缓存。`refresh()` 只影响调用者下一次 `retrieve_meta`，从不改变别的任务的 range（§14.23） | 已确认（2026-11-09，维护者） |
 
 ---
 
@@ -962,6 +965,7 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 - 续传请求带上 `If-Range`：有强 ETag 就用 ETag，否则用 Last-Modified。
   - 返回 `206`：继续下载。
   - 返回 `200`：说明资源已经变了，返回 `ResourceChanged`，丢弃已写区间，从头下载。这种情况**不**走 §4.3 的单连接回退。
+- 维护者的决定（2026-11-09）：下载途中的 `ResourceChanged` 怎么处理见 D12，adapter 怎么刷新缓存见 D13，验证器绑在每个任务上、随每个 range 请求传见 D14；实现见 §14.23。
 
 ### 11.3 状态文件
 
@@ -2214,3 +2218,43 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 再查一遍同类的问题，又找到一处：新开的对冲也是一个新连接，原来的“拥塞期间不开新连接”只查新的主人，不查新的对冲。现在 `check()` 也查：上一步没有的对冲，上一步不能处于拥塞中。另外 `Progress` 也可以挑被打败的一方，核对它晚到的帧被丢掉（原来生成器覆盖不到）。其它按主人记的状态没有问题：槽位的计数已经把未分胜负的对冲和正在停止的 runner 算进去了；`Finish` 只挑主人，没分胜负的一方不可能下完。
   - 变异检查：接管当新连接查（原来的预言），让 `a_hedge_that_wins_keeps_the_counters_of_its_chunk` 失败；按原来的方式找留下的一方，让 `each_pair_keeps_its_own_first_failure` 失败；产品接受被打败一方晚到的帧，让 `a_hedge_that_wins_keeps_the_counters_of_its_chunk` 和已有的 `the_hedge_never_moves_the_no_progress_deadline` 失败；产品在拥塞期间也对冲，让已有的 `no_hedge_without_a_free_connection_or_with_a_range_left` 失败（随机序列很少走到，新加的预言检查在 4096 个用例里没有碰上）。
   - 4096 个用例再跑一次：没有失败，5.7 s。计数：3700 次失败里，对冲一方 1 次，一对的原始一方 1 次，一对的最后一方 1 次，被打败的一方 0 次；接管 1 次；对冲连上、对冲交帧、被打败一方的晚帧都是 0 次。
+
+### 14.23 验证器与 `If-Range`（PR-9b，C19）
+
+- **决定。**
+  - 维护者（2026-11-09，§3 的 D12、D13）：下载途中资源变了，任务内从头重来一次，再变就以 `DownloadError::ResourceChanged` 失败；adapter 新增 `fn refresh(&self) {}`，默认什么也不做。
+  - lead（实现时）：
+    - 一个带 `If-Range` 的请求收到 `200`：比较 `200` 自己的验证器和发出去的那个，相同是 `RangeIgnored`（服务器忽略 Range，照旧回退），不同或没有是 `ResourceChanged`。不带 `If-Range` 的 `200` 仍是 `RangeIgnored`。
+    - 只用强 ETag；`Last-Modified` 离 `Date` 不到 1 s，或者响应没有 `Date`，不能用于 `If-Range`（RFC 9110 §8.8.2.2、§13.1.5）。验证器按服务器发来的原样保存、原样发回。
+    - 提交是 `feat(core)!`；新增 `DownloadError::ResourceChanged` 和 core 的 `UnretryableError::ResourceChanged` 两个变体。
+    - `ReplacedAfterShortRange` 不带验证器，继续测回退；带验证器的场景用新的 fault。
+- **做法。**
+  - core：`BoltLoadAdapterMeta` 增加 `etag`、`last_modified` 和 `with_etag`、`with_last_modified`。`with_etag` 丢掉弱 ETag（`W/` 开头），所以弱 ETag 时 `meta.etag` 是 `None`；`last_modified` 照样保存，即使它不能用于 `If-Range`（C20 比对状态文件时还用得上）。`UnretryableError::ResourceChanged` 是新变体（枚举本来就是 `#[non_exhaustive]`）。`BoltLoadAdapter::refresh` 默认什么也不做。
+  - `bolt-load-http`：新模块 `validator`：`is_strong_etag`、`if_range_validator(etag, last_modified, date)`（强 ETag 优先，否则至少早于 `Date` 1 s 的 `Last-Modified`）、`has_validator(sent, etag, last_modified)`（ETag 按强比较，日期解析后比较）。`RangeHeaders` 增加 `if_range`（发出去的）、`etag`、`last_modified`（响应的），`validate_range_response` 对 `200` 按上面的规则分类。
+  - reqwest：缓存从 `Arc<OnceCell<Context>>` 改为 `Mutex<Arc<OnceCell<Arc<Context>>>>`：`refresh` 换一个新的空 cell，下一次 `retrieve_meta` 重新探测；正在初始化的旧 cell 不受影响。`Context` 多存一个 `if_range`。探测（`bytes=0-0` 的 206，或者回到 HEAD）时读 `ETag`、`Last-Modified`、`Date`。`range_stream` 只用 refresh 之后取到的 context，带上 `If-Range`，并把发出去的值和响应的验证器交给 `check_range`。
+  - ureq2：缓存的 HEAD 响应加一个 `stale` 标记；`refresh` 置上它，下一次用 HEAD 时重新发。`range_stream` 从没过期的 HEAD 响应算出 `If-Range`。
+  - 引擎：`download_loop/runner.rs` 的 `mode_ending`：`ResourceChanged` 变成 `DownloadError::ResourceChanged`，和回退的错误一样结束并发模式（一方失败、对冲一方失败都算），不走回退。`drive.rs` 的 `run`：并发模式以 `ResourceChanged` 结束、还没重来过、临时文件已经删掉时：`adapter.refresh()`，重新取 meta（不用调用者给的 meta），重新选模式，写到同一个目的地，再下一次；否则照常结束。原来的模式分支（含回退）提到 `transfer()`，选模式提到 `select_mode()`。
+- **重来和回退怎么组合**（规范没有写，实现时这样定，请 lead 审）：
+  - 每个任务最多重来一次、最多回退一次。
+  - 重来之后可以回退：新的一次如果发现 range 用不了（比如 `ChangedThenIgnoresRange`：换了版本之后忽略 Range），照常回退到单连接。
+  - 回退之后不会再重来：单连接用 `full_stream`，没有 `If-Range`，看不出资源变了。回退期间资源变了不会被发现，写下的是变了之后的内容，这是已知限制（§4.3 的回退本来也是这样）。
+  - 只有临时文件已经删掉才重来：删不掉时（`leftover_temp_file`），不往残留的文件上再写，任务以 `ResourceChanged` 结束。
+  - 重来之后目的地不变：`save_into` 不按新的文件名重新解析。
+  - 状态：不新增状态，也不新增字段。新的一次发布一个 `Downloading`，`info` 换成新的 meta 和模式，进度从零开始（和回退一样）。
+  - 重来之前的写入、进度、C18 的 `written` 都跟着那一次的 `ConcurrentTaskInner`、`DownloadLoop`、`ChunkPlanner` 一起丢掉，临时文件被删掉，新的一次从空文件开始。
+- **已知限制。**
+  - ureq2 没有 range 探测，验证器只从 HEAD 来；有的服务器对 HEAD 和 GET 给的验证器不一样，这时每个 range 请求都会被当成资源变了，重来一次后失败。
+  - 单连接（包括回退）看不出资源变了，见上。
+  - 自定义 adapter 不实现 `If-Range` 时，资源变了照旧不会被发现。
+- **测试。**
+  - `bolt-load-http`：`validator.rs` 的三个单元测试（强弱 ETag、选哪个验证器、比对）；`range.rs` 的 `a_200_with_another_validator_is_a_changed_resource`。
+  - 测试服务器（`bolt-load-tests`）：`RangeFault::VALIDATED` 里的六个新 fault（`ChangedMidDownload`、`ChangedEveryRange`、`ChangedThenIgnoresRange`、`IgnoreRangeWithValidators`、`WeakEtag`、`RecentLastModified`），带 `ETag`、`Last-Modified`，按 RFC 9110 判 `If-Range`；`RecordedRequest` 记下 `If-Range`。
+  - `bolt-load-adapter/tests/if_range.rs`，两个 adapter 都跑：强 ETag 进 `If-Range`，变了之后是 `ResourceChanged`，`refresh` 之后取到新版本；弱 ETag 时发 `Last-Modified`；`Last-Modified` 离 `Date` 太近时不发；忽略 Range、验证器相同时是 `RangeIgnored`。
+  - `bolt-load/tests/resource_changed.rs`，三种客户端都跑：下载途中被替换，从头下完新版本、hash 一致，新版本的第一个状态进度为零、之后不超过新版本的长度，最后的 `downloaded_chunks` 是 `[0..新长度]`（这就是 C18 留下的“重置之后不留旧区间”的测试；第一次写过 128 KiB，新版本只有 16 KiB）；一直在变，重来一次后以 `ResourceChanged` 失败，发过的 `If-Range` 只有 v1、v2；变了之后忽略 Range，重来之后回退到单连接；忽略 Range、验证器相同，照旧回退。
+  - `runner.rs` 的 `a_changed_resource_ends_the_mode_without_a_fallback`。
+- **变异检查**：
+  - 弱 ETag 也发：`validator.rs` 的两个测试和 `a_weak_etag_gives_way_to_last_modified`；
+  - 验证器相同的 `200` 也当成变了：`range.rs` 的测试、`a_200_with_the_validator_sent_ignores_the_range`、`ignored_ranges_with_the_same_validator_fall_back` 和 `a_changed_resource_that_ignores_ranges_falls_back`；
+  - 重来之前不 refresh：`resource_changed.rs` 的三个测试；
+  - 再变一次又重来：`a_resource_that_changes_again_fails_the_task`（会一直重来，测试超时）；
+  - 新的一次从发布过的进度开始（`written` 没有重置）：`a_resource_changed_mid_download_is_downloaded_again`。另一种写法，在重来时先发布上一次的进度，再由新的一次发布零进度，测不出来：状态通道只留最新的值，两次发布之间没有别的事件，消费者也看不到那个旧值。

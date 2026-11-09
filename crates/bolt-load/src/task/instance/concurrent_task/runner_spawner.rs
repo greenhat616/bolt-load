@@ -7,7 +7,7 @@ use smol_cancellation_token::CancellationToken;
 
 use super::runner_manager::{RunnerChannels, SpawnFailed};
 use crate::{
-    adapter::{AnyAdapter, BoltLoadAdapter},
+    adapter::{AnyAdapter, BoltLoadAdapter, RangeExpectation},
     runner::{LimitReceiver, ReadActivity, TaskRunner},
     runtime::ThreadedRuntimeImpl,
     task::RunnerId,
@@ -23,6 +23,9 @@ pub(super) struct RunnerSpawner {
     pub(super) cancel_token: CancellationToken,
     idle_timeout: Duration,
     connect_timeout: Duration,
+    /// What every range expects of the resource, if the task knows
+    /// (design D14).
+    expected: Option<Arc<RangeExpectation>>,
 }
 
 impl RunnerSpawner {
@@ -40,7 +43,15 @@ impl RunnerSpawner {
             cancel_token,
             idle_timeout,
             connect_timeout: crate::runner::DEFAULT_CONNECT_TIMEOUT,
+            expected: None,
         }
+    }
+
+    /// Request every range as [`BoltLoadAdapter::range_stream_if`] with
+    /// `expected`, the same for the whole attempt.
+    pub(super) fn expectation(mut self, expected: RangeExpectation) -> Self {
+        self.expected = Some(Arc::new(expected));
+        self
     }
 
     /// How long each runner may take to connect.
@@ -66,11 +77,17 @@ impl RunnerSpawner {
     ) -> Result<RunnerChannels, SpawnFailed> {
         let (start, end) = (range.start, range.end);
         let adapter = self.adapter.clone();
+        let expected = self.expected.clone();
         let stop = self.cancel_token.child_token();
         let reads = ReadActivity::default();
         let (runner, lifecycle_rx, data_rx) = TaskRunner::builder()
             .total(end - start)
-            .connector(async move { adapter.range_stream(start, end).await })
+            .connector(async move {
+                match expected {
+                    Some(expected) => adapter.range_stream_if(start, end, &expected).await,
+                    None => adapter.range_stream(start, end).await,
+                }
+            })
             .runner_id(runner_id)
             .limit_receiver(limits)
             .cancel_token(self.cancel_token.clone())
