@@ -26,11 +26,6 @@
 //!
 //! Every integer is little-endian.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "C33b writes the state file of a resumable task")
-)]
-
 use std::{fmt, fs::File, io, path::Path, sync::Arc};
 
 use bolt_load_core::adapter::Validator;
@@ -206,6 +201,7 @@ impl StateFile {
     }
 
     /// Where the next records go.
+    #[cfg(test)]
     pub(crate) fn end(&self) -> u64 {
         self.end
     }
@@ -262,6 +258,11 @@ impl StateFile {
     /// # Errors
     ///
     /// The cut or its sync failed.
+    ///
+    /// The task invalidates through [`DestinationLock::invalidate`](super::destination_lock::DestinationLock::invalidate)
+    /// instead, which knows when it went on unlocked; this one is the
+    /// writer's own, for its tests.
+    #[cfg(test)]
     pub(crate) fn invalidate(&mut self) -> io::Result<()> {
         self.io.set_len(0)?;
         self.io.sync()?;

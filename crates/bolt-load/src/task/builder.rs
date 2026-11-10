@@ -13,6 +13,7 @@ use super::{
     instance::{
         destination_lock::LockHooks,
         drive::{self, Attempt},
+        file_steps::FileHooks,
     },
     status::StatusPublisher,
 };
@@ -40,6 +41,26 @@ pub struct TaskBuilder {
     meta: Option<BoltLoadAdapterMeta>,
     /// How the destination's lock is taken; replaced in tests.
     lock_hooks: LockHooks,
+    /// Whether the task keeps a state file for a later resume.
+    resume: Resume,
+    /// What to call before each file step of a resumable task; tests fail
+    /// them.
+    file_hooks: FileHooks,
+}
+
+/// Whether a task keeps what it downloaded when it does not finish, so
+/// that a later task can continue from it (design §11.5.2).
+///
+/// Crate internal until resuming is public (C20): a task only writes the
+/// state file; nothing reads it back yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Resume {
+    /// Start from an empty file; delete it when the task does not finish.
+    #[default]
+    Off,
+    /// Keep the partial file and a state file when the task does not
+    /// finish, when the download is resumable (design §11.5.3).
+    On,
 }
 
 impl TaskBuilder {
@@ -54,6 +75,8 @@ impl TaskBuilder {
             cancel_token: None,
             meta: None,
             lock_hooks: LockHooks::default(),
+            resume: Resume::Off,
+            file_hooks: FileHooks::default(),
         }
     }
 
@@ -176,6 +199,20 @@ impl TaskBuilder {
         self
     }
 
+    /// Keep a state file for a later resume, or not (design §11.5.2).
+    #[cfg(test)]
+    pub(crate) fn resume(mut self, resume: Resume) -> Self {
+        self.resume = resume;
+        self
+    }
+
+    /// Call `hooks` before each file step of a resumable task.
+    #[cfg(test)]
+    pub(crate) fn file_hooks(mut self, hooks: FileHooks) -> Self {
+        self.file_hooks = hooks;
+        self
+    }
+
     /// Validate and start the download on a `blocking` pool thread.
     ///
     /// Each running task occupies one such thread until it ends.
@@ -191,6 +228,8 @@ impl TaskBuilder {
             cancel_token,
             meta,
             lock_hooks,
+            resume,
+            file_hooks,
         } = self;
         let (Some(runtime), Some(destination)) = (runtime, destination) else {
             unreachable!("validated above");
@@ -208,6 +247,8 @@ impl TaskBuilder {
             meta,
             cancel_token: cancel_token.clone(),
             lock_hooks,
+            resume,
+            file_hooks,
         };
         let join = drive::spawn(attempt, runtime, local_runtime_builder, publisher);
         Ok(Task::new(join, status, cancel_token))
