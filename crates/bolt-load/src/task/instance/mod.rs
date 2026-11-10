@@ -6,6 +6,7 @@ use super::DownloadError;
 /// Concurrent download task implementation.
 pub mod concurrent_task;
 pub(crate) mod destination_lock;
+pub(crate) mod discard;
 pub(crate) mod drained_file;
 pub(crate) mod drive;
 pub(crate) mod file_steps;

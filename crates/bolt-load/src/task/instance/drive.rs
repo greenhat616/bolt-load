@@ -144,6 +144,9 @@ struct Initialized {
     mode: DownloadMode,
     fallback: Option<FallbackReason>,
     path: PathBuf,
+    /// A resumable task that preferred one connection: the concurrent
+    /// engine runs it with one (design §11.5.8).
+    one_connection: bool,
 }
 
 /// Initialize, transfer and publish the terminal status, which comes last,
@@ -164,6 +167,7 @@ pub(super) async fn run(
             mode,
             fallback,
             path,
+            one_connection,
         } = match initialized {
             Ok(initialized) => initialized,
             Err(e) => return publisher.finish(Err(e), Progress::default(), None),
@@ -222,6 +226,7 @@ pub(super) async fn run(
         let Attempt {
             adapter, options, ..
         } = attempt;
+        let options = transfer_options(options, one_connection);
         let (teardown, progress) = match mode {
             DownloadMode::Singleton => {
                 let transfer = SingletonTaskInner::new(
@@ -323,8 +328,22 @@ async fn initialize(
             .await
             .map_err(|source| DownloadError::Metadata { source })?,
     };
+    let mut one_connection = false;
     let (mode, fallback) = if attempt.prefer_mode == Some(DownloadMode::Singleton) {
-        (DownloadMode::Singleton, None)
+        // A task that may resume and could keep a state file over ranges
+        // takes them, with one connection (design §11.5.8); any other
+        // stays with one connection's full download, not resumable.
+        if attempt.resume == Resume::On
+            && resumable_header(attempt.resume, DownloadMode::Concurrent, &meta).is_some()
+            && meta.content_size != 0
+            && meta.content_encoding.is_none()
+            && attempt.adapter.is_range_stream_available().await
+        {
+            one_connection = true;
+            (DownloadMode::Concurrent, None)
+        } else {
+            (DownloadMode::Singleton, None)
+        }
     } else if meta.content_encoding.is_some() {
         // Ranges of a coded response count encoded bytes.
         (DownloadMode::Singleton, Some(FallbackReason::ContentCoded))
@@ -340,6 +359,7 @@ async fn initialize(
         mode,
         fallback,
         path,
+        one_connection,
     })
 }
 
@@ -375,6 +395,15 @@ async fn lock_destination(
         }),
         _ => Ok(()),
     }
+}
+
+/// The options the transfer runs with: one connection for a resumable
+/// task that preferred one (design §11.5.8), `options` otherwise.
+fn transfer_options(mut options: TaskOptions, one_connection: bool) -> TaskOptions {
+    if one_connection {
+        options.max_connections = std::num::NonZeroUsize::MIN;
+    }
+    options
 }
 
 /// The state header of a resumable download, or `None` when it is not
@@ -516,6 +545,24 @@ async fn until_cancelled<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resumable task that preferred one connection runs with one; any
+    /// other with its own limit.
+    #[test]
+    fn test_a_routed_task_runs_with_one_connection() {
+        let options = TaskOptions::default();
+        assert_eq!(
+            transfer_options(options.clone(), true)
+                .max_connections
+                .get(),
+            1
+        );
+        assert_eq!(
+            transfer_options(options.clone(), false),
+            options,
+            "untouched"
+        );
+    }
     use crate::task::{
         TaskState,
         instance::destination_lock::{LockHooks, state_path_for},

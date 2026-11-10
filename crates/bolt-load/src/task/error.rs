@@ -31,6 +31,8 @@ pub enum IoOp {
     /// permission, or a file system that cannot lock files (design
     /// §11.5.4).
     Lock,
+    /// Removing a partial file kept for a resume (design §11.5.5).
+    Remove,
 }
 
 impl fmt::Display for IoOp {
@@ -43,6 +45,7 @@ impl fmt::Display for IoOp {
             Self::Flush => "flush",
             Self::Rename => "rename to",
             Self::Lock => "lock",
+            Self::Remove => "remove",
         })
     }
 }
