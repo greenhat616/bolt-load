@@ -116,7 +116,6 @@ impl ConcurrentTaskInner {
     }
 
     /// Hand the checkpoints of the download to `receiver`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "C33 hands over the state file"))]
     pub(crate) fn checkpoint_to(
         mut self,
         receiver: Box<dyn checkpoint::CheckpointReceiver>,
