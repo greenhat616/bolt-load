@@ -2993,4 +2993,44 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
 - **第二轮审查之后的修改**（codex 第二轮 90 分，一个 Major）：第一轮返回的 `(receiver, outcome, drain)` 元组只在闭包正常返回时有序；阻塞任务在运行之前被丢掉、或者闭包 panic 时，闭包各自捕获的值按未规定的顺序销毁，drain 可能先于接收者或读取器放下。现在按 C31 的 `Drained` 做：接收者和读取器放进 `Work`，`start` 里就包成一个 `Drained<Work>`（drain 是它的最后一个字段），整个交给 `run`，闭包先写 `let mut held = held;` 整个拿走、整个返回；`run` 拿回之后先放读取器、再放 drain（`Drained::into_parts`），接收者交回 `Checkpoints`（它自己持有 drain）。测试（接收者和读取器各带一个探针，放下时记下 drain 是否还开着，只记不断言）：`test_the_work_drops_before_its_drain`（接收者 panic、读取器 panic、正常完成三种）、`test_a_checkpoint_dropped_before_it_ran_drops_its_work_first`（还没运行就丢掉）。变异：`Drained` 两个字段换序、返回时先放 drain 再放读取器，都被抓到；“阻塞部分不持有 drain”仍被 `test_a_running_checkpoint_holds_the_drain` 抓到。另外，测试里等闸门的地方都加了上限（`recv_timeout`、`tokio::time::timeout`）。
 - **第三轮审查之后的修改**（codex 第三轮 91 分，一个 Major）：pool 的 `sync` 原来克隆句柄、在单独的 `blocking` 线程上 `sync_data`，那个线程不持有 drain：尝试 unwind 时 worker 退出、drain 结束，panic 处理就可能在同步还拿着句柄时放锁（§11.5.4）。改为经队列（`sync_through`、`Command::Sync`），由已经持有 drain 的 worker 同步（选了这个，不另包 `Drained`：mmap、compio 本来就这样）。其它新的阻塞操作逐个核对过：mmap、compio 的同步都在持有 drain 的 worker 里；`FileBlocks` 的回读在检查点的阻塞闭包里打开、读完、关掉部分文件，闭包持有 `Drained<Work>`；slow writer（只在测试里）在调用它的 future 里同步，没有另起任务；null 没有文件。测试 `test_a_held_sync_holds_the_drain`（pool_writer.rs）：worker 停在同步前的钩子里，丢掉同步的 future 和 writer，drain 在 0.5 s 内不结束（空闲的 worker 早已退出；没有信号能说明“没结束”，所以这是唯一带时间的断言，正确的实现总是通过），放行之后结束。变异“worker 把同步交给一个不持有 drain 的线程”被它抓到。另外按建议加了 `test_an_unread_result_drops_its_work_before_its_drain`：阻塞部分完成（用一个记录唤醒的 waker 得知，不 poll 结果），丢掉 future 而不读结果，接收者和读取器都在 drain 结束之前放下；变异“闭包在返回之前就放掉 drain”被它和 `test_the_work_drops_before_its_drain` 抓到。`test_the_work_drops_before_its_drain` 的注释改为只说它覆盖的情况（结果被读走）。
 - **第四轮审查**（codex 第四轮 PASS，97 分）：剩下的 Minor 已修：`test_an_unread_result_drops_its_work_before_its_drain` 的阻塞部分可能在第一次 poll 之前就完成，第一次 poll 就是 Ready；现在接收者在 `record` 里等测试放行，第一次 poll 返回 Pending 之后才放行，再等唤醒、不读结果地丢掉 future（连续 20 次通过，变异“闭包在返回之前就放掉 drain”仍被抓到）。
+- **之后的修改。** C33a 用真正的状态文件重测之后，默认的 8 MiB / 2 s 保留，另加检查点之间至少 0.5 s 的间隔（`MIN_SPACING`），见 §14.29.1。
 - **没做的。** 状态文件、追加位置 `end` 和 `set_len`/`fsync` 的顺序在 C33；没有任务交出接收者，生产路径上 `durable` 现在没人读；单连接不做检查点（§11.5.8）。
+
+### 14.29 状态文件（PR-9d，C33）
+
+C33 拆成两个提交（实现者提议，lead 同意，各自审查、各自提交）：C33a 是格式和写入方，没有行为变化；C33b 把它接进任务（`Resume` 仍是 crate 内部的、阶段、提交、完成、丢弃、回退、panic 清理、`On` 的单连接改走并发引擎、`kept_for_resume`、`discard_partial`）。这一节先写 C33a。
+
+- **lead 的决定**（2026-11-10，不是维护者的决定）：`kept_for_resume` 和 `discard_partial` 在 C20 公开 `Resume` 之前都是 crate 内部的：`Resume` 不公开时，公开的 `kept_for_resume` 永远是 `None`，`discard_partial` 也没有用处。C33a、C33b 都不算破坏兼容（tasks.md §0 第 3 条）；C33b 要再核对 `Off` 的文件、开销和错误确实不变。读回状态文件只在测试里有一个解码器，真正的读取和拒绝规则是 C20 的。
+
+#### 14.29.1 C33a：格式和写入方
+
+- **范围。** `task/instance/state_file.rs`：§11.5.5 的二进制格式（头部、24 字节的记录，小端，CRC32C）和写入方 `StateFile`；C32 的 `CheckpointReceiver` 由它实现，成为真正的检查点接收者；Unix 上同步父目录的辅助函数；检查点的最小间隔（C32 留下的未决项）。现在没有任务打开它：只有测试和基准用它，生产代码里的这些项标 `expect(dead_code)`，C33b 接上。
+- **格式。** 和 §11.5.5 的表逐字段一致：`magic`、`version = 1`、`flags = 0`、`block_size`（u32）、`total`、验证器（种类 1 = 强 ETag、2 = Last-Modified，u16 长度，最多 1024 字节）、`source`（u16 长度，`0xFFFF` 表示没有，最多 4096 字节）、`header_crc`（前面所有头部字节的 CRC32C）；记录：`index`、`len`、`data_crc`、`kind = 1` 加 3 个保留的 0、`record_crc`（前 20 字节的 CRC32C）。`encode_header` 对超长的验证器、`source` 返回 `HeaderError`，什么都不写（C33b 据此判“没有可用的验证器”，§11.5.3）。读回是 C20 的事；测试里有一个只供测试的解码器（`state_file::tests::decode_header`、`decode_records`），按 §11.5.5 校验 CRC。
+- **写入方 `StateFile`**（文件操作经一个可以注入的 `StateIo`，生产是 `LockedFile(Arc<File>)`，即 C31 锁住的句柄，`DestinationLock::handle` 交出它的一个 `Arc`；放锁仍由 `DestinationLock::release` 做，谁还拿着句柄都一样）：
+  - `write_header`：在偏移 0 写头部，`sync_all`；`end` 移到头部之后（新开始的第 3 步，§11.5.5）。调用方之前已经作废过（`set_len(0)` + `fsync`）。
+  - `append`（检查点第 3 步）：从 `end` 写这次的记录，`sync_all`，成功之后 `end` 才前移。
+  - `roll_back`：`set_len(end)`，`sync_all`；失败时返回错误，C32 的检查点据此停止（文件在 `end` 之前仍然有效，之后是残片或完整而有效、数据已同步过的记录，§11.5.5 的分析）。
+  - `invalidate`：`set_len(0)`，`sync_all`，`end = 0`。
+  - 用 `sync_all` 而不是 `sync_data`：追加改变文件长度。
+- **父目录同步**：`sync_parent_dir`，Unix 上打开父目录 `fsync`；Windows 没有目录同步，什么都不做，靠 NTFS 的元数据日志（已知限制，§11.5.5）。C33b 按 §11.5.5 的顺序调用。
+- **检查点的默认调度**（C32 的未决项，这里定下，实现者的决定）：保留 8 MiB / 2 s，另加最小间隔：一次检查点结束之后至少 0.5 s 才开始下一次（`checkpoint::MIN_SPACING`，不是 `TaskOptions` 的字段；teardown 的检查点不受它限制）。依据是用真正的状态文件（`StateFile` 写到另一个文件、每次 `sync_all`）重测的结果：`checkpoint_overhead` 加了两组，每组 5 次，中位数，release，默认 feature（mmap writer），单独运行：
+
+  | 场景 | 关闭 | 只在 teardown | 8 MiB / 2 s，无间隔（C32） | 8 MiB / 2 s + 0.5 s 间隔（新默认） | 32 MiB / 2 s，无间隔 |
+  | --- | --- | --- | --- | --- | --- |
+  | 本地不限速，256 MiB | 0.309 s | 0.350 s（+13.2%，1 次） | 0.489 s（+58.1%，32 次） | 0.358 s（+15.8%，2 次） | 0.385 s（+24.5%，8 次） |
+  | 100 MiB/s，256 MiB | 2.439 s | 2.452 s（+0.5%，1 次） | 2.393 s（−1.9%，32 次） | 2.393 s（−1.9%，6 次） | 2.406 s（−1.4%，8 次） |
+  | 20 MiB/s，64 MiB | 3.126 s | 3.132 s（+0.2%，1 次） | 3.113 s（−0.4%，8 次） | 3.116 s（−0.3%，7 次） | 3.126 s（−0.0%，2 次） |
+
+  - 间隔把本地不限速的开销从 +58% 降到 +16%，和“只在 teardown”（每次写都算 CRC、最后一次检查点）的 +13% 接近：剩下的主要是 CRC 和最后一次同步，不再是检查点的频率。限速的两个场景都在噪声之内，而且 20 MiB/s 时间隔几乎不起作用（7 次对 8 次），慢的源每 8 MiB 照样记一次。
+  - 加大 `checkpoint_bytes` 到 32 MiB 也能降本地的开销（+25%），但慢的源也一起变稀（20 MiB/s 时只有 2 次），崩溃时最多要重下的数据变成四倍；间隔只在检查点本来就太密时起作用，所以选间隔。
+  - 代价：快的源在两次检查点之间最多多写约 0.5 s 的数据（本地约 400 MiB，100 MiB/s 时约 50 MiB），崩溃时要重下；这些数据本来下得也快。
+  - 没有试 mmap 只刷脏区间（`flush_range`）：间隔已经把开销降到 teardown 那一档；留给以后，如果慢盘上的测量需要。
+  - `Off` 不受影响：没有接收者时不算 CRC、不同步、不调度（C32 的测试 `no_crc_and_no_sync_without_checkpoints` 仍然成立），关闭组和 C32 时一致（0.309 s 对 0.317 s，噪声之内）。
+  - 环境同 §14.28：一台 Windows 机器，NTFS，mmap writer；置信度：中。
+- **测试。**
+  - `state_file/tests.rs`（`MemoryIo`：内存里的文件，记下每个操作，按编号注入失败，失败的写可以写出一部分，记下最后一次同步时的内容）：头部逐字节（含 CRC）；种类 2 和没有 `source`、空 `source`；长度上限（1024、4096 刚好可以，多一个字节不行）；记录逐字节；头部之后追加两次，操作顺序是写、同步、写、同步、写、同步，同步的内容就是全部；追加的写或同步失败（写出半条记录）时 `end` 不动，回滚是 `set_len(end)` 加同步，回滚之后的追加从同一位置写；回滚失败返回错误，文件在 `end` 之前有效，之后的残片被解码器丢掉；头部的写或同步失败返回错误、`end` 不动；作废是 `set_len(0)` 加同步；经真实文件的句柄写头部、记录、回滚、作废；经 `DestinationLock` 锁住的句柄写，期间另一个任务 `InUse`，放锁之后锁文件没了；父目录同步。
+  - `concurrent_task/mod.rs` 的 `the_state_file_of_a_download_records_its_blocks`：真实的下载，状态文件作为接收者，结束后文件是有效的头部加每块恰好一条有效记录、之后没有别的字节，CRC 等于临时文件里那一块的 CRC。
+  - `checkpoint/tests.rs` 的 `test_checkpoints_keep_their_minimum_spacing`：上一次结束之后不到间隔时不开始，过了才开始。测试的 `Schedule` 用 0 间隔，原有测试不变。
+- **变异检查**（`--all-features` 跑 `state_file`、`checkpoint`、`concurrent_task::tests`），全部被抓到：追加没同步就移动 `end`；回滚什么都不做（失败的追加之后没有回滚）；回滚不同步；头部不同步；记录不同步；作废不同步；头部 CRC 跳过 magic；记录 CRC 只覆盖 16 字节；长度上限差一；忽略最小间隔。
+- **第一轮审查之后的修改**（codex 第一轮 PASS，94 分，两个 Minor、一个建议）：最小间隔的测试改为从检查点自己记下的结束时刻（`ended`）算时间，差 1 ns 不开始、恰好到间隔开始（原来拿固定的 `t0 + 20 s` 和真实的 `Instant::now()` 比）；`checkpoint_interval` 的文档和 `docs/task.md` 改为：0.5 s 的间隔只约束定期的检查点，teardown 的那次不等它；`DestinationLock::handle` 和 `release` 的文档写明：经句柄对状态文件的每个操作都要在 `release` 之前结束，否则句柄比锁活得长；Windows 上写用的是 `seek_write`，它会移动所有克隆共用的文件游标，任何依赖游标的用法都要和它串行。C33b 接上写入方之后，加一个用真实句柄、带闸门的测试：一个状态文件操作停住时 teardown 不放锁，放行之后才放。
+- **兼容性。** 没有公开项变化：`StateFile`、格式、`DestinationLock::handle`、`MIN_SPACING`、`Schedule::min_spacing` 都是 crate 内部的；`TaskOptions` 只改了文档。行为上，检查点只有测试打开，所以生产路径不变。按 tasks.md §0 第 3 条不算破坏兼容，提交是 `feat(task)`。
