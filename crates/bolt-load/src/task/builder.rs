@@ -10,7 +10,10 @@ use smol_cancellation_token::CancellationToken;
 use super::{
     BuildError, DownloadMode, Task, TaskOptions,
     destination::Destination,
-    instance::drive::{self, Attempt},
+    instance::{
+        destination_lock::LockHooks,
+        drive::{self, Attempt},
+    },
     status::StatusPublisher,
 };
 use crate::{
@@ -35,6 +38,8 @@ pub struct TaskBuilder {
     options: TaskOptions,
     cancel_token: Option<CancellationToken>,
     meta: Option<BoltLoadAdapterMeta>,
+    /// How the destination's lock is taken; replaced in tests.
+    lock_hooks: LockHooks,
 }
 
 impl TaskBuilder {
@@ -48,6 +53,7 @@ impl TaskBuilder {
             options: TaskOptions::default(),
             cancel_token: None,
             meta: None,
+            lock_hooks: LockHooks::default(),
         }
     }
 
@@ -163,6 +169,13 @@ impl TaskBuilder {
             .precheck()
     }
 
+    /// Take the destination's lock with `hooks`.
+    #[cfg(test)]
+    pub(crate) fn lock_hooks(mut self, hooks: LockHooks) -> Self {
+        self.lock_hooks = hooks;
+        self
+    }
+
     /// Validate and start the download on a `blocking` pool thread.
     ///
     /// Each running task occupies one such thread until it ends.
@@ -177,6 +190,7 @@ impl TaskBuilder {
             options,
             cancel_token,
             meta,
+            lock_hooks,
         } = self;
         let (Some(runtime), Some(destination)) = (runtime, destination) else {
             unreachable!("validated above");
@@ -193,6 +207,7 @@ impl TaskBuilder {
             options,
             meta,
             cancel_token: cancel_token.clone(),
+            lock_hooks,
         };
         let join = drive::spawn(attempt, runtime, local_runtime_builder, publisher);
         Ok(Task::new(join, status, cancel_token))

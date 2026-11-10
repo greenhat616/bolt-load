@@ -27,8 +27,14 @@ fn attempts_are_send() {
         options: TaskOptions::default(),
         meta: None,
         cancel_token: CancellationToken::new(),
+        lock_hooks: Default::default(),
     };
     let (publisher, _status) = StatusPublisher::new();
-    let attempt = run(attempt, ThreadedRuntimeImpl::new_tokio_rt(), publisher);
+    let attempt = run(
+        attempt,
+        ThreadedRuntimeImpl::new_tokio_rt(),
+        publisher,
+        super::ownership::Ownership::new(),
+    );
     assert_send(&attempt);
 }
