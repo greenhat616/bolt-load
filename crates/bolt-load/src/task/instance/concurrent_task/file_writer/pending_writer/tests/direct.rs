@@ -411,6 +411,7 @@ fn test_completion_drop_does_not_panic_on_full_channel() {
     tx.try_send(WriteCompletion {
         range: 0..1,
         result: Ok(()),
+        crcs: Vec::new(),
     })
     .unwrap();
     let done = CompletionGuard::new(

@@ -150,6 +150,15 @@ impl FileRangeWriter for SlowWriter {
         .await
     }
 
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        self.file
+            .sync_data()
+            .map_err(CommandError::from)
+            .with_context(|_| super::SyncSnafu {
+                path: self.path.clone(),
+            })
+    }
+
     async fn finalize(self) -> Result<(), FileWriterError> {
         self.inject_delay(0).await;
 

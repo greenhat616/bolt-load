@@ -7,6 +7,7 @@
 //! with a panicking worker, or with a task that was never polled.
 use std::{
     io,
+    num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
@@ -32,39 +33,60 @@ pub(super) type CommandAck = oneshot::Sender<io::Result<()>>;
 /// before that, it reports the write as failed.
 pub(super) struct CompletionGuard {
     state: Option<(Sender<WriteCompletion>, Chunk)>,
+    /// The block size to split the CRCs of a successful write at; `None`
+    /// computes no CRC (design §11.5.6).
+    crc_block: Option<NonZeroU64>,
 }
 
 impl CompletionGuard {
     pub(super) fn new(tx: Sender<WriteCompletion>, chunk: Chunk) -> Self {
         Self {
             state: Some((tx, chunk)),
+            crc_block: None,
+        }
+    }
+
+    /// Have a successful write carry the CRCs of its bytes, split at blocks
+    /// of `block_size`, when it is `Some`.
+    pub(super) fn checksummed(mut self, block_size: Option<NonZeroU64>) -> Self {
+        self.crc_block = block_size;
+        self
+    }
+
+    /// The completion of `chunk` with `result`: a successful one carries the
+    /// CRCs of its bytes when asked to, a failed one never, even when part
+    /// of it was written.
+    fn completion(&self, chunk: Chunk, result: Result<(), FileWriterError>) -> WriteCompletion {
+        let crcs = match (&result, self.crc_block) {
+            (Ok(()), Some(block_size)) => {
+                super::crc::frame_segments(chunk.range.clone(), &chunk.data, block_size)
+            }
+            _ => Vec::new(),
+        };
+        WriteCompletion {
+            range: chunk.range,
+            result,
+            crcs,
         }
     }
 
     /// Report the result of a backend write.
     pub(super) fn complete(mut self, result: io::Result<()>, path: &Path) {
         let (tx, chunk) = self.state.take().expect("completed once");
-        let range = chunk.range.clone();
+        // The chunk is cloned for the error only: its data is shared.
         let result = result.map_err(|source| FileWriterError::WriteRange {
             source: source.into(),
-            chunk: Some(chunk),
+            chunk: Some(chunk.clone()),
             path: path.to_path_buf(),
         });
-        publish(tx, WriteCompletion { range, result }, true);
+        publish(tx, self.completion(chunk, result), true);
     }
 
     /// Report the result of [`FileRangeWriter::write_range`](super::FileRangeWriter::write_range),
     /// keeping its error as it is.
     pub(super) fn complete_result(mut self, result: Result<(), FileWriterError>) {
         let (tx, chunk) = self.state.take().expect("completed once");
-        publish(
-            tx,
-            WriteCompletion {
-                range: chunk.range,
-                result,
-            },
-            true,
-        );
+        publish(tx, self.completion(chunk, result), true);
     }
 }
 
@@ -78,7 +100,15 @@ impl Drop for CompletionGuard {
                 path: PathBuf::new(),
             });
             // Never assert while unwinding.
-            publish(tx, WriteCompletion { range, result }, false);
+            publish(
+                tx,
+                WriteCompletion {
+                    range,
+                    result,
+                    crcs: Vec::new(),
+                },
+                false,
+            );
         }
     }
 }
@@ -117,6 +147,8 @@ impl WriteReply {
 /// A command of a backend's worker queue.
 pub(super) enum Command {
     Write(Chunk, WriteReply),
+    /// Sync the data written so far to the disk (design §11.5.5).
+    Sync(CommandAck),
     Finalize(CommandAck),
 }
 
@@ -124,6 +156,7 @@ impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Write(chunk, _) => f.debug_tuple("Write").field(chunk).finish(),
+            Self::Sync(_) => f.write_str("Sync(..)"),
             Self::Finalize(_) => f.write_str("Finalize(..)"),
         }
     }

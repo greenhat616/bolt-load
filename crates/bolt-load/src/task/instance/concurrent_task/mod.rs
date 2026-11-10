@@ -40,6 +40,9 @@ async fn finalize_file_writer(writer: impl FileRangeWriter, tmp_path: &Path) -> 
         .map_err(|error| file_error(tmp_path, error))
 }
 
+mod checkpoint;
+#[cfg(test)]
+mod checkpoint_bench;
 mod chunk_planner;
 mod download_loop;
 /// File writer implementations for concurrent downloads.
@@ -67,6 +70,12 @@ pub(crate) struct ConcurrentTaskInner {
     progress: Progress,
     reporter: ProgressReporter,
     options: TaskOptions,
+    /// Where the checkpoints go, when the task keeps a state file (design
+    /// §11.5.5); `None` takes none.
+    checkpoints: Option<Box<dyn checkpoint::CheckpointReceiver>>,
+    /// How long each sync of a checkpoint took, for the benchmark.
+    #[cfg(test)]
+    sync_times: checkpoint::SyncTimes,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -95,7 +104,20 @@ impl ConcurrentTaskInner {
             progress: Progress::new(Some(total), 0, Vec::new()),
             reporter,
             options,
+            checkpoints: None,
+            #[cfg(test)]
+            sync_times: checkpoint::SyncTimes::default(),
         }
+    }
+
+    /// Hand the checkpoints of the download to `receiver`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "C33 hands over the state file"))]
+    pub(crate) fn checkpoint_to(
+        mut self,
+        receiver: Box<dyn checkpoint::CheckpointReceiver>,
+    ) -> Self {
+        self.checkpoints = Some(receiver);
+        self
     }
 
     /// Download into the temporary file, then commit it or discard it.
@@ -142,6 +164,23 @@ impl ConcurrentTaskInner {
             &self.options,
             cancel_token.clone(),
         );
+        if let Some(receiver) = self.checkpoints.take() {
+            #[cfg_attr(not(test), expect(unused_mut, reason = "the benchmark sets the probe"))]
+            let mut checkpoints = checkpoint::Checkpoints::new(
+                total,
+                checkpoint::Schedule::of(&self.options),
+                receiver,
+                file_writer.clone(),
+                Arc::new(checkpoint::FileBlocks(tmp_path.to_path_buf())),
+                self.output.drain(),
+                std::time::Instant::now(),
+            );
+            #[cfg(test)]
+            {
+                checkpoints.sync_times = self.sync_times.clone();
+            }
+            download = download.with_checkpoints(checkpoints);
+        }
         let transfer_result = download.run().await;
         let transfer_result = download.finish(transfer_result, &mut self.progress).await;
         // Always join the writer workers, so the file handle is released before
@@ -227,6 +266,62 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), wait)
             .await
             .expect("the workers did not exit");
+    }
+
+    /// A real download, through the writer the features pick and real
+    /// runners, records every block with the CRC of its bytes in the
+    /// temporary file, the short last one included, each once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_checkpoints_of_a_download_match_its_file() {
+        use bolt_load_tests::adapter::simple::SimpleTestAdapterBuilder;
+
+        use self::checkpoint::tests::{RecordingReceiver, assert_records_match};
+        use crate::adapter::DynBoltLoadAdapter;
+
+        const TOTAL: u64 = 5 * (1 << 20) + 123;
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(TOTAL as usize)
+            .chunk_size(16 << 10)
+            .support_range(true)
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.bin");
+        let output = OutputFile::new(dest, crate::task::instance::ownership::Ownership::new());
+        let tmp_path = output.tmp.clone();
+        let (receiver, received) = RecordingReceiver::new(
+            file_writer::SyncProbe::default(),
+            checkpoint::BLOCK_SIZE.get(),
+            TOTAL,
+        );
+        let (reporter, _status) = ProgressReporter::for_test();
+        let options = TaskOptions::default()
+            .checkpoint_bytes(std::num::NonZeroU64::new(1 << 20).unwrap())
+            .max_connections(std::num::NonZeroUsize::new(4).unwrap());
+        let mut inner = ConcurrentTaskInner::new(
+            DynBoltLoadAdapter::new_arc(adapter),
+            output,
+            TOTAL,
+            ThreadedRuntimeImpl::new_tokio_rt(),
+            options,
+            reporter,
+        )
+        .checkpoint_to(receiver);
+        inner
+            .download_to(&tmp_path, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let content = std::fs::read(&tmp_path).unwrap();
+        let recorded = received.recorded();
+        let mut indices: Vec<u64> = recorded.iter().map(|block| block.index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..6).collect::<Vec<_>>());
+        assert_records_match(
+            &recorded,
+            &Arc::new(std::sync::Mutex::new(content)),
+            checkpoint::BLOCK_SIZE.get(),
+        );
     }
 
     #[tokio::test]

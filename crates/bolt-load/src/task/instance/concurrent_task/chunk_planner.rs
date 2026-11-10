@@ -1106,6 +1106,18 @@ impl WrittenSet {
         &self.0
     }
 
+    /// Whether every byte of `range` is in the set; an empty range is.
+    pub fn contains(&self, range: &Range<u64>) -> bool {
+        if range.is_empty() {
+            return true;
+        }
+        // The first range that ends after `range` starts must hold it all.
+        let at = self.0.partition_point(|r| r.end <= range.start);
+        self.0
+            .get(at)
+            .is_some_and(|r| r.start <= range.start && range.end <= r.end)
+    }
+
     #[inline]
     pub fn into_ranges(self) -> Vec<Range<u64>> {
         self.0

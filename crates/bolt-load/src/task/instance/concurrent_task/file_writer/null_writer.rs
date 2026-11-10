@@ -14,7 +14,7 @@ use snafu::prelude::*;
 use super::{
     Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
     FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, WriteRangeSnafu,
-    WriteReply,
+    WriteReply, sync_through,
 };
 
 /// A null writer that discards all data.
@@ -59,6 +59,11 @@ impl FileRangeWriter for NullWriter {
         Ok(())
     }
 
+    /// Nothing to sync, through the queue as the other backends.
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        sync_through(&self.tx, std::path::Path::new(NULL_PATH)).await
+    }
+
     async fn finalize(self) -> Result<(), FileWriterError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -101,6 +106,9 @@ fn null_writer_task(
         match command {
             Command::Write(chunk, reply) => {
                 reply.complete(execute_write(chunk), std::path::Path::new(NULL_PATH));
+            }
+            Command::Sync(tx) => {
+                let _ = tx.send(Ok(()));
             }
             Command::Finalize(tx) => {
                 let _ = tx.send(Ok(()));
