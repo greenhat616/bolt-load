@@ -8,6 +8,7 @@
 
 use std::{
     future::poll_fn,
+    num::NonZeroU64,
     ops::Range,
     pin::Pin,
     sync::Arc,
@@ -21,7 +22,7 @@ use bytes::Bytes;
 use futures::{Stream, task::SpawnExt};
 
 use super::{
-    Chunk, FileRangeWriter, FileWriter, FileWriterError,
+    Chunk, CrcSegment, FileRangeWriter, FileWriter, FileWriterError,
     command::{CompletionGuard, SubmitError, SubmitWrite, queue_closed},
 };
 use crate::runtime::ThreadedRuntimeImpl;
@@ -40,6 +41,11 @@ pub struct PendingWrite {
 pub struct WriteCompletion {
     pub range: Range<u64>,
     pub result: Result<(), FileWriterError>,
+    /// The CRC32C of the bytes written, split at block boundaries, when the
+    /// writer was asked for them with `PendingWriter::checksum`: empty
+    /// otherwise, and for a failed write, even one that wrote some of its
+    /// bytes (design §11.5.6).
+    pub crcs: Vec<CrcSegment>,
 }
 
 /// Indicates what happened when [`PendingWriter::write_range`] was called.
@@ -86,6 +92,10 @@ pub struct PendingWriter<F> {
     /// Tracks spawned write tasks until they have fully exited.
     #[debug(skip)]
     write_wg: WaitGroup,
+
+    /// The block size the CRCs of successful writes are split at; `None`
+    /// computes none.
+    crc_block: Option<NonZeroU64>,
 }
 
 impl<F> PendingWriter<F>
@@ -109,7 +119,23 @@ where
             pending_write: None,
             saw_error: false,
             write_wg: WaitGroup::new(),
+            crc_block: None,
         }
+    }
+
+    /// Have every successful write report the CRC32C of its bytes, split at
+    /// blocks of `block_size` (design §11.5.6). Without it, no CRC is
+    /// computed.
+    ///
+    /// Call it before the first write.
+    pub(crate) fn checksum(&mut self, block_size: NonZeroU64) {
+        debug_assert_eq!(self.in_flight, 0, "before the first write");
+        self.crc_block = Some(block_size);
+    }
+
+    /// Compute no CRC for the writes submitted from now on.
+    pub(crate) fn stop_checksumming(&mut self) {
+        self.crc_block = None;
     }
 
     #[inline]
@@ -313,7 +339,8 @@ struct WriteTask<F> {
 
 impl<F: FileRangeWriter + 'static> WriteTask<F> {
     fn new(pending: &PendingWriter<F>, chunk: Chunk) -> Self {
-        let done = CompletionGuard::new(pending.completion_tx.clone(), chunk.clone());
+        let done = CompletionGuard::new(pending.completion_tx.clone(), chunk.clone())
+            .checksummed(pending.crc_block);
         Self::guarded(pending, chunk, done)
     }
 
@@ -363,7 +390,8 @@ impl PendingWriter<FileWriter> {
         if self.writer.submission().is_none() {
             return self.dispatch_spawned(chunk);
         }
-        let done = CompletionGuard::new(self.completion_tx.clone(), chunk.clone());
+        let done = CompletionGuard::new(self.completion_tx.clone(), chunk.clone())
+            .checksummed(self.crc_block);
         match self.writer.try_submit(chunk, done) {
             Ok(()) => {}
             Err(SubmitError::Full(chunk, done)) => self.spawn_submit(chunk, done),

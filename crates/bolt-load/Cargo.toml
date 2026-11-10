@@ -93,6 +93,7 @@ async-io = "2" # for async timer
 blocking = "1" # convert blocking io to async
 fs4 = { version = "1.1", default-features = false, features = ["sync"] } # the destination lock, design §11.5.4
 same-file = "1" # the destination lock's file identity check
+crc32c = "0.6.8" # block checksums of the checkpoints, design §11.5.6
 
 serde = { version = "1", features = ["derive"], optional = true }
 

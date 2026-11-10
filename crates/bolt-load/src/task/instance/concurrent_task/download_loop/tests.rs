@@ -1254,6 +1254,7 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
 }
 
 mod admission;
+mod checkpoint;
 mod growth;
 mod hedge;
 mod restart;

@@ -4,13 +4,14 @@ use std::{
     time::Instant,
 };
 
-use super::{DownloadLoop, LoopEvent, WriteCompletion};
+use super::{super::file_writer::CrcSegment, DownloadLoop, LoopEvent, WriteCompletion};
 use crate::{
     runner::TaskError,
     task::{DownloadError, instance::Result},
 };
 
-/// Hand every successful write of `completions` to `on_written`, and return
+/// Hand every successful write of `completions` to `on_written`, with the
+/// CRCs of its bytes when the writer computes them, and return
 /// the bytes they wrote, or the first failed write in the order the
 /// completions were received as [`TaskError::Write`], keeping its range and
 /// io error.
@@ -19,15 +20,20 @@ use crate::{
 /// are in the file (design §11.1).
 pub(super) fn settle_completions(
     completions: Vec<WriteCompletion>,
-    mut on_written: impl FnMut(std::ops::Range<u64>),
+    mut on_written: impl FnMut(std::ops::Range<u64>, &[CrcSegment]),
 ) -> Result<usize> {
     let mut written = 0usize;
     let mut failed = None;
-    for WriteCompletion { range, result } in completions {
+    for WriteCompletion {
+        range,
+        result,
+        crcs,
+    } in completions
+    {
         match result {
             Ok(()) => {
                 written += (range.end - range.start) as usize;
-                on_written(range);
+                on_written(range, &crcs);
             }
             Err(error) if failed.is_none() => {
                 failed = Some(DownloadError::transfer(TaskError::Write {
@@ -67,7 +73,16 @@ impl DownloadLoop {
         now: Instant,
     ) -> Result<()> {
         let manager = &mut self.manager;
-        let written = settle_completions(completions, |range| manager.note_written(range))?;
+        let checkpoints = &mut self.checkpoints;
+        let written = settle_completions(completions, |range, crcs| {
+            if let Some(checkpoints) = checkpoints.as_mut() {
+                checkpoints.note_written(range.clone(), crcs);
+            }
+            manager.note_written(range);
+        });
+        // The writes that completed count even when one failed.
+        self.maybe_checkpoint(now);
+        let written = written?;
         self.throughput.record_written(written);
         self.policy.on_write_ok(written);
         if was_full && self.writer.can_write() {
@@ -145,7 +160,8 @@ mod tests {
             assert_eq!(completions.len(), 3, "{kind:?}");
 
             let mut written = Vec::new();
-            let error = settle_completions(completions, |range| written.push(range)).unwrap_err();
+            let error =
+                settle_completions(completions, |range, _| written.push(range)).unwrap_err();
             assert_eq!(written, [0..4, 8..12], "{kind:?}");
             let Some(TaskError::Write { range, source }) = error.as_transfer() else {
                 panic!("{kind:?}: expected a write error, got {error:?}");
@@ -175,7 +191,7 @@ mod tests {
         let mut completions = pending.finish().await;
         completions.sort_by_key(|completion| completion.range.start);
         assert_eq!(
-            settle_completions(completions, |range| written.push(range)).unwrap(),
+            settle_completions(completions, |range, _| written.push(range)).unwrap(),
             6
         );
         assert_eq!(written, [0..4, 4..6]);
@@ -184,6 +200,7 @@ mod tests {
     #[test]
     fn a_closed_writer_queue_is_a_broken_pipe() {
         let completion = WriteCompletion {
+            crcs: Vec::new(),
             range: 0..4,
             result: Err(FileWriterError::WriteRange {
                 source: CommandError::Recv,
@@ -192,7 +209,7 @@ mod tests {
             }),
         };
 
-        let error = settle_completions(vec![completion], |range| {
+        let error = settle_completions(vec![completion], |range, _| {
             panic!("{range:?} was not written");
         })
         .unwrap_err();

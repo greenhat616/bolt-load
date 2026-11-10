@@ -144,6 +144,13 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 | `stream_idle_timeout` | 30 s |
 | `connect_timeout` | 30 s |
 | `meta_retry` | 3 retries, 200 ms – 2 s per wait |
+| `checkpoint_bytes` | 8 MiB |
+| `checkpoint_interval` | 2 s |
+
+`checkpoint_bytes` and `checkpoint_interval` schedule the checkpoints of a
+task that keeps a state file for a later resume: its complete blocks,
+with their CRCs, recorded once their data is synced. No task keeps one
+yet, so they have no effect for now.
 
 Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a
 stalled stream ends the task with `NoProgress` before its runner can time
