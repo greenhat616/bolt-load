@@ -610,7 +610,7 @@
 
 设计见 design §11.5（D15–D19）；提交拆分是建议，见 §11.5.13。
 
-- [ ] C31：整个任务期间对 `<dest>.boltload` 加独占的建议锁（`fs4`），拿不到以 `InUse` 失败；核对文件 ID；只经锁住的句柄读写；锁的所有权在 unwind 和取消之外，panic 时等 worker 退出；`Off` 在动部分文件之前作废旧状态；修 #152（design §11.5.4）。
+- [x] C31：整个任务期间对 `<dest>.boltload` 加独占的建议锁（`fs4`），拿不到以 `InUse` 失败；核对文件 ID；只经锁住的句柄读写；锁的所有权在 unwind 和取消之外，panic 时等 worker 退出；`Off` 在动部分文件之前作废旧状态；修 #152（design §11.5.4）。
 - [ ] C34：meta 带上实际用于 `If-Range` 的验证器（design §11.5.7）。
 - [ ] C32：writer 的 `sync`，按 1 MiB 块的 CRC32C，串行的检查点（每 8 MiB 或 2 s、teardown 时一次）和失败时的回滚；测同步和 CRC 的开销（design §11.5.5、§11.5.6）。
 - [ ] C33：`<file>.boltload` 使用带 CRC 的二进制格式（design §11.3、§11.5.5）。记录在数据同步之后才追加；新开始、完成、回退、丢弃都按 §11.5.5 的顺序；按阶段保留或删除文件，`kept_for_resume`，`discard_partial`（design §11.5.9）。

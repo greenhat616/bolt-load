@@ -14,6 +14,7 @@ use super::{
     FileWriterCapability, FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
     WriteReply, finalize_and_join,
 };
+use crate::task::instance::drained_file::Drained;
 
 pub struct MmapWriter {
     pub file: File,
@@ -67,6 +68,8 @@ impl FileRangeWriter for MmapWriter {
 #[derive(Default)]
 pub struct MmapWriterBuilder {
     pub file: Option<File>,
+    /// Kept by the worker until it released the mapping and the handle.
+    pub drain: Option<WaitGroup>,
 }
 
 impl FileWriterCapability for MmapWriterBuilder {
@@ -164,6 +167,11 @@ impl MmapWriterBuilder {
         self
     }
 
+    pub fn drain(mut self, drain: WaitGroup) -> Self {
+        self.drain = Some(drain);
+        self
+    }
+
     pub async fn build(self) -> Result<MmapWriter, FileWriterBuilderError> {
         let Some(file) = self.file else {
             return Err(ValidationSnafu {
@@ -181,12 +189,16 @@ impl MmapWriterBuilder {
                 path: file.path().to_path_buf(),
             })?;
         let worker_wg = WaitGroup::new();
-        let worker_guard = worker_wg.clone();
+        // Release the mapping and file handle before reporting the exit, on
+        // every path, a panic included: the file, then the worker's guard,
+        // then the drain's.
+        let held = Drained::new(
+            Drained::new(file_clone, Some(worker_wg.clone())),
+            self.drain,
+        );
         blocking::unblock(move || {
-            mmap_writer_task(ready_tx, &file_clone, &chunk_rx);
-            // Release the mapping and file handle before reporting the exit.
-            drop(file_clone);
-            drop(worker_guard);
+            let held = held;
+            mmap_writer_task(ready_tx, &held.value.value, &chunk_rx);
         })
         .detach();
 

@@ -276,7 +276,8 @@ publishing `Initializing`:
 4. Publish `info`, then construct the selected transfer from the
    initialized data.
 
-Draft (C31, C33, C20; download strategy hardening, design §11.4-§11.5):
+Download strategy hardening, design §11.4-§11.5 (step 4 and Off's part of
+step 5 implemented in C31; the rest of step 5 is a draft for C33 and C20):
 steps 3 and 4 become these, with everything before `info` is published:
 
 3. Resolve the destination and check the filesystem.
@@ -355,13 +356,14 @@ pub enum DownloadError {
     InvalidDestination { path: PathBuf, reason: &'static str },
     InvalidFilename { name: String },
     MissingFilename,
+    InUse { path: PathBuf }, // download strategy hardening, design §11.5.4 (C31)
     Runtime { message: String },
     Panicked { message: String },
     Aborted,
 }
 
 #[non_exhaustive]
-pub enum IoOp { Inspect, Create, Allocate, Write, Flush, Rename }
+pub enum IoOp { Inspect, Create, Allocate, Write, Flush, Rename, Lock }
 
 impl DownloadError {
     pub fn is_cancelled(&self) -> bool;
@@ -415,11 +417,12 @@ impl DownloadError {
   renamed to the destination, the remaining completion steps run and the
   terminal status is `Finished` instead. The wait has no bound: a worker
   stuck in a file operation keeps the cleanup, the lock and the terminal
-  status pending (design §11.5.4). Awaiting the `Task` returns that error instead of
-  resuming the unwind (`blocking` builds its tasks with
-  `propagate_panic(true)`). (Draft, C31; before it, workers were signalled
-  but not joined, and the temporary file was removed on a best-effort
-  basis.)
+  status pending (design §11.5.4). Awaiting the `Task` returns that error
+  instead of resuming the unwind (`blocking` builds its tasks with
+  `propagate_panic(true)`). (C31 implements the phases it reaches: before
+  the lock, while transferring, and after the rename; the others arrive
+  with C33. Before C31, workers were signalled but not joined, and the
+  temporary file was removed on a best-effort basis.)
 - **TASK-9** `drive_progress_bar` runs a dedicated thread that waits with
   `changed_blocking`. It calls `set_length` once the total is known, leaves
   the bar as a spinner while it is unknown, finishes or abandons the bar on
@@ -655,7 +658,7 @@ tests and the loom models. Where it differs from or refines §4:
 | Item | Implementation |
 |---|---|
 | Destination errors during `Initializing` | `DownloadError::InvalidDestination { path, reason }` mirrors `BuildError::InvalidDestination`; metadata read errors other than "not found" are `Io { op: Inspect }`. |
-| File errors | Singleton: `Io` with `Create`, `Allocate`, `Write`, `Flush` on the temporary path; its writes are buffered, so a failed write may surface on the flush. Concurrent: a failed write is `Transfer(Write { range, source })`, keeping the io error; creating and sizing the file are `Io` with `Create` and `Allocate`, and finalizing it (joining the writer workers, then syncing) is `Io` with `Flush`, on the temporary path. A full disk or an exceeded quota adds a hint to the `Io` and `Write` messages. A failed rename is `Io { op: Rename, path: dest }`. |
+| File errors | Singleton: `Io` with `Create`, `Allocate`, `Write` on the temporary path; since C31 each write reaches the file before the next frame (no buffer to flush), on a blocking thread that holds the attempt's drain group. Concurrent: a failed write is `Transfer(Write { range, source })`, keeping the io error; creating and sizing the file are `Io` with `Create` and `Allocate`, and finalizing it (joining the writer workers, then syncing) is `Io` with `Flush`, on the temporary path. A full disk or an exceeded quota adds a hint to the `Io` and `Write` messages. A failed rename is `Io { op: Rename, path: dest }`. |
 | Singleton connect failure | `Transfer(StreamError { source })`, keeping the adapter's error (previously `StreamFailed`). |
 | `Task::status()` | Returns a receiver that has seen only the initial `Pending` value, so `while rx.changed().await.is_ok()` also reports a task that already ended. |
 | `TaskBuilder::cached_meta` | Added: reads the metadata from `meta` or a completed `retrieve_meta`. |

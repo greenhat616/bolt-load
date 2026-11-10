@@ -12,6 +12,7 @@ use super::{
     FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu,
     WriteRangeSnafu, WriteReply, finalize_and_join,
 };
+use crate::task::instance::drained_file::Drained;
 
 pub struct PoolWriter {
     pub file: File,
@@ -72,6 +73,8 @@ impl FileRangeWriter for PoolWriter {
 pub struct PoolWriterBuilder {
     pub file: Option<File>,
     pub parallel: Option<usize>,
+    /// Kept by every worker until it closed its handle.
+    pub drain: Option<WaitGroup>,
 }
 
 impl FileWriterCapability for PoolWriterBuilder {}
@@ -150,6 +153,11 @@ impl PoolWriterBuilder {
         self
     }
 
+    pub fn drain(mut self, drain: WaitGroup) -> Self {
+        self.drain = Some(drain);
+        self
+    }
+
     pub fn build(self) -> Result<PoolWriter, FileWriterBuilderError> {
         let Some(file) = self.file else {
             return ValidationSnafu {
@@ -174,11 +182,15 @@ impl PoolWriterBuilder {
         let worker_wg = WaitGroup::new();
         for worker_file in worker_files {
             let rx = rx.clone();
-            let worker_guard = worker_wg.clone();
+            // Dropped in order on every path, a panic included: the file,
+            // then the worker's guard, then the drain's.
+            let held = Drained::new(
+                Drained::new(worker_file, Some(worker_wg.clone())),
+                self.drain.clone(),
+            );
             blocking::unblock(move || {
-                file_writer_task(&worker_file, &rx);
-                drop(worker_file);
-                drop(worker_guard);
+                let held = held;
+                file_writer_task(&held.value.value, &rx);
             })
             .detach();
         }

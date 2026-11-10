@@ -8,15 +8,17 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+use async_waitgroup::WaitGroup;
 use bolt_load_utils::telemetry::*;
 use smol_cancellation_token::CancellationToken;
 
-use super::Result;
+use super::{Result, ownership::Ownership};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
-    task::{DownloadError, IoOp},
+    task::{DownloadError, IoOp, Progress},
 };
 
 /// The destination of one attempt and the temporary file it writes into.
@@ -28,24 +30,40 @@ use crate::{
 pub(crate) struct OutputFile {
     pub(crate) dest: PathBuf,
     pub(crate) tmp: PathBuf,
+    /// The attempt's cleanup state, kept outside its unwind boundary.
+    ownership: Arc<Ownership>,
 }
 
 impl OutputFile {
-    pub(crate) fn new(dest: PathBuf) -> Self {
+    pub(crate) fn new(dest: PathBuf, ownership: Arc<Ownership>) -> Self {
         Self {
             tmp: tmp_path_for(&dest),
             dest,
+            ownership,
         }
     }
 
+    /// A clone of the attempt's drain group, for a worker that holds the
+    /// temporary file: it keeps it until it closed the file, so a panic
+    /// handler can wait for it before releasing the destination's lock.
+    pub(crate) fn drain(&self) -> WaitGroup {
+        self.ownership.drain()
+    }
+
     /// Apply the commit rule to a finished transfer whose workers have all
-    /// exited, see [`commit`].
+    /// exited, see [`commit`]. Once the file is renamed, the attempt's
+    /// outcome is `completed`, even if it panics afterwards.
     pub(crate) async fn commit(
         &self,
         transfer: Result<()>,
+        completed: Progress,
         cancel_token: &CancellationToken,
     ) -> Teardown {
-        commit(transfer, &self.tmp, &self.dest, cancel_token).await
+        let teardown = commit(transfer, &self.tmp, &self.dest, cancel_token).await;
+        if teardown.result.is_ok() {
+            self.ownership.publish(completed);
+        }
+        teardown
     }
 }
 

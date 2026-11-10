@@ -121,6 +121,20 @@ connection or mixing the two versions. The ureq2 adapter now also sends a
 `bytes=0-0` GET when it retrieves the metadata, to read the validators of
 a GET.
 
+One task at a time downloads to a destination: a task locks
+`<dest>.boltload` while it runs, and a second task on the same
+destination, in this process or another, fails with
+`DownloadError::InUse`.
+
+**Breaking change.** Every task now creates `<dest>.boltload` next to its
+destination while it runs, and removes it when it ends; it empties one
+left by an earlier task before it starts. A second task on a destination
+in use fails with the new `DownloadError::InUse` instead of sharing the
+temporary file (#152), and a missing permission to create the lock file
+fails it with `DownloadError::Io` and the new `IoOp::Lock`. On a file
+system that cannot lock files, the task warns and goes on unlocked, and
+leaves the lock file behind, empty.
+
 ## Concurrency Control
 
 The concurrent download engine continuously monitors runner outcomes:

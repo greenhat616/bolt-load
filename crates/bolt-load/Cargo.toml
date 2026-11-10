@@ -91,6 +91,8 @@ async-broadcast = { version = "0.7" }
 async-fs = "2" # for async file operation
 async-io = "2" # for async timer
 blocking = "1" # convert blocking io to async
+fs4 = { version = "1.1", default-features = false, features = ["sync"] } # the destination lock, design §11.5.4
+same-file = "1" # the destination lock's file identity check
 
 serde = { version = "1", features = ["derive"], optional = true }
 
@@ -121,6 +123,9 @@ tracing = { version = "0.1", optional = true }
 
 # terminal progress
 indicatif = { version = "0.18", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2" # error codes of an unsupported file lock
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

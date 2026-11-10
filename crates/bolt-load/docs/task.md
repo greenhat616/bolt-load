@@ -119,9 +119,9 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   only once connected; a failed connection keeps the adapter's error.
 - **Write failures** end the task at once and are never retried. The
   concurrent mode reports `TaskError::Write` with the range and the io
-  error. The singleton mode buffers its writes, so a failure may surface
-  on a later write or on the flush: it reports `DownloadError::Io` with
-  `IoOp::Write` or `IoOp::Flush`, without a range. Both keep the
+  error. The singleton mode writes each frame through before it takes
+  the next: it reports `DownloadError::Io` with `IoOp::Write`, without
+  a range. Both keep the
   `io::ErrorKind`, and a full disk or an exceeded quota adds a hint to
   the message.
 - **Other file failures** end the task the same way. Both modes report
@@ -173,7 +173,9 @@ names it.
 - Dropping the [`Task`] cancels the download and lets its teardown run in
   the background; [`Task::detach`] keeps it running instead.
 - A panic in the attempt ends the task in `Failed` with
-  [`DownloadError::Panicked`]; its workers are signalled but not joined.
+  [`DownloadError::Panicked`], after its workers that hold the temporary
+  file have exited, the temporary file was removed and the destination's
+  lock released. A panic after the rename leaves the task `Finished`.
 
 # Temporary File and Commit Rule
 
@@ -187,13 +189,32 @@ before the rename starts discards the result; once the rename starts,
 its outcome decides. On failure the temporary file is removed and an
 existing file at the save path is never touched.
 
+# One Task per Destination
+
+A task holds an exclusive lock on `<save path>.boltload` from
+initialization to its end, so two tasks, in one process or several,
+never write the same temporary file. A second task on a destination in
+use fails at once with [`DownloadError::InUse`], before it writes
+anything; try again once the first has ended. The lock goes with the
+process, so a crashed task does not keep it.
+
+- The lock file sits next to the destination while the task runs, and is
+  removed when it ends. A task that finds one left by a crash takes it
+  over, and empties it before it touches the temporary file.
+- The destination's directory must be writable for the lock file. On a
+  file system that cannot lock files the task warns and goes on unlocked,
+  leaving the lock file behind, empty;
+  a missing permission fails it with [`DownloadError::Io`] and
+  [`IoOp::Lock`].
+
 # Attempt Steps
 
 Each spawned task runs one attempt on a local runtime, on a `blocking`
 pool thread it occupies until the end (rust-lang/rust#100013):
 
 1. **Initializing** — use the cached metadata or retrieve it, select the
-   mode, resolve and check the destination, then publish [`TaskInfo`].
+   mode, resolve and check the destination, take the destination's lock,
+   then publish [`TaskInfo`].
    Cancellation during this step ends the task in `Cancelled`, and wins
    when both are ready.
 2. **Downloading** — publishes a snapshot with zero speed, then spawns

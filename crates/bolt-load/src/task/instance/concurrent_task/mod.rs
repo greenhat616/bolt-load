@@ -22,8 +22,8 @@ fn file_error(tmp_path: &Path, error: FileWriterError) -> DownloadError {
 
 /// Create the writer of the temporary file and size it to `total`.
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-async fn create_file_writer(tmp_path: &Path, total: u64) -> Result<FileWriter> {
-    FileWriter::new(tmp_path, total)
+async fn create_file_writer(tmp_path: &Path, total: u64, drain: WaitGroup) -> Result<FileWriter> {
+    FileWriter::new_drained(tmp_path, total, drain)
         .await
         .map_err(|error| match error {
             FileWriterBuilderError::RangeWriter { source } => file_error(tmp_path, source),
@@ -105,7 +105,8 @@ impl ConcurrentTaskInner {
     async fn download(&mut self, cancel_token: &CancellationToken) -> Teardown {
         let tmp_path = self.output.tmp.clone();
         let transfer = self.download_to(&tmp_path, cancel_token).await;
-        self.output.commit(transfer, cancel_token).await
+        let completed = self.progress.clone();
+        self.output.commit(transfer, completed, cancel_token).await
     }
 
     /// Run the transfer and tear it down on every path: success, failure and
@@ -119,7 +120,7 @@ impl ConcurrentTaskInner {
             .progress
             .total
             .expect("A concurrent task should have a total size");
-        let file_writer = create_file_writer(tmp_path, total).await?;
+        let file_writer = create_file_writer(tmp_path, total, self.output.drain()).await?;
 
         let runners_cancel_token = cancel_token.child_token();
         // Fallback cancellation signal on unwinding; `DownloadLoop::finish` cancels explicitly.
@@ -202,12 +203,38 @@ mod tests {
         }
     }
 
+    /// Every worker that holds the temporary file keeps a clone of the
+    /// drain group until it exited, so a panic handler can wait for them.
+    #[tokio::test]
+    async fn the_writer_workers_hold_the_drain_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp_path = dir.path().join("file.tmp");
+        let drain = WaitGroup::new();
+        let writer = create_file_writer(&tmp_path, 4, drain.clone())
+            .await
+            .unwrap();
+        writer
+            .write_range(0..4, bytes::Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        // Polled here, not on a thread that may not have run yet.
+        let mut wait = std::pin::pin!(drain.wait());
+        assert!(
+            futures::poll!(wait.as_mut()).is_pending(),
+            "the workers are still running"
+        );
+        finalize_file_writer(writer, &tmp_path).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .expect("the workers did not exit");
+    }
+
     #[tokio::test]
     async fn a_file_that_cannot_be_created_is_a_create_error() {
         let dir = tempfile::tempdir().unwrap();
         let tmp_path = dir.path().join("missing").join("file.tmp");
 
-        let Err(error) = create_file_writer(&tmp_path, 4).await else {
+        let Err(error) = create_file_writer(&tmp_path, 4, WaitGroup::new()).await else {
             panic!("created a file in a missing directory");
         };
         assert_eq!(
