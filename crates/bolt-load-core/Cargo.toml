@@ -15,3 +15,4 @@ snafu = { workspace = true }
 futures = { workspace = true }
 dynosaur = "0.3"
 bytes = { workspace = true }
+httpdate = "1"

@@ -82,6 +82,21 @@ length errors and `BodyUndecodable` by downloading over one connection
 instead; any other `RangeMismatch` fails the task. So report a body your
 client cannot decode as `BodyUndecodable`, not as `Io`.
 
+## Validators
+
+Every range request should carry `If-Range`, so that a server holding
+another version of the resource answers with it rather than with a part
+of it. `if_range_validator` picks the validator from the `ETag`,
+`Last-Modified` and `Date` of a GET: the strong entity tag, else a date
+at least a second older than `Date`, none with a weak entity tag.
+Pass the one sent to `RangeHeaders::with_if_range`, with the response's
+own `ETag` and `Last-Modified`, and `validate_range_response` reports a
+changed resource as `Unretryable(ResourceChanged)`.
+
+Report the same value in `BoltLoadAdapterMeta::with_validator`. The
+`Validator` type lives in `bolt-load-core` for that, and is re-exported
+here, so `bolt_load_http::Validator` still names it.
+
 ## Content codings
 
 The task writes the body of a full response as the file. An HTTP
@@ -147,7 +162,7 @@ HTTP header parsing utilities adapted from actix-web, implementing:
 | `bytes`, `futures` | The range body limit |
 | `http`, `headers` | The `Header` trait for `ContentDisposition` |
 | `regex`, `language-tags`, `percent-encoding` | `Content-Disposition` and extended values |
-| `httpdate` | HTTP-dates in `Retry-After` |
+| `httpdate` | HTTP-dates in `Retry-After` and `Last-Modified` |
 
 ## License
 
