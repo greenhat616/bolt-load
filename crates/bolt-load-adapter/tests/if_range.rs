@@ -7,9 +7,14 @@
 
 #![cfg(all(feature = "reqwest", feature = "ureq2"))]
 
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
 use bolt_load_adapter::{reqwest::IntoReqwestAdapter, ureq2::IntoUreqAdapter};
 use bolt_load_core::adapter::{
-    AdapterError, BoltLoadAdapter, DynBoltLoadAdapter, UnretryableError,
+    AdapterError, BoltLoadAdapter, DynBoltLoadAdapter, UnretryableError, Validator,
 };
 use bolt_load_tests::adapter::{
     fault::RangeFault,
@@ -167,6 +172,11 @@ async fn a_200_with_the_validator_sent_ignores_the_range() {
         for (name, adapter, log, server) in adapters(fault).await {
             let meta = adapter.retrieve_meta().await.unwrap();
             assert_eq!(meta.etag.as_deref(), Some("\"v1\""), "{name} {fault:?}");
+            assert_eq!(
+                meta.validator,
+                Some(Validator::StrongEtag("\"v1\"".into())),
+                "{name} {fault:?}"
+            );
             assert!(
                 matches!(
                     unretryable(adapter.range_stream(10, 20).await),
@@ -251,10 +261,225 @@ async fn a_rejected_probe_leaves_no_validator() {
     for (name, adapter, log, server) in adapters(RangeFault::RejectedProbe).await {
         let meta = adapter.retrieve_meta().await.unwrap();
         assert_eq!(meta.etag, None, "{name}");
+        assert_eq!(meta.validator, None, "{name}");
         assert_eq!(meta.content_size, SIZE as u64, "{name}");
         assert!(adapter.is_range_stream_available().await, "{name}");
         assert!(adapter.range_stream(10, 20).await.is_ok(), "{name}");
         assert_eq!(last_if_range(&log), None, "{name}");
         server.abort();
     }
+}
+
+/// The meta names the validator that the range requests send in
+/// `If-Range`, kind and value, and `None` when they send none (design
+/// §11.5.7): a strong `ETag` of the GET, even when the HEAD names another;
+/// a `Last-Modified` a second before `Date`, in the format it came in; none
+/// with a weak `ETag`, a recent or future `Last-Modified`, or a rejected
+/// probe.
+#[tokio::test]
+async fn the_meta_names_the_validator_sent() {
+    let etag = |value: &str| Some(Validator::StrongEtag(value.to_owned()));
+    let date = |value: &str| Some(Validator::LastModified(value.to_owned()));
+    for (fault, expected) in [
+        (RangeFault::HeadValidatorsDiffer, etag("\"v1\"")),
+        (
+            RangeFault::LastModifiedOneSecondOld,
+            date("Fri, 15 Jan 2027 07:59:59 GMT"),
+        ),
+        (
+            RangeFault::ObsoleteDateFormats,
+            date("Tuesday, 14-Nov-23 22:13:21 GMT"),
+        ),
+        (RangeFault::WeakEtag, None),
+        (RangeFault::RecentLastModified, None),
+        (RangeFault::FutureLastModified, None),
+        (RangeFault::RejectedProbe, None),
+    ] {
+        for (name, adapter, log, server) in adapters(fault).await {
+            let meta = adapter.retrieve_meta().await.unwrap();
+            assert_eq!(meta.validator, expected, "{name} {fault:?}");
+            for (start, end) in [(10, 20), (20, 30)] {
+                assert!(
+                    adapter.range_stream(start, end).await.is_ok(),
+                    "{name} {fault:?}"
+                );
+                assert_eq!(
+                    last_if_range(&log).as_deref(),
+                    meta.validator.as_ref().map(Validator::as_str),
+                    "{name} {fault:?}"
+                );
+            }
+            server.abort();
+        }
+    }
+}
+
+/// The server of `fault`, with its log, and the resource it serves.
+async fn server(fault: RangeFault) -> (Url, RequestLog, tokio::task::JoinHandle<()>) {
+    let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+    let (port, server, log) = create_range_fault_server_with_log(content.into(), None)
+        .await
+        .unwrap();
+    let url = Url::parse(&format!("http://127.0.0.1:{port}{}", fault.path())).unwrap();
+    (url, log, server)
+}
+
+/// How many `bytes=0-0` probes the server answered.
+fn probes(log: &RequestLog) -> usize {
+    log.requests()
+        .into_iter()
+        .filter(|request| request.range == Some((0, 0)))
+        .count()
+}
+
+/// A port that accepts connections and closes them at once, without an
+/// answer: every request sent there fails at the transport level.
+async fn closing_port() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    (port, task)
+}
+
+/// A reqwest adapter cloned before the probe shares the probe: the clone
+/// reports the same `meta.validator` and sends the same `If-Range`, and the
+/// resource is probed once. `UreqAdapter` is not `Clone`; it is shared
+/// through an `Arc`, which is one instance.
+#[tokio::test]
+async fn a_cloned_adapter_shares_the_validator() {
+    let (url, log, server) = server(RangeFault::HeadValidatorsDiffer).await;
+    let original = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .into_reqwest_adapter((reqwest::Method::GET, url));
+    let clone = original.clone();
+    let meta = original.retrieve_meta().await.unwrap();
+    assert_eq!(meta.validator, Some(Validator::StrongEtag("\"v1\"".into())));
+    assert!(clone.range_stream(10, 20).await.is_ok());
+    assert_eq!(last_if_range(&log).as_deref(), Some("\"v1\""));
+    assert_eq!(
+        clone.retrieve_meta().await.unwrap().validator,
+        meta.validator
+    );
+    assert!(original.range_stream(20, 30).await.is_ok());
+    assert_eq!(last_if_range(&log).as_deref(), Some("\"v1\""));
+    assert_eq!(probes(&log), 1);
+    server.abort();
+}
+
+/// What a test hook saw of the range requests other than the probe, and
+/// whether it sends the next one to a port that closes the connection.
+#[derive(Clone, Default)]
+struct Hook {
+    fail: Arc<AtomicBool>,
+    sent: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl Hook {
+    /// Record the `If-Range` of a range request with `range`, if it is not
+    /// the probe; and whether it is to fail.
+    fn record(&self, range: Option<&str>, if_range: Option<&str>) -> bool {
+        if range.is_none_or(|range| range == "bytes=0-0") {
+            return false;
+        }
+        self.sent.lock().unwrap().push(if_range.map(str::to_owned));
+        self.fail.load(Ordering::SeqCst)
+    }
+
+    fn sent(&self) -> Vec<Option<String>> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+/// A range request that fails at the transport level leaves the meta as it
+/// was: it sent the validator of the meta, and the request that retries it
+/// sends the same one, for both adapters.
+#[tokio::test]
+#[expect(
+    clippy::result_large_err,
+    reason = "the ureq call hook returns the error type of ureq"
+)]
+async fn a_failed_range_request_keeps_the_validator() {
+    let (dead, closer) = closing_port().await;
+    for name in ["reqwest", "ureq2"] {
+        let (url, log, server) = server(RangeFault::HeadValidatorsDiffer).await;
+        let hook = Hook::default();
+        let adapter: Box<DynBoltLoadAdapter<'static>> = match name {
+            "reqwest" => {
+                let mut adapter = reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .into_reqwest_adapter((reqwest::Method::GET, url));
+                let hook = hook.clone();
+                adapter.before_request(move |builder| {
+                    let (client, request) = builder.build_split();
+                    let mut request = request.unwrap();
+                    let header = |name| {
+                        request
+                            .headers()
+                            .get(name)
+                            .map(|value: &reqwest::header::HeaderValue| {
+                                value.to_str().unwrap().to_owned()
+                            })
+                    };
+                    let range = header(reqwest::header::RANGE);
+                    let if_range = header(reqwest::header::IF_RANGE);
+                    if hook.record(range.as_deref(), if_range.as_deref()) {
+                        request.url_mut().set_port(Some(dead)).unwrap();
+                    }
+                    reqwest::RequestBuilder::from_parts(client, request)
+                });
+                DynBoltLoadAdapter::new_box(adapter)
+            }
+            _ => {
+                let mut adapter = ureq2::Agent::new().into_ureq_adapter(("get", url));
+                let hook = hook.clone();
+                adapter.call(move |request| {
+                    if hook.record(request.header("range"), request.header("if-range")) {
+                        ureq2::get(&format!("http://127.0.0.1:{dead}/")).call()
+                    } else {
+                        request.call()
+                    }
+                });
+                DynBoltLoadAdapter::new_box(adapter)
+            }
+        };
+        let meta = adapter.retrieve_meta().await.unwrap();
+        let v1 = Some(Validator::StrongEtag("\"v1\"".into()));
+        assert_eq!(meta.validator, v1, "{name}");
+
+        hook.fail.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(
+                adapter.range_stream(10, 20).await,
+                Err(AdapterError::Retryable { .. })
+            ),
+            "{name}"
+        );
+        assert_eq!(
+            adapter.retrieve_meta().await.unwrap().validator,
+            v1,
+            "{name}"
+        );
+
+        hook.fail.store(false, Ordering::SeqCst);
+        assert!(adapter.range_stream(10, 20).await.is_ok(), "{name}");
+        assert_eq!(
+            adapter.retrieve_meta().await.unwrap().validator,
+            v1,
+            "{name}"
+        );
+        let sent = Some("\"v1\"".to_owned());
+        assert_eq!(hook.sent(), [sent.clone(), sent.clone()], "{name}");
+        assert_eq!(last_if_range(&log), sent, "{name}");
+        assert_eq!(probes(&log), 1, "{name}");
+        server.abort();
+    }
+    closer.abort();
 }
