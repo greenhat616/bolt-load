@@ -3198,3 +3198,25 @@ C20 拆成三个提交（实现者提议）：C20a 是状态文件的读取和�
   - Minor：进度的测试原来靠记录器看到 `Downloading`，而且只检查“不少于”。第一轮改成在闸门处等状态通道的第一次变化，第二轮按 codex 的意见再改（见下）。
   - 建议：再次续传的测试改成 `test_resuming_again_keeps_what_was_added`：第二次续传多下完一块（第 2 块）才在第 3 块里失败，检查状态文件记了第 0、1、2 块；第三次续传保留 `0..3 × BLOCK`，只请求 `3 × BLOCK..SIZE`，内容正确。为此测试的 `Source` 加了 `fault_at`（默认 `HALF`）和范围检查的闸门。
 - **第二轮审查**（codex 第二轮 PASS 96 分，一个 Minor，按规则提交前修掉）：状态通道只保留最新的值，测试线程慢过 250 ms 时，进度采样会在闸门还关着的时候把错误的零进度换成正确的种子进度，变异就可能漏过。改成只在测试里存在的握手：`StatusPublisher` 在发布每个 `Downloading` 时、传输开始之前，把它的进度记进测试给的 `Starts`（`TaskBuilder::record_starts`，都是 `#[cfg(test)]`）；`test_the_progress_starts_with_what_was_kept` 断言记下的恰好是一次 `Progress::new(Some(SIZE), 2 × BLOCK, [0..2 × BLOCK])`，不再看通道里当时是什么。`Fault::GateFirst` 因此不再需要，删掉。变异“进度从零开始”重跑三次都被抓到；全部 26 个变异重跑一次，结果不变（25 个被抓到，1 个是上面说的等价变异）。另外更新了 `Resume` 过时的文档（“只写不读”）。
+
+#### 14.30.3 C20c：公开续传
+
+- **范围。** 公开 `Resume`（`Off`、`On`，`#[non_exhaustive]`，默认 `Off`）、`TaskBuilder::resume`、`TaskBuilder::resume_source`、`TaskStatus::kept_for_resume`、`bolt_load::task::discard_partial`；task-api-spec 的 STATUS-12、STATUS-13 定稿；README 和 `docs/task.md` 加“续传”一节；端到端测试。去掉了 C20b 那些公开项文档里“还不能打开”的说法。
+- **`resume_source`**（§11.5.2）：存进状态文件的头部，续传时和这一次给的比对，不同（包括一边有一边没有）→ `ResumeRejected(SourceMismatch)`。超过 4096 字节由 `TaskBuilder::validate` 拒绝（`BuildError::InvalidOptions`，沿用已有的变体，原因是 `the resume source is longer than 4096 bytes`），不进到 `Initializing`。
+- **文档**写明（lead 要求）：同一个 adapter 上续传，比对的是它缓存的探测；之后资源变了，只有续传还发 range 请求时才会被 `If-Range` 发现（`ResourceChanged`），全部保留的续传不发请求，发现不了；要按当前的资源检查，用新的 adapter。续传的说明提到单连接，所以同时写了 ureq2 可能短暂多占一个连接，链接 #207。
+- **不破坏兼容的核对**（对最终的公开 API 逐项，tasks.md §0 第 3 条）：`Resume` 是新的 `#[non_exhaustive]` 枚举；`resume`、`resume_source` 是 `TaskBuilder` 的新方法；`discard_partial` 是新函数；`kept_for_resume` 是 `#[non_exhaustive]` 的 `TaskStatus` 的新字段；`BuildError` 没有新变体（沿用 `InvalidOptions`）；C20b 公开的项不变。`Off` 是默认值，行为不变。所以提交是 `feat(task)`，不带 `!`。测试 crate（`bolt-load-tests`，`publish = false`）的 `RangeFault` 加了 `Stable`，不是公开 API。
+- **测试设施**（实现者的选择）：`bolt-load-tests` 加了 `RangeFault::Stable`（`"v1"` 的验证器，按请求回答 range，资源从不变）和 `create_range_fault_server_held_at(content, position, gate)`：覆盖 `position` 的 range 响应先发它之前的字节，再停在闸门，直到放行。
+- **测试**：
+  - G9（`tests/resume.rs`）：21 个种子，每个种子用 SplitMix64 定一个字节位置（不是第 0 字节，探测要它），每个种子在三种客户端（reqwest、解码的 reqwest、ureq2）上都跑，共 63 次（lead 的决定：按更严的理解，种子乘客户端；一共约 4.7 s）。第一个任务在那个位置被服务器停住时取消：`Cancelled`、`kept_for_resume` 是部分文件、状态文件在；第二个任务用新的 adapter 续传：完成、hash 正确、`resumed` 有值、`resumable` 为真、旁边不留文件；每种客户端都至少有一个种子保留了块。
+  - `discard_partial`：取消之后丢弃，两个文件都没了，下一个任务是新开始、内容正确。
+  - 进程崩溃和跨进程的锁（`src/task/tests/resume_crash.rs`）：测试把这个测试二进制自己再起一次当子进程（`--exact`，环境变量传目标和杀的位置），子进程用 `StepLog` 的闸门停在某一步（或者等任务结束），打印一行，父进程读到这一行就 `kill`（Windows 是 `TerminateProcess`，Unix 是 `SIGKILL`）：不跑任何清理，和崩溃一样；没有任何靠时间的同步。四个位置：第一次检查点写记录之前（只有头部）、第一次检查点写完记录、同步之前（检查点进行中）、改名失败、任务结束之后（每块都记了，两个文件都留着）、改名之前。每个下载至少有一次检查点（teardown 那次），所以每个位置不管下载多快都会到达（实现者原来另有一个“第二次检查点之前”的位置，依赖时间上有两次检查点，去掉了）。子进程下载中停着的时候，父进程 `On` 和 `Off` 的任务都以 `InUse` 失败；杀掉之后，状态文件有有效的头部和那个位置该有的记录数；父进程续传：完成、内容正确、没有丢弃、保留的字节等于记录的块、只请求其余的字节、锁已放。
+  - **§11.5.11 G9 列的三个位置，各由哪个测试覆盖**（lead 要求逐一对应，都经真实的进程或公开 API）：第一次检查点之前 → 崩溃测试的第一个位置（子进程在第一次检查点写记录之前被杀），以及 G9 里位置落在第一块写完之前的种子；检查点进行中 → 崩溃测试的第二个位置（记录已写、同步之前被杀）；改名失败之后 → 崩溃测试的第三个位置（子进程的任务改名失败、保留两个文件之后被杀，父进程续传：每块都保留、一个请求都不发、改名完成）。C20b 的 `test_a_complete_pair_downloads_nothing` 在同一进程里用钩子覆盖同一种情况。
+  - `resume_source`：同一个来源续上；另一个或没有 → `SourceMismatch`、两个文件不变；4096 字节通过验证，4097 字节不通过。
+- **变异**：4 个，全部被抓到：来源不存进头部、不比对来源、4096 字节被拒、来源不设上限。
+- **第一轮审查之后的修改**（codex 第一轮 PASS 88 分，按规则修掉四个 Minor 和一个建议）：
+  - 崩溃测试的子进程原来用 `StepLog::gate`，它 30 s 后自己放行，负载高时子进程可能越过要杀的位置。加了只在测试里的 `StepLog::hold`：不设期限，一直等到发送端发送或被丢弃；子进程把发送端留到进程结束，所以停住的那一步只能等被杀。父进程的看门狗和 `KillOnDrop` 不变。
+  - G9 原来在服务器的闸门到达时就取消，前缀可能还在客户端的缓冲里，取消时不一定保留了块，`kept_any` 没有保证。改成按协议：位置在第一块之后超过 64 KiB（runner 最多攒着不到一帧，32 KiB，留了余量）的种子，位置之前的每个字节最终都会写入，第一块也在其中，所以在取消之前等任务报告的已写入区间里有一整块（`downloaded_chunks`，teardown 的检查点会记它）；这些种子续传时 `kept_bytes` 至少是一块。每种客户端都有这样的种子（种子在三种客户端上都跑）。断言来自这个协议，不靠时间。G9 因此变成约 15 s（等进度采样报告已写入的区间）。
+  - `TaskBuilder::prefer_mode`、`docs/task.md`、README 原来说 `Singleton` 总会被采用；补上例外：`Resume::On` 而可续的任务以 1 个连接走并发模式，好保留状态文件（§11.5.8）。
+  - ureq2 的限制原来写得太轻。改为：放弃一个区间时还在运行的阻塞请求或读取，要等调用返回才放开连接；在那之前任务的连接数可以超过 `max_connections`，反复重试或重启时可以有好几个；agent 没设超时、服务器卡住时可以一直这样；链接 #207 和 bolt-load-adapter README 里设超时的说明。
+  - 建议：`probe_send.rs` 的 `Attempt` 初始化补上 `resume`、`resume_source`、`file_hooks`。核对方式：照 CI `hra-probe` 的两个命令，用单独的 target 目录，`RUSTFLAGS="--cfg bolt_load_probe_send"` 和加上 `-Zhigher-ranked-assumptions` 各跑一次 `cargo +nightly-2026-11-06 check -p bolt-load --tests`，两个都编译通过。
+- **第二轮审查**（codex 第二轮 PASS 97 分，没有 Critical、Major、Minor）：按它的建议，G9 等待用的 `holds_a_block` 原来把最后那块 12,345 字节的短块也算作一整块，等到的条件推不出 `kept_bytes >= BLOCK`；改成要求一个区间覆盖整整 `BLOCK` 字节（`first + BLOCK <= range.end`，不再截到总长），和断言一致。G9 连跑三次都通过。

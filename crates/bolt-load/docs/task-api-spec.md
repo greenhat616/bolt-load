@@ -210,7 +210,7 @@ resume-related fields can be added later.
   the file; the error that caused the discard is not replaced. With
   `Resume::On`, a task that can be resumed keeps the temporary file and the
   state file instead of removing them (STATUS-13; design §11.5.9;
-  implemented in C33 behind a crate-internal `Resume`, public with C20).
+  implemented in C33 behind a crate-internal `Resume`, public with C20c).
 - **STATUS-7** The watch sender MUST be dropped right after the terminal
   value, so `while rx.changed().await.is_ok()` ends after the receiver has
   seen it (watch delivers unseen values before `Closed`).
@@ -237,8 +237,7 @@ resume-related fields can be added later.
   ([#153](https://github.com/greenhat616/bolt-load/issues/153)). A full
   download accepts any status outside 4xx and 5xx, so `204 No Content` is an
   empty file too.
-- **STATUS-12** Resume (download strategy hardening, design §11.5; draft,
-  C20). `info.resumed` is `Some(ResumeReport)` when the task continued from
+- **STATUS-12** Resume (download strategy hardening, design §11.5; C20). `info.resumed` is `Some(ResumeReport)` when the task continued from
   a state file, even when every record was dropped; it is `None` for a
   fresh start and with `Resume::Off`. When ranges are continued from, the
   first `Downloading` status reports `downloaded == kept_bytes` and
@@ -256,8 +255,8 @@ resume-related fields can be added later.
   §11.5.9). It is never set together with `leftover_temp_file` for the
   same file, and never once the temporary file has been renamed to the
   destination: a failure after the rename leaves the task `Finished`.
-  (C33 sets it on a crate-internal field; it becomes the public field with
-  `Resume`, in C20, a lead decision. When the invalidation of a discard
+  (C33 set it on a crate-internal field; it became the public field with
+  `Resume`, in C20c, a lead decision. When the invalidation of a discard
   fails, both files stay and the partial file is reported in
   `leftover_temp_file`, not here: the task meant to discard it.)
 

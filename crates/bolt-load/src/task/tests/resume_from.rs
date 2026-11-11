@@ -979,3 +979,89 @@ async fn test_a_resume_cancelled_in_the_range_check_ends() {
     assert_eq!(log.steps(), [Step::ReadState]);
     assert_unlocked(&dest);
 }
+
+/// A task on `source` that may resume, from `resume_source` when given.
+fn with_source(source: Source, dest: &Path, resume_source: Option<&str>) -> crate::task::Task {
+    let mut builder = crate::task::test_support::builder(
+        DownloadMode::Concurrent,
+        source,
+        dest,
+        &CancellationToken::new(),
+    )
+    .meta(meta())
+    .options(super::resume_state::options())
+    .resume(crate::task::Resume::On);
+    if let Some(resume_source) = resume_source {
+        builder = builder.resume_source(resume_source);
+    }
+    builder.spawn().unwrap()
+}
+
+/// The source a state file names must be the one a resume gives: the
+/// same one resumes; another, or none, is rejected and leaves both files.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_resume_needs_the_same_source() {
+    for (resume_source, resumes) in [
+        (Some("https://example.com/a"), true),
+        (Some("https://example.com/b"), false),
+        (None, false),
+    ] {
+        let (_dir, dest) = dest();
+        let status = finish(with_source(
+            Source::new(Fault::Error(
+                UnretryableError::NotFound { status: 404 }.into(),
+            )),
+            &dest,
+            Some("https://example.com/a"),
+        ))
+        .await;
+        assert_eq!(status.kept_for_resume, Some(tmp_path(&dest)));
+        let state = std::fs::read(state_path_for(&dest)).unwrap();
+        assert_eq!(
+            decode_header(&state).unwrap().source.as_deref(),
+            Some("https://example.com/a")
+        );
+        let before = files(&dest);
+        let status = finish(with_source(Source::new(Fault::None), &dest, resume_source)).await;
+        if resumes {
+            assert_eq!(status.state, TaskState::Finished, "{:?}", status.error);
+        } else {
+            assert!(
+                matches!(
+                    status.error,
+                    Some(DownloadError::ResumeRejected {
+                        reason: RejectReason::SourceMismatch,
+                        ..
+                    })
+                ),
+                "{resume_source:?}: {:?}",
+                status.error
+            );
+            assert_eq!(files(&dest), before, "{resume_source:?}");
+        }
+    }
+}
+
+/// A source longer than a state file holds fails the builder's
+/// validation; one exactly that long does not.
+#[test]
+fn test_a_resume_source_has_a_limit() {
+    let (_dir, dest) = dest();
+    let builder = |len: usize| {
+        crate::task::test_support::builder(
+            DownloadMode::Concurrent,
+            Source::new(Fault::None),
+            &dest,
+            &CancellationToken::new(),
+        )
+        .resume(crate::task::Resume::On)
+        .resume_source("s".repeat(len))
+    };
+    assert_eq!(builder(4096).validate(), Ok(()));
+    assert_eq!(
+        builder(4097).validate(),
+        Err(crate::task::BuildError::InvalidOptions {
+            reason: "the resume source is longer than 4096 bytes"
+        })
+    );
+}

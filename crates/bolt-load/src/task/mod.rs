@@ -19,6 +19,7 @@ mod tests;
 pub use builder::*;
 pub use error::*;
 pub use handle::*;
+pub use instance::discard::discard_partial;
 pub use options::*;
 pub use resume::{DropReason, DroppedRecord, RejectReason, ResumeReport};
 pub use status::{Speed, StatusReceiver, TaskInfo, TaskState, TaskStatus};
