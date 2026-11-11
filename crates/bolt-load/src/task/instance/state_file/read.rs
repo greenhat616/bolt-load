@@ -2,8 +2,6 @@
 //! header, which rejects the whole file when it is bad, then the records,
 //! each kept or dropped with a reason.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "the task resumes in C20b"))]
-
 use std::{fs::File, io, ops::Range};
 
 use bolt_load_core::adapter::Validator;
@@ -431,7 +429,7 @@ pub(crate) fn read_state(file: &dyn ReadAt) -> Result<Scanned, ReadError> {
 }
 
 /// Fill `buf` from `offset`; fewer bytes only when the file ends sooner.
-fn read_full(file: &dyn ReadAt, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_full(file: &dyn ReadAt, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let mut at = 0;
     while at < buf.len() {
         match file.read_at(&mut buf[at..], offset + at as u64) {

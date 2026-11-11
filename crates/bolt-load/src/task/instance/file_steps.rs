@@ -31,7 +31,8 @@ pub(crate) enum Step {
     Rename,
     /// Sync the destination's directory after the rename.
     SyncDirAfterRename,
-    /// Cut the state file to nothing after the rename.
+    /// Cut the state file: to nothing after the rename, or to its header
+    /// before a resume writes back the records it keeps.
     TruncateState,
     /// Remove the partial file in a discard.
     RemovePartial,
@@ -41,6 +42,13 @@ pub(crate) enum Step {
     RemoveState,
     /// Sync the directory after the state file was removed.
     SyncDirAfterState,
+    /// Read the state file a resume continues from.
+    ReadState,
+    /// Read a block of the partial file to check it before a resume.
+    ReadPartial,
+    /// Size the partial file to the total, after a resume wrote back the
+    /// records it keeps.
+    SizePartial,
 }
 
 type Hook = dyn Fn(Step) -> io::Result<()> + Send + Sync;

@@ -46,13 +46,15 @@ pub struct TaskBuilder {
     /// What to call before each file step of a resumable task; tests fail
     /// them.
     file_hooks: FileHooks,
+    /// Where a test records the progress each transfer starts with.
+    #[cfg(test)]
+    starts: Option<super::status::Starts>,
 }
 
 /// Whether a task keeps what it downloaded when it does not finish, so
 /// that a later task can continue from it (design §11.5.2).
 ///
-/// Crate internal until resuming is public (C20): a task only writes the
-/// state file; nothing reads it back yet.
+/// Crate internal until resuming is public (C20c); tests switch it on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Resume {
     /// Start from an empty file; delete it when the task does not finish.
@@ -77,6 +79,8 @@ impl TaskBuilder {
             lock_hooks: LockHooks::default(),
             resume: Resume::Off,
             file_hooks: FileHooks::default(),
+            #[cfg(test)]
+            starts: None,
         }
     }
 
@@ -213,6 +217,14 @@ impl TaskBuilder {
         self
     }
 
+    /// Record in `starts` the progress of every `Downloading` start, as
+    /// it is published, before the transfer runs.
+    #[cfg(test)]
+    pub(crate) fn record_starts(mut self, starts: super::status::Starts) -> Self {
+        self.starts = Some(starts);
+        self
+    }
+
     /// Validate and start the download on a `blocking` pool thread.
     ///
     /// Each running task occupies one such thread until it ends.
@@ -230,6 +242,8 @@ impl TaskBuilder {
             lock_hooks,
             resume,
             file_hooks,
+            #[cfg(test)]
+            starts,
         } = self;
         let (Some(runtime), Some(destination)) = (runtime, destination) else {
             unreachable!("validated above");
@@ -239,6 +253,10 @@ impl TaskBuilder {
             None => CancellationToken::new(),
         };
         let (publisher, status) = StatusPublisher::new();
+        #[cfg(test)]
+        if let Some(starts) = starts {
+            publisher.record_starts(starts);
+        }
         let attempt = Attempt {
             adapter,
             destination,

@@ -8,7 +8,7 @@ use std::{
 
 use bolt_load_sync::watch;
 
-use super::{DownloadError, DownloadMode, FallbackReason, Progress};
+use super::{DownloadError, DownloadMode, FallbackReason, Progress, ResumeReport};
 use crate::adapter::BoltLoadAdapterMeta;
 
 /// The lifecycle state of a task.
@@ -85,6 +85,18 @@ pub struct TaskInfo {
     /// status turns `Downloading` again with this info and progress from
     /// zero.
     pub fallback: Option<FallbackReason>,
+    /// Whether this attempt keeps a state file for a later resume (design
+    /// §11.5.3); `false` after a fallback.
+    ///
+    /// Resuming cannot be switched on yet (it arrives with C20c): until
+    /// then this is always `false`.
+    pub resumable: bool,
+    /// What the task continued from, when it resumed (design §11.5.10);
+    /// `None` after a fallback.
+    ///
+    /// Resuming cannot be switched on yet (it arrives with C20c): until
+    /// then this is always `None`.
+    pub resumed: Option<ResumeReport>,
 }
 
 /// A snapshot of a task, published through a [`StatusReceiver`].
@@ -155,7 +167,15 @@ struct Shared {
     terminal: Mutex<bool>,
     /// Set when downloading starts, replaced by a fallback.
     info: Mutex<Option<Arc<TaskInfo>>>,
+    /// The progress of every `Downloading` start, recorded for a test as it
+    /// is published, before the transfer runs.
+    #[cfg(test)]
+    starts: Mutex<Option<Starts>>,
 }
+
+/// Where a test records the progress each transfer starts with.
+#[cfg(test)]
+pub(crate) type Starts = Arc<Mutex<Vec<Progress>>>;
 
 impl Shared {
     fn info(&self) -> Option<Arc<TaskInfo>> {
@@ -192,8 +212,16 @@ impl StatusPublisher {
             tx,
             terminal: Mutex::new(false),
             info: Mutex::new(None),
+            #[cfg(test)]
+            starts: Mutex::new(None),
         };
         (Self(Arc::new(shared)), rx)
+    }
+
+    /// Record in `starts` the progress of every `Downloading` start.
+    #[cfg(test)]
+    pub(crate) fn record_starts(&self, starts: Starts) {
+        *self.0.starts.lock().unwrap_or_else(PoisonError::into_inner) = Some(starts);
     }
 
     /// Another handle to the same channel, for the panic handler.
@@ -212,6 +240,10 @@ impl StatusPublisher {
     /// Record `info` and publish a `Downloading` status with zero speed: the
     /// first one, or the first after a fallback.
     pub(crate) fn downloading(&self, info: TaskInfo, progress: Progress) {
+        #[cfg(test)]
+        if let Some(starts) = &*self.0.starts.lock().unwrap_or_else(PoisonError::into_inner) {
+            starts.lock().unwrap().push(progress.clone());
+        }
         let info = Arc::new(info);
         *self.0.info.lock().unwrap_or_else(PoisonError::into_inner) = Some(info.clone());
         self.0.publish(TaskStatus::new(
@@ -332,6 +364,8 @@ mod tests {
             mode: DownloadMode::Singleton,
             path: "out.bin".into(),
             fallback: None,
+            resumable: false,
+            resumed: None,
         }
     }
 
