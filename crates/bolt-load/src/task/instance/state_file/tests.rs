@@ -488,3 +488,228 @@ fn test_the_state_is_written_through_the_lock() {
     lock.release();
     assert!(!path.exists());
 }
+
+/// A rewrite cuts the file to the header and syncs before it writes the
+/// kept records, then syncs them (design §11.5.5, "续传"); records go after
+/// them.
+#[test]
+fn test_a_rewrite_cuts_then_writes_the_records() {
+    let io = MemoryIo::default();
+    let mut state = StateFile::new(Box::new(io.clone()));
+    let header = header_bytes();
+    let len = header.len() as u64;
+    state.write_header(&header).unwrap();
+    state.append(&[block(0), block(3), block(1)]).unwrap();
+    let before = io.ops().len();
+    state.rewrite(len, [block(0), block(1)]).unwrap();
+    assert_eq!(
+        io.ops()[before..],
+        [
+            Op::SetLen(len),
+            Op::Sync,
+            Op::Write {
+                offset: len,
+                len: 2 * RECORD_LEN
+            },
+            Op::Sync,
+        ]
+    );
+    assert_eq!(state.end(), len + 2 * RECORD_LEN as u64);
+    state.append(&[block(2)]).unwrap();
+    assert_eq!(io.synced(), io.bytes());
+    assert_eq!(
+        decode_records(&io.bytes(), header.len()),
+        [block(0), block(1), block(2)]
+    );
+    assert_eq!(io.bytes().len(), header.len() + 3 * RECORD_LEN);
+}
+
+/// With no records kept, a rewrite only cuts and syncs.
+#[test]
+fn test_a_rewrite_of_nothing_only_cuts() {
+    let io = MemoryIo::default();
+    let mut state = StateFile::new(Box::new(io.clone()));
+    let header = header_bytes();
+    state.write_header(&header).unwrap();
+    state.append(&[block(0)]).unwrap();
+    let before = io.ops().len();
+    state.rewrite(header.len() as u64, []).unwrap();
+    assert_eq!(
+        io.ops()[before..],
+        [Op::SetLen(header.len() as u64), Op::Sync]
+    );
+    assert_eq!(io.synced(), header);
+    assert_eq!(state.end(), header.len() as u64);
+}
+
+/// A failed step of a rewrite is an error. The file holds the old records
+/// when the cut failed, and otherwise the header and a prefix of the kept
+/// records; a cut that did not sync is never followed by a write.
+#[test]
+fn test_a_failed_rewrite_is_an_error() {
+    // Ops after the setup: 0 set_len, 1 sync, 2 write, 3 sync.
+    let header = header_bytes();
+    let len = header.len();
+    let mut old = header.clone();
+    for index in [0, 3] {
+        old.extend_from_slice(&encode_record(&block(index)));
+    }
+    for (failed, ops, bytes) in [
+        (0, 1, old.len()),
+        (1, 2, len),
+        (2, 3, len + RECORD_LEN),
+        (3, 4, len + 2 * RECORD_LEN),
+    ] {
+        let io = MemoryIo::default();
+        let mut state = StateFile::new(Box::new(io.clone()));
+        state.write_header(&header).unwrap();
+        state.append(&[block(0), block(3)]).unwrap();
+        let setup = io.ops().len();
+        io.fail_op(setup + failed);
+        io.tear(RECORD_LEN);
+        assert!(
+            state.rewrite(len as u64, [block(0), block(1)]).is_err(),
+            "{failed}"
+        );
+        assert_eq!(io.ops().len() - setup, ops, "{failed}");
+        assert_eq!(io.bytes().len(), bytes, "{failed}");
+        let records = decode_records(&io.bytes(), len);
+        assert!(
+            records.is_empty()
+                || records == [block(0), block(3)]
+                || records[..] == [block(0), block(1)][..records.len()],
+            "{failed}: {records:?}"
+        );
+    }
+}
+
+/// A rewrite of more records than one batch writes them all, in order,
+/// one batch at a time, and syncs once; a failed batch leaves a prefix and
+/// the end at the header.
+#[test]
+fn test_a_rewrite_writes_in_batches() {
+    let header = header_bytes();
+    let len = header.len() as u64;
+    let count = 2 * read::CHUNK_RECORDS + 5;
+    let blocks: Vec<_> = (0..count as u64)
+        .map(|index| CheckpointBlock {
+            index,
+            len: 1 << 20,
+            crc: index as u32,
+        })
+        .collect();
+    let io = MemoryIo::default();
+    let mut state = StateFile::new(Box::new(io.clone()));
+    state.write_header(&header).unwrap();
+    let before = io.ops().len();
+    state.rewrite(len, blocks.iter().copied()).unwrap();
+    let batch = read::CHUNK_RECORDS * RECORD_LEN;
+    assert_eq!(
+        io.ops()[before..],
+        [
+            Op::SetLen(len),
+            Op::Sync,
+            Op::Write {
+                offset: len,
+                len: batch
+            },
+            Op::Write {
+                offset: len + batch as u64,
+                len: batch
+            },
+            Op::Write {
+                offset: len + 2 * batch as u64,
+                len: 5 * RECORD_LEN
+            },
+            Op::Sync,
+        ]
+    );
+    assert_eq!(decode_records(&io.bytes(), header.len()), blocks);
+    assert_eq!(state.end(), len + (count * RECORD_LEN) as u64);
+    // The second batch fails: the first is all that is written.
+    let io = MemoryIo::default();
+    let mut state = StateFile::new(Box::new(io.clone()));
+    state.write_header(&header).unwrap();
+    let before = io.ops().len();
+    io.fail_op(before + 3);
+    assert!(state.rewrite(len, blocks.iter().copied()).is_err());
+    assert_eq!(state.end(), len);
+    assert_eq!(
+        decode_records(&io.bytes(), header.len()),
+        blocks[..read::CHUNK_RECORDS]
+    );
+}
+
+/// A batch torn inside a record leaves the complete records before it,
+/// which a reader keeps, and a torn tail, which it cuts off; the end stays
+/// at the header. A retried rewrite replaces it all, and an append lands
+/// after it.
+#[test]
+fn test_a_rewrite_torn_inside_a_batch() {
+    use crate::task::resume::{DropReason, DroppedRecord};
+
+    let count = 2 * read::CHUNK_RECORDS + 5;
+    let header = encode_header(&Header {
+        block_size: 1 << 20,
+        total: (count as u64 + 1) << 20,
+        validator: &etag(),
+        source: Some("src"),
+    })
+    .unwrap();
+    let len = header.len() as u64;
+    let block = |index: u64| CheckpointBlock {
+        index,
+        len: 1 << 20,
+        crc: index as u32,
+    };
+    let blocks: Vec<_> = (0..count as u64).map(block).collect();
+    let io = MemoryIo::default();
+    let mut state = StateFile::new(Box::new(io.clone()));
+    state.write_header(&header).unwrap();
+    let before = io.ops().len();
+    // The second batch writes one record and 7 bytes of the next.
+    io.fail_op(before + 3);
+    io.tear(RECORD_LEN + 7);
+    assert!(state.rewrite(len, blocks.iter().copied()).is_err());
+    assert_eq!(state.end(), len);
+    let bytes = io.bytes();
+    let kept = read::CHUNK_RECORDS + 1;
+    assert_eq!(bytes.len(), header.len() + kept * RECORD_LEN + 7);
+    let scanned = read::read_state(&bytes.as_slice()).unwrap();
+    assert_eq!(
+        scanned
+            .records
+            .iter()
+            .map(|record| record.block)
+            .collect::<Vec<_>>(),
+        blocks[..kept]
+    );
+    assert_eq!(
+        scanned.dropped,
+        [DroppedRecord {
+            position: len + (kept * RECORD_LEN) as u64,
+            reason: DropReason::TornTail,
+            range: None,
+        }]
+    );
+    // Retried, it writes everything; an append goes after it.
+    state.rewrite(len, blocks.iter().copied()).unwrap();
+    let end = len + (count * RECORD_LEN) as u64;
+    assert_eq!(state.end(), end);
+    state.append(&[block(count as u64)]).unwrap();
+    let ops = io.ops();
+    assert_eq!(
+        ops[ops.len() - 2..],
+        [
+            Op::Write {
+                offset: end,
+                len: RECORD_LEN
+            },
+            Op::Sync
+        ]
+    );
+    let scanned = read::read_state(&io.bytes().as_slice()).unwrap();
+    assert_eq!(scanned.dropped, []);
+    assert_eq!(scanned.records.len(), count + 1);
+    assert_eq!(scanned.records[count].block, block(count as u64));
+}

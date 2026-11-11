@@ -14,6 +14,7 @@ mod full_body;
 mod id;
 mod output_file;
 mod ownership;
+pub(crate) mod resume_check;
 mod sampler;
 mod singleton_task;
 pub(crate) mod state_file;
