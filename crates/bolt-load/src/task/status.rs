@@ -86,16 +86,12 @@ pub struct TaskInfo {
     /// zero.
     pub fallback: Option<FallbackReason>,
     /// Whether this attempt keeps a state file for a later resume (design
-    /// §11.5.3); `false` after a fallback.
-    ///
-    /// Resuming cannot be switched on yet (it arrives with C20c): until
-    /// then this is always `false`.
+    /// §11.5.3): [`Resume::On`](super::Resume::On), a known size, no content
+    /// coding, ranges and a usable validator; `false` after a fallback.
     pub resumable: bool,
-    /// What the task continued from, when it resumed (design §11.5.10);
-    /// `None` after a fallback.
-    ///
-    /// Resuming cannot be switched on yet (it arrives with C20c): until
-    /// then this is always `None`.
+    /// What the task continued from, when it resumed (design §11.5.10),
+    /// even when every record was dropped; `None` for a new start, and
+    /// after a fallback.
     pub resumed: Option<ResumeReport>,
 }
 
@@ -115,14 +111,11 @@ pub struct TaskStatus {
     /// The temporary file that could not be removed after a failure or a
     /// cancellation; the error that caused the removal is kept in `error`.
     pub leftover_temp_file: Option<PathBuf>,
-    /// The partial file a resumable task kept, with its state file, for a
-    /// later resume (design §11.5.9; task-api-spec STATUS-13). Crate
-    /// internal until resuming is public (C20).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "public with resuming, C20 (lead decision)")
-    )]
-    pub(crate) kept_for_resume: Option<PathBuf>,
+    /// The partial file a task with [`Resume::On`](super::Resume::On) kept,
+    /// with its state file, for a later resume: set only when the pair can
+    /// be resumed, never together with `leftover_temp_file`, and never once
+    /// the task finished (design §11.5.9; task-api-spec STATUS-13).
+    pub kept_for_resume: Option<PathBuf>,
 }
 
 impl TaskStatus {

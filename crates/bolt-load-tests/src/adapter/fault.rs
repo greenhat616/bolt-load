@@ -232,6 +232,12 @@ pub enum RangeFault {
     /// the `Content-Range` of its 206, the real one. The resource does not
     /// change.
     HeadSizeDiffers,
+    /// The validators of [`RangeFault::ChangedMidDownload`], `"v1"`, and
+    /// ranges answered as asked; the resource never changes. Served by
+    /// [`create_range_fault_server_held_at`](super::http_server::create_range_fault_server_held_at),
+    /// a range that covers the position held holds its body there. Not in
+    /// [`RangeFault::VALIDATED`], whose servers change.
+    Stable,
 }
 
 /// The `Date` of every response of the faults of
@@ -316,6 +322,7 @@ impl RangeFault {
             Self::ListEtag => "/list-etag",
             Self::RejectedProbe => "/rejected-probe",
             Self::HeadSizeDiffers => "/head-size-differs",
+            Self::Stable => "/stable",
         }
     }
 
@@ -339,7 +346,7 @@ impl RangeFault {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .chain([Self::StalledOnce])
+            .chain([Self::StalledOnce, Self::Stable])
             .chain(Self::VALIDATED)
             .find(|fault| fault.path().strip_prefix('/') == Some(name))
     }

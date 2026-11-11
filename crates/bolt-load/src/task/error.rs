@@ -35,7 +35,7 @@ pub enum IoOp {
     /// Removing a partial file kept for a resume (design §11.5.5).
     Remove,
     /// Reading the state file, or the partial file to check it, before a
-    /// resume (design §11.5.10). Resuming cannot be switched on yet (C20c).
+    /// resume (design §11.5.10).
     Read,
 }
 
@@ -125,10 +125,8 @@ pub enum DownloadError {
     /// The partial file and the state file an earlier task kept cannot be
     /// continued, for `reason` (design §11.5.10). The task changed neither
     /// file; continuing is impossible, so starting over is up to the
-    /// caller.
-    ///
-    /// Resuming cannot be switched on yet (it arrives with C20c), so no
-    /// task fails with this until then.
+    /// caller, for example after
+    /// [`discard_partial`](super::discard_partial).
     #[snafu(display("cannot resume from {}: {reason}", state_file.display()))]
     ResumeRejected {
         reason: RejectReason,

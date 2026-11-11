@@ -67,6 +67,8 @@ pub(crate) struct Attempt {
     pub(crate) lock_hooks: LockHooks,
     /// Whether the task keeps a state file for a later resume.
     pub(crate) resume: Resume,
+    /// The identity of the source the state file names.
+    pub(crate) resume_source: Option<String>,
     /// What to call before each file step of a resumable task.
     pub(crate) file_hooks: FileHooks,
 }
@@ -245,7 +247,12 @@ pub(super) async fn run(
             // A resumable new start creates the partial file and writes the
             // state header before the transfer starts (design §11.5.5).
             Locked::Fresh => {
-                let state = match resumable_header(attempt.resume, mode, &meta) {
+                let state = match resumable_header(
+                    attempt.resume,
+                    mode,
+                    &meta,
+                    attempt.resume_source.as_deref(),
+                ) {
                     None => None,
                     Some(header) => match start_resumable(
                         &output,
@@ -408,7 +415,13 @@ async fn initialize(
         // takes them, with one connection (design §11.5.8); any other
         // stays with one connection's full download, not resumable.
         if attempt.resume == Resume::On
-            && resumable_header(attempt.resume, DownloadMode::Concurrent, &meta).is_some()
+            && resumable_header(
+                attempt.resume,
+                DownloadMode::Concurrent,
+                &meta,
+                attempt.resume_source.as_deref(),
+            )
+            .is_some()
             && meta.content_size != 0
             && meta.content_encoding.is_none()
             && attempt.adapter.is_range_stream_available().await
@@ -525,6 +538,7 @@ fn resumable_header(
     resume: Resume,
     mode: DownloadMode,
     meta: &BoltLoadAdapterMeta,
+    source: Option<&str>,
 ) -> Option<Vec<u8>> {
     if resume != Resume::On || mode != DownloadMode::Concurrent {
         return None;
@@ -534,7 +548,7 @@ fn resumable_header(
         block_size: checkpoint::BLOCK_SIZE.get() as u32,
         total: meta.content_size,
         validator,
-        source: None,
+        source,
     })
     .inspect_err(|e| debug!("[TASK] not resumable: {e}"))
     .ok()
@@ -715,7 +729,13 @@ async fn resume_checked(
             .await
             .map_err(|source| DownloadError::Metadata { source })?;
         let ranges = attempt.adapter.is_range_stream_available().await;
-        compare(&scanned.header, &meta, None, ranges).map_err(rejected)?;
+        compare(
+            &scanned.header,
+            &meta,
+            attempt.resume_source.as_deref(),
+            ranges,
+        )
+        .map_err(rejected)?;
         Ok(meta)
     })
     .await?;

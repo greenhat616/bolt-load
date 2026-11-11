@@ -1,8 +1,5 @@
 //! What a task reports when it resumes from a state file, or why it cannot
 //! (design §11.5.10).
-//!
-//! Resuming cannot be switched on yet: it arrives with a later release
-//! (C20c). Until then no task resumes, so none reports these.
 
 use std::{fmt, ops::Range, path::PathBuf};
 

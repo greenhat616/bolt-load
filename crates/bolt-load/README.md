@@ -86,7 +86,10 @@ directory and included via `#![doc = include_str!(...)]`.
 | **Concurrent** | Adapter supports range requests | Multiple `TaskRunner` instances download non-overlapping byte ranges in parallel, with dynamic splitting of slow ranges |
 
 Mode selection is automatic based on `is_range_stream_available()` and a
-known size, or the singleton mode can be forced via `TaskBuilder::prefer_mode()`.
+known size, or the singleton mode can be preferred via
+`TaskBuilder::prefer_mode()`. A preferred singleton mode gives way in one
+case: a task with `Resume::On` that can be resumed runs the concurrent
+mode with one connection, so that it keeps a state file.
 
 A content-coded full response is decoded as it is written, with up to two
 codings: gzip and deflate by default, br and zstd behind features. Its
@@ -135,6 +138,55 @@ temporary file (#152), and a missing permission to create the lock file
 fails it with `DownloadError::Io` and the new `IoOp::Lock`. On a file
 system that cannot lock files, the task warns and goes on unlocked, and
 leaves the lock file behind, empty.
+
+## Resuming
+
+With `TaskBuilder::resume(Resume::On)`, a task that does not finish keeps
+the partial file and a state file, `<dest>.boltload`, that records the
+blocks written and synced, each with its CRC32C;
+`TaskStatus::kept_for_resume` names the partial file. The next task with
+`Resume::On` for the destination checks every recorded block and
+downloads only the rest; `TaskInfo::resumed` reports what it kept and
+what it dropped, and why.
+
+```rust,ignore
+use bolt_load::task::{DownloadError, Resume, Task, discard_partial};
+
+let task = Task::builder(adapter()).runtime(rt.clone()).save_to("big.iso").resume(Resume::On);
+match task.spawn()?.await {
+    Err(DownloadError::ResumeRejected { reason, .. }) => {
+        // The resource changed, or what was kept is unusable: start over.
+        discard_partial("big.iso").await?;
+        Task::builder(adapter()).runtime(rt).save_to("big.iso").resume(Resume::On).spawn()?.await?;
+    }
+    other => {
+        other?;
+    }
+}
+```
+
+- A task resumes only when the size is known, the response is not
+  content-coded, and the server takes ranges and sends a strong `ETag` or
+  a usable `Last-Modified` (`TaskInfo::resumable`); otherwise it
+  downloads as with `Resume::Off`. It never starts over on its own:
+  `DownloadError::ResumeRejected` leaves both files for the caller.
+- Resume with a new adapter. An adapter caches its metadata, so on the
+  same one the state file is compared with what it learned then; a change
+  since is caught only by `If-Range` on the ranges the resume requests,
+  and a resume that kept every block requests none.
+- `TaskBuilder::resume_source` stores an identity of the source, such as
+  its URL, and a resume from another source is rejected.
+- A resume needs the destination's lock, so `Resume::On` fails on a file
+  system that cannot lock files. The checks catch crashes, power losses
+  and bad sectors, not deliberate tampering.
+- With the ureq2 adapter, a blocking request or read still running when
+  its range is given up keeps its connection open until the call returns,
+  so a task can hold more connections than `max_connections`, several
+  after repeated retries, and indefinitely against a stalled server when
+  the agent has no timeouts
+  ([#207](https://github.com/greenhat616/bolt-load/issues/207)). Set the
+  agent's timeouts as the
+  [bolt-load-adapter README](../bolt-load-adapter/README.md) describes.
 
 ## Concurrency Control
 

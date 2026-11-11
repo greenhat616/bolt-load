@@ -28,6 +28,9 @@ fn attempts_are_send() {
         meta: None,
         cancel_token: CancellationToken::new(),
         lock_hooks: Default::default(),
+        resume: crate::task::Resume::On,
+        resume_source: Some("https://example.com/attempt.bin".to_owned()),
+        file_hooks: Default::default(),
     };
     let (publisher, _status) = StatusPublisher::new();
     let attempt = run(
