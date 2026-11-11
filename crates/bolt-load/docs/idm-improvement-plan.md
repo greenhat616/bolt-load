@@ -314,15 +314,18 @@ IDM 的 `y_sc`（§8 A5）不只看“有没有数据”，还会比较“按速
 | 2 | P0-1 Range 校验（两个 adapter）+ meta 探测修正 + 对抗测试。**已完成**（#162–#164，见实施 spec T3、T4；body 错误分类见 design §14.1） | 1 | 否 | 中 |
 | 3 | P0-1 任务级 `RangeUnsupported` 回退到 Singleton，P0-5 扩展到内容编码。**已完成**（#168，见实施 spec T5；实现说明见 design §14.3） | 2 | 是（`DownloadError` 新变体） | 中 |
 | 3a | HTTP 校验与解析拆到 `bolt-load-http`，新增 `ContentCoding`（D11）。**已完成**（#169–#171，见实施 spec T24；实现说明见 design §14.4） | 3 | 是（import 路径） | 中 |
-| 3b | P0-5 `bolt-load-decode` 解码 crate，单连接下载自己解码 | 3 | 是（按 D10 方案 A，`full_stream` 的返回类型） | 中 |
-| 4 | P0-3 写错误结构化 | — | 是（`TaskError` 新变体） | 小 |
-| 5 | P1-1 公开 `max_connections`（含 S2 预算默认值）+ P1-2 容量安全切分 + `SplitCandidate` | — | 否（新增 API；预算默认值在多核机器上会变小） | 中 |
-| 6 | P1-3 退避 / `Retry-After` + P1-4 预算三层化（S3） | 1, 5 | 否 | 大 |
-| 7 | P1-5 扩张控制器 + S1 切分尺寸 + P1-7 低速重启（S4），都放在 feature flag 后面，附基准测试 | 5, 6 | 否 | 大 |
-| 8 | P2 共享 `Limits`：准入 + host 信号量 + 令牌桶（S5），可选加 S7 `HostCaps` | 5 | 否（可选注入） | 大 |
-| 9 | P3 双位点 → 验证器 → 一致性检查（S6）→ 续传 | 1, 2 | 是 | 大 |
+| 3b | P0-5 `bolt-load-decode` 解码 crate，单连接下载自己解码。**已实现，待合入**（#173、#174，见实施 spec T23；实现说明见 design §14.5、§14.6） | 3 | 是（按 D10 方案 A，`full_stream` 的返回类型） | 中 |
+| 3c | 空 body：`total` 未知时接受任何长度，修 [#153](https://github.com/greenhat616/bolt-load/issues/153)（实施中发现，属于 P0，不在原方案里）。**已实现，待合入**（#175，见实施 spec T25；实现说明见 design §14.7） | 3b | 是（删除 `TaskError::Empty`） | 小 |
+| 4 | P0-3 写错误结构化。**已实现，待合入**（#176；并发模式的文件错误另见 #177；见实施 spec T6、T26；实现说明见 design §14.8、§14.9） | — | 是（`TaskError` 新变体） | 小 |
+| 5 | P1-1 公开 `max_connections`（含 S2 预算默认值）+ P1-2 容量安全切分 + `SplitCandidate`。**已实现，待合入**（#178、#179，见实施 spec T7、T8；实现说明见 design §14.10、§14.11） | — | 是（#178：`TaskOptions::max_consecutive_failures` 从 `usize` 改为 `Option<usize>`，不设时跟随 `max_connections`；预算默认值在多核机器上会变小） | 中 |
+| 6 | P1-3 退避 / `Retry-After` + P1-4 预算三层化（S3）。**已实现，待合入**（#180、#181，见实施 spec T9、T10；实现说明见 design §14.12、§14.13） | 1, 5 | 是（#181：`TaskError` 新增 `RangeExhausted`，`TaskError` 不是 `#[non_exhaustive]`，穷举的 `match` 要加分支） | 大 |
+| 7 | P1-5 扩张控制器 + S1 切分尺寸 + P1-7 低速重启（S4），都放在 feature flag 后面，附基准测试。**已实现，待合入**：#184（扩张控制器和切分尺寸）、#185（低速重启）、#187（收尾对冲，D5；决定见 #182，状态表见 #186）、#188（基准测试）、#189（上限处的翻倍）、#191（重启静默 runner）、#192（把 `Doubling` 改为唯一的策略，feature flag 已删）；见实施 spec T11–T15、T27–T29；实现说明见 design §14.14–§14.20 | 5, 6 | 是（#192：删除 `unstable-strategy` feature、`GrowthStrategy`、`TaskOptions::growth_strategy` 和 `TaskBuilder::growth_strategy`，启用这个 feature 的 crate 编译不过；其余各 PR 不破坏） | 大 |
+| 8 | P2 共享 `Limits`：准入 + host 信号量 + 令牌桶（S5），可选加 S7 `HostCaps`。**推迟**：维护者 2026-11-11 决定不在本计划中做。这些是跨任务的策略，按分层原则属于 Task 之上的客户端或 job 层（见实施 spec T16–T18 前的说明、design §14.31；缺口盘点见 design §14.32） | 5 | 否（可选注入） | 大 |
+| 9 | P3 双位点 → 验证器 → 一致性检查（S6）→ 续传。**已实现，待合入**：#193（已写入的区间）、#194（性质测试）、#197（验证器与 `If-Range`）、#200（续传的设计）、#201（目标路径的锁，修 #152）、#202（meta 带上验证器）、#203（检查点）、#204、#205、#206（状态文件）、#208、#209、#210（续传）；见实施 spec T19–T21；实现说明见 design §14.21–§14.23、§14.26–§14.30 | 1, 2 | 是（#193：`Progress.downloaded_chunks` 的含义从“已接收”改为“已写入”，签名不变；#197：range 请求带 `If-Range`，资源中途变了以新的 `DownloadError::ResourceChanged` 失败，不再回退或照常完成；#201：每个任务都建 `<dest>.boltload`，同一目标的第二个任务以新的 `DownloadError::InUse` 失败，锁文件的错误报为新的 `IoOp::Lock`；#203：公开的 `file_writer` 模块里 `WriteCompletion` 加字段、非 `#[non_exhaustive]` 的 `FileWriterError` 加变体 `Sync`。迁移方式见各 PR 的 Breaking change 一节；其余各 PR 不破坏） | 大 |
 
 每个 PR 合入前都要通过 `cargo test --workspace` 和 `cargo clippy --workspace --all-targets`；PR 2、3、6 还需要新增的故障注入测试全部通过。
+
+状态截至 2026-11-11：标“待合入”的 PR 都还开着，合入之后要把对应的行改成“已完成”（实施 spec T22）。不对应表中某一行的另有 #183（clippy 修正）、#198、#199（测试设施，design §14.24、§14.25）。
 
 ---
 

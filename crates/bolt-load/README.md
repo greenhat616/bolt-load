@@ -17,6 +17,7 @@ handles the rest.
 - **Backpressure-aware** — lock-free SPSC ring-buffer channels between runners and writers with configurable queue depth.
 - **Progress & observability** — latest-value status snapshots with EMA speed, optional `indicatif` progress bars, and `tracing` integration.
 - **Structured errors** — two-level retryable/unretryable classification via `snafu`, enabling intelligent retry decisions.
+- **Resumable downloads** — with `Resume::On`, an unfinished download keeps its blocks, each checked by CRC32C, and the next task continues from them (see [Resuming](#resuming)).
 
 ## Quick Start
 
@@ -138,6 +139,31 @@ temporary file (#152), and a missing permission to create the lock file
 fails it with `DownloadError::Io` and the new `IoOp::Lock`. On a file
 system that cannot lock files, the task warns and goes on unlocked, and
 leaves the lock file behind, empty.
+
+## Options
+
+Set them on `TaskOptions` and pass it with `TaskBuilder::options`, or with
+the builder's shortcuts where they exist:
+
+| Option | Builder shortcut | Default |
+|--------|------------------|---------|
+| `max_connections` | `TaskBuilder::max_connections(NonZeroUsize)` | 8, whatever the CPU count |
+| `max_attempts_per_range` | `TaskBuilder::max_attempts_per_range(NonZeroU32)` | 5 |
+| `max_consecutive_failures` | — | `max(8, 2 × max_connections)` |
+| `no_progress_timeout` | — | 60 s |
+| `stream_idle_timeout` | — | 30 s |
+| `connect_timeout` | — | 30 s |
+| `meta_retry` | — | 3 retries, 200 ms – 2 s per wait |
+| `checkpoint_bytes`, `checkpoint_interval` | — | 8 MiB, 2 s; only for a task that keeps a state file |
+
+`max_connections` caps the connections of one task;
+`max_attempts_per_range` fails the task once one range has failed that
+often (see [Concurrency Control](#concurrency-control)). Resuming is set
+on the builder: `TaskBuilder::resume(Resume::On)` and, optionally,
+`TaskBuilder::resume_source` (see [Resuming](#resuming)). Limits shared
+across tasks, such as tasks at once, connections per host or a speed
+limit, are not part of bolt-load; they belong to the layer that runs the
+tasks.
 
 ## Resuming
 
