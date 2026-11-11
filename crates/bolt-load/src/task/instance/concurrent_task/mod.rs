@@ -124,6 +124,15 @@ impl ConcurrentTaskInner {
         self
     }
 
+    /// Continue from `kept`, the ranges a resume kept (design §11.5.10
+    /// step 5): sorted, neither overlapping nor adjacent, whole blocks.
+    /// The progress starts with them, and the transfer from it.
+    pub(crate) fn resume_from(mut self, kept: Vec<std::ops::Range<u64>>) -> Self {
+        let kept_bytes = kept.iter().map(|range| range.end - range.start).sum();
+        self.progress = Progress::new(self.progress.total, kept_bytes, kept);
+        self
+    }
+
     /// Download into the temporary file, then commit it or discard it.
     ///
     /// Returns only after every owned worker has exited.
@@ -193,6 +202,8 @@ impl ConcurrentTaskInner {
             }
             download = download.with_checkpoints(checkpoints);
         }
+        // The progress holds what a resume kept until the transfer ends.
+        download = download.resume_from(&self.progress.downloaded_chunks);
         let transfer_result = download.run().await;
         let transfer_result = download.finish(transfer_result, &mut self.progress).await;
         // Always join the writer workers, so the file handle is released before

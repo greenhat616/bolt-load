@@ -755,6 +755,17 @@ impl RunnerManager {
         self.chunk_planner.mark_failed(runner_id)
     }
 
+    /// Start from the ranges a resumed download kept, see
+    /// [`ChunkPlanner::seed_kept`].
+    pub fn seed_kept(&mut self, kept: &[Range<u64>]) {
+        self.chunk_planner.seed_kept(kept);
+    }
+
+    /// Whether every byte is downloaded: a resume may have kept them all.
+    pub fn is_complete(&self) -> bool {
+        self.chunk_planner.is_complete()
+    }
+
     /// Gets the total amount downloaded
     #[inline]
     pub fn get_total_downloaded(&self) -> u64 {

@@ -2,6 +2,7 @@
 
 use std::{
     any::Any,
+    ops::Range,
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
     sync::Arc,
@@ -13,18 +14,24 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{
     ConcurrentTaskInner, SingletonTaskInner,
-    concurrent_task::checkpoint,
+    concurrent_task::checkpoint::{self, BlockReader},
     destination_lock::{DestinationLock, LockHooks, Unsupported},
     file_steps::{FileHooks, Step},
     output_file::{self, OutputFile, Teardown},
     ownership::{Ownership, Phase},
-    state_file::{Header, StateFile, encode_header, sync_parent_dir},
+    resume_check::{VerifyError, compare, report, verify},
+    state_file::{
+        Header, StateFile, encode_header,
+        read::{ReadError, Scanned, read_full, read_state},
+        sync_parent_dir,
+    },
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
-        DownloadError, DownloadMode, FallbackReason, IoOp, Progress, TaskInfo, TaskOptions,
+        DownloadError, DownloadMode, FallbackReason, IoOp, Progress, RejectReason, ResumeReport,
+        TaskInfo, TaskOptions,
         builder::Resume,
         destination::{self, Destination},
         meta,
@@ -174,33 +181,55 @@ pub(super) async fn run(
         };
         trace!("[TASK] initialized, mode: {mode:?}, fallback: {fallback:?}, path: {path:?}");
         let output = OutputFile::new(path.clone(), ownership.clone());
-        // A task that may resume needs the lock (design §11.5.4).
-        let unsupported = match attempt.resume {
-            Resume::Off => Unsupported::Proceed,
-            Resume::On => Unsupported::Fail,
-        };
-        if let Err(e) =
-            lock_destination(&path, &output, &ownership, &attempt.lock_hooks, unsupported).await
+        let locked = match lock_destination(
+            &path,
+            &output,
+            &ownership,
+            &attempt.lock_hooks,
+            attempt.resume,
+        )
+        .await
         {
-            ownership.release();
-            return publisher.finish(Err(e), Progress::default(), None);
-        }
+            Ok(locked) => locked,
+            Err(e) => {
+                ownership.release();
+                return publisher.finish(Err(e), Progress::default(), None);
+            }
+        };
         // Observed only between steps: the lock is never left to a dropped
-        // future (design §11.5.4). The task owns the temporary file now, so
-        // it removes one an earlier task left (design §11.5.9, phase D).
+        // future (design §11.5.4). A task that found a state to resume from
+        // leaves both files (design §11.5.9, B2); any other owns the
+        // temporary file now, so it removes one an earlier task left
+        // (phase D).
         if cancel_token.is_cancelled() {
-            let leftover = output_file::discard(&output.tmp).await;
+            let leftover = match locked {
+                Locked::ToResume => {
+                    ownership.keep_files();
+                    None
+                }
+                Locked::Fresh => output_file::discard(&output.tmp).await,
+            };
             ownership.release();
             return publisher.finish(Err(DownloadError::Cancelled), Progress::default(), leftover);
         }
-        let total = meta.content_size;
-        // A resumable new start creates the partial file and writes the
-        // state header before the transfer starts (design §11.5.5).
-        let state = match resumable_header(attempt.resume, mode, &meta) {
-            None => None,
-            Some(header) => {
-                match start_resumable(&output, &ownership, total, header, &cancel_token).await {
-                    Ok(state) => Some(state),
+        let (meta, mode, fallback, one_connection, state, resumed) = match locked {
+            // Continue from the state file, once it was checked (design
+            // §11.5.10).
+            Locked::ToResume => {
+                match resume_checked(&attempt, &rt, &output, &ownership, &cancel_token).await {
+                    Ok(Resumed {
+                        meta,
+                        state,
+                        report,
+                        kept,
+                    }) => (
+                        meta,
+                        DownloadMode::Concurrent,
+                        None,
+                        attempt.prefer_mode == Some(DownloadMode::Singleton),
+                        Some(state),
+                        Some((report, kept)),
+                    ),
                     Err(e) => {
                         let (leftover, kept) = end_failed_start(&output, &ownership).await;
                         ownership.release();
@@ -213,7 +242,38 @@ pub(super) async fn run(
                     }
                 }
             }
+            // A resumable new start creates the partial file and writes the
+            // state header before the transfer starts (design §11.5.5).
+            Locked::Fresh => {
+                let state = match resumable_header(attempt.resume, mode, &meta) {
+                    None => None,
+                    Some(header) => match start_resumable(
+                        &output,
+                        &ownership,
+                        meta.content_size,
+                        header,
+                        &cancel_token,
+                    )
+                    .await
+                    {
+                        Ok(state) => Some(state),
+                        Err(e) => {
+                            let (leftover, kept) = end_failed_start(&output, &ownership).await;
+                            ownership.release();
+                            return publisher.finish_keeping(
+                                Err(e),
+                                Progress::default(),
+                                leftover,
+                                kept,
+                            );
+                        }
+                    },
+                };
+                (meta, mode, fallback, one_connection, state, None)
+            }
         };
+        let total = meta.content_size;
+        let (resumed, kept) = resumed.unzip();
         // A zero size is unknown, and a coded size is not the file's: download
         // until the stream ends.
         let singleton_total = (total != 0 && meta.content_encoding.is_none()).then_some(total);
@@ -222,6 +282,8 @@ pub(super) async fn run(
             mode,
             path,
             fallback,
+            resumable: state.is_some(),
+            resumed,
         };
         let Attempt {
             adapter, options, ..
@@ -251,8 +313,20 @@ pub(super) async fn run(
                 if let Some(state) = state {
                     transfer = transfer.checkpoint_to(Box::new(state));
                 }
-                let (teardown, progress) =
-                    drive(transfer, info.clone(), &publisher, &cancel_token).await;
+                if let Some(kept) = kept {
+                    transfer = transfer.resume_from(kept);
+                }
+                // What a fallback publishes, built before the info moves:
+                // a resume's report is not copied (design §14.30.1).
+                let fallback_info = TaskInfo {
+                    meta: info.meta.clone(),
+                    mode: DownloadMode::Singleton,
+                    path: info.path.clone(),
+                    fallback: None,
+                    resumable: false,
+                    resumed: None,
+                };
+                let (teardown, progress) = drive(transfer, info, &publisher, &cancel_token).await;
                 let Err(DownloadError::RangeUnsupported { reason, source }) = &teardown.result
                 else {
                     ownership.release();
@@ -266,10 +340,10 @@ pub(super) async fn run(
                 // The concurrent teardown removed what it wrote; the
                 // singleton truncates the file again when it starts.
                 warn!("[TASK] falling back to one connection, {reason}: {source}");
+                // What a resume kept went with the state file.
                 let info = TaskInfo {
-                    mode: DownloadMode::Singleton,
                     fallback: Some(*reason),
-                    ..info
+                    ..fallback_info
                 };
                 let transfer = SingletonTaskInner::new(
                     adapter,
@@ -363,24 +437,61 @@ async fn initialize(
     })
 }
 
-/// Take the destination's lock and own the temporary file, then invalidate
-/// any state an earlier task left, before the temporary file is touched
-/// (design §11.5.4, §11.5.5). Not raced against cancellation: the lock is
-/// registered with `ownership` before any file is changed, so it is always
-/// released.
+/// What the destination's lock found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Locked {
+    /// No state to resume from: the task starts anew.
+    Fresh,
+    /// A state file an earlier task left, to resume from (B2).
+    ToResume,
+}
+
+/// Take the destination's lock (design §11.5.4); a task that may resume
+/// needs it. With `Resume::On`, a state file an earlier task left, not
+/// created by this task and not empty, is resumed from: both files are
+/// left as they are (design §11.5.2, §11.5.10 step 0). Otherwise own the
+/// temporary file, then invalidate any state an earlier task left, before
+/// the temporary file is touched (design §11.5.5). Not raced against
+/// cancellation: the lock is registered with `ownership` before any file
+/// is changed, so it is always released.
 async fn lock_destination(
     dest: &std::path::Path,
     output: &OutputFile,
     ownership: &Arc<Ownership>,
     hooks: &LockHooks,
-    unsupported: Unsupported,
-) -> Result<(), DownloadError> {
-    let lock = blocking::unblock({
+    resume: Resume,
+) -> Result<Locked, DownloadError> {
+    let unsupported = match resume {
+        Resume::Off => Unsupported::Proceed,
+        Resume::On => Unsupported::Fail,
+    };
+    let state_path = super::destination_lock::state_path_for(dest);
+    let (lock, found) = blocking::unblock({
         let dest = dest.to_path_buf();
         let hooks = hooks.clone();
-        move || DestinationLock::acquire(&dest, unsupported, &hooks)
+        let state_path = state_path.clone();
+        move || {
+            let lock = DestinationLock::acquire(&dest, unsupported, &hooks)?;
+            let found = match lock.handle() {
+                Some(handle) if resume == Resume::On && !lock.created() => {
+                    match handle.metadata() {
+                        Ok(metadata) => metadata.len() > 0,
+                        Err(source) => {
+                            lock.release_keeping();
+                            return Err(DownloadError::io(IoOp::Lock, state_path, source));
+                        }
+                    }
+                }
+                _ => false,
+            };
+            Ok::<_, DownloadError>((lock, found))
+        }
     })
     .await?;
+    if found {
+        ownership.own_to_resume(lock, output.tmp.clone());
+        return Ok(Locked::ToResume);
+    }
     ownership.own(lock, output.tmp.clone());
     let invalidated = blocking::unblock({
         let ownership = ownership.clone();
@@ -390,10 +501,10 @@ async fn lock_destination(
     match invalidated {
         Some(Err(source)) => Err(DownloadError::Io {
             op: IoOp::Lock,
-            path: super::destination_lock::state_path_for(dest),
+            path: state_path,
             source: Arc::new(source),
         }),
-        _ => Ok(()),
+        _ => Ok(Locked::Fresh),
     }
 }
 
@@ -506,14 +617,247 @@ async fn start_resumable(
     .await
 }
 
-/// After a resumable new start failed or was cancelled: discard both files
-/// before the header was durable (B1), keep both after (C). The partial
-/// file left and the one kept for a resume.
+/// A resume that was checked and can go on.
+struct Resumed {
+    /// The adapter's own metadata, which the state file was checked
+    /// against.
+    meta: BoltLoadAdapterMeta,
+    /// The state file, its records written back, for the checkpoints.
+    state: StateFile,
+    report: ResumeReport,
+    /// The ranges kept, which the transfer does not download again.
+    kept: Vec<Range<u64>>,
+}
+
+/// Check the state file an earlier task left and the partial file next to
+/// it, then write the records kept back (design §11.5.10, §11.5.5
+/// "续传"), from phase B2:
+///
+/// 0. the partial file must be there ([`RejectReason::MissingPartial`]);
+/// 1. and 3. read the state file through the locked handle;
+/// 2. compare it with the metadata the adapter retrieves itself, not one
+///    the caller gave (design §14.30);
+/// 4. read every kept block back and check its CRC;
+/// 5. enter phase C, write the kept records back, then size the partial
+///    file to the total.
+///
+/// Cancellation is checked between the steps and before each block, never
+/// raced against a file step. Whatever grows with the records is
+/// allocated fallibly.
+///
+/// # Errors
+///
+/// [`DownloadError::ResumeRejected`] before either file was changed; the
+/// metadata could not be retrieved; a file step failed; cancelled.
+async fn resume_checked(
+    attempt: &Attempt,
+    rt: &ThreadedRuntimeImpl,
+    output: &OutputFile,
+    ownership: &Arc<Ownership>,
+    cancel_token: &CancellationToken,
+) -> Result<Resumed, DownloadError> {
+    let tmp = output.tmp.clone();
+    let state_path = super::destination_lock::state_path_for(&output.dest);
+    let rejected = |reason| DownloadError::ResumeRejected {
+        reason,
+        state_file: state_path.clone(),
+    };
+    let cancelled = || {
+        if cancel_token.is_cancelled() {
+            Err(DownloadError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    let (scanned, partial_len) = blocking::unblock({
+        let owner = ownership.clone();
+        let tmp = tmp.clone();
+        let state_path = state_path.clone();
+        move || {
+            let rejected = |reason| DownloadError::ResumeRejected {
+                reason,
+                state_file: state_path.clone(),
+            };
+            let partial_len = match std::fs::metadata(&tmp) {
+                Ok(metadata) => metadata.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(rejected(RejectReason::MissingPartial));
+                }
+                Err(e) => return Err(DownloadError::io(IoOp::Inspect, &tmp, e)),
+            };
+            let read = owner
+                .hooks()
+                .before(Step::ReadState)
+                .map_err(ReadError::Io)
+                .and_then(|()| {
+                    let handle = owner
+                        .with_lock(DestinationLock::handle)
+                        .flatten()
+                        .ok_or_else(|| {
+                            ReadError::Io(std::io::Error::other("the state file is not locked"))
+                        })?;
+                    read_state(&*handle)
+                });
+            match read {
+                Ok(scanned) => Ok((scanned, partial_len)),
+                Err(ReadError::Rejected(reason)) => Err(rejected(reason)),
+                Err(ReadError::Io(source)) => {
+                    Err(DownloadError::io(IoOp::Read, &state_path, source))
+                }
+            }
+        }
+    })
+    .await?;
+    cancelled()?;
+    // The network steps race cancellation; they change no file.
+    let meta = until_cancelled(cancel_token, async {
+        let meta = meta::retrieve_meta(&attempt.adapter, &attempt.options.meta_retry, Some(rt))
+            .await
+            .map_err(|source| DownloadError::Metadata { source })?;
+        let ranges = attempt.adapter.is_range_stream_available().await;
+        compare(&scanned.header, &meta, None, ranges).map_err(rejected)?;
+        Ok(meta)
+    })
+    .await?;
+    cancelled()?;
+    let Scanned {
+        header,
+        records,
+        dropped,
+    } = scanned;
+    let block_size = header.block_size;
+    let (mut kept, dropped) = blocking::unblock({
+        let hooks = ownership.hooks().clone();
+        let tmp = tmp.clone();
+        let token = cancel_token.clone();
+        move || {
+            let file =
+                std::fs::File::open(&tmp).map_err(|e| DownloadError::io(IoOp::Read, &tmp, e))?;
+            let partial = CheckedBlocks { file, hooks };
+            let mut dropped = dropped;
+            let kept = verify(
+                records,
+                block_size,
+                partial_len,
+                &partial,
+                &|| token.is_cancelled(),
+                &mut dropped,
+            )
+            .map_err(|e| match e {
+                VerifyError::Cancelled => DownloadError::Cancelled,
+                // The error names the block; its kind stays.
+                VerifyError::Read { range, source } => DownloadError::io(
+                    IoOp::Read,
+                    &tmp,
+                    std::io::Error::new(source.kind(), format!("the bytes {range:?}: {source}")),
+                ),
+                VerifyError::OutOfMemory(source) => DownloadError::io(IoOp::Read, &tmp, source),
+            })?;
+            Ok::<_, DownloadError>((kept, dropped))
+        }
+    })
+    .await?;
+    let report = report(state_path.clone(), &mut kept, block_size, dropped)
+        .map_err(|e| DownloadError::io(IoOp::Read, &state_path, e))?;
+    for drop in &report.dropped {
+        warn!(
+            "[TASK] resuming without the record at {} of {}, {}: {:?}",
+            drop.position,
+            state_path.display(),
+            drop.reason,
+            drop.range
+        );
+    }
+    let mut ranges = Vec::new();
+    ranges.try_reserve_exact(report.kept.len()).map_err(|e| {
+        DownloadError::io(
+            IoOp::Read,
+            &state_path,
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, e),
+        )
+    })?;
+    ranges.extend_from_slice(&report.kept);
+    cancelled()?;
+    let total = meta.content_size;
+    let state = blocking::unblock({
+        let owner = ownership.clone();
+        let token = cancel_token.clone();
+        let tmp = tmp.clone();
+        let state_path = state_path.clone();
+        move || {
+            // The state file changes from here on: the pair stays
+            // resumable whatever happens (design §11.5.9, C).
+            owner.enter(Phase::Resumable);
+            let handle = owner.state_file().ok_or_else(|| {
+                DownloadError::io(
+                    IoOp::Lock,
+                    &state_path,
+                    std::io::Error::other("the state file is not locked"),
+                )
+            })?;
+            let mut state = StateFile::new(Box::new(handle));
+            state
+                .rewrite(header.len, kept.iter().map(|record| record.block))
+                .map_err(|e| DownloadError::io(IoOp::Write, &state_path, e))?;
+            if token.is_cancelled() {
+                return Err(DownloadError::Cancelled);
+            }
+            owner
+                .hooks()
+                .before(Step::SizePartial)
+                .and_then(|()| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&tmp)?
+                        .set_len(total)
+                })
+                .map_err(|e| DownloadError::io(IoOp::Allocate, &tmp, e))?;
+            Ok(state)
+        }
+    })
+    .await?;
+    cancelled()?;
+    Ok(Resumed {
+        meta,
+        state,
+        report,
+        kept: ranges,
+    })
+}
+
+/// The partial file, read block by block through its own handle to check
+/// it before a resume; each read announced to the hooks.
+struct CheckedBlocks {
+    file: std::fs::File,
+    hooks: FileHooks,
+}
+
+impl BlockReader for CheckedBlocks {
+    fn read(&self, range: Range<u64>) -> std::io::Result<Vec<u8>> {
+        self.hooks.before(Step::ReadPartial)?;
+        // A block: at most `BLOCK_SIZE` bytes.
+        let mut data = vec![0; (range.end - range.start) as usize];
+        if read_full(&self.file, &mut data, range.start)? < data.len() {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(data)
+    }
+}
+
+/// After a resumable new start or a resume failed or was cancelled before
+/// the transfer: leave both files as they are while a resume was checked
+/// (B2); discard both before a new start's header was durable (B1); keep
+/// both after it, or once a resume began to write back (C). The partial
+/// file left and the one kept for a resume (design §11.5.9).
 async fn end_failed_start(
     output: &OutputFile,
     ownership: &Arc<Ownership>,
 ) -> (Option<PathBuf>, Option<PathBuf>) {
     match ownership.phase() {
+        Phase::Checking => {
+            ownership.keep_files();
+            (None, None)
+        }
         Phase::Resumable => {
             ownership.keep_files();
             (None, Some(output.tmp.clone()))
@@ -579,6 +923,8 @@ mod tests {
                 mode: DownloadMode::Singleton,
                 path: path.to_path_buf(),
                 fallback: None,
+                resumable: false,
+                resumed: None,
             },
             Progress::default(),
         );

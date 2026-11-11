@@ -250,7 +250,6 @@ impl StateFile {
     ///
     /// A step failed. The file holds the header and a prefix of
     /// `records`, or the old records, when the cut was not taken.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the task resumes in C20b"))]
     pub(crate) fn rewrite(
         &mut self,
         header_len: u64,

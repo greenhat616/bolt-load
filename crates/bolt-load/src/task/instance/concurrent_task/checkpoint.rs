@@ -227,6 +227,19 @@ impl Checkpoints {
         }
     }
 
+    /// The blocks of `kept`, the ranges a resumed download kept, are
+    /// recorded already: the state file holds them (design §11.5.10).
+    /// Each range is whole blocks, the last one perhaps shorter at the
+    /// total.
+    pub(super) fn seed_durable(&mut self, kept: &[Range<u64>]) {
+        let size = self.schedule.block_size.get();
+        for range in kept {
+            debug_assert!(range.start % size == 0, "{range:?} is not whole blocks");
+            self.durable
+                .insert(range.start / size..range.end.div_ceil(size));
+        }
+    }
+
     /// Whether a failed rollback stopped the checkpoints.
     pub(super) fn is_stopped(&self) -> bool {
         self.stopped
@@ -248,7 +261,7 @@ impl Checkpoints {
     }
 
     /// The blocks recorded so far, by index.
-    #[cfg_attr(not(test), expect(dead_code, reason = "C33 reads it"))]
+    #[cfg(test)]
     pub(super) fn durable(&self) -> &WrittenSet {
         &self.durable
     }

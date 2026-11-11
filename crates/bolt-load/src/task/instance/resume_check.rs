@@ -2,8 +2,6 @@
 //! against the fresh metadata (step 2), and every kept block against the
 //! partial file (step 4); then the report (step 6).
 
-#![cfg_attr(not(test), expect(dead_code, reason = "the task resumes in C20b"))]
-
 use std::{io, ops::Range, path::PathBuf};
 
 use super::{
@@ -73,16 +71,7 @@ pub(crate) enum VerifyError {
     },
     /// There was no memory to report a dropped record: an io error of kind
     /// [`io::ErrorKind::OutOfMemory`]. The task fails as on a read error.
-    OutOfMemory(
-        #[cfg_attr(
-            test,
-            expect(
-                dead_code,
-                reason = "read by the task (C20b); a test cannot run out of memory"
-            )
-        )]
-        io::Error,
-    ),
+    OutOfMemory(io::Error),
 }
 
 /// The records whose blocks the partial file holds, of the `records` kept
