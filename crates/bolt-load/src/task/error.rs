@@ -20,12 +20,17 @@ pub enum IoOp {
     /// Writing the content in the singleton mode. The concurrent mode
     /// reports [`TaskError::Write`] instead, with the range.
     Write,
-    /// Flushing the content. The singleton mode buffers its writes, so a
-    /// write may also fail here. The concurrent mode joins its writer
-    /// workers and syncs the file to disk here.
+    /// Flushing the content: the concurrent mode joins its writer workers
+    /// and syncs the file to disk here. The singleton mode writes through,
+    /// so its write errors are `Write`.
     Flush,
     /// Moving the temporary file to the destination.
     Rename,
+    /// Opening or locking the destination's lock file, `<dest>.boltload`,
+    /// for a reason other than another task holding it: a missing
+    /// permission, or a file system that cannot lock files (design
+    /// §11.5.4).
+    Lock,
 }
 
 impl fmt::Display for IoOp {
@@ -37,6 +42,7 @@ impl fmt::Display for IoOp {
             Self::Write => "write",
             Self::Flush => "flush",
             Self::Rename => "rename to",
+            Self::Lock => "lock",
         })
     }
 }
@@ -103,6 +109,11 @@ pub enum DownloadError {
         path: PathBuf,
         source: Arc<io::Error>,
     },
+    /// Another task, in this process or another, is downloading to the same
+    /// destination: it holds the lock on `<dest>.boltload` (design §11.5.4,
+    /// #152). Nothing was written; try again once that task ended.
+    #[snafu(display("another task is downloading to {}", path.display()))]
+    InUse { path: PathBuf },
     /// The destination cannot be written, for example its directory is
     /// missing or it is a directory.
     #[snafu(display("invalid destination {}: {reason}", path.display()))]
@@ -118,7 +129,9 @@ pub enum DownloadError {
     /// The runtime could not run the task.
     #[snafu(display("runtime error: {message}"))]
     Runtime { message: String },
-    /// The task panicked; its workers were signalled but not joined.
+    /// The task panicked. Its workers that hold the temporary file were
+    /// cancelled and waited for, the temporary file removed and the
+    /// destination's lock released before this was published.
     #[snafu(display("the download panicked: {message}"))]
     Panicked { message: String },
     /// The task ended without publishing an outcome.

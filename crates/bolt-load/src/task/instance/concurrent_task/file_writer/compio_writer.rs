@@ -129,6 +129,8 @@ fn compio_file_writer_task(
 #[derive(Default)]
 pub struct CompioWriterBuilder {
     path: Option<PathBuf>,
+    /// Kept by the worker until it closed the file.
+    drain: Option<WaitGroup>,
 }
 
 impl FileWriterCapability for CompioWriterBuilder {}
@@ -140,6 +142,11 @@ impl CompioWriterBuilder {
 
     pub fn path(mut self, path: PathBuf) -> Self {
         self.path = Some(path);
+        self
+    }
+
+    pub fn drain(mut self, drain: WaitGroup) -> Self {
+        self.drain = Some(drain);
         self
     }
 
@@ -155,9 +162,11 @@ impl CompioWriterBuilder {
         let path_clone = path.clone();
         let worker_wg = WaitGroup::new();
         let worker_guard = worker_wg.clone();
+        let drain = self.drain;
         blocking::unblock(move || {
             compio_file_writer_task(path_clone, ready_tx, &rx);
             drop(worker_guard);
+            drop(drain);
         })
         .detach();
         let ready = ready_rx

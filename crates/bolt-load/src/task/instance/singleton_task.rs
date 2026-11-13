@@ -7,14 +7,14 @@ use std::{
     },
 };
 
-use async_fs::{File, OpenOptions};
 use async_io::Timer;
 use bolt_load_utils::telemetry::*;
-use futures::{AsyncWriteExt, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
 
 use super::{
     Result,
+    drained_file::DrainedFile,
     drive::Transfer,
     full_body::file_body,
     output_file::{OutputFile, Teardown},
@@ -65,13 +65,11 @@ impl SingletonTaskInner {
 }
 
 impl SingletonTaskInner {
-    /// Create the temporary file, sized to the total when it is known.
-    async fn create_file(&self, tmp_path: &Path) -> Result<File> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(tmp_path)
+    /// Create the temporary file, sized to the total when it is known. Its
+    /// writes hold the attempt's drain group, so a panic handler waits for
+    /// one in flight before it releases the destination (design §11.5.4).
+    async fn create_file(&self, tmp_path: &Path) -> Result<DrainedFile> {
+        let file = DrainedFile::create(tmp_path, self.output.drain())
             .await
             .map_err(|e| DownloadError::io(IoOp::Create, tmp_path, e))?;
         if let Some(total) = self.total {
@@ -103,13 +101,13 @@ impl SingletonTaskInner {
     async fn handle_data_frame(
         &mut self,
         data: bytes::Bytes,
-        file: &mut File,
+        file: &mut DrainedFile,
         meter: &mut usize,
     ) -> Result<()> {
         trace!("[SINGLETON TASK] downloaded chunk: {:?}", data.len());
         *meter += data.len();
         self.downloaded += data.len() as u64;
-        file.write_all(&data)
+        file.write_all(data)
             .await
             .map_err(|e| DownloadError::io(IoOp::Write, &self.output.tmp, e))?;
         Ok(())
@@ -132,7 +130,8 @@ impl SingletonTaskInner {
         );
         let tmp_path = self.output.tmp.clone();
         let transfer = self.download_to(&tmp_path, cancel_token).await;
-        self.output.commit(transfer, cancel_token).await
+        let completed = Transfer::final_progress(self);
+        self.output.commit(transfer, completed, cancel_token).await
     }
 
     /// Run the transfer; returns only after the runner has exited.
@@ -283,16 +282,11 @@ impl SingletonTaskInner {
         runner_token.cancel();
         drop(runner);
         drop(control_tx);
-        let flush = match file.as_mut() {
-            Some(file) => file
-                .flush()
-                .await
-                .map_err(|e| DownloadError::io(IoOp::Flush, tmp_path, e)),
-            None => Ok(()),
-        };
+        // Every write was awaited until it reached the file: nothing is
+        // buffered to flush.
         drop(file);
 
-        result.and(flush)
+        result
     }
 }
 
