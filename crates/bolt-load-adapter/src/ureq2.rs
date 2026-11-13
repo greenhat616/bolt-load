@@ -99,23 +99,20 @@ fn single<'a>(response: &'a ureq2::Response, name: &http::HeaderName) -> Option<
 }
 
 /// `meta` with the validators of `response`, a response to a GET: its
-/// strong `ETag` and its `Last-Modified`; and the validator for
-/// `If-Range`. A repeated field counts as missing.
-fn with_validators(
-    meta: BoltLoadAdapterMeta,
-    response: &ureq2::Response,
-) -> (BoltLoadAdapterMeta, Option<Validator>) {
+/// strong `ETag`, its `Last-Modified`, and the validator for `If-Range`,
+/// which the range requests send from the meta. A repeated field counts as
+/// missing.
+fn with_validators(meta: BoltLoadAdapterMeta, response: &ureq2::Response) -> BoltLoadAdapterMeta {
     let etag = single(response, &http::header::ETAG);
     let last_modified = single(response, &http::header::LAST_MODIFIED);
     let date = single(response, &http::header::DATE);
     let validator = if_range_validator(etag, last_modified, date);
-    let meta = meta
-        .with_etag(
-            etag.filter(|etag| is_strong_etag(etag))
-                .map(|etag| etag.trim().to_owned()),
-        )
-        .with_last_modified(last_modified.map(|value| value.trim().to_owned()));
-    (meta, validator)
+    meta.with_etag(
+        etag.filter(|etag| is_strong_etag(etag))
+            .map(|etag| etag.trim().to_owned()),
+    )
+    .with_last_modified(last_modified.map(|value| value.trim().to_owned()))
+    .with_validator(validator)
 }
 
 /// What the adapter learned about the resource, from a HEAD and an
@@ -131,9 +128,8 @@ fn with_validators(
 /// rejected, there is no validator, so range requests carry no `If-Range`
 /// and a changed resource goes unnoticed.
 struct Probed {
+    /// Its `validator` is what every range request sends in `If-Range`.
     meta: BoltLoadAdapterMeta,
-    /// What every range request sends in `If-Range`.
-    if_range: Option<Validator>,
     /// The HEAD says `Accept-Ranges: bytes`, or the GET was a 206 that
     /// proves its offsets.
     is_range_stream_available: bool,
@@ -176,6 +172,16 @@ fn any_status(
 }
 
 impl UreqAdapter {
+    /// Customize every request before it is sent: the HEAD, the probe,
+    /// full and range requests.
+    ///
+    /// The adapter sets `If-Range` on range requests from
+    /// [`BoltLoadAdapterMeta::validator`], and checks every range response
+    /// against that cached value whatever was sent. So `f` must not replace
+    /// the `If-Range` it set, nor add one when the meta has no validator;
+    /// the same holds for a [`call`](Self::call) hook. Otherwise a range of
+    /// another version can pass as this one, or a range of this one fail
+    /// as a changed resource.
     pub fn before_request(&mut self, f: impl Fn(Request) -> Request + Send + Sync + 'static) {
         self.before_request = Some(Box::new(f));
     }
@@ -253,13 +259,12 @@ impl UreqAdapter {
         let meta = BoltLoadAdapterMeta::new(size)
             .with_filename(self.suggest_filename(&head))
             .with_content_encoding(combined(&head, &http::header::CONTENT_ENCODING));
-        let (meta, if_range) = match &get {
+        let meta = match &get {
             Some(get) => with_validators(meta, get),
-            None => (meta, None),
+            None => meta,
         };
         Ok(Probed {
             meta,
-            if_range,
             // A weak signal: every range response is still checked.
             is_range_stream_available: accepts_ranges || probed.is_some(),
         })
@@ -395,7 +400,9 @@ impl BoltLoadAdapter for UreqAdapter {
             .as_ref()
             .map(|probed| probed.meta.content_size)
             .filter(|&size| size > 0);
-        let if_range = probed.as_ref().and_then(|probed| probed.if_range.as_ref());
+        let if_range = probed
+            .as_ref()
+            .and_then(|probed| probed.meta.validator.as_ref());
         self.request_range(start, end, expected_total, if_range)
             .await
     }
@@ -448,7 +455,7 @@ mod test {
     use super::*;
 
     /// The metadata of a response with `headers`.
-    fn validators_of(headers: &[(&str, &str)]) -> (BoltLoadAdapterMeta, Option<Validator>) {
+    fn validators_of(headers: &[(&str, &str)]) -> BoltLoadAdapterMeta {
         let mut response = String::from("HTTP/1.1 200 OK\r\n");
         for (name, value) in headers {
             response.push_str(&format!("{name}: {value}\r\n"));
@@ -466,42 +473,41 @@ mod test {
     #[test]
     fn validators_come_from_single_fields() {
         let date = |value: &str| Some(Validator::LastModified(value.into()));
-        let (meta, validator) = validators_of(&[("last-modified", OLD)]);
+        let meta = validators_of(&[("last-modified", OLD)]);
         assert_eq!(meta.last_modified.as_deref(), Some(OLD));
-        assert_eq!(validator, None);
+        assert_eq!(meta.validator, None);
         assert_eq!(
-            validators_of(&[("last-modified", OLD), ("date", DATE)]).1,
+            validators_of(&[("last-modified", OLD), ("date", DATE)]).validator,
             date(OLD)
         );
         assert_eq!(
-            validators_of(&[("last-modified", OLD), ("date", DATE), ("date", DATE)]).1,
+            validators_of(&[("last-modified", OLD), ("date", DATE), ("date", DATE)]).validator,
             None
         );
-        let (meta, validator) = validators_of(&[
+        let meta = validators_of(&[
             ("last-modified", OLD),
             ("last-modified", OLD),
             ("date", DATE),
         ]);
-        assert_eq!((meta.last_modified, validator), (None, None));
-        let (meta, validator) = validators_of(&[
+        assert_eq!((meta.last_modified, meta.validator), (None, None));
+        let meta = validators_of(&[
             ("etag", "\"a\""),
             ("etag", "\"a\""),
             ("last-modified", OLD),
             ("date", DATE),
         ]);
-        assert_eq!((meta.etag, validator), (None, date(OLD)));
-        let (meta, validator) = validators_of(&[
+        assert_eq!((meta.etag, meta.validator), (None, date(OLD)));
+        let meta = validators_of(&[
             ("etag", "\"a\", \"b\""),
             ("last-modified", OLD),
             ("date", DATE),
         ]);
-        assert_eq!((meta.etag, validator), (None, date(OLD)));
-        let (meta, validator) =
-            validators_of(&[("etag", "W/\"a\""), ("last-modified", OLD), ("date", DATE)]);
-        assert_eq!((meta.etag, validator), (None, None));
-        let (meta, validator) = validators_of(&[("etag", "\"a\""), ("last-modified", OLD)]);
+        assert_eq!((meta.etag, meta.validator), (None, date(OLD)));
+        let meta = validators_of(&[("etag", "W/\"a\""), ("last-modified", OLD), ("date", DATE)]);
+        assert_eq!((meta.etag, meta.validator), (None, None));
+        let meta = validators_of(&[("etag", "\"a\""), ("last-modified", OLD)]);
         assert_eq!(meta.etag.as_deref(), Some("\"a\""));
-        assert_eq!(validator, Some(Validator::StrongEtag("\"a\"".into())));
+        assert_eq!(meta.validator, Some(Validator::StrongEtag("\"a\"".into())));
     }
 
     #[tokio::test]

@@ -7,6 +7,9 @@
 //! checks the response's own validators against it. A server that holds
 //! another representation then answers with the whole of it, or with
 //! another validator, and the task learns that the resource changed.
+//! Report the validator sent in `BoltLoadAdapterMeta::validator` too, from
+//! the same value, so that the metadata names what the ranges were checked
+//! against.
 //!
 //! Take the validators from a GET, not a HEAD: some servers send other
 //! validators with a HEAD, and every range request would then look like a
@@ -18,28 +21,9 @@
 
 use std::time::{Duration, SystemTime};
 
-/// A validator that can make a range request conditional, sent in
-/// `If-Range` (RFC 9110 §13.1.5).
-///
-/// It holds the value as the server sent it, and is sent back unchanged.
-/// `If-Range` takes no other kind, so the enum is exhaustive.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Validator {
-    /// A strong entity tag, quotes included, such as `"v1"`.
-    StrongEtag(String),
-    /// A `Last-Modified` date at least one second older than the `Date` of
-    /// the response that carried it.
-    LastModified(String),
-}
-
-impl Validator {
-    /// The value to send in `If-Range`.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Validator::StrongEtag(value) | Validator::LastModified(value) => value,
-        }
-    }
-}
+/// The type lives in `bolt-load-core`, so that an adapter's metadata can
+/// carry it; it stays here under its old path.
+pub use bolt_load_core::adapter::Validator;
 
 /// Optional whitespace around a field value (RFC 9110 §5.6.3).
 const OWS: [char; 2] = [' ', '\t'];

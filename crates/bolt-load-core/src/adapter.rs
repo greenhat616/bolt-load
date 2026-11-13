@@ -3,10 +3,12 @@ use std::fmt;
 use futures::stream::BoxStream;
 mod content_range;
 pub mod error;
+mod validator;
 pub use content_range::{ContentRange, InvalidContentRange};
 pub use error::{AdapterError, RetryableError, UnretryableError};
 use error::{UnretryableSnafu, unretryable::RangeStreamNotSupportedSnafu};
 use snafu::ResultExt;
+pub use validator::Validator;
 
 /// A download source.
 ///
@@ -65,6 +67,10 @@ pub struct BoltLoadAdapterMeta {
     pub etag: Option<String>,
     /// The `Last-Modified` of the resource, as the server sent it.
     pub last_modified: Option<String>,
+    /// The validator the adapter sends in `If-Range` with every range
+    /// request, kind and value; `None` when it has none it can use, and
+    /// its ranges are not conditional.
+    pub validator: Option<Validator>,
 }
 
 impl BoltLoadAdapterMeta {
@@ -77,6 +83,7 @@ impl BoltLoadAdapterMeta {
             content_encoding: None,
             etag: None,
             last_modified: None,
+            validator: None,
         }
     }
 
@@ -102,6 +109,12 @@ impl BoltLoadAdapterMeta {
     /// Set the `Last-Modified`.
     pub fn with_last_modified(mut self, last_modified: Option<String>) -> Self {
         self.last_modified = last_modified;
+        self
+    }
+
+    /// Set the validator sent in `If-Range`.
+    pub fn with_validator(mut self, validator: Option<Validator>) -> Self {
+        self.validator = validator;
         self
     }
 }

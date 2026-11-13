@@ -44,7 +44,9 @@ they retrieve its metadata ([`BoltLoadAdapterMeta::etag`],
 every range request: the strong `ETag`, or else the `Last-Modified` when
 it is at least a second older than the response's `Date`. With only a
 weak `ETag` none is sent, and a field that occurs more than once counts
-as missing. A 200 with another validator than the one sent, or none, and
+as missing. [`BoltLoadAdapterMeta::validator`] names the one sent, kind
+and value, and is `None` when none is; a custom adapter that sends one
+should report it there too. A 200 with another validator than the one sent, or none, and
 a 206 with a validator that conflicts with it, are
 `UnretryableError::ResourceChanged`: the task removes what it wrote and
 fails with `DownloadError::ResourceChanged`. A 206 without a validator
