@@ -22,7 +22,7 @@ use std::{
 
 use bolt_load_core::adapter::{AdapterError, RetryableError, UnretryableError};
 
-use super::super::runner_manager::AttemptFailure;
+use super::super::runner_manager::{AttemptFailure, SideFailed};
 use crate::{runner::TaskError, task::TaskOptions};
 
 /// A server rejecting the connection count (429/503), which the concurrency
@@ -75,7 +75,7 @@ fn is_timeout_or_drop(error: &TaskError) -> bool {
 ///
 /// Delivered means accepted by the planner, so a restart always shrinks
 /// its range, and restarts cannot go on without progress.
-fn is_restart(error: &TaskError, received: u64) -> bool {
+pub(in super::super) fn is_restart(error: &TaskError, received: u64) -> bool {
     received > 0 && is_timeout_or_drop(error)
 }
 
@@ -145,27 +145,63 @@ impl FailurePolicy {
     /// [`TaskError::RangeExhausted`]; this comes before the consecutive
     /// limit, as it names the range. Otherwise it counts towards the
     /// consecutive failures.
+    ///
+    /// The budget is checked first, for a congestion rejection too: alone,
+    /// neither a restart nor a congestion is ever charged, so this only
+    /// matters for the last side of a hedged attempt, charged for the pair
+    /// (design §9.6).
     pub fn on_failure(&mut self, failure: &AttemptFailure, in_flight: usize) -> Option<TaskError> {
-        if !failure.retryable {
-            let tolerated = in_flight > 0 && is_congestion(&failure.error);
-            return (!tolerated).then(|| failure.error.clone());
-        }
-        if is_restart(&failure.error, failure.received) {
-            return None;
-        }
+        let congestion = is_congestion(&failure.error);
         // Nothing is left to retry of a range that was complete.
-        if !failure.range.is_empty() && failure.charged >= self.max_attempts_per_range {
+        if (failure.retryable || congestion)
+            && !failure.range.is_empty()
+            && failure.charged >= self.max_attempts_per_range
+        {
             return Some(TaskError::RangeExhausted {
                 range: failure.range.clone(),
                 attempts: failure.charged,
                 source: Arc::new(failure.error.clone()),
             });
         }
+        if !failure.retryable {
+            let tolerated = in_flight > 0 && congestion;
+            return (!tolerated).then(|| failure.error.clone());
+        }
+        if is_restart(&failure.error, failure.received) {
+            return None;
+        }
+        self.count_consecutive(&failure.error)
+    }
+
+    /// Returns the terminal error if the failure of a side of an undecided
+    /// pair ends the task (design §9.6).
+    ///
+    /// The other side runs on, so a congestion rejection is left to the
+    /// concurrency strategy; any other unretryable failure ends the task.
+    /// The range's budget waits for the other side; a failure that is not
+    /// a restart counts towards the consecutive failures.
+    pub fn on_side_failure(&mut self, failure: &SideFailed) -> Option<TaskError> {
+        if !failure.retryable {
+            return (!is_congestion(&failure.error)).then(|| failure.error.clone());
+        }
+        if is_restart(&failure.error, failure.received) {
+            return None;
+        }
+        self.count_consecutive(&failure.error)
+    }
+
+    fn count_consecutive(&mut self, error: &TaskError) -> Option<TaskError> {
         self.consecutive += 1;
         (self.consecutive >= self.max_consecutive).then(|| TaskError::RetryLimitExceeded {
             limit: self.max_consecutive,
-            source: Arc::new(failure.error.clone()),
+            source: Arc::new(error.clone()),
         })
+    }
+
+    /// The failures since the last successful non-empty write.
+    #[cfg(test)]
+    pub fn consecutive(&self) -> usize {
+        self.consecutive
     }
 
     pub fn deadline(&self) -> Instant {
@@ -183,7 +219,13 @@ impl FailurePolicy {
 mod tests {
     use std::ops::Range;
 
-    use super::{super::super::chunk_planner::Released, *};
+    use super::{
+        super::super::{
+            chunk_planner::{Released, SideFailure},
+            runner_manager::{Admission, SideFailed},
+        },
+        *,
+    };
 
     fn policy(max_consecutive: usize, no_progress: Duration, now: Instant) -> FailurePolicy {
         FailurePolicy::new(
@@ -615,5 +657,142 @@ mod tests {
             }
             other => panic!("expected RangeExhausted, got {other:?}"),
         }
+    }
+
+    // === Hedged pairs (design §9.6) ===
+
+    fn released(charged: u32, received: u64) -> Released {
+        Released {
+            range: 0..100,
+            attempts: charged + 1,
+            charged,
+            received,
+        }
+    }
+
+    /// A pair is charged once at most, when neither side restarted and
+    /// either was charged; each side classified by its own bytes.
+    #[test]
+    fn test_a_pair_is_charged_at_most_once() {
+        let restart = SideFailure {
+            restart: true,
+            charged: false,
+        };
+        let charged = SideFailure {
+            restart: false,
+            charged: true,
+        };
+        let neither = SideFailure::default();
+        let congestion = congestion().error;
+        // (first, last error, last retryable, last's own bytes, charge)
+        let cases = [
+            (Some(charged), congestion.clone(), false, 0, 1),
+            (Some(charged), TaskError::Timeout, true, 64, 0),
+            (Some(restart), TaskError::Timeout, true, 0, 0),
+            (Some(neither), congestion.clone(), false, 0, 0),
+            (Some(restart), TaskError::ChannelClosed, true, 64, 0),
+            (Some(charged), TaskError::ChannelClosed, true, 64, 1),
+            (Some(neither), TaskError::ChannelClosed, true, 0, 1),
+            // Alone, or after a decision: as `charges_range` has it.
+            (None, TaskError::ChannelClosed, true, 64, 1),
+            (None, TaskError::Timeout, true, 64, 0),
+            (None, congestion, false, 0, 0),
+        ];
+        for (n, (first, error, retryable, own, charge)) in cases.into_iter().enumerate() {
+            // The planner's own count differs from the side's.
+            let failure = AttemptFailure::of_attempt(
+                1,
+                error,
+                retryable,
+                released(2, 999),
+                own,
+                first,
+                Admission::NONE,
+            );
+            assert_eq!(
+                (failure.charged, failure.received),
+                (2 + charge, own),
+                "case {n}"
+            );
+        }
+        let slow = AttemptFailure::slow_of_attempt(1, released(2, 999), 0, Some(restart));
+        assert_eq!((slow.charged, slow.slow), (2, true));
+    }
+
+    /// The budget comes first for the last side of a pair: a congestion
+    /// charged for the pair at the limit exhausts the range, even with
+    /// other attempts in flight.
+    #[test]
+    fn test_a_congestion_charged_for_a_pair_exhausts_its_range() {
+        let charged = SideFailure {
+            restart: false,
+            charged: true,
+        };
+        let failure = |budget| {
+            AttemptFailure::of_attempt(
+                1,
+                congestion().error,
+                false,
+                released(budget, 0),
+                0,
+                Some(charged),
+                Admission::NONE,
+            )
+        };
+        let mut p = budget_policy(8, 3);
+        for in_flight in [0, 1] {
+            match p.on_failure(&failure(2), in_flight) {
+                Some(TaskError::RangeExhausted {
+                    attempts: 3,
+                    source,
+                    ..
+                }) => assert!(is_congestion(&source)),
+                other => panic!("expected RangeExhausted, got {other:?}"),
+            }
+        }
+        assert!(p.on_failure(&failure(1), 1).is_none());
+        assert!(
+            p.on_failure(&failure(1), 0)
+                .is_some_and(|error| is_congestion(&error))
+        );
+        assert_eq!(p.consecutive(), 0);
+    }
+
+    /// A side that fails while the other runs on is never charged to the
+    /// range: a congestion is left to the strategy, a restart only backs
+    /// off, any other retryable failure counts towards the consecutive
+    /// limit, and any other unretryable failure ends the task.
+    #[test]
+    fn test_a_side_failure_counts_only_towards_the_consecutive_limit() {
+        let side = |error: TaskError, retryable, received| SideFailed {
+            runner_id: 1,
+            error,
+            retryable,
+            received,
+            attempts: 1,
+        };
+        let mut p = budget_policy(2, 1);
+        assert!(
+            p.on_side_failure(&side(congestion().error, false, 0))
+                .is_none()
+        );
+        assert!(
+            p.on_side_failure(&side(TaskError::Timeout, true, 64))
+                .is_none()
+        );
+        assert_eq!(p.consecutive(), 0);
+        assert!(
+            p.on_side_failure(&side(TaskError::Timeout, true, 0))
+                .is_none()
+        );
+        assert_eq!(p.consecutive(), 1);
+        assert!(matches!(
+            p.on_side_failure(&side(TaskError::ChannelClosed, true, 64)),
+            Some(TaskError::RetryLimitExceeded { limit: 2, .. })
+        ));
+        assert!(matches!(
+            p.on_side_failure(&side(unretryable().error, false, 0)),
+            Some(TaskError::Other { .. })
+        ));
     }
 }

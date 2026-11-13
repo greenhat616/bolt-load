@@ -121,7 +121,11 @@ runner that delivered under a quarter of the median of at least three
 runners over the last 10 s, allowing one 32 KiB buffer either way, when
 it has at least twice the minimum chunk size left; its range is retried
 from the bytes already received after a backoff, which counts against
-the range's budget only when the runner had received nothing. It may
+the range's budget only when the runner had received nothing. In the
+endgame, when nothing is left to split, a runner with less than twice the
+minimum chunk size left that has delivered nothing for 2 s is hedged: a
+second runner requests the rest of its range again, the first to deliver
+goes on and the other is stopped, so no byte is written twice. It may
 change or go away.
 
 A failed range is retried after a backoff: 0.5 s after its first

@@ -1,6 +1,7 @@
 use std::{
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use super::{DownloadLoop, LoopEvent, WriteCompletion};
@@ -30,17 +31,34 @@ pub(super) fn check_completions(completions: Vec<WriteCompletion>) -> Result<usi
 impl DownloadLoop {
     /// Pending while no write is in flight: only the loop itself dispatches
     /// writes, and it polls again after handling the event that did.
+    ///
+    /// Whether the writer could take data is read before the completions
+    /// are polled: polling them already frees their slots and dispatches
+    /// the pending write, so the writer can take data by the time the event
+    /// is handled (design §9.6).
     #[inline]
     pub(super) fn poll_writer(&mut self, cx: &mut Context<'_>) -> Poll<LoopEvent> {
+        let was_full = !self.writer.can_write();
         self.writer
             .poll_completions(cx)
-            .map(LoopEvent::WriterCompleted)
+            .map(|completions| LoopEvent::WriterCompleted(completions, was_full))
     }
 
-    pub(super) fn record_completions(&mut self, completions: Vec<WriteCompletion>) -> Result<()> {
+    /// Account for `completions` at `now`; when the writer could not take
+    /// data before them and can now, every runner's silence starts over,
+    /// as the loop took no data meanwhile (design §9.6).
+    pub(super) fn record_completions(
+        &mut self,
+        completions: Vec<WriteCompletion>,
+        was_full: bool,
+        now: Instant,
+    ) -> Result<()> {
         let written = check_completions(completions)?;
         self.throughput.record_written(written);
         self.policy.on_write_ok(written);
+        if was_full && self.writer.can_write() {
+            self.manager.restart_silences(now);
+        }
         Ok(())
     }
 }

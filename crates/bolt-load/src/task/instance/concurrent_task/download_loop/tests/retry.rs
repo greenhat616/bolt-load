@@ -434,7 +434,9 @@ async fn deliver_and_write(
     assert!(tick.downloaded.is_some());
     assert!(download.on_runner(tick, now).unwrap().is_continue());
     let completions = download.writer.tick().await.unwrap();
-    download.record_completions(completions).unwrap();
+    download
+        .record_completions(completions, false, now)
+        .unwrap();
 }
 
 fn reset() -> TaskError {

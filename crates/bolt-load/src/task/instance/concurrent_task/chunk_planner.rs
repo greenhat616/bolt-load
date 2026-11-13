@@ -37,6 +37,73 @@ pub struct ChunkState {
     /// is a new attempt. A chunk keeps its own when it shrinks; the chunk
     /// split off it gets a new one.
     pub generation: u64,
+    /// The endgame hedge of this attempt, from the fork until the attempt
+    /// ends (design §9.6); `None` while the attempt was never hedged.
+    pub hedge: Option<Hedge>,
+}
+
+/// Which side of a hedged attempt a runner is (design §9.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// The runner that held the chunk when it was hedged.
+    Original,
+    /// The runner that requested the rest of the chunk again.
+    Hedge,
+}
+
+/// How the side of a pair that failed first failed (design §9.6): what
+/// the budget of the pair needs of it once the other side fails too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideFailure {
+    /// A restart: a timeout or a dropped stream after its own bytes were
+    /// accepted.
+    pub restart: bool,
+    /// Charged to the range's budget, see
+    /// [`charges_range`](super::strategy::charges_range).
+    pub charged: bool,
+}
+
+/// The hedge runner of an undecided pair, while it is alive and the
+/// original runner still owns the chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Partner {
+    pub runner_id: RunnerId,
+    /// Whether it reported `Started`.
+    pub running: bool,
+}
+
+/// The endgame hedge of one attempt on a chunk (design §9.6).
+///
+/// The arbitration ends at the first non-empty frame taken since the fork;
+/// the budget of the pair lasts until the attempt ends, when the chunk is
+/// complete or released.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hedge {
+    /// The downloaded end when the hedge was forked: where its request
+    /// starts.
+    pub fork: u64,
+    /// The side of the chunk's runner.
+    pub owner_side: Side,
+    /// The side that failed first, while the other ran on.
+    pub first: Option<SideFailure>,
+    /// No non-empty frame was taken since the fork: the pair is undecided,
+    /// and its runners are neither judged nor split.
+    pub undecided: bool,
+    /// The hedge runner while both sides run; the chunk's runner is then
+    /// the original one.
+    pub partner: Option<Partner>,
+}
+
+impl Hedge {
+    /// The bytes the owner's own attempt delivered, given the chunk's
+    /// downloaded end: the original's from the chunk's start, the hedge's
+    /// from the fork.
+    fn owner_bytes(&self, downloaded: &Range<u64>) -> u64 {
+        match self.owner_side {
+            Side::Original => downloaded.end - downloaded.start,
+            Side::Hedge => downloaded.end - self.fork,
+        }
+    }
 }
 
 /// The backoff of an available range that failed runners gave back
@@ -118,6 +185,10 @@ pub enum Error {
     InvalidSplitPosition { position: u64 },
     #[snafu(display("Invalid resize of runner {runner_id} to {new_size} remaining bytes"))]
     InvalidResize { runner_id: RunnerId, new_size: u64 },
+    #[snafu(display("The chunk of runner {runner_id} cannot be hedged"))]
+    InvalidHedge { runner_id: RunnerId },
+    #[snafu(display("Runner {runner_id} is no hedge of an undecided pair"))]
+    PartnerNotFound { runner_id: RunnerId },
 }
 
 /// A range the strategy may hand to a new runner, see
@@ -156,6 +227,7 @@ impl ChunkState {
             attempts: 0,
             charged: 0,
             generation: 0,
+            hedge: None,
         }
     }
 
@@ -193,6 +265,17 @@ impl ChunkState {
     pub fn is_complete(&self) -> bool {
         self.downloaded.end >= self.allocated.end
     }
+
+    /// Whether the chunk is hedged and undecided (design §9.6): neither
+    /// side may be judged slow, and the chunk may not be split.
+    pub fn is_undecided(&self) -> bool {
+        self.hedge.as_ref().is_some_and(|hedge| hedge.undecided)
+    }
+
+    /// The hedge runner of the undecided pair, while both sides run.
+    pub fn partner(&self) -> Option<Partner> {
+        self.hedge.as_ref().and_then(|hedge| hedge.partner)
+    }
 }
 
 /// Enhanced chunk planner that maintains unified state
@@ -206,8 +289,13 @@ pub struct ChunkPlanner {
     pub max_chunk_count: Option<NonZeroUsize>,
     /// All chunks keyed by `allocated.start`; their allocated ranges never overlap
     chunks: BTreeMap<u64, ChunkState>,
-    /// Runner ID to chunk start mapping for quick lookup
+    /// Runner ID to chunk start mapping for quick lookup; only the runner
+    /// that owns each chunk
     runner_to_chunk: HashMap<RunnerId, u64>,
+    /// The hedge runner of an undecided pair to its chunk's start, while
+    /// it is alive and not the owner (design §9.6). An entry is removed
+    /// before its runner's ID can be reclaimed.
+    hedge_of: HashMap<RunnerId, u64>,
     /// Bytes accepted into all chunks; no operation ever drops accepted bytes.
     accepted_bytes: u64,
     /// Available ranges backing off after a failure, keyed by start. They
@@ -226,6 +314,7 @@ impl ChunkPlanner {
             max_chunk_count: None,
             chunks: BTreeMap::new(),
             runner_to_chunk: HashMap::new(),
+            hedge_of: HashMap::new(),
             accepted_bytes: 0,
             cooldowns: BTreeMap::new(),
             next_generation: 0,
@@ -244,12 +333,15 @@ impl ChunkPlanner {
         self.chunks.len()
     }
 
-    /// Get number of active runners
+    /// Get number of active runners: the runner of every connecting or
+    /// running chunk, and the hedge runner of every undecided pair whose
+    /// sides both run (design §9.6).
     pub fn get_active_runners_count(&self) -> usize {
         self.chunks
             .values()
             .filter(|c| c.status.is_active())
             .count()
+            + self.hedge_of.len()
     }
 
     /// The runners that are running and had at least one byte accepted on
@@ -257,7 +349,16 @@ impl ChunkPlanner {
     pub fn get_proven_runners_count(&self) -> usize {
         self.chunks
             .values()
-            .filter(|c| c.status == ChunkStatus::Running && !c.downloaded.is_empty())
+            .filter(|c| {
+                // A hedged chunk's owner proves itself only by its own side's
+                // bytes: a hedge handed the chunk delivered none of those
+                // before the fork (design §9.6).
+                let own = match &c.hedge {
+                    Some(hedge) => hedge.owner_bytes(&c.downloaded),
+                    None => c.downloaded.end - c.downloaded.start,
+                };
+                c.status == ChunkStatus::Running && own > 0
+            })
             .count()
     }
 
@@ -349,9 +450,10 @@ impl ChunkPlanner {
         let previous_end = std::mem::replace(&mut chunk.downloaded.end, new_end);
         self.accepted_bytes += new_end - previous_end;
 
-        // Check if complete
+        // Check if complete; the attempt ends, and its hedge with it.
         if chunk.is_complete() {
             chunk.status = ChunkStatus::Finished;
+            chunk.hedge = None;
         }
 
         Ok(previous_end..new_end)
@@ -385,6 +487,7 @@ impl ChunkPlanner {
 
         if let Some(chunk) = self.chunks.get_mut(&range) {
             chunk.status = ChunkStatus::Finished;
+            chunk.hedge = None;
             Ok(())
         } else {
             Err(Error::ChunkNotFound { runner_id })
@@ -401,6 +504,12 @@ impl ChunkPlanner {
             .ok_or(Error::RunnerNotFound { runner_id })?;
 
         if let Some(mut chunk) = self.chunks.remove(&range) {
+            debug_assert!(
+                chunk.partner().is_none(),
+                "the last side of a pair fails, not the first"
+            );
+            // The attempt ends here, and its hedge with it.
+            chunk.hedge = None;
             let attempts = chunk.attempts.saturating_add(1);
             let charged = chunk.charged;
             // A chunk is claimed by one attempt and starts empty.
@@ -569,8 +678,11 @@ impl ChunkPlanner {
             .remove(&range)
             .ok_or(Error::ChunkNotFound { runner_id })?;
 
-        // Validate split position
-        if split_pos <= chunk.downloaded.end || split_pos >= chunk.allocated.end {
+        // Validate split position; a hedged chunk is never split.
+        if split_pos <= chunk.downloaded.end
+            || split_pos >= chunk.allocated.end
+            || chunk.hedge.is_some()
+        {
             self.chunks.insert(range, chunk);
             self.runner_to_chunk.insert(runner_id, range);
             return Err(Error::InvalidSplitPosition {
@@ -744,7 +856,7 @@ impl ChunkPlanner {
     ///
     /// A connecting runner is left alone, as by
     /// [`Self::get_incomplete_states`], and so is every runner `skip`
-    /// names.
+    /// names, and every chunk hedged in this attempt (design §9.6).
     pub fn largest_running_chunk(
         &self,
         skip: impl Fn(RunnerId) -> bool,
@@ -752,6 +864,7 @@ impl ChunkPlanner {
         self.chunks
             .values()
             .filter(|c| c.status == ChunkStatus::Running && !c.is_complete())
+            .filter(|c| c.hedge.is_none())
             .filter_map(|c| Some((c.runner_id?, c)))
             .filter(|&(runner_id, _)| !skip(runner_id))
             .max_by_key(|(_, c)| c.remaining())
@@ -763,6 +876,153 @@ impl ChunkPlanner {
         self.runner_to_chunk
             .get(&runner_id)
             .and_then(|range| self.chunks.get(range))
+    }
+
+    /// Fork a hedge of the chunk of `owner` for the runner `hedge` (design
+    /// §9.6); returns the range it requests: the rest of the chunk, from
+    /// the bytes accepted so far.
+    ///
+    /// Only a connecting or running chunk that is incomplete and was not
+    /// hedged in this attempt may be hedged, by a runner without a chunk.
+    pub fn fork_hedge(&mut self, owner: RunnerId, hedge: RunnerId) -> Result<Range<u64>, Error> {
+        let invalid = Error::InvalidHedge { runner_id: owner };
+        let start = *self
+            .runner_to_chunk
+            .get(&owner)
+            .ok_or(Error::RunnerNotFound { runner_id: owner })?;
+        if self.runner_to_chunk.contains_key(&hedge) || self.hedge_of.contains_key(&hedge) {
+            return Err(invalid);
+        }
+        let chunk = self
+            .chunks
+            .get_mut(&start)
+            .ok_or(Error::ChunkNotFound { runner_id: owner })?;
+        if !chunk.status.is_active() || chunk.is_complete() || chunk.hedge.is_some() {
+            return Err(invalid);
+        }
+        chunk.hedge = Some(Hedge {
+            fork: chunk.downloaded.end,
+            owner_side: Side::Original,
+            first: None,
+            undecided: true,
+            partner: Some(Partner {
+                runner_id: hedge,
+                running: false,
+            }),
+        });
+        self.hedge_of.insert(hedge, start);
+        Ok(chunk.incomplete_range())
+    }
+
+    /// The chunk of the undecided pair whose hedge runner is `runner_id`,
+    /// while both sides run.
+    pub fn partner_chunk(&self, runner_id: RunnerId) -> Option<&ChunkState> {
+        self.hedge_of
+            .get(&runner_id)
+            .and_then(|start| self.chunks.get(start))
+    }
+
+    /// The hedge runner `runner_id` reported `Started`.
+    pub fn mark_partner_running(&mut self, runner_id: RunnerId) -> Result<(), Error> {
+        let partner = self
+            .hedge_of
+            .get(&runner_id)
+            .and_then(|start| self.chunks.get_mut(start))
+            .and_then(|chunk| chunk.hedge.as_mut()?.partner.as_mut())
+            .ok_or(Error::PartnerNotFound { runner_id })?;
+        partner.running = true;
+        Ok(())
+    }
+
+    /// The hedge runner `runner_id` leaves its undecided pair, failed or
+    /// beaten: the original runner keeps the chunk. Returns the original
+    /// runner.
+    pub fn drop_partner(&mut self, runner_id: RunnerId) -> Result<RunnerId, Error> {
+        let start = self
+            .hedge_of
+            .remove(&runner_id)
+            .ok_or(Error::PartnerNotFound { runner_id })?;
+        let chunk = self
+            .chunks
+            .get_mut(&start)
+            .expect("an undecided pair has a chunk");
+        chunk
+            .hedge
+            .as_mut()
+            .expect("an undecided pair is hedged")
+            .partner = None;
+        Ok(chunk.runner_id.expect("an undecided pair has an owner"))
+    }
+
+    /// The original runner `owner` leaves its undecided pair, failed or
+    /// beaten: the hedge runner takes the chunk over, with its downloaded
+    /// part and its counts. Returns the hedge runner.
+    pub fn hand_over(&mut self, owner: RunnerId) -> Result<RunnerId, Error> {
+        let start = *self
+            .runner_to_chunk
+            .get(&owner)
+            .ok_or(Error::RunnerNotFound { runner_id: owner })?;
+        let chunk = self
+            .chunks
+            .get_mut(&start)
+            .ok_or(Error::ChunkNotFound { runner_id: owner })?;
+        let hedge = chunk
+            .hedge
+            .as_mut()
+            .ok_or(Error::PartnerNotFound { runner_id: owner })?;
+        let partner = hedge
+            .partner
+            .take()
+            .ok_or(Error::PartnerNotFound { runner_id: owner })?;
+        hedge.owner_side = Side::Hedge;
+        chunk.runner_id = Some(partner.runner_id);
+        chunk.status = if partner.running {
+            ChunkStatus::Running
+        } else {
+            ChunkStatus::Pending
+        };
+        self.hedge_of.remove(&partner.runner_id);
+        self.runner_to_chunk.remove(&owner);
+        self.runner_to_chunk.insert(partner.runner_id, start);
+        Ok(partner.runner_id)
+    }
+
+    /// The side that runs on in the chunk of `owner` took over from one
+    /// that failed as `failure`, before either delivered since the fork.
+    pub fn record_side_failure(&mut self, owner: RunnerId, failure: SideFailure) {
+        if let Some(hedge) = self
+            .runner_to_chunk
+            .get(&owner)
+            .and_then(|start| self.chunks.get_mut(start))
+            .and_then(|chunk| chunk.hedge.as_mut())
+        {
+            debug_assert!(hedge.first.is_none(), "one side fails first");
+            hedge.first = Some(failure);
+        }
+    }
+
+    /// A non-empty frame of `owner` is taken: its pair, if undecided, is
+    /// decided. The hedge stays, for the budget of the attempt.
+    pub fn decide(&mut self, owner: RunnerId) {
+        if let Some(hedge) = self
+            .runner_to_chunk
+            .get(&owner)
+            .and_then(|start| self.chunks.get_mut(start))
+            .and_then(|chunk| chunk.hedge.as_mut())
+        {
+            debug_assert!(hedge.partner.is_none(), "the beaten side left first");
+            hedge.undecided = false;
+        }
+    }
+
+    /// The bytes the attempt of `owner` delivered itself: of a hedged
+    /// chunk's runner, only those of its own side (design §9.6).
+    pub fn owner_bytes(&self, owner: RunnerId) -> Option<u64> {
+        let chunk = self.get_runner_state(owner)?;
+        Some(match &chunk.hedge {
+            Some(hedge) => hedge.owner_bytes(&chunk.downloaded),
+            None => chunk.downloaded.end - chunk.downloaded.start,
+        })
     }
 
     /// Shrink the runner's chunk to end `new_size` bytes after its downloaded part.
@@ -782,6 +1042,14 @@ impl ChunkPlanner {
             .chunks
             .get_mut(&start)
             .ok_or(Error::ChunkNotFound { runner_id })?;
+        // A hedged chunk is never split (design §9.6): its hedge runner
+        // requested up to its end, and counts its limit from the fork.
+        if state.hedge.is_some() {
+            return Err(Error::InvalidResize {
+                runner_id,
+                new_size,
+            });
+        }
         let new_end = match state.downloaded.end.checked_add(new_size) {
             Some(end) if end == state.allocated.end => return Ok(Resize::Unchanged),
             Some(end) if state.allocated.start < end && end < state.allocated.end => end,
@@ -2260,5 +2528,86 @@ mod tests {
             planner.cooldowns(),
             vec![(0..500, cooldown(500, 1, now + SECOND))]
         );
+    }
+
+    /// A hedge joins a chunk as its partner (design §9.6): it counts as an
+    /// active runner, and the chunk is neither resized nor split. When the
+    /// original leaves, the hedge takes the chunk over with its counts, and
+    /// the bytes each side delivered itself are told apart by the fork.
+    #[test]
+    fn test_a_hedge_joins_the_chunk_of_its_original() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        planner.cool_down(0..1000, 2, 1, now);
+        assert!(planner.allocate_chunk(0..600, Some(1)));
+        assert!(planner.allocate_chunk(600..1000, Some(2)));
+        planner.mark_running(1).unwrap();
+        planner.mark_running(2).unwrap();
+        planner.update_progress(1, 100).unwrap();
+        let generation = planner.get_runner_state(1).unwrap().generation;
+
+        assert_eq!(planner.fork_hedge(1, 3).unwrap(), 100..600);
+        // Once per attempt, by a runner without a chunk.
+        assert!(planner.fork_hedge(1, 4).is_err());
+        assert!(planner.fork_hedge(2, 3).is_err());
+        assert!(planner.fork_hedge(2, 1).is_err());
+        assert_eq!(planner.get_active_runners_count(), 3);
+        assert!(planner.get_runner_state(3).is_none());
+        assert_eq!(planner.partner_chunk(3).unwrap().runner_id, Some(1));
+        assert!(planner.resize_runner_state(1, 100).is_err());
+        assert!(planner.split_chunk(1, 300, 5).is_err());
+        assert_eq!(planner.get_runner_state(1).unwrap().allocated, 0..600);
+        assert_eq!(
+            planner.largest_running_chunk(|_| false),
+            Some((2, 600..1000))
+        );
+
+        // The original leaves; the hedge, still connecting, takes over.
+        assert_eq!(planner.hand_over(1).unwrap(), 3);
+        assert!(planner.partner_chunk(3).is_none());
+        assert!(planner.get_runner_state(1).is_none());
+        let state = planner.get_runner_state(3).unwrap();
+        assert_eq!(
+            (
+                state.status.clone(),
+                state.downloaded.clone(),
+                state.attempts,
+                state.charged,
+                state.generation,
+            ),
+            (ChunkStatus::Pending, 0..100, 2, 1, generation)
+        );
+        assert_eq!(planner.owner_bytes(3), Some(0));
+        planner.record_side_failure(
+            3,
+            SideFailure {
+                restart: true,
+                charged: false,
+            },
+        );
+        assert!(planner.get_runner_state(3).unwrap().is_undecided());
+        planner.mark_running(3).unwrap();
+        planner.update_progress(3, 50).unwrap();
+        planner.decide(3);
+        let hedge = planner.get_runner_state(3).unwrap().hedge.clone().unwrap();
+        assert_eq!(
+            (hedge.fork, hedge.owner_side, hedge.undecided, hedge.partner),
+            (100, Side::Hedge, false, None)
+        );
+        assert!(hedge.first.is_some(), "kept until the attempt ends");
+        assert_eq!(planner.owner_bytes(3), Some(50));
+        assert_eq!(planner.get_active_runners_count(), 2);
+
+        // The attempt ends with its hedge.
+        let released = planner.mark_failed(3).unwrap();
+        assert_eq!((released.range, released.received), (150..600, 150));
+        assert!(planner.chunks[&0].hedge.is_none());
+
+        // A hedge that leaves gives the chunk back to the original.
+        assert_eq!(planner.fork_hedge(2, 4).unwrap(), 600..1000);
+        assert_eq!(planner.drop_partner(4).unwrap(), 2);
+        assert_eq!(planner.get_active_runners_count(), 1);
+        assert_eq!(planner.get_runner_state(2).unwrap().runner_id, Some(2));
+        assert_eq!(planner.owner_bytes(2), Some(0));
     }
 }

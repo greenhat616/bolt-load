@@ -666,10 +666,12 @@ async fn test_clipped_frame_does_not_count_as_progress() {
         RunnerTick {
             state: TaskState::Downloading,
             downloaded: Some(DownloadedChunk {
+                runner_id: 0,
                 bytes: bytes::Bytes::from(vec![0; (range.end - range.start) as usize]),
                 range,
             }),
             failure: None,
+            side_failure: None,
         }
     }
 
@@ -1253,6 +1255,7 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
 
 mod admission;
 mod growth;
+mod hedge;
 mod restart;
 mod retry;
 
