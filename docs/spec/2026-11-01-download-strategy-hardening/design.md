@@ -3156,3 +3156,45 @@ C20 拆成三个提交（实现者提议）：C20a 是状态文件的读取和�
 - **第三轮审查之后的修改**（codex 第三轮 90 分）：Major：稳定排序会按记录数分配临时内存、分配失败时直接中止，改成不分配的 `sort_unstable_by_key`，键加上位置；核对了读取的其它分配都和记录数无关或可失败。建议：块边界上的重复、冲突和残片的回归测试。
 - **第四轮审查之后的修改**（codex 第四轮 90 分）：Major：读取之外随记录数增长的分配也改成可失败或有界：逐块校验原地保留、`try_push` 丢弃的记录、新的 `VerifyError::OutOfMemory`；报告原地不分配地排序、`try_push` 区间；写回按批写、不按总数分配（范围按 lead 的决定，见上）。Minor：“整个读取都可失败地分配”改成准确的说法。建议：`scan` 只有测试调用，改成 `#[cfg(test)]`（它在内存里扫，分配失败时 panic），`&[u8]` 的 `ReadAt` 也只在测试里。
 - **第五轮审查**（codex 第五轮 PASS 97 分，没有 Critical、Major、Minor）：按它的两条建议加了测试。`test_a_rewrite_torn_inside_a_batch`：第二批写到一半（一条完整记录加 7 字节）失败，`read_state` 读回第一批和那一条、尾巴是 `TornTail`，`end` 仍在头部；重试的写回成功，之后的追加落在正确的偏移。`test_a_stopped_verification_keeps_the_dropped_records`：直接调 `verify`，丢弃列表里已有一条；丢弃一块、保留一块之后取消或读失败，已有的那条和已完成的丢弃都在、没有重复，停下之后不再读。
+
+#### 14.30.2 C20b：任务从状态文件续传
+
+- **范围。** §11.5.10 的检查接进任务（`Resume` 仍是 crate 内部的，测试打开）：阶段 B2、和 adapter 自己取的 meta 比对、逐块校验、写回、按保留的块给 planner、已写入的区间、进度和检查点的“已记录”做种子，只下载缺的部分；拒绝和新开始两条路。公开 API、文档和端到端测试是 C20c。
+- **公开的结果类型提前到 C20b**（lead 的决定，2026-11-11，不是维护者的决定；实现者提出了两种做法，lead 选了这一种，另一种“crate 内部的临时结果加占位错误、C20c 再换”是一次性的管道，被否决）：`DownloadError::ResumeRejected { reason: RejectReason, state_file }` 是公开枚举的变体，Rust 不允许它带 crate 内部的类型，`TaskInfo::resumed: Option<ResumeReport>` 同理。所以 C20b 公开 `ResumeReport`、`DroppedRecord`、`DropReason`、`RejectReason`（从 `bolt_load::task` 导出）、`DownloadError::ResumeRejected`、`TaskInfo::{resumed, resumable}`，以及新的 `IoOp::Read`（读状态文件、校验时读部分文件失败）。逐项核对过：四个新类型都是 `#[non_exhaustive]`；`DownloadError`、`IoOp`、`TaskInfo` 本来就是 `#[non_exhaustive]`；工作区里（包括 `bolt-load` 的集成测试、测试 crate、示例）没有对它们的穷举 `match` 或结构体字面量（`#[non_exhaustive]` 本来也不允许 crate 之外这样写），四种 clippy 配置和两次工作区测试都通过。所以提交是 `feat(task)`，不带 `!`。这些项的文档都写明续传还不能打开（C20c）：在那之前 `resumed` 总是 `None`、`resumable` 总是 `false`，没有任务以 `ResumeRejected` 失败。`ResumeRejected` 的消息按最终的样子写：`cannot resume from <state file>: <reason>`，原因如 `the partial file next to it is missing`、`the resource changed: its validator is another`（有测试）。C20c 剩下 `Resume`、`resume`、`resume_source`、`kept_for_resume`、`discard_partial`、STATUS-12/13、README、`docs/task.md` 和端到端测试。
+- **加锁之后的分支**（`drive::lock_destination`）：`Resume::On`、锁文件不是这次新建的、长度非 0 → 有状态可续（`Locked::ToResume`）：`Ownership::own_to_resume` 登记锁和临时文件、直接进入新的阶段 `Phase::Checking`（B2），不作废状态、不碰部分文件；同时记下 `durable`（之后会写状态文件，结束时删除要同步目录）。否则照旧（`own` 进入 D、作废旧状态，`Locked::Fresh`）。`On` 而状态可续时，不管这一次的新开始能不能续（比如没有验证器、不能用 Range），都走续传的检查，由比对给出原因（§11.5.2）。
+- **B2 的结束**：拒绝、失败、取消、panic 都不碰两个文件、都不报告（`kept_for_resume`、`leftover_temp_file` 都是 `None`），放锁时保留状态文件（`keep_files` → `release_keeping`）。加锁之后、续传开始之前就取消的（在锁的钩子里取消），同样保留两者。`end_failed_start` 加了 B2 的分支；`clean_up_after_panic` 加了 `Phase::Checking`。
+- **和 §11.5.9 的表逐格核对**（lead 要求）：`ResumeRejected`、B2：两个文件不碰，`kept_for_resume`、`leftover_temp_file` 都是 `None` —— 一致（拒绝发生在 B2，§11.5.5、§11.5.10 都说不改动文件、不丢弃、不从头来；从头来是上层的事）。失败、取消、`Panicked`（比如校验时）、B2：不碰、都是 `None` —— 一致。写回失败（`Io`）、C：部分文件没动，状态是实际剩下的（头部加接受记录的前缀），`kept_for_resume` 是部分文件 —— 一致（包括写回之后 `SizePartial` 失败，按 lead 的要求算阶段 C）。失败、取消、`Panicked`、C：两者都留、`kept_for_resume` —— 一致（传输开始之前还没有 teardown 检查点可做）。B2 不需要 C33b 那样的 `cut` 标记：进入 C 在写回的截断之前，截断之后的任何结束都按 C 处理，而 C 里留下的总是有效的头部加校验过的记录前缀，是一对能续的文件；截断之前（B2）旧的一对原样有效。
+- **续传的顺序**（`drive::resume_checked`，每一步之间检查取消，不和文件步骤赛跑）：
+  0. 部分文件不在 → `ResumeRejected(MissingPartial)`；读它的元数据失败 → `Io { Inspect }`。
+  1、3. `Step::ReadState` 之后经锁住的句柄 `read_state`（C20a 的读取、界和流式扫描）：坏头部、超长 → `ResumeRejected`；读失败 → `Io { Read }`（状态文件的路径）。
+  2. 和 adapter 自己的 `retrieve_meta` 比对（lead 同意的 §14.27 的理解，§14.30），取 meta 和取消赛跑（网络，不是文件步骤），能不能用 Range 问 adapter；`compare` 不过 → `ResumeRejected`。取 meta 失败 → `Metadata`。
+  4. 部分文件用自己的只读句柄逐块读回（每块之前 `Step::ReadPartial`），C20a 的 `verify`：每块之前问取消；读失败（包括打不开）→ `Io { Read }`（部分文件的路径，消息里带块的区间、保留错误的种类）；没有内存 → 同样是 `Io { Read }`。之后 `report`，每条丢弃打一条 `warn!`；交给传输的区间可失败地复制一份。
+  5. 进入阶段 C（在第一次改动状态文件之前），`StateFile::rewrite` 经锁住的句柄写回保留的记录（截断 → 同步 → 分批写 → 同步）；失败 → `Io { Write }`。写回之后检查取消（写回作为一个整体，不在中间停）；然后 `Step::SizePartial`：打开部分文件、`set_len(total)`，失败 → `Io { Allocate }`。最后再检查一次取消。
+  - 之后 `info` 的模式是并发；偏好单连接的任务用 1 个连接（和新开始的改道一样，§11.5.8）。`StateFile` 成为检查点的接收者，`end` 在写回的记录之后。
+- **SizePartial**（实现者的决定）：writer 本来也会 `create` + `set_len(total)`，单独一步是为了让测试按钩子的顺序确认“写回在 `set_len` 之前”（§11.5.11），以及在写回之后、传输之前有一个能注入失败的点。阶段 C，失败时两者都留、`kept_for_resume` 是部分文件。
+- **种子**：`ConcurrentTaskInner::resume_from(kept)` 让进度从保留的区间开始（`downloaded = kept_bytes`、`downloaded_chunks = kept`，STATUS-12）；`download_to` 把进度里的区间交给 `DownloadLoop::resume_from`：`ChunkPlanner::seed_kept` 把每个区间变成一个已完成的块（已下载、已接受、已写入），`get_available_ranges` 只剩空洞；`Checkpoints::seed_durable` 把这些块记为已记录。全部保留时 `DownloadLoop::run` 一开始就结束（planner 已完成），不发任何请求，直接走完成。planner 和已写入的区间按 lead 的范围决定不要求可失败分配（§14.30.1）。
+- **info**：`resumable` = 这一次写状态文件（可续的新开始或续传）；`resumed` = 续传的报告；回退到单连接时两者变成 `false`、`None`。
+- **测试**（`task/tests/resume_from.rs`，真实的任务和文件，`StepLog` 的钩子；`resume_state.rs` 的辅助函数改成 `pub(super)`，`Source` 加了 adapter 的 meta 和记下请求的区间）：
+  - 失败后留下的一对续传：步骤是 `ReadState`、两次 `ReadPartial`、写回的四步、`SizePartial`，然后是检查点和完成；请求的区间都在 `2 × BLOCK` 之后；报告保留 `0..2 × BLOCK`、没有丢弃；`resumable` 为真；每个 `Downloading` 状态的进度都从保留的区间开始。
+  - 改名失败留下的一对（每块都记了）续传时一个请求都不发，直接完成。
+  - 拒绝：部分文件不在、坏头部、超长、总长不同、ETag 不同、验证器种类不同、没有验证器、内容编码、不能用 Range；两个文件逐字节不变、没有报告、没有 `info`、没有请求、只走了 `ReadState`，锁已放。
+  - 调用方的 meta 和 adapter 的不同时，以 adapter 的为准（两个方向）。
+  - 丢弃的记录：翻转一个字节（`CrcMismatch`）、部分文件被截短（`BeyondFileLength`）、残片（`TornTail`）、坏记录（`BadRecord`）、冲突（`Conflict`，两条）、越界（`OutOfBounds`）：写回之后（在 `SizePartial` 注入失败让任务停住）状态文件只有保留的记录；续传到底时报告的丢弃逐条正确、丢掉的块重新下载、内容正确。
+  - 续传的每一步失败：读状态、读块（B2）两个文件不变、不报告；写回的截断、同步、写、`SizePartial`（C）部分文件不变、`kept_for_resume` 是部分文件、状态是有效的头部加保留记录的前缀；之后再续传都能完成。
+  - 取消：在读状态、第一块、最后一块（之后的取消由校验之后的检查看到）停住时取消 → B2 两者不变；在写回的写入停住时取消 → 写回做完、`SizePartial` 不做、两者都留。加锁时取消（锁的钩子里）→ 两者不变。
+  - panic：读状态、读块（B2）两者不变、不报告；写回、`SizePartial`（C）两者都留、`kept_for_resume`。
+  - 再次续传：续传后又失败，保留不少于上次；第三次完成。
+  - 续传后回退到单连接：完成，`info` 的 `resumed` 为 `None`、`resumable` 为假，状态文件已删。
+  - 偏好单连接的任务续传：只请求 `2 × BLOCK..SIZE` 一个区间，最多一个连接。
+  - 空的状态文件当作没有状态（新开始）；`Off` 遇到有效的一对会作废它、从头下载。
+  - §11.5.5“紧接着的下一次 On”的表：删除成功、只有截断成功 → 新开始；截断和删除都失败 → `MissingPartial`。
+  - 部分文件比总长长（`SizePartial` 截到总长；总长已经比对过，所以截掉的只是这个下载之外的字节）和比总长短（长到总长）：都续传完成、内容正确。
+  - `resumable`：`On` 的新开始为真，`Off` 为假。
+  - 检查点的单元测试：保留的块从一开始就算已记录，之后只记新写完的块。
+- **变异**：26 个，25 个被抓到（第一轮之后加了“范围检查不和取消赛跑”“进度从零开始”“回退之后说自己可续”，“用调用方的 meta 比对”按新的代码重写；“回退留着报告”去掉：报告不再被复制，回退的 info 从一开始就没有它）。没抓到的一个是“保留的块不记为已记录”（`DownloadLoop::resume_from` 不调 `seed_durable`）：在任务层面看不出来，因为保留的块从不被写，也就从不进检查点的候选（`touched`），不会再被记一次；`durable` 只有测试读。`seed_durable` 本身由检查点的单元测试覆盖。被抓到的包括：空状态当作可续、`Off` 续传、加锁时取消丢弃一对、B2 的 panic 清理、续传以 D 登记、续传不记 `durable`、检查失败时丢弃、不比对、用调用方的 meta 比对、不校验、不写回、写回之后才进入 C、不做 `SizePartial`、保留的区间又下载、全部保留时照跑循环、种子不算写入、种子不算下载、不发布报告、`resumable` 总为假、回退留着报告、校验之后和写回之后的取消、部分文件不在时照读。
+- **第一轮审查之后的修改**（codex 第一轮 86 分）：
+  - Major：取 meta 和别的网络步骤赛跑取消，但随后的 `is_range_stream_available` 没有：adapter 卡在那里时，取消了的任务会一直停在 B2、拿着锁。改成取 meta、问 Range、比对放在同一个 `until_cancelled` 里。核对了续传路径上其余的 `await`：都是 `blocking::unblock` 的文件步骤（按 §11.5.4 不赛跑，步骤之间检查取消）。测试 `test_a_resume_cancelled_in_the_range_check_ends`：adapter 在第二次范围检查（续传的那次）卡在闸门，取消后任务结束，两个文件逐字节不变、都不报告、只走了 `ReadState`、锁已放。
+  - Major：`TaskInfo::resumed` 有值时，原来的 `info.clone()` 会深拷贝报告（保留和丢弃的列表），是写回之后一次和记录数同量级的不可失败分配。改成把报告随 `info` 一次移进发布的状态（`StatusPublisher::downloading` 把它包进 `Arc<TaskInfo>`，之后的快照只复制 `Arc`）；回退要的 `info` 在移走之前单独构造，只复制 meta 和路径，`resumable` 为假、`resumed` 为 `None`。没有改公开的形状：`TaskInfo::resumed` 仍是 `Option<ResumeReport>`，C20c 最简单（实现者的选择）。核对了其余复制 `TaskInfo`、`TaskStatus` 的地方：状态通道和快照里都是 `Arc<TaskInfo>`，只有测试里 `info.clone()` 复制 `Arc`。
+  - Minor：进度的测试原来靠记录器看到 `Downloading`，而且只检查“不少于”。第一轮改成在闸门处等状态通道的第一次变化，第二轮按 codex 的意见再改（见下）。
+  - 建议：再次续传的测试改成 `test_resuming_again_keeps_what_was_added`：第二次续传多下完一块（第 2 块）才在第 3 块里失败，检查状态文件记了第 0、1、2 块；第三次续传保留 `0..3 × BLOCK`，只请求 `3 × BLOCK..SIZE`，内容正确。为此测试的 `Source` 加了 `fault_at`（默认 `HALF`）和范围检查的闸门。
+- **第二轮审查**（codex 第二轮 PASS 96 分，一个 Minor，按规则提交前修掉）：状态通道只保留最新的值，测试线程慢过 250 ms 时，进度采样会在闸门还关着的时候把错误的零进度换成正确的种子进度，变异就可能漏过。改成只在测试里存在的握手：`StatusPublisher` 在发布每个 `Downloading` 时、传输开始之前，把它的进度记进测试给的 `Starts`（`TaskBuilder::record_starts`，都是 `#[cfg(test)]`）；`test_the_progress_starts_with_what_was_kept` 断言记下的恰好是一次 `Progress::new(Some(SIZE), 2 × BLOCK, [0..2 × BLOCK])`，不再看通道里当时是什么。`Fault::GateFirst` 因此不再需要，删掉。变异“进度从零开始”重跑三次都被抓到；全部 26 个变异重跑一次，结果不变（25 个被抓到，1 个是上面说的等价变异）。另外更新了 `Resume` 过时的文档（“只写不读”）。

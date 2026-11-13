@@ -1,13 +1,8 @@
 //! What a task reports when it resumes from a state file, or why it cannot
 //! (design §11.5.10).
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the task resumes in C20b, and they are public in C20c"
-    )
-)]
+//!
+//! Resuming cannot be switched on yet: it arrives with a later release
+//! (C20c). Until then no task resumes, so none reports these.
 
 use std::{fmt, ops::Range, path::PathBuf};
 
@@ -101,16 +96,16 @@ pub enum RejectReason {
 impl fmt::Display for RejectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::MissingPartial => "the partial file is missing",
-            Self::BadHeader => "the state file's header is bad",
-            Self::Oversized => "the state file is too long",
-            Self::TotalMismatch => "the size changed",
-            Self::SourceMismatch => "the source changed",
-            Self::ValidatorMismatch => "the resource changed",
-            Self::NoValidator => "the resource has no usable validator",
-            Self::ContentCoded => "the resource is content-coded",
-            Self::UnknownSize => "the size is unknown",
-            Self::RangeUnsupported => "the server does not take ranges",
+            Self::MissingPartial => "the partial file next to it is missing",
+            Self::BadHeader => "its header is not one this version reads",
+            Self::Oversized => "it is longer than any state file of its download",
+            Self::TotalMismatch => "the resource's size changed",
+            Self::SourceMismatch => "it names another source",
+            Self::ValidatorMismatch => "the resource changed: its validator is another",
+            Self::NoValidator => "the resource has no validator to tell its versions apart",
+            Self::ContentCoded => "the resource is served with a content coding",
+            Self::UnknownSize => "the resource's size is unknown",
+            Self::RangeUnsupported => "the server does not take range requests",
         })
     }
 }
@@ -120,6 +115,19 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    /// A rejection names the state file and its reason.
+    #[test]
+    fn test_a_rejection_reads_well() {
+        let error = crate::task::DownloadError::ResumeRejected {
+            reason: RejectReason::MissingPartial,
+            state_file: PathBuf::from("big.iso.boltload"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "cannot resume from big.iso.boltload: the partial file next to it is missing"
+        );
+    }
 
     /// Every reason has its own message.
     #[test]

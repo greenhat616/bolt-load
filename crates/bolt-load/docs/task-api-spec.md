@@ -284,7 +284,7 @@ Download strategy hardening, design §11.4-§11.5 (step 4 and Off's part of
 step 5 implemented in C31; a resumable fresh start, the lock that
 `Resume::On` requires, and the switch of `prefer_mode(Singleton)` to the
 concurrent engine in C33, behind a crate-internal `Resume`; the resume
-check in C20). The switch happens where the mode is selected (step 2): a
+check in C20b, still behind it, and the public `Resume` in C20c). The switch happens where the mode is selected (step 2): a
 `Resume::On` task that prefers one connection, has a known, non-zero,
 uncoded size and a usable validator, and whose source takes ranges, runs
 on the concurrent engine with one connection; any other keeps the
@@ -296,8 +296,9 @@ steps 3 and 4 become these, with everything before `info` is published:
    register the cleanup ownership outside the unwind boundary (TASK-8)
    before any file is created or changed.
 5. With `Resume::On`: when a state file is there, inspect it (design
-   §11.5.10) and either fail with `ResumeRejected` or write back the
-   accepted records; a resumable fresh start creates the partial file
+   §11.5.10) against the metadata the adapter retrieves again, not one
+   the caller gave, and either fail with `ResumeRejected` or write back
+   the accepted records; a resumable fresh start creates the partial file
    and writes the state header
    (design §11.5.5). With `Resume::Off`: invalidate a stale state file
    before the partial file is touched.
@@ -432,8 +433,8 @@ impl DownloadError {
   `propagate_panic(true)`). (C31 implements the phases it reaches: before
   the lock, while transferring, and after the rename; C33 adds a resumable
   new start (B1, discarded) and a resumable transfer (C, both files kept,
-  the lock released without removing the state file); the resume check
-  (B2) arrives with C20. Before C31, workers were signalled but not joined,
+  the lock released without removing the state file); C20b adds the resume
+  check (B2: neither file touched, neither reported). Before C31, workers were signalled but not joined,
   and the temporary file was removed on a best-effort basis.)
 - **TASK-9** `drive_progress_bar` runs a dedicated thread that waits with
   `changed_blocking`. It calls `set_length` once the total is known, leaves
