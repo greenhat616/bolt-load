@@ -1,7 +1,7 @@
 //! Regression tests for issue #102: failures terminate with an error, and
 //! stop/wait only return once every owned worker has exited.
 
-use std::{path::Path, time::Duration};
+use std::{num::NonZeroUsize, path::Path, time::Duration};
 
 use bolt_load_tests::adapter::{
     fault::{FaultKind, FaultPlan, Gate},
@@ -15,7 +15,8 @@ use crate::{
     runner::TaskError,
     runtime::ThreadedRuntimeImpl,
     task::{
-        DownloadError, DownloadMode, IoOp, Task, TaskBuilder, TaskOptions, TaskOutput, TaskState,
+        DEFAULT_MAX_CONNECTIONS, DownloadError, DownloadMode, IoOp, Task, TaskBuilder, TaskOptions,
+        TaskOutput, TaskState,
         test_support::{tmp_path, watchdog},
     },
 };
@@ -131,7 +132,7 @@ async fn test_concurrent_unretryable_failure_keeps_adapter_error() {
         } => {}
         other => panic!("expected the adapter's unretryable error, got {other:?}"),
     }
-    let first_wave = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let first_wave = DEFAULT_MAX_CONNECTIONS.get();
     assert!(
         adapter.range_attempts() <= first_wave,
         "an unretryable failure must not be retried"
@@ -188,9 +189,9 @@ async fn test_hung_connect_times_out_while_others_progress() {
         .range_connect_plan(FaultPlan::HangAt(1))
         .build()
         .unwrap();
-    let mut options = TaskOptions::default().connect_timeout(Duration::from_millis(300));
-    // Room for the strategy to split, whatever the CPU count.
-    options.max_concurrency = Some(4);
+    let options = TaskOptions::default()
+        .connect_timeout(Duration::from_millis(300))
+        .max_connections(NonZeroUsize::new(4).unwrap());
     let token = CancellationToken::new();
     let task = start(&adapter, &dest, &token, options, DownloadMode::Concurrent);
 

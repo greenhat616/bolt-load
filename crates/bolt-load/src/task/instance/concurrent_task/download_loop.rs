@@ -24,7 +24,7 @@ use self::{
     strategy_tick::StrategyTick, throughput::ThroughputSampler,
 };
 use super::{
-    DEFAULT_MAX_CONCURRENCY, RunnerManager, RunnerSpawner,
+    RunnerManager, RunnerSpawner,
     file_writer::{FileWriter, PendingWriter, WriteCompletion},
     runner_manager::RunnerTick,
     strategy::{DEFAULT_STRATEGY_TICK_INTERVAL, FailurePolicy, StrategyControl},
@@ -74,11 +74,7 @@ impl DownloadLoop {
         options: &TaskOptions,
         cancel_token: CancellationToken,
     ) -> Self {
-        let max_concurrency = std::thread::available_parallelism()
-            .map(|t| t.get())
-            .unwrap_or(DEFAULT_MAX_CONCURRENCY);
-        #[cfg(test)]
-        let max_concurrency = options.max_concurrency.unwrap_or(max_concurrency);
+        let max_concurrency = options.max_connections.get();
         let manager = RunnerManager::new(total, max_concurrency);
         let strategy = StrategyControl::new(max_concurrency);
         let policy = FailurePolicy::new(options, Instant::now());

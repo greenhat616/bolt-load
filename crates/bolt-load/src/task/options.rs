@@ -1,19 +1,16 @@
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use super::BuildError;
 
 /// Default for [`TaskOptions::no_progress_timeout`].
 pub const DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default for [`TaskOptions::max_connections`], whatever the CPU count.
+pub const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 /// Lower bound of the default [`TaskOptions::max_consecutive_failures`].
 ///
-/// The actual default is `max(8, 2 × available parallelism)`, so a single
-/// failed wave of parallel connections cannot exhaust the budget.
+/// The default is `max(8, 2 × max_connections)`, so a single failed wave of
+/// parallel connections cannot exhaust the budget.
 pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: usize = 8;
-
-fn default_max_consecutive_failures() -> usize {
-    let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
-    DEFAULT_MAX_CONSECUTIVE_FAILURES.max(parallelism.saturating_mul(2))
-}
 /// Default for [`TaskOptions::stream_idle_timeout`].
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = crate::runner::DEFAULT_IDLE_TIMEOUT;
 /// Default for [`TaskOptions::connect_timeout`].
@@ -89,15 +86,21 @@ impl MetaRetry {
     }
 }
 
-/// Termination policy of a download task.
+/// Connection limit and termination policy of a download task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TaskOptions {
+    /// The most connections a concurrent task has open at once, connecting
+    /// ones included. The concurrency strategy may use fewer, never more.
+    pub max_connections: NonZeroUsize,
     /// Fail the task when no new non-empty bytes are accepted for this long.
     pub no_progress_timeout: Duration,
     /// Fail the concurrent task after this many consecutive failed attempts
     /// without a successful non-empty write in between. Must be at least 1.
-    pub max_consecutive_failures: usize,
+    ///
+    /// `None` takes `max(8, 2 × max_connections)` when the task starts, see
+    /// [`Self::resolved_max_consecutive_failures`].
+    pub max_consecutive_failures: Option<usize>,
     /// A runner reports a retryable `Timeout` when its upstream yields no
     /// non-empty data for this long. Must be non-zero.
     pub stream_idle_timeout: Duration,
@@ -108,34 +111,43 @@ pub struct TaskOptions {
     pub connect_timeout: Duration,
     /// Retry policy of the metadata request, see [`MetaRetry`].
     pub meta_retry: MetaRetry,
-    /// Replaces the CPU count as the concurrent task's concurrency limit.
-    #[cfg(test)]
-    pub(crate) max_concurrency: Option<usize>,
 }
 
 impl Default for TaskOptions {
     fn default() -> Self {
         Self {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
-            max_consecutive_failures: default_max_consecutive_failures(),
+            max_consecutive_failures: None,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             meta_retry: MetaRetry::default(),
-            #[cfg(test)]
-            max_concurrency: None,
         }
     }
 }
 
 impl TaskOptions {
+    pub fn max_connections(mut self, limit: NonZeroUsize) -> Self {
+        self.max_connections = limit;
+        self
+    }
+
     pub fn no_progress_timeout(mut self, timeout: Duration) -> Self {
         self.no_progress_timeout = timeout;
         self
     }
 
     pub fn max_consecutive_failures(mut self, limit: usize) -> Self {
-        self.max_consecutive_failures = limit;
+        self.max_consecutive_failures = Some(limit);
         self
+    }
+
+    /// The consecutive failure limit in effect: `max_consecutive_failures`,
+    /// or `max(8, 2 × max_connections)` when it is `None`.
+    pub fn resolved_max_consecutive_failures(&self) -> usize {
+        self.max_consecutive_failures.unwrap_or_else(|| {
+            DEFAULT_MAX_CONSECUTIVE_FAILURES.max(self.max_connections.get().saturating_mul(2))
+        })
     }
 
     pub fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -156,7 +168,7 @@ impl TaskOptions {
     pub(crate) fn validate(&self) -> Result<(), BuildError> {
         let reason = if self.no_progress_timeout.is_zero() {
             "no_progress_timeout must be greater than zero"
-        } else if self.max_consecutive_failures == 0 {
+        } else if self.max_consecutive_failures == Some(0) {
             "max_consecutive_failures must be at least 1"
         } else if self.stream_idle_timeout.is_zero() {
             "stream_idle_timeout must be greater than zero"
@@ -179,8 +191,10 @@ mod tests {
     fn test_default_options_are_valid() {
         let options = TaskOptions::default();
         assert!(options.validate().is_ok());
+        assert_eq!(options.max_connections.get(), 8);
         assert_eq!(options.no_progress_timeout, DEFAULT_NO_PROGRESS_TIMEOUT);
-        assert!(options.max_consecutive_failures >= DEFAULT_MAX_CONSECUTIVE_FAILURES);
+        assert_eq!(options.max_consecutive_failures, None);
+        assert_eq!(options.resolved_max_consecutive_failures(), 16);
         assert_eq!(options.stream_idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT);
         assert_eq!(options.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
         assert_eq!(options.meta_retry, MetaRetry::default());
@@ -206,6 +220,24 @@ mod tests {
                 Err(BuildError::InvalidOptions { .. })
             ));
         }
+    }
+
+    #[test]
+    fn test_the_default_failure_limit_follows_max_connections() {
+        for (connections, limit) in [(1, 8), (4, 8), (5, 10), (8, 16), (32, 64)] {
+            let options =
+                TaskOptions::default().max_connections(NonZeroUsize::new(connections).unwrap());
+            assert_eq!(
+                options.resolved_max_consecutive_failures(),
+                limit,
+                "{connections} connections"
+            );
+        }
+        // A limit that is set does not follow.
+        let options = TaskOptions::default()
+            .max_consecutive_failures(3)
+            .max_connections(NonZeroUsize::new(32).unwrap());
+        assert_eq!(options.resolved_max_consecutive_failures(), 3);
     }
 
     #[test]
