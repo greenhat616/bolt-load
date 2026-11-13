@@ -334,14 +334,14 @@
 
 ## T11 — `Doubling` 扩张控制器（C11）
 
-- [ ] 新增 crate 内部的 `GrowthStrategy { Legacy, Doubling }`。新增 feature `unstable-strategy`，在 `#[cfg(any(test, feature = "unstable-strategy"))]` 下暴露 `TaskOptions::growth_strategy`。
-- [ ] 新增 `strategy/doubling_strategy.rs`，按 design §9.2 实现：
+- [x] 新增 crate 内部的 `GrowthStrategy { Legacy, Doubling }`。新增 feature `unstable-strategy`，在 `#[cfg(any(test, feature = "unstable-strategy"))]` 下暴露 `TaskOptions::growth_strategy`，`TaskBuilder` 也有同名的设置方法（design §14.14）。
+- [x] 新增 `strategy/doubling_strategy.rs`，按 design §9.2 实现（`allowed`、上限、对齐和停滞的定义见 design §14.14）：
   - 2 s 冷却；
   - 有 runner 不活跃时跳过；
   - `congestion_until` 和 85% 限速条件下跳过（限速部分在 P2 之前恒为 false）；
   - 扩张后增益不到 10% 就停止扩张；
   - 每次扩张 `target = min(2 × allowed, max)`，通过 T8 的 `split` 逐个落地。
-- [ ] `Legacy` 的路径保持原样，包括 `abs()` 和原来的阈值，作为 A/B 的对照组。
+- [x] `Legacy` 的路径保持原样，包括 `abs()` 和原来的阈值，作为 A/B 的对照组。
 
 **验证**
 
@@ -354,15 +354,17 @@
 
 ## T12 — 切分尺寸（C11）
 
-- [ ] 在 `Doubling` 模式下，`planned_chunk_size` 按 design §9.3 计算：`clamp(donor_speed × 2 s, min_chunk_size, remaining / 2)`。`donor_speed` 取被切 runner 自己的速率；如果 runner 还没有速率样本，就用 `per_runner_speed`。
-- [ ] 如果 `RunnerManager` 目前没有按 runner 统计的速率，先在 `throughput.rs` 里补上这项统计。
-- [ ] `Legacy` 模式保持 `current_speed * 2.0`（`strategy/mod.rs:80`）不变。
+- [x] 在 `Doubling` 模式下，`planned_chunk_size` 按 design §9.3 计算：`clamp(donor_speed × 2 s, min_chunk_size, remaining / 2)`。`donor_speed` 取被切 runner 自己的速率；如果 runner 还没有速率样本，就用 `per_runner_speed`。实现改为 `max(donor_speed × 2 s, min_chunk_size)`，只当门槛用：剩余量达到它才在一半处切。去掉上界 `remaining / 2` 的原因见 design §14.14。
+- [x] 如果 `RunnerManager` 目前没有按 runner 统计的速率，先在 `throughput.rs` 里补上这项统计（`RunnerRates`，窗口是一个策略 tick）。
+- [x] `Legacy` 模式保持 `current_speed * 2.0`（`strategy/mod.rs:80`）不变。
 
 **验证**
 
 - 单元测试：
   - 总速率相同时，8 个 runner 和 2 个 runner 算出的 `planned` 相同（只要 donor 的速率相同）；
-  - `planned` 夹在下限和上限之间。
+  - `planned` 不低于 `min_chunk_size`；
+  - `donor_speed` 取被切 runner 自己的速率，没有速率样本时用 `per_runner_speed`；
+  - 剩余量正好等于 `planned` 时在一半处切，少 1 B 不切（design §14.14）。
 
 ## T13 — 低速 runner 重启（C12）
 
