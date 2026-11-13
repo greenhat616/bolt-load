@@ -10,7 +10,7 @@ use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
 use super::{
-    AttemptFailure, RunnerFailureKind, RunnerManager, RunnerTick, SpawnFailed,
+    AttemptFailure, AttemptPhase, RunnerFailureKind, RunnerManager, RunnerTick, SpawnFailed,
     is_attempt_retryable,
     stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem},
 };
@@ -143,6 +143,7 @@ impl RunnerManager {
                     .remove(&runner_id)
                     .expect("a connecting runner has a data receiver");
                 self.data_aggregator.register(runner_id, data_rx);
+                self.record_started(runner_id);
                 return RunnerTick::downloading();
             }
             LifecycleEvent::Stopped(reason) => reason,
@@ -183,6 +184,7 @@ impl RunnerManager {
         if kind.is_cancelled() {
             return RunnerTick::downloading();
         }
+        self.record_attempt_end(AttemptPhase::Streaming, &kind);
         self.runner_outcome_sampler
             .record_stream_closed(if kind.is_retryable() {
                 RunnerFailureKind::Retryable
@@ -210,6 +212,7 @@ impl RunnerManager {
             return RunnerTick::downloading();
         }
         error!("runner {runner_id} failed to connect: {error:?}");
+        self.record_attempt_end(AttemptPhase::Connecting, &error);
         let retryable = is_attempt_retryable(&error);
         self.runner_outcome_sampler
             .record_connect_failed(if retryable {
@@ -256,6 +259,12 @@ impl RunnerManager {
                 .record_stream_closed(RunnerFailureKind::Retryable);
         }
         self.release_runner(runner_id);
+        let phase = if connecting {
+            AttemptPhase::Connecting
+        } else {
+            AttemptPhase::Streaming
+        };
+        self.record_attempt_end(phase, &TaskError::ChannelClosed);
         trace!(
             "runner {runner_id} lost, released range: {:?}",
             released.range

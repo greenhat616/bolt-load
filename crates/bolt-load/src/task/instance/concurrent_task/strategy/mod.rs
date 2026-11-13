@@ -5,12 +5,14 @@ use std::{
 
 use bolt_load_utils::telemetry::*;
 
+mod admission_evidence;
 mod backoff;
 mod concurrency_control_strategy;
 mod dynamic_strategy;
 mod failure_policy;
 mod runner_outcome_sampler;
 
+pub use admission_evidence::{AdmissionEvidence, AttemptPhase, classify};
 pub use backoff::Backoff;
 #[cfg(test)]
 pub use backoff::MIN_RANGE_BACKOFF;

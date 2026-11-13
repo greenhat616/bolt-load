@@ -31,6 +31,8 @@ impl DownloadLoop {
     /// Handle a runner event at `now`; a failure the task survives backs
     /// its range off.
     pub(super) fn on_runner(&mut self, tick: RunnerTick, now: Instant) -> Result<ControlFlow<()>> {
+        // The manager recorded the event without a clock.
+        self.manager.admission_mut().stamp(now);
         if let Some(chunk) = tick.downloaded {
             self.accept_chunk(chunk, now)?;
         }
