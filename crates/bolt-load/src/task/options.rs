@@ -115,9 +115,17 @@ pub struct TaskOptions {
     /// split off a running one starts at none. A restart, a timeout or a
     /// dropped stream after the attempt delivered bytes, does not count:
     /// that range only backs off, and `no_progress_timeout` still bounds
-    /// it. Neither does a `Congestion` failure (429/503). Every other
-    /// retryable failure counts, a lost runner even after it delivered
-    /// bytes.
+    /// it. Neither does a `Congestion` failure (429/503), nor a refused
+    /// connect above what the server was seen to admit: a connect that
+    /// failed before it started, while another attempt had delivered bytes
+    /// and at least as many other attempts were in flight as had delivered
+    /// bytes at once since the connection limit was last lowered. Every
+    /// other retryable failure counts, a lost runner even after it
+    /// delivered bytes.
+    ///
+    /// While refusals stay exempt, nothing bounds them per range: the
+    /// task then ends when the other connections have downloaded the rest,
+    /// or by `no_progress_timeout` or `max_consecutive_failures`.
     pub max_attempts_per_range: NonZeroU32,
     /// A runner reports a retryable `Timeout` when its upstream yields no
     /// non-empty data for this long. Must be non-zero.

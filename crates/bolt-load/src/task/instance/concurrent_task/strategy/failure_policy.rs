@@ -6,8 +6,10 @@
 //! Three tiers bound the retries (design §8.2):
 //! - a restart, a timeout or a dropped stream after the attempt delivered
 //!   bytes, only backs its range off;
-//! - each range fails at most `max_attempts_per_range` times, however well
-//!   the other connections go;
+//! - each range fails at most `max_attempts_per_range` charged times,
+//!   however well the other connections go. A refused connect above the
+//!   proven window is not charged (design §14.13a): while refusals stay
+//!   exempt, the other tiers and the peers' finite data end the task;
 //! - the task fails after `max_consecutive_failures` failures without a
 //!   successful non-empty write in between.
 //!
@@ -82,7 +84,8 @@ fn is_restart(error: &TaskError, received: u64) -> bool {
 ///
 /// Never a congestion rejection (429/503), which the concurrency strategy
 /// answers: the server limits connections, not this range. Any other
-/// unretryable failure ends the task anyway.
+/// unretryable failure ends the task anyway. The runner manager also
+/// exempts a refusal above the proven window (design §14.13a).
 pub(in super::super) fn charges_range(error: &TaskError, retryable: bool, received: u64) -> bool {
     retryable && !is_restart(error, received)
 }
@@ -133,7 +136,10 @@ impl FailurePolicy {
     /// left to the concurrency strategy; the no-progress deadline still
     /// bounds it. Any other unretryable failure ends the task.
     ///
-    /// A restart only backs its range off. Any other retryable failure is
+    /// A restart only backs its range off. A connect refused above the
+    /// proven window is not charged either (the manager clears the charge
+    /// before this call, see `AttemptFailure::with_admission`); it still
+    /// counts as a consecutive failure. Any other retryable failure is
     /// charged to its range, and ends the task once the range has been
     /// charged `max_attempts_per_range` times, see
     /// [`TaskError::RangeExhausted`]; this comes before the consecutive

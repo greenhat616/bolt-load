@@ -11,7 +11,9 @@ mod concurrency_control_strategy;
 mod dynamic_strategy;
 mod failure_policy;
 
-pub use admission_evidence::{AdmissionEvidence, AttemptPhase, classify, streak_gap};
+pub use admission_evidence::{
+    AdmissionClass, AdmissionEvidence, AttemptPhase, classify, streak_gap,
+};
 pub use backoff::Backoff;
 #[cfg(test)]
 pub use backoff::MIN_RANGE_BACKOFF;

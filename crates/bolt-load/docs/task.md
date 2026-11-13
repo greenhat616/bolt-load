@@ -75,8 +75,14 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   writes do not reset them. Once a range has failed
   [`TaskOptions::max_attempts_per_range`] times, the task fails with
   `TaskError::RangeExhausted`, which names the range and carries its last
-  error. A `Congestion` failure is not counted. The count goes with the
-  range like its backoff, see below. When a failure reaches both limits,
+  error. A `Congestion` failure is not counted, nor is a connect refused
+  above what the server was seen to admit: it failed before `Started`,
+  another attempt had delivered bytes, and at least as many other
+  attempts were in flight as had delivered bytes at once since the
+  connection limit was last lowered. While refusals stay exempt, nothing
+  bounds them per range: the task then ends when the other connections
+  have the rest, or by the no-progress deadline and the consecutive
+  failures. The count goes with the range like its backoff, see below. When a failure reaches both limits,
   the task fails with `RangeExhausted`.
 - **Restarts** (concurrent mode): a timeout or a dropped stream after the
   attempt delivered bytes counts neither as a consecutive failure nor

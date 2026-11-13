@@ -436,13 +436,126 @@ async fn deliver_and_write(
     download.record_completions(completions).unwrap();
 }
 
-/// G6 through the loop: the range of a runner that keeps failing is
-/// retried after each backoff, while another runner writes between its
-/// failures, so the consecutive failures never reach their limit of 2. The
-/// range's third failure ends the task with `RangeExhausted`, which carries
-/// that failure, not an earlier one.
+fn reset() -> TaskError {
+    TaskError::StreamError {
+        source: AdapterError::Retryable {
+            source: crate::adapter::RetryableError::Io {
+                source: Arc::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            },
+        },
+    }
+}
+
+/// Run the parked retry of the failing range at `now`, once its backoff
+/// ended, and return its failure, which the loop then handles.
+async fn retry_and_fail(
+    download: &mut DownloadLoop,
+    rt: &ScriptedRuntime,
+    now: &mut Instant,
+) -> super::super::super::runner_manager::AttemptFailure {
+    let (_, cooldown) = single_cooldown(download);
+    download.on_deadline(cooldown.not_before - NANO).unwrap();
+    assert_eq!(download.manager.allocated_runner_count(), 1);
+    *now = cooldown.not_before;
+    download.on_deadline(*now).unwrap();
+    assert_eq!(download.manager.allocated_runner_count(), 2);
+    single_parked(rt).await;
+    let tick = download.manager.tick().await;
+    let failure = tick.failure.clone().unwrap();
+    assert!(download.on_runner(tick, *now).unwrap().is_continue());
+    failure
+}
+
+/// G6 through the loop: both connections were proven, so the server
+/// admits two, and the range of one that keeps failing is refused inside
+/// the proven window. It is retried after each backoff while the other
+/// runner writes between its failures, so the consecutive failures never
+/// reach their limit of 2. The range's third charged failure ends the task
+/// with `RangeExhausted`, which carries that failure, not an earlier one.
 #[tokio::test]
 async fn a_failing_range_ends_the_task_while_another_runner_writes() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let options = TaskOptions::default()
+        .max_connections(NonZeroUsize::new(2).unwrap())
+        .max_consecutive_failures(2)
+        .max_attempts_per_range(NonZeroU32::new(3).unwrap());
+    let (mut download, file_writer) = failing_loop(&rt, &options).await;
+    let mut healthy = spawn_test_runner(&mut download, 0..HALF);
+    let mut doomed = spawn_test_runner(&mut download, HALF..TOTAL);
+    for runner in [&mut healthy, &mut doomed] {
+        runner.lifecycle.try_push(LifecycleEvent::Started).unwrap();
+        download.manager.tick().await;
+    }
+    let mut now = Instant::now();
+    download.on_strategy_tick(now);
+    deliver_and_write(&mut download, &mut healthy, 1024, now).await;
+    deliver_and_write(&mut download, &mut doomed, 1024, now).await;
+    // A tick sees both proven.
+    now += DEFAULT_STRATEGY_TICK_INTERVAL;
+    download.on_strategy_tick(now);
+    assert_eq!(download.manager.admission().proven_window(), 2);
+
+    // Its connection resets after the bytes: a restart, not charged.
+    doomed
+        .lifecycle
+        .try_push(LifecycleEvent::failed(reset()))
+        .unwrap();
+    let tick = download.manager.tick().await;
+    let failure = tick.failure.as_ref().unwrap();
+    assert_eq!((failure.received, failure.charged), (1024, 0));
+    assert!(download.on_runner(tick, now).unwrap().is_continue());
+    let rest = HALF + 1024..TOTAL;
+
+    for charged in 1..=2 {
+        // A refused connect beside one proven runner, inside the window.
+        let failure = retry_and_fail(&mut download, &rt, &mut now).await;
+        assert!(failure.error.is_retryable(), "{failure:?}");
+        assert_eq!(
+            (
+                failure.range.clone(),
+                failure.attempts,
+                failure.charged,
+                failure.exempt
+            ),
+            (rest.clone(), charged + 1, charged, false)
+        );
+        // The other runner writes, which resets the consecutive failures.
+        deliver_and_write(&mut download, &mut healthy, 1024, now).await;
+        assert_eq!(single_cooldown(&download).1.charged, charged);
+    }
+
+    // The third attempt is lost instead.
+    let (_, cooldown) = single_cooldown(&download);
+    now = cooldown.not_before;
+    download.on_deadline(now).unwrap();
+    drop(single_parked(&rt));
+    let tick = download.manager.tick().await;
+    match download.on_runner(tick, now) {
+        Err(DownloadError::Transfer { source }) => match &*source {
+            TaskError::RangeExhausted {
+                range,
+                attempts,
+                source,
+            } => {
+                assert_eq!((range.clone(), *attempts), (rest, 3));
+                assert!(matches!(**source, TaskError::ChannelClosed), "{source:?}");
+            }
+            other => panic!("expected RangeExhausted, got {other:?}"),
+        },
+        other => panic!("expected RangeExhausted, got {other:?}"),
+    }
+
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// The old shape of G6's loop test (design §14.13): the range's runner was
+/// never proven. Its first refusal comes while nothing is proven and is
+/// charged; once the other runner delivered, the server admitted one, and
+/// a refusal beside it is above the proven window and not charged. A loss
+/// is charged as before. The range is not exhausted.
+#[tokio::test]
+async fn a_range_never_proven_is_exempt_above_the_window() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
     let options = TaskOptions::default()
         .max_connections(NonZeroUsize::new(2).unwrap())
@@ -456,49 +569,35 @@ async fn a_failing_range_ends_the_task_while_another_runner_writes() {
     let mut now = Instant::now();
     download.on_strategy_tick(now);
 
-    for attempt in 1..=2 {
-        // It fails to connect.
-        single_parked(&rt).await;
-        let tick = download.manager.tick().await;
-        let failure = tick.failure.as_ref().unwrap();
-        assert!(failure.error.is_retryable(), "{failure:?}");
+    // Refused while nothing is proven: charged.
+    single_parked(&rt).await;
+    let tick = download.manager.tick().await;
+    let failure = tick.failure.clone().unwrap();
+    assert_eq!((failure.charged, failure.exempt), (1, false));
+    assert!(download.on_runner(tick, now).unwrap().is_continue());
+    deliver_and_write(&mut download, &mut healthy, 1024, now).await;
+
+    // Refused beside the proven runner, with one other in flight.
+    for attempt in 2..=3 {
+        let failure = retry_and_fail(&mut download, &rt, &mut now).await;
         assert_eq!(
-            (failure.range.clone(), failure.attempts, failure.charged),
-            (HALF..TOTAL, attempt, attempt)
+            (failure.attempts, failure.charged, failure.exempt),
+            (attempt, 1, true)
         );
-        assert!(download.on_runner(tick, now).unwrap().is_continue());
-
-        // The other runner writes, which resets the consecutive failures.
         deliver_and_write(&mut download, &mut healthy, 1024, now).await;
-
-        // The range is retried once its backoff ends.
-        let (range, cooldown) = single_cooldown(&download);
-        assert_eq!((range, cooldown.charged), (HALF..TOTAL, attempt));
-        download.on_deadline(cooldown.not_before - NANO).unwrap();
-        assert_eq!(download.manager.allocated_runner_count(), 1);
-        now = cooldown.not_before;
-        download.on_deadline(now).unwrap();
-        assert_eq!(download.manager.allocated_runner_count(), 2);
     }
 
-    // The third attempt is lost instead.
+    // A loss is no refusal, and is charged.
+    let (_, cooldown) = single_cooldown(&download);
+    now = cooldown.not_before;
+    download.on_deadline(now).unwrap();
     drop(single_parked(&rt));
     let tick = download.manager.tick().await;
-    match download.on_runner(tick, now) {
-        Err(DownloadError::Transfer { source }) => match &*source {
-            TaskError::RangeExhausted {
-                range,
-                attempts,
-                source,
-            } => {
-                assert_eq!((range.clone(), *attempts), (HALF..TOTAL, 3));
-                assert!(matches!(**source, TaskError::ChannelClosed), "{source:?}");
-            }
-            other => panic!("expected RangeExhausted, got {other:?}"),
-        },
-        other => panic!("expected RangeExhausted, got {other:?}"),
-    }
+    let failure = tick.failure.clone().unwrap();
+    assert_eq!((failure.charged, failure.exempt), (2, false));
+    assert!(download.on_runner(tick, now).unwrap().is_continue());
 
+    drop(rt.take_parked());
     drop(download);
     file_writer.finalize().await.unwrap();
 }

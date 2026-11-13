@@ -44,6 +44,19 @@ pub(super) struct AttemptFailure {
     /// [`Released::received`](super::chunk_planner::Released::received);
     /// 0 for a failed connect.
     pub received: u64,
+    /// What the attempt says about the server's admission (design §8.3).
+    pub class: AdmissionClass,
+    /// Whether the failure is a refusal above the proven window, which is
+    /// not charged (design §14.13a).
+    pub exempt: bool,
+}
+
+/// What the manager decided about an ended attempt when it classified it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Admission {
+    pub class: AdmissionClass,
+    /// See [`AttemptFailure::exempt`].
+    pub exempt: bool,
 }
 
 impl AttemptFailure {
@@ -63,7 +76,24 @@ impl AttemptFailure {
             range: released.range,
             attempts: released.attempts,
             received: released.received,
+            class: AdmissionClass::NoEvidence,
+            exempt: false,
         }
+    }
+
+    /// The failure as the manager classified it: an exempt refusal is not
+    /// charged to its range.
+    pub(super) fn with_admission(mut self, admission: Admission) -> Self {
+        if admission.exempt {
+            debug_assert!(
+                charges_range(&self.error, self.retryable, self.received),
+                "only a charged refusal is exempted"
+            );
+            self.charged -= 1;
+        }
+        self.class = admission.class;
+        self.exempt = admission.exempt;
+        self
     }
 }
 
@@ -133,7 +163,7 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 use super::{
     ChunkPlanner, PlannerGuard,
     chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SplitCandidate},
-    strategy::{AdmissionEvidence, AttemptPhase, charges_range, classify},
+    strategy::{AdmissionClass, AdmissionEvidence, AttemptPhase, charges_range, classify},
 };
 use crate::{
     runner::{
@@ -277,11 +307,18 @@ impl RunnerManager {
     /// Record what an attempt that ended in `phase` with `error` tells
     /// about the server's admission, once its chunk and its slot are given
     /// back (design §8.3).
-    fn record_attempt_end(&mut self, phase: AttemptPhase, error: &TaskError) {
+    ///
+    /// Returns the class, and whether the failure is exempt from its
+    /// range's budget, as decided with the state of this moment.
+    fn record_attempt_end(&mut self, phase: AttemptPhase, error: &TaskError) -> Admission {
+        let class = classify(phase, error);
         let proven = self.chunk_planner.get_proven_runners_count();
         let others = self.allocated_runner_count();
-        self.admission
-            .on_attempt_ended(classify(phase, error), proven, others);
+        self.admission.on_attempt_ended(class, proven, others);
+        Admission {
+            class,
+            exempt: self.admission.exempts(class, proven, others),
+        }
     }
 
     // ==================== ID Generator Related Methods ====================
