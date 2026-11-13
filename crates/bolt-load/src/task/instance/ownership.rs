@@ -100,6 +100,8 @@ pub(crate) struct Discarded {
     /// The partial file, when it is left: it could not be removed, or the
     /// invalidation failed and it was kept on purpose.
     pub(crate) leftover: Option<PathBuf>,
+    /// Why the partial file could not be removed.
+    pub(crate) removal: Option<io::Error>,
 }
 
 /// How an invalidation of the state file went: a cut to nothing, then its
@@ -253,6 +255,7 @@ impl Ownership {
             return Discarded {
                 invalidation,
                 leftover: tmp,
+                removal: None,
             };
         }
         self.enter(Phase::Transfer);
@@ -260,15 +263,22 @@ impl Ownership {
             return Discarded {
                 invalidation,
                 leftover: None,
+                removal: None,
             };
         };
-        let leftover = match self.hooks.before(Step::RemovePartial) {
-            Ok(()) => output_file::discard_blocking(&tmp),
+        let removal = match self
+            .hooks
+            .before(Step::RemovePartial)
+            .and_then(|()| std::fs::remove_file(&tmp))
+        {
+            Ok(()) => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
                 warn!("failed to remove temporary file {tmp:?}: {e}");
-                Some(tmp.clone())
+                Some(e)
             }
         };
+        let leftover = removal.is_some().then(|| tmp.clone());
         if let Err(e) = self
             .hooks
             .before(Step::SyncDirAfterPartial)
@@ -279,6 +289,7 @@ impl Ownership {
         Discarded {
             invalidation,
             leftover,
+            removal,
         }
     }
 

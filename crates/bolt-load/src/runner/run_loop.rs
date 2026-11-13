@@ -284,10 +284,11 @@ impl<'a> RunnerLoop<'a> {
     /// Stop with `result`, draining the data channel first when the
     /// delivered bytes count.
     fn begin_stop(&mut self, result: RunResult) {
-        if matches!(self.phase, Phase::Connecting(_)) {
-            // Release the connection before reporting the stop.
-            self.runner.input = RunnerInput::Abandoned;
-        }
+        // Release the connection, or the stream, before reporting the stop:
+        // the manager frees the runner's slot on the stop, and a new
+        // runner must not open a stream while this one's is still alive
+        // (design §11.5.8, one connection). Nothing reads it any more.
+        self.runner.input = RunnerInput::Abandoned;
         if TaskRunner::should_wait_data_drain(&result) {
             self.phase = Phase::Draining(DrainState::new(result));
         } else {
