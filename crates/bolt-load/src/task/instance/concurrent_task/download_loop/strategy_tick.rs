@@ -7,7 +7,10 @@ use std::{
 use bolt_load_utils::telemetry::*;
 
 use super::{
-    super::{runner_manager::RunnerSlot, strategy::StrategyAction},
+    super::{
+        runner_manager::RunnerSlot,
+        strategy::{LoopSignals, StrategyAction},
+    },
     DownloadLoop, LoopEvent,
 };
 use crate::{runtime::EventTimer, task::RunnerId};
@@ -29,15 +32,26 @@ impl StrategyTick {
 }
 
 impl DownloadLoop {
+    /// What the strategies need to know of the loop at `now`.
+    pub(super) fn signals(&self, now: Instant) -> LoopSignals {
+        LoopSignals {
+            congested: self.backoff.is_congested(now),
+            congestion_until: self.backoff.congestion_until(),
+            last_progress_at: self.policy.last_progress_at(),
+            writer_ready: self.writer.can_write(),
+        }
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(super) fn on_strategy_tick(&mut self, now: Instant) {
+        let signals = self.signals(now);
         let Some((strategy_name, actions)) = self.strategy.execute(
             self.max_concurrency,
             self.throughput.speed,
             self.throughput.per_runner_speed,
             &mut self.manager,
             now,
-            self.backoff.is_congested(now),
+            signals,
         ) else {
             return;
         };
@@ -49,6 +63,8 @@ impl DownloadLoop {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(super) fn apply(&mut self, action: StrategyAction, now: Instant) {
+        #[cfg(test)]
+        self.applied.push(format!("{action:?}"));
         match action {
             // Split current all task into two separate tasks
             StrategyAction::SplitAllTask(planned_chunk_size) => {

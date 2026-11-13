@@ -36,7 +36,12 @@
 | PR-5 连接上限 | C7 `feat(task)!: make the connection limit configurable` | T7 | — |
 | | C8 `fix(task): reserve a runner slot before splitting a chunk` | T8 | |
 | PR-6 退避与预算 | C9 `feat(task): back off failed ranges and honour Retry-After` | T9 | PR-1、PR-5 |
-| | C10 `feat(task): budget failures per range` | T10 | |
+| | C10 `feat(task)!: budget failures per range` | T10 | |
+| | C39 `fix(task): do not charge a range for a refusal above the proven window` | T10 | PR-6a |
+| PR-6a 静默限连 | C35 `refactor(task): record how connects end beside the outcome sampler` | T30 | PR-6（C9） |
+| | C36 `test(tests): add a silent connection limit to the fault server` | | |
+| | C37 `fix(task): lower the connection limit after refused connects` | | |
+| | C38 `fix(task): validate the connection limit's recovery steps and back them off` | | |
 | PR-7 扩张控制器 | C11 `feat(task): add the doubling growth strategy behind unstable-strategy` | T11、T12 | PR-5、PR-6 |
 | | C12 `feat(task): restart slow runners under the doubling strategy` | T13 | |
 | | C13 `bench(task): compare the growth strategies` | T14 | |
@@ -296,13 +301,28 @@
   - 切分和合并之后，`attempts` 符合规则。
 - T4 的 `503 + Retry-After` 场景：断言两次请求之间的间隔 ≥ 2 s（用服务器记录的请求时间来判断）。
 
+## T30 — 静默的连接上限（C35–C38）
+
+- [x] C35：`AdmissionEvidence` 和每个结束的尝试都经过的分类钩子（design §8.3）；不读它，行为不变。
+- [x] C36：故障服务器的连接上限，超出的连接被关闭或不应答，并记录同时服务的连接数。
+- [x] C37：拥塞规则和静默规则取代按失败率的降级；`SmallerThanTotalSize` 不再降级。
+- [x] C38：恢复步骤要验证、按退避拉开间隔；删掉 `RunnerOutcomeSampler`（design §14.12a）。
+
+**验证**
+
+- 单元测试（注入 `now`）：分类表的每一行；连续拒绝由同水平的连接结束、不被旧的成功稀释、`STREAK_GAP` 后失效；没有佐证的拒绝不算；没有进度、迟到的 tick、writer 满时不降；拥塞不升高上限。
+- 单元测试（注入 `now`）：step 要到期、`connected ≥ limit`、没有拥塞；从试探连接连上算 15 s 才接受，中途替换或丢失重新计时；截止时间结束为不确定；拒绝的 step 依次相隔 30、60、120、240、300、300 s。
+- 下载循环的测试（真实的连接失败经过生命周期）：4 个连接在下载、其余的连接被拒绝或不应答时，上限降到 4，之后 300 s 里只有 step 的试探连接超过 4，每个都被拒绝，间隔加倍；传输中的 503 降级，也拒绝进行中的 step；丢失的 runner、短暂故障、拒绝与成功交替都不降级；性质测试检查 design §14.12a 列出的不变量。
+- 端到端（reqwest、tokio、C36 的故障服务器）：`max_connections = 8`、服务器限 3，关闭和不应答两种方式各一次：下载完成，BLAKE3 正确，服务器同时服务的连接不超过 3，上限降到 3 且不再升高，第一个 step 在降级 30 s 之后（G10）；step 的试探个数和间隔由注入时间的测试检查。
+
 ## T10 — 每区间预算（C10）
 
-- [ ] `FailurePolicy` 改为三层（design §8.2）：
+- [x] `FailurePolicy` 改为三层（design §8.2）：
   - 收到过数据之后的 `Timeout` 或断流，不计入连续失败；
-  - `attempts >= max_attempts_per_range` 时，返回 `TaskError::RangeExhausted { range, source }`；
+  - `charged >= max_attempts_per_range` 时，返回 `TaskError::RangeExhausted { range, attempts, source }`。`charged` 是区间记到预算上的失败数，重启和 429/503 都不记；决定退避的 `attempts` 不参与比较（design §14.13）；
   - 任务级连续失败计数保持不变。
-- [ ] 新增 `TaskOptions::max_attempts_per_range`，默认 5。
+- [x] 新增 `TaskOptions::max_attempts_per_range`，默认 5。类型是 `NonZeroU32`，`TaskBuilder` 也有同名的设置方法（design §14.13）。
+- [x] C39：在已证实窗口之上的拒绝不记预算（design §14.13a、D27）。
 
 **验证**
 

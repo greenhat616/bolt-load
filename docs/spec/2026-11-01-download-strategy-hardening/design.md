@@ -83,10 +83,11 @@
 | G3 | 写错误保留 `io::ErrorKind`；磁盘满会直接终止任务，错误里带上区间 | 单元测试（T6） |
 | G4 | 调用方可以设置 `max_connections`。在任何时序下都不会 panic，活跃 runner 数也不会超过上限 | 单元测试和性质测试（T7、T8） |
 | G5 | 失败的区间要等退避结束才会重新领取；遇到 `Retry-After` 时，本任务的所有新连接都遵守它 | 用注入时钟的确定性测试（T9） |
-| G6 | 健康的连接不能“洗白”一个反复失败的区间：一个区间累计 `max_attempts_per_range` 次失败后，任务终止，错误里带上该区间最后一次的真实原因 | 单元测试（T10） |
+| G6 | 健康的连接不能“洗白”一个反复失败的区间：一个区间累计 `max_attempts_per_range` 次记到预算上的失败后，任务终止，错误里带上该区间最后一次的真实原因。在已证实窗口之上、旁边有已证实连接时被拒绝的连接不记预算（§14.13a，确认 2026-11-13）；同时开多个连接的开始、客户端已关闭而服务器仍在计数的连接、运行中缩小的上限、接受后不发数据的服务器，都不保证能活下来 | 单元测试和下载循环测试（T10），窗口之内和之上的拒绝各有测试 |
 | G7 | 新的扩张控制器在三个场景里，完成时间都不比旧实现差，连接数也不比旧实现多：单连接限速、高速、对 429 敏感 | 基准测试（T13），结果写进 PR 描述 |
 | G8（P2） | 注入 `Limits` 后，跨任务的总速率误差不超过 `limit` 的 ±10%（2 s 窗口）；限速等待不会触发空闲超时 | 集成测试（T15） |
 | G9（P3） | 进程在任意时刻被杀掉后续传，最终 hash 正确；状态文件损坏、越界或重叠时，坏区间被丢弃并上报 | 集成测试（T19） |
+| G10 | 服务器静默限制连接数（拒绝或不应答超出的连接）时，任务完成，hash 正确；上限降到服务器接受的连接数之后，超出它的连接只有恢复步骤的试探：每个到期时刻至多一个，同时至多 `limit + 1` 个，间隔按退避拉开 | 故障服务器的端到端测试（T30） |
 
 ---
 
@@ -107,6 +108,14 @@
 | D9 | 解码 crate 的后端 | `compression-codecs`，只在 crate 内部使用；gzip、deflate 默认开启，br、zstd 放在 feature 后面（§4.4） | 已确认（2026-11-03） |
 | D10 | 在哪一层解码 | `full_stream` 把 `Content-Encoding` 和 `Content-Type` 交给引擎，由引擎决定是否解码；adapter 自己不解码（§4.4） | 已确认（2026-11-03） |
 | D11 | HTTP 校验与解析放在哪 | 新 crate `bolt-load-http`，依赖 core：搬入 core 里只有 adapter 调用的函数，以及 utils 的 `http` 模块；新增 `ContentCoding`。core 只留 trait、meta、错误类型和 `ContentRange`（§4.5） | 已确认（2026-11-03） |
+| D20 | 带着数据断开的流是否还降并发 | 不降：只有 `Started` 之前失败的尝试和 429/503 是证据（§8.3） | 已确认（2026-11-13） |
+| D21 | 连续拒绝之后降到多少 | 降到已连接的 runner 数（§8.3） | 已确认（2026-11-13） |
+| D22 | 服务器明确限连（429/503）之后是否继续试探 | 继续，按退避拉开间隔（§8.3） | 已确认（2026-11-13） |
+| D23 | §8.3 的常量 | 按 §8.3 的表，之后用基准测试校准 | 已确认（2026-11-13） |
+| D24 | 降级前要多少证据 | 连续三次被佐证的拒绝，加上第三次之后一个 tick 间隔的进度（§8.3） | 已确认（2026-11-13） |
+| D25 | 拒绝与 DNS、TLS 失败的区分 | 暂时靠佐证；core 里类型化的连接原因以后再做 | 已确认（2026-11-13） |
+| D26 | 是否检测接受连接之后不发数据或重置的服务器 | 暂不检测：需要 runner 报告是哪种超时 | 已确认（2026-11-13） |
+| D27 | 拒绝和区间预算 | 在已证实窗口之上的拒绝不记预算，其余照旧；不承诺 §14.13a 列出的几种情况能活下来 | 已确认（2026-11-13） |
 
 ---
 
@@ -474,6 +483,103 @@ struct AvailableRange {
 
 不采纳“空闲超时一律不计失败”：如果没有进展判据，就可能无限重连下去。
 
+### 8.3 静默的连接上限（PR-6a）
+
+**问题。** 有的服务器限制连接数，却不回 429/503：超出的连接被直接拒绝（连接被关闭或重置），或者被接受后一直不应答。原来的并发控制按失败率降级，有三个缺陷：
+
+- 降过一次之后停在 `Degraded`，只看失败率决定是否恢复，不会再降。服务器限 4 个、`max_connections = 8` 时，上限停在 7，超出的连接一直被拒。
+- 恢复不验证：15 s 内没有新失败就升一级，不管试探的连接有没有用上。
+- 任何不可重试的结果都会立即降级，包括带着数据断开的 `SmallerThanTotalSize`，它说的不是连接数。
+
+**证据：只看 `Started` 之前失败的尝试（D20）。**
+
+| 阶段 | 原因 | 分类 |
+| --- | --- | --- |
+| 连接中 | `RetryableError::Io` | 拒绝 |
+| 连接中 | `TaskError::Timeout` | 拒绝（连接超时） |
+| 任意 | `UnretryableError::Congestion`（429/503） | 拥塞 |
+| 连接中 | `RetryableError::Status`、`ChannelClosed`、spawn 失败、其它不可重试的错误 | 无 |
+| 传输中 | 其它一切 | 无 |
+
+- `Started` 之前的 `Timeout` 只能是连接超时：这时还没有帧，drain 不会超时，所以 runner 不用改。
+- `Started` 之后的都不算：那里的 `Timeout` 可能是空闲超时，也可能是 drain 超时（循环没及时取帧，与服务器无关），两者是同一个 `TaskError::Timeout`；收到响应头之后、第一个字节之前的重置，也分不清是“没发字节”还是“字节还在背压里没被接收”。
+- 所以“接受连接之后不发数据或重置”的服务器**检测不到**（D26），照旧按区间退避处理。
+- 拒绝和 DNS、TLS 失败分不开：adapter 把连接失败拍平成同一种错误。下面的“佐证”挡住了大部分（D25）。
+
+**记录。** `RunnerManager` 持有 `AdmissionEvidence`，是一组固定的值，没有事件日志，不会溢出也不会丢弃：
+
+| 值 | 由谁改 |
+| --- | --- |
+| `connected`：runner ID 的集合 | 生命周期的 `Started` 分支和测试的 `mark_started` 调 `on_started`；`release_runner` 调 `on_ended`，任何结束方式都经过它 |
+| 连续拒绝 `{ count, level }` | 一次被佐证的拒绝；`level` 及以上的一次 `Started`；下文的重置 |
+| `congestion_pending` | 一次拥塞；由并发控制取走 |
+| 恢复步骤的两个标记 | 见 §8.3 的“恢复” |
+| `proven_window` | 策略 tick 和失败时取已证实的连接数的最大值；降级时截到新上限（供 C39 使用） |
+| 三个时刻：第三次拒绝、最近一次拒绝、本次占满的起点 | manager 没有时钟，只标为“待盖章”；循环在 `on_runner` 开头和每个策略 step 开头用自己的 `now` 调 `stamp(now)` |
+
+- 每个结束的尝试都经过同一个钩子 `classify(phase, error)`：连接失败、runner 丢失、传输中的失败。拒绝只在连接中记录；拥塞在任何阶段都记录，包括 body 流里的 429/503。
+- 还没盖章的时刻读作“未知”，未知时并发控制什么都不做。
+
+**静默规则：连续三次拒绝（D21、D24）。**
+
+- 分类时另有一个尝试**已证实**（连接中、本次尝试已有字节被接收），这次拒绝才算被**佐证**，并记下 `others`：此刻其它在途的尝试数。没有佐证的拒绝在这里不算数。
+- `count` 是连续被佐证的拒绝次数，`level` 是其中最小的 `others`。
+- 连续拒绝在以下情况清零：一次 `Started` 时至少有 `level` 个其它尝试在途（服务器在这个水平上接受了连接）；上限改变，或恢复步骤开始、结束；`STREAK_GAP` 内没有新的拒绝。间隔按循环处理每次拒绝的时刻计算，在盖章时检查：间隔之后才到的拒绝开始新的一轮，不会续上已经过期的一轮，即使中间还没有 tick。
+- 低于 `level` 的成功、连续拒绝开始之前的成功都不算，所以很长的成功历史稀释不了它。
+- 策略 tick 时同时满足以下条件就降：`count ≥ 3`；第三次拒绝之后至少一个 tick 间隔，有非空帧被接收（排除整体断网）；`1 ≤ connected < limit`；tick 不迟到；writer 能接收数据。降到 `max(connected, min_concurrency, 1)`，`proven_window` 截到新上限。
+
+**拥塞规则（D22）。** 拥塞（只认类型化的 429/503）在下一个 step 生效：`limit := min(limit, max(active, min_concurrency, 1))`，这一个 step 只改上限，不建 runner。它永远不会升高上限。`create_tasks` 在拥塞待处理时不创建，原来是任何不可重试的结果都会挡住它。`SmallerThanTotalSize` 不再降级。
+
+**迟到的 tick。** 距上一个 tick 超过两个间隔的 tick 是迟到的。循环先轮询 tick 再轮询 runner，卡顿之后 tick 看到的状态可能马上被排队的生命周期事件改掉，所以迟到的 tick 不执行静默规则。
+
+**恢复：一次一步，要验证，按退避拉开（D22）。**
+
+- 两个控制器之间只交换两个数：扩张一侧给出 `want`（目前恒为 `max_connections`），并发控制给出 `limit_cap`，step 进行中是 `limit + 1`，否则是 `limit`。`cap = min(limit_cap, want, max_connections)`，能新增的 runner 数一律按 `free = cap.saturating_sub(active)` 计算：建 runner、唤醒后的创建、dynamic 策略的切分都一样。`active > cap` 是合法状态，多出来的 runner 不会被停掉，下完自己的块就结束。
+- 上限只能通过 step 升高。step 是对 `limit + 1` 的一次试探，在策略 tick 上开始，要求同时满足：没有 step 在进行；没有拥塞在挡新连接；`want > limit` 且 `limit < max_connections`；`now ≥ due`；`connected ≥ limit`；tick 不迟到。如果已经有超过 `limit` 个连接在活动，step 不新开连接，直接评判现有的连接：上一个 step 留下的试探连接就这样被下一个 step 计入，既不停掉也不忽略。
+- step 有四个出口，每个 tick 按顺序检查：
+
+| 检查 | 结果 |
+| --- | --- |
+| step 开始之后分类到一次被佐证的拒绝或一次拥塞 | 拒绝 |
+| step 开始之后分类到一次没有佐证的拒绝（迟到的 tick 不看这一条） | 不确定 |
+| `now ≥ started_at + STEP_DEADLINE` | 不确定 |
+| `connected ≥ limit + 1` 连续保持了 `T_OBS`，此刻 `proven ≥ limit + 1`，tick 不迟到 | 接受 |
+
+| 结果 | `limit` | 等待 | 下一个 `due` |
+| --- | --- | --- | --- |
+| 接受 | `limit + 1` | 回到基础值 | `now` |
+| 拒绝 | 不变（拥塞时再按拥塞规则降） | 加倍，不超过上限 | `now + 等待`；拥塞时从拥塞结束算起 |
+| 不确定 | 不变 | 不变 | `now + 等待` |
+
+- step 被标记之后（被佐证或没有佐证的拒绝、拥塞），到下一个 tick 判定它之前，补充 runner 和切分都按 `limit` 而不是 `limit + 1` 计算：试探的区间退避结束得比 tick 早，也不会再开第二个试探；低于 `limit` 的连接照常补上。
+- 两个标记按程序顺序记录，不比较时间：`begin_step()` 清空，之后分类到的拒绝或拥塞才会置位。和 step 同一个 `now`、但在它之前处理的拒绝不会拒绝它。
+- 连续占满的起点来自生命周期，不来自 tick 碰巧看到的数：让 `connected` 达到 `limit + 1` 的那次 `Started` 把它标为待盖章；step 开始时已经达到，就取 step 的开始时间；任何一次 `release_runner` 让数目跌破，立即清空，还没盖章的也一样。所以一个 runner 在一个 tick 之后结束、替补在下一个 tick 之前连上，时钟重新开始；计时从试探连接连上算起，不从 step 开始算起。
+- 静默降级之后，`due` 是降级时刻加基础等待；拥塞之后，`due` 从拥塞结束算起。任何结果之后，下一个 step 都在 300 s 之内到期。拒绝永远不会升高上限，只有被接受的 step 会，每次加 1。
+- `max_connections = 1` 时不会有 step，也不会降级。
+
+**常量（D23）。**
+
+| 常量 | 值 |
+| --- | --- |
+| 连续拒绝 | 3 次 |
+| 确认 | 第三次拒绝之后一个 tick 间隔的进度 |
+| `STREAK_GAP` | `2 × connect_timeout + 30 s`（默认 90 s），容得下连续三次连接超时；溢出时取 `Duration::MAX` |
+| 迟到的 tick | 距上一个 tick 超过 2 个间隔 |
+| `T_OBS` | 连续占满 15 s（原来的 `recovery_observation_period`） |
+| `STEP_DEADLINE` | `connect_timeout + T_OBS + 2` 个 tick（默认 48 s）；溢出时取 `Duration::MAX`，这样的截止时间永远到不了 |
+| step 之间的等待 | 30 s（原来的 `recovery_delay`），每次拒绝加倍，上限 300 s |
+
+都没有校准，留给基准测试。
+
+**定时器。** 没有新的定时器，也没有新的唤醒点。所有判断都在策略 tick 上做，时间都是传入的 `now`，`strategy/` 里不调 `Instant::now()`。
+
+**不做的事。**
+
+- 接受连接之后不发数据或重置的服务器（D26）。
+- 拒绝与 DNS、TLS 失败的区分（D25）。
+- 一次短暂故障之后只剩一个连接还在下载：上限会降到 1，靠恢复步骤每 15 s 升一级（D21 的已知误判）。
+- 排在满 writer 后面的帧在拒绝之后被接收，也算进度：第二种已知误判，上限是每个 runner 32 帧的队列。
+
 ---
 
 ## 9. 扩张控制器与切分尺寸（P1-5、S1、P1-6、P1-7、S4）
@@ -623,6 +729,10 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 | 解压炸弹：很小的响应解出极大的文件 | 每次 poll 最多产出一块输出，内存有上界；`DecodeOptions::max_output` 可以给输出总量设上限 |
 | 没有长度、靠关连接结束的 body 在第一个字节之前断开，会存成空文件（§14.7） | HTTP 层测不出这种截断，断在之后任何位置也一样放行；IDM 同样按完成处理。原来的 `Empty` 只拦下了断在第一个字节之前这一种，代价是合法的空文件全部失败 |
 | IDM 的部分结论只有 dsh 一个来源（对冲、ECONNRESET 计数、HTTP 低限速时的初始连接数） | 本设计不依赖这些结论；需要用到的参数都通过自己的基准测试来定 |
+| 静默规则的误判一：一次短暂故障之后只剩一个连接还在下载，它佐证了其它连接的拒绝，上限降到 1（§8.3） | 恢复步骤每 15 s 升一级；D21 接受这个代价 |
+| 静默规则的误判二：排在满 writer 后面的帧在拒绝之后才被接收，也算作进度 | 只在 writer 能接收数据时降级；误差上限是每个 runner 32 帧的队列 |
+| 服务器接受连接之后不发数据或重置，§8.3 检测不到（D26） | 照旧按区间退避和预算处理；要检测，runner 先得报告是哪种超时 |
+| §8.3 的常量都没有校准（D23） | 用基准测试校准；在那之前按设计值 |
 
 ---
 
@@ -885,7 +995,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - 合并：退回的区间和它重叠或相接的记录合成一条，`attempts` 取较大值，`not_before` 取较晚值。这样任何字节都不会早于它原来的 `not_before` 被领取。旁边的新字节不并进来，仍然是新的。
     - 部分领取：领取的部分带走覆盖到的记录里最大的 `attempts`；记录在领取范围以外的部分，保留原来的 `attempts` 和 `not_before`。正常流程不会领取冷却中的区间（见门控），只有直接调用才会出现。
     - 切分：后半段从 0 开始。`resize` 让出的尾部原来属于 chunk，没有记录；`split_chunk` 的新 chunk 也从 0 开始。原 chunk 保留自己的 `attempts`。
-  - 两步记录：runner manager 处理失败时只释放区间，`AttemptFailure` 带上 `range` 和 `attempts`。下载循环在 `on_runner` 里拿到 `now`，再算退避、写记录，两步之间没有别的代码运行。任务取消时 runner 不报失败，所以不退避。T10 可以直接拿 `AttemptFailure::attempts` 和 `max_attempts_per_range` 比较。
+  - 两步记录：runner manager 处理失败时只释放区间，`AttemptFailure` 带上 `range` 和 `attempts`。下载循环在 `on_runner` 里拿到 `now`，再算退避、写记录，两步之间没有别的代码运行。任务取消时 runner 不报失败，所以不退避。`attempts` 只决定退避；T10 的每区间预算不比较它，而是比较另一个计数 `charged`，见 §14.13。
   - 退避函数：backon 1.6.0（`Cargo.lock`）的 `ExponentialBuilder`，最小 0.5 s，×2，最大 30 s，`with_jitter()`。
     - 第 n 次失败（从 1 数）的基础延迟是 `min(0.5 s × 2^(n−1), 30 s)`。
     - backon 的抖动是加性的：`d + d × U[0, 1)`，结果落在 `[d, 2d)`；而且抖动加在 `max_delay` 截断之后。所以和 `meta.rs` 一样，结果再截到 30 s。第 n 次的等待在 `[d, min(2d, 30 s)]` 之间，从第 7 次起恒为 30 s。
@@ -963,3 +1073,170 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `split` 不检查拥塞：`retry_after_holds_back_every_new_connection`；
     - 领取时不带上 `attempts`：4 个 `ChunkPlanner` 测试、4 个下载循环测试和性质测试；
     - 唤醒创建不等降级：`test_create_tasks_waits_for_the_first_step_and_the_degradation` 和 `wake_up_before_the_degradation_leaves_the_retry_to_a_later_tick`。
+
+### 14.12a 静默的连接上限（PR-6a，C35–C38）
+
+- **做法。**
+  - C35：新增 `strategy/admission_evidence.rs`，`RunnerManager` 持有它。生命周期的 `Started` 分支和 `mark_started` 调 `on_started`，`release_runner` 调 `on_ended`。每个结束的尝试都经过 `record_attempt_end(phase, error)`：连接失败（含 spawn 失败）、runner 丢失、传输中的失败；取消不算失败，不经过它。佐证用的“已证实”数来自 `ChunkPlanner::get_proven_runners_count()`：`Running` 且本次尝试 `downloaded` 非空的块。`on_runner` 开头先 `stamp(now)`。连续拒绝分两部分：已盖章的和还没盖章的；盖章时先检查已盖章的最近一次拒绝是否已过 `STREAK_GAP`，过了就丢掉，再并入新的拒绝，所以间隔之后才到的拒绝不会续上过期的一轮，不必等 tick。这一步不读证据，行为不变。
+  - C36：`bolt-load-tests` 新增 `create_limited_range_server(content, limit, mode, bytes_per_sec)` 和 `LimitMode::{Close, Hang}`。用 axum 的 `Listener` 包一层：超过上限的连接，`Close` 在接受后立即关闭，`Hang` 接受后一直持有、不读也不答。`ConnectionLog` 记录每个连接的服务、关闭和拒绝，以及同时服务的连接数。range 响应按给定速率发送，原来的限速响应改为同一个 `paced` 函数。
+  - C37：并发控制读证据。`StrategyControl::execute` 和 `create_tasks` 改为接收 `LoopSignals`（拥塞、最近进度、writer 能否接收），`FailurePolicy` 新增 `last_progress_at()`。拥塞规则取代立即降级，静默规则取代按失败率的降级，在 `Normal` 和 `Degraded` 里都执行；旧的恢复仍然读 sampler。`RunnerOutcomeSampler` 的 `unretryable_pending` 和 `has_recent_unretryable` 删掉，由证据的 `congestion_pending` 和 `take_congestion` 代替。
+  - C38：并发控制改为 §8.3 的 step；`ConcurrencyControlContext` 增加 `want`、`congestion_until`，去掉 `max_concurrency`，`LoopSignals` 增加 `congestion_until`。`StrategyControl` 记住 `max_connections` 作为 `want`，dynamic 策略的切分闸门改为 `min(max_concurrency, cap)`。删掉旧的 `Degraded`、`Recovering`、失败率阈值、`degradation_step`、`min_samples`，以及 `RunnerOutcomeSampler` 和它的全部记录点；`strategy/` 的非测试代码里不再有 `Instant::now()`。
+- **与 §8.3 之外的约定的偏差。**
+  - 被接受的 step 不再下发 `ChangeMaxConcurrency`：新的 `limit` 等于原来的 `limit_cap`，循环的上限不用变。
+  - 不带 step 的拥塞也把 `due` 推到拥塞结束加当前等待之后：服务器刚说过已满，不马上试探。
+  - 迟到的 tick 只处理拒绝和截止时间，没有佐证的拒绝留给下一个 tick。
+  - 测试里的 writer 改为每次写入一个任务、停在测试的 runtime 里：循环自己的 writer 把写入交给后台线程，完成的时机测试控制不了，重放就不确定。
+  - G10 的端到端测试由测试自己切分出第四个连接：任务只有在 dynamic 策略的速度采样需要时才会切分，测试无法强制（§14.12 的同一限制）。
+- **验证。**
+  - 单元测试（注入 `now`）：
+    - 证据：分类表的每一行；同水平的连接结束连续拒绝，较低水平的不结束，开始之前的成功不算；没盖章的时刻读作未知；丢失会清掉没盖章的占满；step 开始时已占满就从开始算起；标记按程序顺序；降级截断 `proven_window`。
+    - manager：分类经过生命周期，13 种结束方式；`Started` 两条路径都记录；完成、失败、丢失、取消都离开 `connected`。
+    - 并发控制（`strategy/concurrency_control_strategy/tests.rs`）：三次拒绝加进度才降，降过还能再降，旧的成功稀释不了，没有进度不降，`STREAK_GAP` 后失效，没有佐证不算，带数据的短流不降，拥塞不升高上限，迟到的 tick 和满 writer 不降；step 要 `want`、到期、`connected ≥ limit`、没有拥塞；从试探连接的 `Started` 算 15 s 才接受；两个 tick 之间的替换、writer 满时的丢失都会重新计时；迟到的 tick 不接受；截止时间结束为不确定且等待不变；下一个 step 计入留下的试探连接，不新开连接；同一时刻之前处理的拒绝不拒绝 step；被佐证的拒绝拒绝，没有佐证的不确定，拥塞拒绝并降级、从拥塞结束算起；拒绝的 step 依次相隔 30、60、120、240、300、300 s；一个连接永远不 step。
+    - 原有的三个单元测试保留断言，只改准备步骤：`test_immediate_degradation_never_drops_to_zero` 和 `test_create_tasks_waits_for_the_first_step_and_the_degradation` 把 sampler 里的不可重试结果换成证据里的拥塞；`test_a_pending_unretryable_failure_triggers_once` 改为证据的 `take_congestion` 测试。
+  - 下载循环（`download_loop/tests/admission.rs`，健康的 runner 由测试驱动，循环自己建的 runner 通过拒绝或不应答的 adapter 连接，经过生命周期结束）：
+    - 8 个里服务器接受 4 个、其余被拒绝或不应答：在第三次拒绝之后第一个间隔一个 tick 的 tick 降到 4，之后 25 s 内没有新连接。
+    - 同样的场景跑 300 s：只有 step 的试探连接超过 4，每个 step 一个，都被拒绝，每个 step 在到期后的第一个 tick 开始，拒绝之后的等待依次加倍；上限在 4 和 5 之间交替，从不更高。
+    - 传输中的 503 在下一个 step 降到 4，之后 25 s 不升；step 进行中的 503 拒绝它，等待加倍并从拥塞结束算起。
+    - 丢失的 runner、四个连接同时断开后重连被拒、拒绝与成功交替：上限都不变。
+    - writer 满 15 s，期间拒绝照常到达、runner 的结束照常处理，但不接收数据，静默规则等待；写入完成后的下一个 tick 降级。
+    - 性质测试：连接、交付、完成、拒绝、带数据后失败、丢失、拥塞、填满和清空 writer、按时和迟到的 tick、唤醒，128 组，每组最多 400 步。测试自己维护已连接的 runner 和 step 的连续占满（从它报告的事件算），用这个模型而不是证据判断：模型和证据的连接数、占满起点必须一致；上限在 `[1, max_connections]` 之内，新增 runner 不超过 cap；只在按时的 tick、模型的连续占满达到 15 s 之后加 1；静默降级只在 writer 能接收数据、第三次拒绝之后有进度时发生，拥塞立即降；step 在截止之后的第一个 tick 结束；传输中的失败、丢失、完成和 writer 不产生证据，也不改上限；循环的上限等于 cap；同样的操作在同样的时刻重放，下发的动作序列相同。
+  - 端到端（reqwest、tokio、C36 的服务器，真实计时器）：`max_connections = 8`，服务器限 3、每个连接 256 KiB/s，`Close` 和 `Hang`（连接超时 300 ms）各一次：下载完成，BLAKE3 正确，服务器同时服务的连接不超过 3，上限从 8 降到 3，之后不再升高；第一个 step 至少在降级 30 s 之后开始，两者都是并发控制自己的决策时刻（循环处理事件时的 `now`）（G10）。服务器的记录不和循环的时刻比较：不应答的连接，服务器记下拒绝的时间可能晚于循环的时刻。step 开了哪些试探、什么时候开，只在注入时间的测试里断言。每个约 20 s。
+  - 已有测试：`retry.rs` 的断言都没有改。manager 测试里读 sampler 的断言改读证据（旧：`connect_failed_*`、`stream_closed_*`、`total` 的计数；新：连续拒绝为 0、没有待处理的拥塞、`connected` 为 0）；`test_custom_timer_survives_other_events` 改为断言丢失的连接让它的区间退避了一次。
+  - 回归：两次拒绝在 0.1 s 和 0.2 s，tick 每 1.5 s 一次，第三次在 90.3 s（间隔已过、下一个 tick 之前），之后有进度：不降级（证据和并发控制各一个测试）。`connect_timeout = Duration::MAX` 时 `STREAK_GAP` 和 `STEP_DEADLINE` 饱和，不 panic，step 只按标记或接受结束。
+  - 回归：step 的试探在它的 tick 被拒、区间只退避 1 s（比 tick 短），唤醒时不再开第二个试探，下一个 tick 拒绝这个 step（下载循环）；被标记的 step 在 tick 之前不补试探的位置，低于 `limit` 的照常补（单元，两种标记）。去掉这条规则，两个测试都失败。
+  - 变异检查：接受时不看连续占满，4 个单元测试和性质测试失败；释放时不清空占满，性质测试失败。
+- **已知限制。** 见 §8.3 的“不做的事”和 §12。
+
+### 14.13 每区间失败预算（PR-6，C10）
+
+- **做法。**
+  - 三层都在 `FailurePolicy::on_failure` 里判定，顺序如下：
+    1. 不可重试的失败照旧：别的连接还在途时，429/503 交给并发控制，任务继续；其它不可重试的失败直接结束任务。
+    2. 重启：本次尝试收到过数据之后的超时或断流，只退避，然后返回。它不计入连续失败，也不记到区间的预算上。
+    3. 每区间预算：区间记过的失败数达到 `max_attempts_per_range` 时，任务以 `RangeExhausted` 结束。
+    4. 任务级连续失败：和原来一样，`on_write_ok` 会清零。
+  - 两个上限在同一次失败上同时达到时，返回 `RangeExhausted`。它说明是哪个区间，还带着这个区间最后一次的错误，比“连续失败太多”更有用。
+  - “收到过数据”指这次尝试有字节被 planner 接收，也就是 chunk 的已下载部分不为空：
+    - 被截掉的字节不算，例如 runner 读到缩小后的上限之前多发的部分；
+    - 还在通道里、没被取走就超时的字节也不算；
+    - 一个 chunk 只属于一次尝试，领取时已下载部分是空的。所以失败时已下载部分的长度，就是这次尝试交付的字节数。`mark_failed` 把它放进 `Released::received`，runner manager 再把它带到 `AttemptFailure::received`。
+    - 这样定义，每次重启都会让区间变短，重启不可能在没有进展的情况下一直进行。
+  - “超时或断流”对应的错误（按 §14.1 的分类）：
+    - `TaskError::Timeout`：空闲超时、数据排空超时和连接超时。连接超时发生在连上之前，一定没有数据，所以总是计入；
+    - `RetryableError::Io`：连接失败（没有数据，计入），或者 body 读到一半断开，例如连接被重置、EOF 来得太早；
+    - `TaskError::SmallerThanTotalSize`：body 正常结束，但没到区间末尾。
+    - 不算重启：可重试的状态码（`RetryableError::Status`），它在第一个字节之前就到了；`ChannelClosed`，它表示 runner 丢了，是本地的问题，不是连接断了。
+  - 两个计数。区间上有两个失败计数，名字和规则以这里为准：
+    - `attempts`（C9，不变）：这个区间失败过几次。每次任务挺过去的失败都加 1，包括被容忍的 429/503。它只决定退避多长（§8.1、§14.12）。
+    - `charged`（本次新增）：这个区间记到预算上的失败数，每区间预算只比较它。
+      - 加 1 的失败：可重试、并且不是重启的失败。也就是连接失败、没有数据的超时、`ChannelClosed`、可重试的状态码，以及没有数据时的断流。
+      - 不加的失败：重启（收到过数据之后的超时或断流），以及 429/503。其它不可重试的失败直接结束任务，也不加。
+      - 判定写在 `failure_policy.rs` 的 `charges_range` 里。
+    - 两个计数随区间走的规则相同：
+      - 存在 `ChunkState::charged` 和 `Cooldown::charged` 里，和 `attempts` 并排；
+      - 相接或重叠的冷却记录合并时，各自取较大值；
+      - 新 chunk 领取区间时，各自取它覆盖到的记录里的最大值，新字节算 0；
+      - 切分出的后半段（`resize` 让出的尾部和 `split_chunk` 的新 chunk）都从 0 开始，原 chunk 保留自己的值；
+      - `PlannerGuard` 回滚时随整个 planner 一起恢复。
+    - 所以总有 `charged ≤ attempts`。
+    - 传递：`mark_failed` 在 `Released::charged` 里返回失败之前的值，因为 planner 不知道失败的原因。runner manager 构造 `AttemptFailure` 时调用 `charges_range`，算出包含这次在内的 `AttemptFailure::charged`。`back_off` 把 `attempts` 和 `charged` 一起写进冷却记录。
+  - 空区间：runner 在区间下完之后才失败时，退回的区间是空的。这时没有可耗尽的东西，不检查预算。连续失败照常按上面的规则算：重启不计，其余可重试的失败计入。
+  - 公开 API 的变化：
+    - 新增 `TaskError::RangeExhausted { range, attempts, source }`。消息是 `bytes {start}..{end} failed {attempts} times, last error: {source}`，`source()` 指向最后一次的错误，写法和 `RetryLimitExceeded` 一样。`TaskError` 不是 `#[non_exhaustive]`，加变体是破坏性变更，所以提交信息带 `!`。
+    - 新增 `TaskOptions::max_attempts_per_range: NonZeroU32` 和常量 `DEFAULT_MAX_ATTEMPTS_PER_RANGE`（5）。`TaskOptions::max_attempts_per_range(n)` 和 `TaskBuilder::max_attempts_per_range(n)` 设置它，和 C7 的 `max_connections` 一样；之后再调用 `options(...)` 会整体替换掉它。`TaskOptions` 是 `#[non_exhaustive]`，加字段不破坏兼容。
+    - 类型本身保证至少为 1，所以不需要构建时检查。等于 1 时，区间第一次记到预算上的失败就结束任务；重启和 429/503 仍然只退避。
+    - `DownloadError::Transfer` 的文档加上了这种情况。没有别的地方按 `TaskError` 的变体做映射，所以不用改别的代码。
+- **与 §8.2 的偏差。**
+  - 预算比较的是 `charged`，不是 `attempts`，所以有两个计数。
+    - §8.2 的表里，重启一行写的是“不计入连续失败，只走 §8.1 的退避；`attempts` 照常增加”，兜底一栏是 `no_progress_timeout`，不是预算。每区间预算一行又写 `attempts >= max_attempts_per_range`。两处放在一起是矛盾的：如果预算直接数 `attempts`，重启就不只是退避了。
+    - 具体的后果：网络不稳定时，一个大区间每次都收到一些数据、然后断开，断 5 次任务就失败了。原来的代码在这种情况下会一直下完。
+    - 429/503 也会悄悄耗掉预算。服务器限制连接数时，并发控制降级 30 s 后会多开一个连接试探，可能每次都落在同一个区间上。这个区间被拒 4 次之后，再来一次普通的失败，任务就结束了。
+    - 改进方案也是这么分的：P1-4 第 1 条说重启“整体由 `no_progress_timeout` 兜底”；P1-7 的 S4 第 3 条说重启“不计入失败预算……但计入 `attempts`”。
+    - 所以 `attempts` 仍按 §8.1 增加，C9 的退避和它的断言都不变；预算另外计数。
+  - 不记预算的失败怎么收尾：
+    - 重启一定会结束：重启要求这次尝试有字节被 planner 接收，所以每次重启都让区间严格变短。区间只有有限个字节，重启的次数也就有限。没有进展的失败都不是重启，都要记预算。
+    - 429/503（§8.2 没说计不计入，这里不计入）：只有别的连接还在途时才被容忍；没有别的连接时，它像原来一样直接结束任务。被容忍期间，`no_progress_timeout` 也照常有效。
+  - G6 仍然成立：它针对的是“健康连接掩盖一个反复失败的区间”。没有进展的失败都记到这个区间的预算上，别的连接写成功也不会清零它。每次都有进展的区间不算反复失败，它会一点点下完。C39 起，在已证实窗口之上的拒绝例外，不记预算（§14.13a，确认 2026-11-13）；它说的是服务器的连接数，不是这个区间。
+  - `RangeExhausted` 比 §8.2 多一个 `attempts` 字段，用来在消息里写出次数。它等于 `charged`，也就是上限，可能比决定退避的 `attempts` 小。`source` 是这次失败的错误。
+  - `range` 是最后一次失败退回的区间。区间收到过数据时，它只是还没下完的那部分。
+- **已知限制。**
+  - 重启只受 `no_progress_timeout` 约束。服务器每次只发很少的字节就停住时，每次重启都有进展，无进展超时不会触发，下载会很慢但不会失败。以后 §9.5 的低速重启可以处理这种情况。
+  - 区间被切分后，新的一半从 0 开始计数（§8.1 的规则，C9 已经这样做）。一个坏区间被切成几段时，每段都有自己的预算。
+  - runner 丢失（`ChannelClosed`）总是记到预算上，即使它之前收到过数据。
+- **验证。**
+  - `FailurePolicy` 的单元测试（`AttemptFailure` 都用 runner manager 的构造函数生成，记不记预算走真实的判定）：
+    - `test_a_failing_range_ends_the_task_despite_healthy_writes`（G6）：连续失败上限是 2。区间先后以 5 种不同的错误失败，每两次之间别的连接写成功一次。前 4 次任务继续，第 5 次以 `RangeExhausted { range, attempts: 5 }` 结束，`source` 是第 5 次的错误；
+    - `test_without_writes_the_consecutive_limit_ends_the_task_first`：同样的失败，中间没有写入时，第 2 次就以 `RetryLimitExceeded` 结束；
+    - `test_a_timeout_after_data_is_not_a_consecutive_failure`：两个上限都是 1。收到数据之后的超时、连接重置和提前结束都不结束任务，连续失败数保持 0，预算也不记；
+    - `test_a_timeout_without_data_still_counts`：没有数据的超时计入连续失败，第 2 次以 `RetryLimitExceeded` 结束；
+    - `test_what_restarts_and_what_is_charged`：上面的错误分类表，以及不可重试的失败（包括 429/503）都不记预算；
+    - `test_the_range_budget_ends_at_exactly_its_limit`：上限是 3 时，记到第 2 次继续，第 3 次结束；上限是 1 时，第一次记的失败就结束，而重启仍然只退避；
+    - `test_restarts_and_congestion_are_not_charged`：区间已经失败 6 次，但都是重启或 429/503，预算还是 0；之后第 2 次记的失败才结束任务；
+    - `test_the_range_budget_comes_before_the_consecutive_limit`：两个上限同时达到时，返回 `RangeExhausted`；
+    - `test_a_complete_range_is_not_exhausted`：退回的区间为空时，不检查预算，但仍计入连续失败。
+  - `ChunkPlanner`：`test_charged_failures_are_carried_like_attempts` 里 `charged` 和 `attempts` 不相等，验证两者各自取较大值、领取时带走、切分出的区间从 0 开始，以及 `mark_failed` 返回失败之前的 `charged` 和收到的字节数。C9 测试里的辅助函数改为每次失败都记预算，所以 C9 的合并、部分领取和切分测试也同时覆盖了 `charged`。
+  - runner manager：`test_a_failure_reports_only_the_bytes_the_planner_accepted` 直接检查 `received` 的边界，三个 runner 都以超时结束：
+    - 数据排空超时，帧还都在通道里：`received = 0`，这次失败记预算（`charged = 1`）；
+    - 接收了一帧，下一帧还在通道里：`received` 只算接收的 100 字节，这次是重启（`charged = 0`），退回的是剩下的部分；
+    - chunk 缩小到已下载部分之后 50 字节，runner 读到新上限之前又发了 200 字节：planner 只接收 50 字节，`received` 是 150，不是 300。
+  - 下载循环的测试（显式传入 `now`）：
+    - `a_failing_range_ends_the_task_while_another_runner_writes`：两个连接，连续失败上限 2，每区间上限 3。一个测试控制的 runner 下载前半段；后半段的 runner 由循环自己创建，用真实的 runner 和 adapter 连接，连接失败（可重试的 io 错误）。每次失败后，另一个 runner 交付 1 KiB，写入完成，连续失败清零；区间在 `not_before − 1 ns` 时不重试，在 `not_before` 时由唤醒重试。第 3 次的 runner 丢失（`ChannelClosed`），任务以 `RangeExhausted { range: 后半段, attempts: 3 }` 结束，`source` 是 `ChannelClosed`，不是前两次的 io 错误；
+    - `a_timeout_after_data_restarts_the_range`：两个上限都是 1。runner 交付 1 KiB 后超时，`AttemptFailure` 带着 `received = 1024`、`charged = 0`，任务继续；剩下的部分冷却，`attempts = 1`、`charged = 0`。冷却结束后的 step 重建 runner，它没有数据就丢失了，这是区间第一次记的失败，任务以 `RangeExhausted` 结束。这个测试检查 `received` 从 planner 一路传到了 `FailurePolicy`。
+  - 性质测试：`Fail` 新增超时一种（有数据时是重启），失败改用 `AttemptFailure::new` 构造。每次失败后检查：`mark_failed` 返回失败之前的 `charged`；`charged` 只在 `ChannelClosed`、或没有数据的超时时加 1，429/503 和重启不加；冷却记录的 `charged` 不小于这次的值。每一步之后还检查：冷却记录和每个 runner 的 chunk 都满足 `charged ≤ attempts`；新建的 runner 的 `charged` 等于它领取到的记录里最大的 `charged`；切分出的后半段（落在这一步之前已有 chunk 的范围里）`attempts` 和 `charged` 都是 0。
+  - `TaskError` 的消息和 `source()`、默认值 5、两个设置方法各有单元测试。
+  - 已有测试：C9 关于 `attempts` 的断言一条都没改。只有机械的改动：`Released` 和 `Cooldown` 的字面量加了新字段（C9 的 503 测试里是 `charged: 0`，同时验证了 503 不记预算）；C9 测试的 `cool_down` 调用多了一个参数，值和 `attempts` 相同。`termination.rs` 里 `RetryLimitExceeded` 的测试把连续失败上限设成 2 或 3，比 5 小，结果不变。
+  - 变异检查，每种都有测试失败：
+    - 去掉预算检查：6 个测试，包括两个下载循环测试；
+    - `>=` 改成 `>`：同样 6 个测试；
+    - 收到数据之后的超时计入连续失败：`test_a_timeout_after_data_is_not_a_consecutive_failure` 和 `a_timeout_after_data_restarts_the_range`；
+    - 没有数据的超时不计入：3 个 `FailurePolicy` 测试和性质测试；
+    - `source` 不是最后一次的错误（改用上一次失败的错误）：`test_a_failing_range_ends_the_task_despite_healthy_writes` 和 `a_failing_range_ends_the_task_while_another_runner_writes`；
+    - 429/503 也记预算：`test_restarts_and_congestion_are_not_charged`、`test_what_restarts_and_what_is_charged`、`retry_after_holds_back_every_new_connection` 和性质测试；
+    - 重启也记预算：`test_a_timeout_after_data_is_not_a_consecutive_failure`、`test_what_restarts_and_what_is_charged`、`a_timeout_after_data_restarts_the_range` 和性质测试；
+    - 切分出的后半段继承前面 chunk 的 `charged`：`test_split_range_starts_without_attempts` 和性质测试；
+    - 有数据时 `received` 报 0：2 个 `ChunkPlanner` 测试、`test_a_failure_reports_only_the_bytes_the_planner_accepted` 和 `a_timeout_after_data_restarts_the_range`；
+    - 领取时不带走 `charged`：3 个 `ChunkPlanner` 测试、`a_failing_range_ends_the_task_while_another_runner_writes` 和性质测试；
+    - 合并时不取较大的 `charged`：`test_adjacent_cooldowns_merge`；
+    - `FailurePolicy` 不读配置（固定为 5）：5 个测试；
+    - `TaskBuilder::max_attempts_per_range` 不写入：`test_max_attempts_per_range_sets_the_option`；
+    - 先查连续失败、再查预算：`test_the_range_budget_comes_before_the_consecutive_limit` 和 `a_timeout_after_data_restarts_the_range`；
+    - 区间为空时也检查预算：`test_a_complete_range_is_not_exhausted`。
+
+### 14.13a 已证实窗口之上的拒绝不记预算（PR-6，C39）
+
+- **决策（D27，确认 2026-11-13）。** 服务器静默限连时，超出它接受数的连接被拒绝，这不是这个区间的问题。以前这样的拒绝每次都记到区间的预算上：并发控制还没降上限之前，一个区间就能被拒五次，任务以 `RangeExhausted` 结束（§8.3 的问题 A）。
+- **规则。** 在 manager 给失败分类的那一刻，用那一刻的状态决定，之后不再更正。同时满足以下三条的失败不记预算：
+  - 是拒绝（§8.3 的分类：连接中的 `RetryableError::Io` 或连接超时）；
+  - 此刻另有一个已证实的尝试；
+  - 此刻至少有 `max(a, 1)` 个其它尝试在途，`a` 是已证实窗口：降上限以来，在策略 tick 和失败时看到的同时已证实的尝试数的最大值，降上限时截到新上限。
+- 免记的失败照常：`attempts` 加 1，照常退避，照常算一次连续失败；只是 `charged` 不加。其它失败照旧（§14.13），429/503 仍然不记。
+
+| 失败 | 记预算吗 |
+| --- | --- |
+| 在已证实窗口之上、旁边有已证实的连接时被拒绝 | 不记 |
+| 在窗口之内被拒绝（其它在途的尝试少于 `a`） | 记 |
+| 没有任何连接已证实时被拒绝：一开始就开多个连接、续传时有多个区间、整体断网 | 记 |
+| `Started` 之后没有数据的失败；丢失的 runner；可重试的状态码 | 记，同 §14.13 |
+| 重启；429/503 | 不记，同 §14.13 |
+
+- **做到了什么。** 静默限制不变时，满足这三条的拒绝不耗预算。问题常见的形态正好满足：扩张越过上限时，先前的连接都在下载；之后恢复步骤每次多试一个连接。
+- **没有保证的（不承诺能活下来）：**
+  - 一开始就同时开多个连接：第一个 step 为每个可用区间建一个 runner。新下载只有一个区间，续传可能有很多。在任何连接交付之前，每次拒绝都没有佐证，都要记：第一次被拒各记一次，所以 `max_attempts_per_range = 1` 时在这里就结束，和以前一样；第一次重试在 0.5–1 s 之后，如果那时还没有连接交付，它也要记，预算 2 就可能在第一次交付之前用完。
+  - 客户端已关闭、服务器仍在计数的连接（ureq2 的 issue #207）：这时的拒绝在窗口之内，要记。
+  - 运行中缩小的上限：拒绝在窗口之内，要记，直到上限降下来。降下来要连续三次拒绝和一个 tick 的进度；一个区间单独重试时，在 0、0.5、1.5、3.5 s 失败（不加抖动），所以可能先记四次；中间如果在那个水平上连上过一个连接，还会更多。预算小于 5 时，一次缩小就可能结束任务；5 在这个过程里还剩一次，但这是算出来的，不是保证。
+  - 接受连接之后不发数据或重置的服务器（§8.3、D26）。
+- 坏区间仍然会被耗尽：在窗口之内，它从第一次失败起就记。没被证实过的区间在窗口之上免记，直到上限降到其它连接的数目，之后在窗口之内的下一次重试开始记。只有一种形态计数不会前进：这个区间只作为 step 的试探被尝试，例如 `max_connections = 2`、旁边一个很长的健康区间。这和“服务器只接受一个连接”分不开。
+- **做法。** `AdmissionEvidence::exempts(class, proven, others)` 在 `on_attempt_ended` 记下同一次失败之后判定；`record_attempt_end` 返回 `Admission { class, exempt }`。`AttemptFailure::new` 仍按 `charges_range` 算 `charged`，`with_admission` 对免记的拒绝减回去，并带上 `class` 和 `exempt` 供诊断。`charges_range` 仍然只看错误和字节。
+- **验证。**
+  - 证据的单元测试：免记只给被佐证、在窗口之上的拒绝；窗口在降级时截断。
+  - 下载循环：
+    - `refusals_above_the_proven_window_are_not_charged`：静默限 4，预算 1、2、3、5，300 s 里所有拒绝都不记，任务不结束。
+    - `a_refused_range_inside_the_proven_window_is_exhausted`：五个已证实，一个重置之后它的区间在四个其它在途时被拒，每次都记，预算 B 时在第 B 次结束（B = 1、2、3、5）。
+    - `a_range_never_proven_is_charged_once_inside_the_window`：没被证实过的区间在窗口之上免记；上限降到 4 后，一个健康连接下完，下一次重试在窗口之内，记一次。
+    - `a_resumed_start_charges_its_first_refusals`：四个区间在任何连接交付之前同时连接，每个被拒一次、各记一次；四个健康连接紧接着交付（在第一次重试之前），预算 1 时结束，2、3、5 时继续，之后的拒绝免记，上限降到 4。这个结果依赖交付先于重试。
+    - `a_resumed_start_with_late_delivery_charges_until_corroborated`：同样的开始，但健康连接到第一个 tick（1.5 s）才交付。不加抖动时重试在 0.5 s 和 1.5 s，后者在 tick 的交付之前，所以预算 2、3 在任何佐证之前就以 `RangeExhausted` 结束；预算 5 活下来，每个区间记 3 次，之后的拒绝免记，上限降到 4。
+    - `a_shrinking_limit_charges_until_it_is_lowered`：八个已证实，服务器从 8 变成 7：单独重试的区间每次被拒都记，直到上限降到 7；预算 1、2、3 在第 B 次结束，5 时活下来。
+    - G6 的下载循环测试 `a_failing_range_ends_the_task_while_another_runner_writes` 改为先让两个连接都证实（窗口为 2），失败的区间在窗口之内被拒，第三次记的失败以 `RangeExhausted` 结束。原来的形态（失败的区间从没被证实）改成 `a_range_never_proven_is_exempt_above_the_window`：第一次拒绝时什么都没证实，记一次；之后在窗口之上，不记；丢失照常记，任务不结束。
+    - 性质测试新增不变量：`charged` 每次失败至多加 1；只有拒绝能免记，免记的不加；不免记的拒绝加 1。
+  - 端到端：两种方式都在两个连接已证实之后才切出被拒的连接，所有失败的 `charged` 都是 0。
+  - 变异检查：去掉免记，4 个下载循环测试失败。

@@ -547,12 +547,12 @@ fn test_custom_timer_survives_other_events() {
             ["strategy", "strategy", "strategy", "throughput"]
         );
         assert!(harness.download.writer.is_idle());
-        let stats = harness
-            .download
-            .manager
-            .runner_outcome_sampler_mut()
-            .stats();
-        assert_eq!(stats.connect_failed_retryable, 1, "{stats:?}");
+        // The lost connection was handled: its range backs off once.
+        let cooldowns = harness.download.manager.cooldowns();
+        assert!(
+            matches!(cooldowns[..], [(_, ref cooldown)] if cooldown.attempts == 1),
+            "{cooldowns:?}"
+        );
         assert!(progress_published(&mut harness.events));
         harness.teardown().await;
     });
@@ -731,6 +731,19 @@ async fn connecting_loop(
     total: u64,
     max_concurrency: usize,
 ) -> (DownloadLoop, FileWriter) {
+    let options =
+        TaskOptions::default().max_connections(NonZeroUsize::new(max_concurrency).unwrap());
+    loop_with_options(rt, adapter, total, &options).await
+}
+
+/// A loop on `rt` whose runners connect through `adapter`, built as a task
+/// does with `options`.
+async fn loop_with_options(
+    rt: ThreadedRuntimeImpl,
+    adapter: Arc<crate::adapter::AnyAdapter>,
+    total: u64,
+    options: &TaskOptions,
+) -> (DownloadLoop, FileWriter) {
     let file_writer = FileWriter::new_with_kind(Path::new(""), total, FileRangeWriterKind::Null)
         .await
         .unwrap();
@@ -742,14 +755,12 @@ async fn connecting_loop(
         crate::runner::DEFAULT_IDLE_TIMEOUT,
     );
     let (reporter, _status) = ProgressReporter::for_test();
-    let options =
-        TaskOptions::default().max_connections(NonZeroUsize::new(max_concurrency).unwrap());
     let download = DownloadLoop::new(
         total,
         spawner,
         &file_writer,
         reporter,
-        &options,
+        options,
         CancellationToken::new(),
     );
     (download, file_writer)
@@ -910,13 +921,15 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
     let mut rounds = Vec::new();
     for _ in 0..ticks {
         // `on_strategy_tick`, observing each split.
+        let now = Instant::now();
+        let signals = download.signals(now);
         let Some((_, actions)) = download.strategy.execute(
             download.max_concurrency,
             download.throughput.speed,
             download.throughput.per_runner_speed,
             &mut download.manager,
-            Instant::now(),
-            false,
+            now,
+            signals,
         ) else {
             continue;
         };
@@ -1235,6 +1248,7 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
     file_writer.finalize().await.unwrap();
 }
 
+mod admission;
 mod retry;
 
 /// Random sequences of the loop's steps, including failures that back their
@@ -1260,6 +1274,8 @@ mod split_properties {
     #[derive(Clone, Copy, Debug)]
     enum Failure {
         Retryable,
+        /// A restart once the runner received bytes (design §8.2).
+        Timeout,
         /// A 503 with this `Retry-After`, in seconds.
         Congestion(Option<u64>),
     }
@@ -1268,6 +1284,7 @@ mod split_properties {
         fn error(self) -> TaskError {
             match self {
                 Failure::Retryable => TaskError::ChannelClosed,
+                Failure::Timeout => TaskError::Timeout,
                 Failure::Congestion(retry_after) => TaskError::StreamError {
                     source: AdapterError::Unretryable {
                         source: UnretryableError::Congestion {
@@ -1312,6 +1329,7 @@ mod split_properties {
     fn failure() -> impl Strategy<Value = Failure> {
         prop_oneof![
             Just(Failure::Retryable),
+            Just(Failure::Timeout),
             prop::option::of(0..5u64).prop_map(Failure::Congestion),
         ]
     }
@@ -1396,24 +1414,25 @@ mod split_properties {
                 let Some(runner_id) = nth(&active, n) else {
                     return;
                 };
-                let attempts = download
-                    .manager
-                    .get_runner_state(runner_id)
-                    .unwrap()
-                    .attempts;
+                let state = download.manager.get_runner_state(runner_id).unwrap();
+                let (attempts, charged) = (state.attempts, state.charged);
                 let released = download.manager.mark_failed(runner_id).unwrap();
                 download.manager.release_runner(runner_id);
                 assert_eq!(released.attempts, attempts + 1, "the failure is counted");
-                download.back_off(
-                    &AttemptFailure {
-                        runner_id,
-                        error: failure.error(),
-                        retryable: matches!(failure, Failure::Retryable),
-                        range: released.range.clone(),
-                        attempts: released.attempts,
-                    },
-                    *now,
+                assert_eq!(released.charged, charged);
+                let failure = AttemptFailure::new(
+                    runner_id,
+                    failure.error(),
+                    !matches!(failure, Failure::Congestion(_)),
+                    released.clone(),
                 );
+                let charge = match failure.error {
+                    TaskError::ChannelClosed => 1,
+                    TaskError::Timeout => u32::from(released.received == 0),
+                    _ => 0,
+                };
+                assert_eq!(failure.charged, charged + charge, "{failure:?}");
+                download.back_off(&failure, *now);
                 if released.range.is_empty() {
                     return;
                 }
@@ -1425,6 +1444,7 @@ mod split_properties {
                     })
                     .expect("the released range backs off");
                 assert!(cooldown.attempts >= released.attempts);
+                assert!(cooldown.charged >= failure.charged);
                 assert!(cooldown.not_before >= *now + MIN_RANGE_BACKOFF);
             }
             Op::SplitAll(planned) => download.apply(StrategyAction::SplitAllTask(planned), *now),
@@ -1451,6 +1471,7 @@ mod split_properties {
         held: Vec<crate::task::RunnerId>,
         congested: bool,
         cooldowns: Vec<(std::ops::Range<u64>, Cooldown)>,
+        chunks: Vec<std::ops::Range<u64>>,
     }
 
     impl Before {
@@ -1462,6 +1483,7 @@ mod split_properties {
                 held: runners(download, max_connections, &[Pending, Running, Finished]),
                 congested: download.backoff.is_congested(now),
                 cooldowns: download.manager.cooldowns(),
+                chunks: download.manager.chunk_ranges(),
             }
         }
     }
@@ -1471,9 +1493,11 @@ mod split_properties {
     /// exactly once.
     ///
     /// The cooldowns lie in the unassigned ranges, merged where they touch,
-    /// and the loop wakes no later than the next one ends. A new runner
-    /// opened no connection while congested, claimed no range backing off,
-    /// and counts on from the failed attempts on its range.
+    /// and the loop wakes no later than the next one ends. Neither a
+    /// cooldown nor a chunk charges more failures than it counts. A new
+    /// runner opened no connection while congested, claimed no range
+    /// backing off, and counts on from the failed and the charged attempts
+    /// on its range; a split tail starts at none.
     fn check(download: &DownloadLoop, max_connections: usize, before: &Before) {
         use ChunkStatus::{Finished, Pending, Running};
 
@@ -1506,6 +1530,7 @@ mod split_properties {
                 range.start < range.end && cooldown.attempts >= 1,
                 "{range:?}"
             );
+            assert!(cooldown.charged <= cooldown.attempts, "{cooldown:?}");
             assert!(
                 available
                     .iter()
@@ -1523,12 +1548,31 @@ mod split_properties {
             );
         }
 
+        for &runner_id in &held {
+            let state = manager.get_runner_state(runner_id).unwrap();
+            assert!(
+                state.charged <= state.attempts,
+                "runner {runner_id}: {state:?}"
+            );
+        }
         for runner_id in held.into_iter().filter(|id| !before.held.contains(id)) {
             assert!(
                 !before.congested,
                 "runner {runner_id} connects while congested"
             );
             let state = manager.get_runner_state(runner_id).unwrap();
+            // A runner on a range a chunk held before is a split tail.
+            if before
+                .chunks
+                .iter()
+                .any(|chunk| overlaps(chunk, &state.allocated))
+            {
+                assert_eq!(
+                    (state.attempts, state.charged),
+                    (0, 0),
+                    "split tail of runner {runner_id}"
+                );
+            }
             let claimed: Vec<_> = before
                 .cooldowns
                 .iter()
@@ -1543,6 +1587,12 @@ mod split_properties {
             assert_eq!(
                 state.attempts,
                 claimed.iter().map(|c| c.attempts).max().unwrap_or(0),
+                "runner {runner_id} on {:?}",
+                state.allocated
+            );
+            assert_eq!(
+                state.charged,
+                claimed.iter().map(|c| c.charged).max().unwrap_or(0),
                 "runner {runner_id} on {:?}",
                 state.allocated
             );
