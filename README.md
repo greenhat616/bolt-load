@@ -26,6 +26,7 @@
 - **Multiple I/O backends** — mmap, pwrite thread pool, compio writer.
 - **Backpressure-aware** — lock-free SPSC ring-buffer channels prevent memory blow-up.
 - **Structured errors** — retryable vs. unretryable classification drives intelligent retry logic.
+- **Resumable downloads** — with `Resume::On`, an unfinished download keeps its blocks, checked by CRC32C on resume, and a later task downloads only the rest (see the [crate README](crates/bolt-load/README.md#resuming)).
 - **Observable** — EMA speed sampling, progress events, `indicatif` progress bars, `tracing` spans.
 
 ## Quick Start
@@ -101,11 +102,25 @@ progress, speed) for your own UI; dropping the `Task` cancels the download.
 
 ### Concurrency Control
 
-The engine monitors runner failure rates over a sliding window:
+The engine sets its connection limit from evidence, not failure rates:
 
-1. **Normal** — spawn up to CPU-core-count runners.
-2. **Degraded** — failure rate > 30% triggers stepwise concurrency reduction.
-3. **Recovering** — after 30 s cooldown, probe with +1 runner; commit if stable over 15 s.
+1. **Start** — spawn up to `max_connections` runners (8 by default, whatever the CPU count; `TaskBuilder::max_connections`).
+2. **Lower** — three refused connects in a row, while the runners already
+   connected keep delivering, lower the limit to those runners; a congestion
+   response (429/503) lowers it to the runners still active.
+3. **Recover** — after a wait, try one more connection. The step is kept
+   once it has held a delivering connection for 15 s; a refused step doubles
+   the wait (30 s up to 300 s).
+
+A range whose charged failures reach `max_attempts_per_range` (5 by
+default; `TaskBuilder::max_attempts_per_range`) fails the task with the
+range and its last error. Congestion, a timeout after the runner's own
+bytes, and a connect refused while another connection is delivering and at
+least as many others (and at least one) are in flight as the server was seen
+to serve at once are not charged; failed ranges back off and honour
+`Retry-After`. The
+[crate README](crates/bolt-load/README.md#options) lists every option and
+its default.
 
 ### File Writer Backends
 
@@ -115,6 +130,52 @@ The engine monitors runner failure rates over a sliding window:
 | `PoolWriter` | *(default)* | Thread-pool `pwrite` (portable) |
 | `CompioWriter` | `compio` | io_uring-based async writes (Linux) |
 | `NullWriter` | — | Discard output for benchmarking |
+
+## Resuming
+
+```rust,ignore
+use bolt_load::task::{Resume, Task};
+
+let task = Task::builder(adapter)
+    .runtime(ThreadedRuntimeImpl::new_tokio_rt())
+    .save_to("large-file.bin")
+    .resume(Resume::On)
+    .spawn()?;
+```
+
+A download that can be resumed keeps state: its size is known and not
+zero, it is not content-coded, and the server takes ranges and sends a
+strong `ETag` or a usable `Last-Modified` of at most 1024 bytes
+(`TaskInfo::resumable`). Started without a state file, any other download
+with `Resume::On` behaves as with `Resume::Off`. When a state file is
+there and the download cannot continue from it, the task fails with
+`DownloadError::ResumeRejected` and both files stay.
+
+When a resumable task fails, is cancelled, panics or cannot rename the
+file, it keeps `large-file.bin.downloading` and a state file,
+`large-file.bin.boltload` (`TaskStatus::kept_for_resume`); the next task
+with `Resume::On` checks every kept block and downloads only the rest. A
+resource that changes during the download (`ResourceChanged`) and a
+fallback to one connection first invalidate the state file, then discard
+both files. When that fails, both files stay:
+
+- a fallback whose state file cannot be emptied does not fall back: the
+  task stops with `DownloadError::Io` and keeps a pair that can still be
+  resumed (`kept_for_resume`);
+- a fallback whose state file was emptied but not synced, and a changed
+  resource whose state file cannot be emptied or synced, end with the
+  partial file in `leftover_temp_file`, not as a pair to resume.
+
+A task never starts over on its own: when what was kept cannot be
+continued, it fails with `DownloadError::ResumeRejected` and leaves both
+files, and `bolt_load::task::discard_partial` removes them. Resume with a
+new adapter so that the resource is checked as it is now. Details, limits
+and an example of starting over are in the
+[crate README](crates/bolt-load/README.md#resuming).
+
+bolt-load runs one download per task. Limits across tasks, such as how
+many download at once, connections per host or a shared speed limit,
+belong to the layer that runs the tasks, above `Task`.
 
 ## Workspace
 
@@ -203,31 +264,17 @@ RUSTFLAGS="--cfg tokio_unstable" cargo run --example test_performance
 
 ### Thread Control Algorithm
 
-The concurrent download engine uses a two-phase approach to find optimal parallelism:
-
-#### Slow Start
-
-Start with 1 runner, doubling each period until additional runners stop producing significant throughput gains:
-
-```math
-\begin{align}
-\text{if} \quad &|total\_speed_t - 2 \times total\_speed_{t-1}| < THRESHOLD_1 \\
-\text{then} \quad &thread_t = 2 \times thread_{t-1} \\
-\text{else} \quad &\text{break}
-\end{align}
-```
-
-#### Fine-Tuning
-
-After slow start, add one runner at a time by splitting the chunk with the longest remaining range:
-
-```math
-\begin{align}
-\text{if} \quad &|total\_speed_t - (total\_speed_{t-1} + avg\_speed)| > THRESHOLD_2 \;\&\&\; thread_t < MAX \\
-\text{then} \quad &thread_t = thread_{t-1} + 1 \\
-\text{else} \quad &thread_t = thread_{t-1}
-\end{align}
-```
+The concurrent engine grows by doubling. At most every 2 s, while every
+running runner delivers data, no runner is connecting and no 429 or 503
+holds the task back, it doubles the runners up to `max_connections`, by
+splitting the running ranges with the most left. A running runner that
+has been silent for at least 2 s, and running at least that long, does
+not hold the growth back. Each split needs at least 2 s of work at the
+split runner's own rate, or at the average rate per runner when it has
+none yet. Once a doubling gains less than 10% in speed, it stops growing. Slow or silent runners are
+restarted, and a stalled range at the end of the download is hedged by a
+second runner. The [crate README](crates/bolt-load/README.md#concurrency-control)
+describes the rules in full.
 
 ## MSRV
 
