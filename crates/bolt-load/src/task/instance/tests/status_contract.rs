@@ -301,12 +301,14 @@ fn incompressible(len: usize) -> Vec<u8> {
 
 /// A full response that turns out to be coded is decoded. The size the
 /// metadata names counts the coded bytes, so the total is unknown from the
-/// first byte on, whether the file is longer or shorter than that.
+/// first byte on, whether the file is longer or shorter than that. A body
+/// that decodes to nothing is an empty file (#153).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_coded_full_response_is_decoded_with_an_unknown_total() {
     for (case, content) in [
         ("compressible", create_deterministic_content(SIZE)),
         ("incompressible", incompressible(SIZE)),
+        ("empty", Vec::new()),
     ] {
         let encoded = gzip(&content).unwrap();
         assert_ne!(encoded.len(), content.len(), "{case}");
@@ -329,7 +331,7 @@ async fn test_a_coded_full_response_is_decoded_with_an_unknown_total() {
             }
         }
         assert_eq!(output.mode, DownloadMode::Singleton, "{case}");
-        assert_eq!(output.progress.total, Some(SIZE as u64), "{case}");
+        assert_eq!(output.progress.total, Some(content.len() as u64), "{case}");
         assert!(std::fs::read(&dest).unwrap() == content, "{case}");
     }
 }

@@ -65,6 +65,10 @@ impl TaskRunner {
 
     /// Check the delivered bytes against the size limit once the stream ended
     /// or reached it.
+    ///
+    /// An unknown total accepts any length, zero included: a stream that ends
+    /// without an error is complete as far as the HTTP framing can tell, so an
+    /// empty body is an empty file (#153).
     pub(super) fn validate_size(&self) -> RunResult {
         match self.total {
             Some(total) => match total.cmp(&self.downloaded) {
@@ -89,8 +93,7 @@ impl TaskRunner {
                     Err(TaskError::ExceededTotalSize.into())
                 }
             },
-            None if self.downloaded > 0 => Ok(()),
-            None => Err(TaskError::Empty.into()),
+            None => Ok(()),
         }
     }
 }

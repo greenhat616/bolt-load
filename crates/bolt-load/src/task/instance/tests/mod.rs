@@ -186,8 +186,7 @@ async fn test_singleton_task_cancellation() {
 }
 
 /// A zero size is unknown and selects the singleton mode, even when the
-/// concurrent mode is preferred. An empty stream of unknown size then fails
-/// with `Empty` (#153), so only the mode is checked here.
+/// concurrent mode is preferred. The empty body is then an empty file (#153).
 #[tokio::test]
 #[n0_tracing_test::traced_test]
 async fn test_zero_size_selects_singleton_mode() {
@@ -201,11 +200,17 @@ async fn test_zero_size_selects_singleton_mode() {
     );
     let status = task.status();
 
-    let result = watchdog(task).await;
+    let output = watchdog(task)
+        .await
+        .expect("an empty body is an empty file");
 
-    info!("Zero-size test result: {result:?}");
     let info = status.borrow().info.clone().expect("initialization ended");
     assert_eq!(info.mode, DownloadMode::Singleton);
+    assert_eq!(output.mode, DownloadMode::Singleton);
+    assert_eq!(output.progress.downloaded, 0);
+    assert_eq!(output.progress.total, Some(0));
+    assert_eq!(std::fs::read(&file_path).unwrap(), b"");
+    assert!(!tmp_path(&file_path).exists());
 }
 
 #[tokio::test]
