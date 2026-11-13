@@ -69,6 +69,9 @@ impl TaskRunner {
         match self.total {
             Some(total) => match total.cmp(&self.downloaded) {
                 Ordering::Equal => Ok(()),
+                // Also a valid 206 whose `Content-Range` ends before the
+                // requested end. The task treats it as transient and requests
+                // the rest from the received offset.
                 Ordering::Greater => {
                     warn!(
                         "runner: downloaded content is smaller than the total size, total: {}, \

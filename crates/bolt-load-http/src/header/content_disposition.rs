@@ -21,13 +21,10 @@ use super::ExtendedValue;
 
 /// Split at the index of the first `needle` if it exists or at the end.
 fn split_once(haystack: &str, needle: char) -> (&str, &str) {
-    haystack.find(needle).map_or_else(
-        || (haystack, ""),
-        |sc| {
-            let (first, last) = haystack.split_at(sc);
-            (first, last.split_at(1).1)
-        },
-    )
+    haystack.find(needle).map_or((haystack, ""), |sc| {
+        let (first, last) = haystack.split_at(sc);
+        (first, last.split_at(1).1)
+    })
 }
 
 /// Split at the index of the first `needle` if it exists or at the end, trim the right of the
@@ -538,7 +535,7 @@ mod tests {
     use http::HeaderValue;
 
     use super::{ContentDisposition, DispositionParam, DispositionType};
-    use crate::http::ExtendedValue;
+    use crate::header::ExtendedValue;
 
     #[test]
     fn test_from_raw_basic() {

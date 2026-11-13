@@ -899,9 +899,9 @@ mod tests {
         lifecycle_tx
             .try_push(LifecycleEvent::failed(TaskError::StreamError {
                 source: bolt_load_core::adapter::AdapterError::Unretryable {
-                    source: UnretryableError::ServiceUnavailable {
-                        status: "429".into(),
-                        description: "Too Many Requests".into(),
+                    source: UnretryableError::Congestion {
+                        status: 429,
+                        retry_after: None,
                     },
                 },
             }))

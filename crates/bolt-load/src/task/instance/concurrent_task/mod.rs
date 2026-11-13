@@ -1,26 +1,17 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 use async_waitgroup::WaitGroup;
-use bolt_load_core::adapter::AdapterError;
 use smol_cancellation_token::CancellationToken;
 
 use super::{
-    Result, TaskInstance,
-    drive::{self, Transfer},
-    output_file,
+    Result,
+    drive::Transfer,
+    output_file::{OutputFile, Teardown},
 };
 use crate::{
-    adapter::{AnyAdapter, UnretryableError},
-    runner::TaskError,
-    runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeImpl},
-    task::{
-        Progress, TaskOptions,
-        instance::{TaskControl, TaskEvent, TaskInstanceError},
-        meta,
-    },
+    adapter::AnyAdapter,
+    runtime::ThreadedRuntimeImpl,
+    task::{DownloadError, Progress, TaskOptions, status::ProgressReporter},
 };
 
 mod chunk_planner;
@@ -43,106 +34,14 @@ use runner_spawner::RunnerSpawner;
 
 static DEFAULT_MAX_CONCURRENCY: usize = 4;
 
-#[expect(
-    dead_code,
-    reason = "the initial progress is kept for resumable downloads"
-)]
-pub struct ConcurrentTask {
-    threaded_rt: ThreadedRuntimeImpl,
-    local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-    task: Option<TaskControl>,
-    progress: Progress,
-    options: TaskOptions,
-}
-
-impl ConcurrentTask {
-    pub fn new(
-        threaded_rt: ThreadedRuntimeImpl,
-        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-    ) -> Self {
-        Self::with_options(threaded_rt, local_runtime_builder, TaskOptions::default())
-    }
-
-    pub fn with_options(
-        threaded_rt: ThreadedRuntimeImpl,
-        local_runtime_builder: Option<LocalRuntimeBuilderImpl>,
-        options: TaskOptions,
-    ) -> Self {
-        Self {
-            threaded_rt,
-            local_runtime_builder,
-            task: None,
-            progress: Progress::default(),
-            options,
-        }
-    }
-}
-
-/// One download attempt, run on a local runtime by [`drive::spawn_on_local`].
-pub(super) fn concurrent_attempt(
-    adapter: Arc<AnyAdapter>,
-    path: PathBuf,
-    event_tx: async_channel::Sender<TaskEvent>,
-    cancel_token: CancellationToken,
+/// The transfer of the concurrent mode: runners download ranges in parallel.
+pub(crate) struct ConcurrentTaskInner {
     rt: ThreadedRuntimeImpl,
-    options: TaskOptions,
-) -> impl Future<Output = ()> + 'static {
-    let inner = ConcurrentTaskInner::new(adapter, path, event_tx.clone(), rt, options);
-    let task = drive::drive(inner, event_tx, cancel_token);
-    #[cfg(feature = "tracing")]
-    let task = tracing::Instrument::instrument(
-        task,
-        tracing::trace_span!(parent: None, "ConcurrentTask::background_task"),
-    );
-    task
-}
-
-impl TaskInstance for ConcurrentTask {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(skip_all, name = "ConcurrentTask::run")
-    )]
-    fn run(
-        &mut self,
-        adapter: Arc<AnyAdapter>,
-        path: PathBuf,
-        event_tx: async_channel::Sender<TaskEvent>,
-        cancel_token: CancellationToken,
-    ) -> Result<()> {
-        let options = self.options.clone();
-        let task = drive::spawn_on_local(
-            self.threaded_rt.clone(),
-            self.local_runtime_builder.clone(),
-            cancel_token.clone(),
-            // Built on the local runtime's thread, so it does not need to be `Send`.
-            move |rt| concurrent_attempt(adapter, path, event_tx, cancel_token, rt, options),
-        );
-        self.task = Some(task);
-        Ok(())
-    }
-
-    async fn stop(&mut self) -> Result<()> {
-        if let Some(task) = self.task.as_mut() {
-            task.stop().await;
-        }
-        Ok(())
-    }
-
-    async fn wait(&mut self) -> Result<()> {
-        if let Some(task) = self.task.as_mut() {
-            task.wait().await;
-        }
-        Ok(())
-    }
-}
-
-pub struct ConcurrentTaskInner {
-    rt: ThreadedRuntimeImpl,
-    path: PathBuf,
+    output: OutputFile,
     adapter: Arc<AnyAdapter>,
-    /// The initial progress of the task, for task resume
+    /// The progress of the task, kept for resumable downloads.
     progress: Progress,
-    event_tx: async_channel::Sender<TaskEvent>,
+    reporter: ProgressReporter,
     options: TaskOptions,
 }
 
@@ -155,71 +54,45 @@ enum RunnerStatus {
 }
 
 impl ConcurrentTaskInner {
-    fn new(
+    /// `total` must be non-zero; a zero size selects the singleton mode.
+    pub(crate) fn new(
         adapter: Arc<AnyAdapter>,
-        path: PathBuf,
-        event_tx: async_channel::Sender<TaskEvent>,
+        output: OutputFile,
+        total: u64,
         rt: ThreadedRuntimeImpl,
         options: TaskOptions,
+        reporter: ProgressReporter,
     ) -> Self {
+        debug_assert!(total > 0, "a concurrent task needs a known size");
         Self {
             rt,
-            path,
+            output,
             adapter,
-            progress: Progress::default(),
-            event_tx,
+            progress: Progress::new(Some(total), 0, Vec::new()),
+            reporter,
             options,
         }
-    }
-    /// Retrieve the meta data of the file
-    async fn retrieve_meta(&mut self) -> Result<()> {
-        let meta = meta::retrieve_meta(&self.adapter, &self.options.meta_retry, Some(&self.rt))
-            .await
-            .map_err(TaskInstanceError::new_retrieve_meta_failed)?;
-        let total = if meta.content_size == 0 {
-            return Err(TaskInstanceError::RetrieveMetaFailed {
-                source: AdapterError::Unretryable {
-                    source: UnretryableError::Whatever {
-                        message: "content size is 0; concurrent task does not support 0-size file"
-                            .to_string(),
-                        source: None,
-                    },
-                },
-            });
-        } else {
-            meta.content_size
-        };
-        if self.progress.total.is_some_and(|t| t != total) {
-            self.progress.total = Some(total);
-            self.progress.downloaded = 0;
-        } else if self.progress.total.is_none() {
-            self.progress.total = Some(total);
-        }
-        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn create_file_writer(&self, tmp_path: &Path) -> Result<FileWriter> {
-        let total_size = self.progress.total.ok_or_else(|| {
-            TaskInstanceError::new_failed(TaskError::Other {
-                message: "File writer creation called before meta retrieval".to_string(),
-            })
-        })?;
-        FileWriter::new(tmp_path, total_size).await.map_err(|e| {
-            TaskInstanceError::new_failed(TaskError::Other {
-                message: e.to_string(),
-            })
-        })
+        let total_size = self
+            .progress
+            .total
+            .ok_or_else(|| DownloadError::other("the concurrent task has no size"))?;
+        FileWriter::new(tmp_path, total_size)
+            .await
+            .map_err(|e| DownloadError::other(e.to_string()))
     }
 
-    /// Download into the temporary file, then publish it or discard it.
+    /// Download into the temporary file, then commit it or discard it.
     ///
     /// Returns only after every owned worker has exited.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
-        let tmp_path = output_file::tmp_path_for(&self.path);
+    async fn download(&mut self, cancel_token: &CancellationToken) -> Teardown {
+        let tmp_path = self.output.tmp.clone();
         let transfer = self.download_to(&tmp_path, cancel_token).await;
-        output_file::commit(transfer, &tmp_path, &self.path, cancel_token).await
+        self.output.commit(transfer, cancel_token).await
     }
 
     /// Run the transfer and tear it down on every path: success, failure and
@@ -251,7 +124,7 @@ impl ConcurrentTaskInner {
             total,
             spawner,
             &file_writer,
-            self.event_tx.clone(),
+            self.reporter.clone(),
             &self.options,
             cancel_token.clone(),
         );
@@ -259,11 +132,10 @@ impl ConcurrentTaskInner {
         let transfer_result = download.finish(transfer_result, &mut self.progress).await;
         // Always join the writer workers, so the file handle is released before
         // the temporary file is renamed or removed.
-        let finalize_result = file_writer.finalize().await.map_err(|e| {
-            TaskInstanceError::new_failed(TaskError::Other {
-                message: e.to_string(),
-            })
-        });
+        let finalize_result = file_writer
+            .finalize()
+            .await
+            .map_err(|e| DownloadError::other(e.to_string()));
 
         // The first error takes precedence.
         transfer_result.and(finalize_result)
@@ -271,10 +143,6 @@ impl ConcurrentTaskInner {
 }
 
 impl Transfer for ConcurrentTaskInner {
-    async fn prepare(&mut self) -> Result<()> {
-        self.retrieve_meta().await
-    }
-
     fn progress(&self) -> Progress {
         self.progress.clone()
     }
@@ -283,7 +151,7 @@ impl Transfer for ConcurrentTaskInner {
         self.progress.clone()
     }
 
-    async fn download(&mut self, cancel_token: &CancellationToken) -> Result<()> {
+    async fn download(&mut self, cancel_token: &CancellationToken) -> Teardown {
         ConcurrentTaskInner::download(self, cancel_token).await
     }
 }

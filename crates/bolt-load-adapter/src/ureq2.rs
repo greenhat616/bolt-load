@@ -1,19 +1,27 @@
-use std::{convert::AsRef, sync::Arc};
+use std::{
+    convert::AsRef,
+    ops::Range,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use blocking::unblock;
-use bolt_load_core::adapter::error::{
-    retryable::IoSnafu as RetryableIoSnafu,
-    unretryable::{
-        IoSnafu as UnretryableIoSnafu, NotFoundSnafu, ServiceUnavailableSnafu, UnauthorizedSnafu,
-    },
+use bolt_load_core::adapter::{
+    UnretryableError, error::unretryable::IoSnafu as UnretryableIoSnafu,
 };
-use bolt_load_utils::{http::ContentDisposition, reader::CrossRuntimeStream};
+use bolt_load_http::{
+    RangeHeaders, check_content_coding, classify_status,
+    header::{ContentDisposition, parse_retry_after},
+    limit_range_body, validate_range_response,
+};
+use bolt_load_utils::reader::CrossRuntimeStream;
 use futures::Stream;
 use snafu::IntoError;
 use ureq2::{Agent, Request};
 
 use super::{
-    AdapterError, AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, RetryableError,
+    AdapterError, AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange,
+    RetryableError,
 };
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
@@ -62,33 +70,53 @@ impl From<UreqError> for AdapterError {
                 )),
             }
             .into(),
-            ureq2::Error::Status(404, _) => NotFoundSnafu {}.build().into(),
-            ureq2::Error::Status(401, _) | ureq2::Error::Status(403, _) => UnauthorizedSnafu {
-                message: format!("http status code: {}", 401),
+            ureq2::Error::Status(status, response) => {
+                classify_status(status, retry_after(&response))
             }
-            .build()
-            .into(),
-            ureq2::Error::Status(503, _) | ureq2::Error::Status(429, _) => {
-                ServiceUnavailableSnafu {
-                    status: format!("{}", 503),
-                    description: e.to_string(),
-                }
-                .build()
-                .into()
-            }
-            ureq2::Error::Status(status, _) if status < 500 => UnretryableIoSnafu {}
-                .into_error(Arc::new(std::io::Error::other(format!(
-                    "http client error, status code: {}",
-                    status
-                ))))
-                .into(),
-            ureq2::Error::Status(status, _) => RetryableIoSnafu {}
-                .into_error(Arc::new(std::io::Error::other(format!(
-                    "http status code: {}",
-                    status
-                ))))
-                .into(),
         }
+    }
+}
+
+fn retry_after(response: &ureq2::Response) -> Option<Duration> {
+    response
+        .header(http::header::RETRY_AFTER.as_str())
+        .and_then(|v| parse_retry_after(v, SystemTime::now()))
+}
+
+/// Every line of a field, combined as [`RangeHeaders`] expects.
+fn combined(response: &ureq2::Response, name: &http::HeaderName) -> Option<String> {
+    let values = response.all(name.as_str());
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// Check that a range response carries `requested`, and return its range.
+fn check_range(
+    response: &ureq2::Response,
+    requested: Range<u64>,
+    expected_total: Option<u64>,
+) -> Result<ContentRange, AdapterError> {
+    let content_range = combined(response, &http::header::CONTENT_RANGE);
+    let content_type = combined(response, &http::header::CONTENT_TYPE);
+    let content_encoding = combined(response, &http::header::CONTENT_ENCODING);
+    let headers = RangeHeaders::default()
+        .with_content_range(content_range.as_deref())
+        .with_content_type(content_type.as_deref())
+        .with_content_encoding(content_encoding.as_deref())
+        .with_retry_after(retry_after(response));
+    validate_range_response(response.status(), &headers, requested, expected_total)
+}
+
+/// The response, also for an error status, so its headers can be checked.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error type is returned by ureq"
+)]
+fn any_status(
+    result: Result<ureq2::Response, ureq2::Error>,
+) -> Result<ureq2::Response, ureq2::Error> {
+    match result {
+        Err(ureq2::Error::Status(_, response)) => Ok(response),
+        result => result,
     }
 }
 
@@ -130,8 +158,25 @@ impl UreqAdapter {
         }
     }
 
+    /// Run `f` on the HEAD response, sent once and shared by the meta, the
+    /// range check and range detection.
+    async fn with_head<T>(&self, f: impl FnOnce(&ureq2::Response) -> T) -> Result<T, AdapterError> {
+        let mut head = self.head_response.lock().await;
+        let response = match head.take() {
+            Some(response) => response,
+            None => self.perform_head().await?,
+        };
+        let result = f(&response);
+        *head = Some(response);
+        Ok(result)
+    }
+
     async fn perform_head(&self) -> Result<ureq2::Response, AdapterError> {
-        let request = self.apply_before_request(self.agent.head(self.target.1.as_str()));
+        let request = self.apply_before_request(
+            self.agent
+                .head(self.target.1.as_str())
+                .set(http::header::ACCEPT_ENCODING.as_str(), "identity"),
+        );
         let call = self.call.clone();
         unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
             .await
@@ -158,6 +203,25 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 
 struct UreqStream(AnyStream<'static, Result<bytes::Bytes, std::io::Error>>);
 
+/// Classify an error reading the body. A connection lost mid-body is
+/// retryable, as it is on reqwest; a body that cannot be decoded is not.
+fn body_error(e: std::io::Error) -> AdapterError {
+    use std::io::ErrorKind;
+
+    let source = Arc::new(e);
+    match source.kind() {
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::TimedOut
+        | ErrorKind::Interrupted
+        | ErrorKind::NetworkDown => RetryableError::Io { source }.into(),
+        ErrorKind::InvalidData => UnretryableError::BodyUndecodable { source }.into(),
+        _ => UnretryableIoSnafu {}.into_error(source).into(),
+    }
+}
+
 impl Stream for UreqStream {
     type Item = Result<bytes::Bytes, AdapterError>;
 
@@ -167,28 +231,34 @@ impl Stream for UreqStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.get_mut().0)
             .poll_next(cx)
-            .map_err(|e| UnretryableIoSnafu {}.into_error(Arc::new(e)).into())
+            .map_err(body_error)
     }
 }
 
 impl BoltLoadAdapter for UreqAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
-        let response = self.perform_head().await?;
-        let content_size = self.get_content_size(&response);
-        let filename = self.suggest_filename(&response);
-        Ok(BoltLoadAdapterMeta {
-            content_size,
-            filename,
+        self.with_head(|response| {
+            BoltLoadAdapterMeta::new(self.get_content_size(response))
+                .with_filename(self.suggest_filename(response))
+                .with_content_encoding(combined(response, &http::header::CONTENT_ENCODING))
         })
+        .await
     }
 
     async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
-        let request =
-            self.apply_before_request(self.agent.request_url(&self.target.0, &self.target.1));
+        let request = self.apply_before_request(
+            self.agent
+                .request_url(&self.target.0, &self.target.1)
+                .set(http::header::ACCEPT_ENCODING.as_str(), "identity"),
+        );
         let call = self.call.clone();
         let res = unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
             .await
             .map_err(AdapterError::from)?;
+        check_content_coding(
+            combined(&res, &http::header::CONTENT_ENCODING).as_deref(),
+            combined(&res, &http::header::CONTENT_TYPE).as_deref(),
+        )?;
         let reader = res.into_reader();
         let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
         let ureq_stream = UreqStream(Box::pin(stream));
@@ -196,52 +266,58 @@ impl BoltLoadAdapter for UreqAdapter {
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
-        let request =
-            self.apply_before_request(self.agent.request_url(&self.target.0, &self.target.1).set(
-                http::header::RANGE.as_str(),
-                &format!("bytes={}-{}", start, end - 1),
-            ));
+        let request = self.apply_before_request(
+            self.agent
+                .request_url(&self.target.0, &self.target.1)
+                .set(
+                    http::header::RANGE.as_str(),
+                    &format!("bytes={}-{}", start, end - 1),
+                )
+                .set(http::header::ACCEPT_ENCODING.as_str(), "identity"),
+        );
         let call = self.call.clone();
-        let res = unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
+        let res =
+            unblock(move || any_status(Self::apply_call(call, request)).map_err(UreqError::from))
+                .await
+                .map_err(AdapterError::from)?;
+        let expected_total = self
+            .head_response
+            .lock()
             .await
-            .map_err(AdapterError::from)?;
+            .as_ref()
+            .map(|head| self.get_content_size(head))
+            .filter(|&size| size > 0);
+        let got = check_range(&res, start..end, expected_total)?;
         let reader = res.into_reader();
         let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
         let ureq_stream = UreqStream(Box::pin(stream));
-        Ok(Box::pin(ureq_stream))
+        Ok(limit_range_body(Box::pin(ureq_stream), got))
     }
 
     async fn is_range_stream_available(&self) -> bool {
-        let mut response = self.head_response.lock().await;
-        if response.is_none() {
-            match self.perform_head().await {
-                Ok(res) => *response = Some(res),
-                Err(_) => return false,
-            }
-        }
-        // check Accept-Ranges header
-        let mut is_range_supported = response
-            .as_ref()
-            .unwrap()
-            .header(http::header::ACCEPT_RANGES.as_str())
-            .is_some_and(|v| v == "bytes");
-        // try to send a real range request to test
+        // A weak signal: every range response is still checked.
+        let accepts_ranges = self
+            .with_head(|response| {
+                response
+                    .header(http::header::ACCEPT_RANGES.as_str())
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("bytes"))
+            })
+            .await;
+        let Ok(mut is_range_supported) = accepts_ranges else {
+            return false;
+        };
+        // Otherwise only a 206 that proves its offsets shows range support.
         if !is_range_supported {
             let request = self.apply_before_request(
                 self.agent
                     .request_url(&self.target.0, &self.target.1)
-                    .set(http::header::RANGE.as_str(), "bytes=0-8"),
+                    .set(http::header::RANGE.as_str(), "bytes=0-0")
+                    .set(http::header::ACCEPT_ENCODING.as_str(), "identity"),
             );
             let call = self.call.clone();
             is_range_supported = unblock(move || Self::apply_call(call, request))
                 .await
-                .map(|res| {
-                    res.header(http::header::CONTENT_RANGE.as_str()).is_some()
-                        && res
-                            .header(http::header::CONTENT_LENGTH.as_str())
-                            .is_some_and(|v| v.parse::<u64>().unwrap_or(0) > 1)
-                })
-                .unwrap_or_default();
+                .is_ok_and(|res| check_range(&res, 0..1, None).is_ok());
         }
         is_range_supported
     }
@@ -249,6 +325,37 @@ impl BoltLoadAdapter for UreqAdapter {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn a_lost_connection_is_retryable_and_a_bad_body_is_not() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                matches!(
+                    body_error(Error::from(kind)),
+                    AdapterError::Retryable { .. }
+                ),
+                "{kind:?}"
+            );
+        }
+        assert!(matches!(
+            body_error(Error::from(ErrorKind::InvalidData)),
+            AdapterError::Unretryable {
+                source: UnretryableError::BodyUndecodable { .. }
+            }
+        ));
+        assert!(matches!(
+            body_error(Error::from(ErrorKind::InvalidInput)),
+            AdapterError::Unretryable {
+                source: UnretryableError::Io { .. }
+            }
+        ));
+    }
+
     use bolt_load_tests::adapter::http_server::{self, DEFAULT_FILE_SIZE};
     use futures::StreamExt;
     use pretty_assertions::assert_eq;

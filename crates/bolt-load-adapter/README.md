@@ -26,7 +26,7 @@ let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
 - Lazy metadata initialization — a single `Range: bytes=0-0` probe
   detects range support and caches content size
 - Request interceptors via `before_request()` callback
-- Automatic error classification (404 → `NotFound`, 429 → `ServiceUnavailable`, etc.)
+- Automatic error classification (404 → `NotFound`, 429 → `Congestion`, etc.)
 
 ### Ureq (optional, feature `ureq2`)
 
@@ -43,30 +43,79 @@ let adapter = agent.into_ureq_adapter(("GET", url));
 - Blocking I/O offloaded to `blocking` thread pool for async compatibility
 - Request interceptors via `before_request()` callback
 - Custom request execution via `call()` callback (useful for mocking)
-- HEAD response caching for range support detection
+- One cached HEAD response for the meta, range detection and the total
+  that range responses must name
 
 ## Range Request Detection
 
 Both adapters probe the server to determine range request support:
 
-1. **Reqwest**: sends `Range: bytes=0-0`, checks for `Content-Range` in response
-2. **Ureq**: checks `Accept-Ranges: bytes` header, falls back to a probe request
+1. **Reqwest**: sends `Range: bytes=0-0`; range support needs a 206 whose
+   `Content-Range` is `bytes 0-0/…`. Otherwise `Accept-Ranges: bytes` on
+   a HEAD response counts.
+2. **Ureq**: checks `Accept-Ranges: bytes` on a HEAD response, falls back
+   to the same `bytes=0-0` probe.
+
+`Accept-Ranges` is only a hint, so every `range_stream` response is
+checked with `bolt_load_http::validate_range_response` before
+its body is read: a 200 is `RangeIgnored`, a content-encoded 206 is
+`RangeContentCoded`, and a 206 whose `Content-Range` does not start at
+the requested offset, runs past the requested end, names another total,
+or comes multipart is `RangeMismatch`. Repeated header lines are
+combined first, so a second `Content-Range` or `Content-Encoding` line
+is seen.
+
+Every request, HEAD and full downloads included, sends
+`Accept-Encoding: identity`: without the header a server may encode the
+body (RFC 9110 §12.5.3), and the file would hold the encoded bytes.
+`before_request` can still replace it.
+
+A client that decodes bodies removes `Content-Encoding` before the check
+can see it. The body is therefore held to its `Content-Range` length: it
+fails with `RangeBodyTooLong` past it, and with `RangeBodyTooShort` if it
+ends cleanly before.
+
+The task answers `RangeIgnored`, `RangeContentCoded`, these two errors
+and `BodyUndecodable` by starting over on one connection, with the size
+unknown. A full download that the client left content-coded fails with
+`ContentCoded` instead of writing the coded bytes, unless its
+`Content-Type` is the coding's own format (a `.tar.gz` served as
+`Content-Encoding: gzip`). The metadata records a coding it sees in
+`content_encoding`, and the task then skips ranges.
+
+- **Ureq** depends on ureq 2 without its default `gzip` feature. If
+  another crate in your build enables it, ureq decodes again and only the
+  cap is left.
+- **Reqwest** uses the `Client` you pass in. Build it with `no_gzip()`,
+  `no_brotli()`, `no_zstd()` and `no_deflate()` if it may enable
+  decoding; these exist even without the features.
 
 When range requests are available, bolt-load can use concurrent
 multi-runner downloads for higher throughput.
 
 ## Error Mapping
 
-HTTP status codes are mapped to structured `AdapterError` variants:
+Both adapters map HTTP statuses through `bolt_load_http::classify_status`,
+so they classify every status the same way. A custom HTTP adapter should
+call it too; see the `bolt-load-http` README.
 
 | Status | Error |
 |--------|-------|
-| 401, 403 | `Unauthorized` |
-| 404 | `NotFound` |
-| 429, 503 | `ServiceUnavailable` |
-| Network errors | `Retryable(Io)` |
-| Other 4xx | `Unretryable(Io)` |
-| Other 5xx | `Retryable(Io)` |
+| 401, 403 | `Unretryable(Unauthorized)` |
+| 404, 410 | `Unretryable(NotFound)` |
+| 408 | `Retryable(Status)` |
+| 416 | `Unretryable(RangeNotSatisfiable)`, carrying the total from `bytes */total` on range requests |
+| 429, 503 | `Unretryable(Congestion)`, carrying `Retry-After` |
+| Other 4xx | `Unretryable(Status)` |
+| Other 5xx | `Retryable(Status)` |
+| Network errors, including a body cut off mid-stream | `Retryable(Io)` |
+| A body that cannot be decoded, such as invalid gzip from a decoding reqwest `Client`, or `InvalidData` on ureq2 | `Unretryable(BodyUndecodable)` |
+| ureq2 only: a body read error of another kind, such as `InvalidInput` | `Unretryable(Io)` |
+| A full response left content-coded | `Unretryable(ContentCoded)` |
+
+`Retry-After` is parsed with `bolt_load_http::header::parse_retry_after`
+(delay-seconds or an HTTP-date) and clamped to 120 s
+(`MAX_RETRY_AFTER`); a value that parses as neither is dropped.
 
 ## Features
 
@@ -78,7 +127,8 @@ HTTP status codes are mapped to structured `AdapterError` variants:
 ## Dependencies
 
 Core dependencies include `bolt-load-core` (adapter trait),
-`bolt-load-utils` (HTTP header parsing, cross-runtime streams),
+`bolt-load-http` (status, range and coding checks, header parsing),
+`bolt-load-utils` (cross-runtime streams, telemetry),
 `url`, `bytes`, `futures`, and `async-lock`.
 
 ## License

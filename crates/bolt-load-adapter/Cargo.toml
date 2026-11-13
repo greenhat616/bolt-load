@@ -12,17 +12,24 @@ categories.workspace = true
 
 [features]
 default = ["reqwest"]
-reqwest = ["dep:reqwest", "bolt-load-utils/http", "bolt-load-utils/tracing", "dep:async-once-cell"]
+reqwest = [
+    "dep:reqwest",
+    "dep:hyper",
+    "dep:bolt-load-http",
+    "bolt-load-utils/tracing",
+    "dep:async-once-cell",
+]
 ureq2 = [
     "dep:ureq2",
     "bolt-load-utils/reader",
-    "bolt-load-utils/http",
+    "dep:bolt-load-http",
     "dep:blocking",
     "dep:http",
 ]
 
 [dependencies]
 bolt-load-core = { path = "../bolt-load-core", version = "0.2" }
+bolt-load-http = { path = "../bolt-load-http", version = "0.2", optional = true }
 bolt-load-utils = { path = "../bolt-load-utils", version = "0.2" }
 
 futures = { workspace = true }
@@ -41,12 +48,22 @@ http = { version = "1", optional = true }
 reqwest = { version = "0.13", optional = true, features = [
     "stream",
 ], default-features = false }
+# Only to tell a broken connection from an undecodable body in reqwest's errors.
+hyper = { version = "1", optional = true, default-features = false }
 # for ureq adapter
-ureq2 = { version = "2", package = "ureq", optional = true }
+# No `gzip`: a decoding client hides `Content-Encoding` from the range check.
+ureq2 = { version = "2", package = "ureq", optional = true, default-features = false, features = [
+    "tls",
+] }
 ureq3 = { version = "3", package = "ureq", optional = true }
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = true, features = ["stream"] }
+# `gzip` for the decoding-client tests in `tests/body_decoding.rs` and
+# `tests/content_coding.rs`.
+reqwest = { version = "0.13", default-features = true, features = [
+    "stream",
+    "gzip",
+] }
 tokio = { workspace = true, features = ["full"] }
 pretty_assertions = { workspace = true }
 n0-tracing-test = { workspace = true }

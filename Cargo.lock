@@ -81,6 +81,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compression"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f10dafd0c8d2e51ae9a748805777613ed0bbe17bf586b76c8311f45c020a32f"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-executor"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -253,17 +265,6 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
-
-[[package]]
-name = "atomic_enum"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99e1aca718ea7b89985790c94aad72d77533063fe00bc497bb79a7c2dae6a661"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "autocfg"
@@ -492,7 +493,6 @@ dependencies = [
  "async-ringbuf",
  "async-stream",
  "async-waitgroup",
- "atomic_enum",
  "backon",
  "bitvec",
  "blocking",
@@ -507,7 +507,6 @@ dependencies = [
  "criterion",
  "derive_more",
  "dynosaur",
- "enum_dispatch",
  "fs-err",
  "futures",
  "futures-concurrency",
@@ -527,6 +526,7 @@ dependencies = [
  "pin-project-lite",
  "pretty_assertions",
  "regex",
+ "reqwest",
  "serde",
  "smol",
  "smol-cancellation-token",
@@ -538,6 +538,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tracing-tracy",
+ "ureq 2.12.1",
  "url",
  "windows-sys 0.61.2",
 ]
@@ -550,11 +551,13 @@ dependencies = [
  "async-once-cell",
  "blocking",
  "bolt-load-core",
+ "bolt-load-http",
  "bolt-load-tests",
  "bolt-load-utils",
  "bytes",
  "futures",
  "http",
+ "hyper",
  "n0-tracing-test",
  "pretty_assertions",
  "reqwest",
@@ -576,11 +579,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bolt-load-http"
+version = "0.2.0"
+dependencies = [
+ "bolt-load-core",
+ "bytes",
+ "futures",
+ "headers",
+ "http",
+ "httpdate",
+ "language-tags",
+ "percent-encoding",
+ "pretty_assertions",
+ "regex",
+]
+
+[[package]]
 name = "bolt-load-sync"
 version = "0.2.0"
 dependencies = [
+ "bolt-load-sync",
  "event-listener",
  "futures",
+ "futures-core",
  "loom",
  "pretty_assertions",
 ]
@@ -600,6 +621,7 @@ dependencies = [
  "bolt-load-utils",
  "bytes",
  "derive_more",
+ "flate2",
  "futures",
  "governor",
  "n0-tracing-test",
@@ -622,13 +644,7 @@ dependencies = [
  "blocking",
  "bytes",
  "futures",
- "headers",
- "http",
- "language-tags",
  "n0-tracing-test",
- "percent-encoding",
- "pretty_assertions",
- "regex",
  "tokio",
  "tracing",
 ]
@@ -909,6 +925,23 @@ dependencies = [
  "cfg-if",
  "loom",
 ]
+
+[[package]]
+name = "compression-codecs"
+version = "0.4.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58a6d0db8759036a783bc7c3f7a07f8cef3bf9470eb1db3bc86e8bcd1c5d0fe8"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e8ccc4ea9f6acc32d102c0f6d471d11d913ad15f20c04de743374861fa1d414"
 
 [[package]]
 name = "concurrent-queue"
@@ -1244,18 +1277,6 @@ dependencies = [
  "rustversion",
  "scopeguard",
  "simdutf8",
-]
-
-[[package]]
-name = "enum_dispatch"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
-dependencies = [
- "once_cell",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -3631,12 +3652,17 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -3814,7 +3840,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
 dependencies = [
  "base64 0.22.1",
- "flate2",
  "log",
  "once_cell",
  "rustls",

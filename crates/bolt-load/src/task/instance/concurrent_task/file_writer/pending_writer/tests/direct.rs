@@ -15,7 +15,7 @@ use futures::{
     task::{Spawn, SpawnError},
 };
 
-use super::{
+use super::super::{
     super::{
         CloseOnExit, Command, FileRangeWriterImpl, FileRangeWriterKind, null_writer::NullWriter,
     },
@@ -430,7 +430,7 @@ async fn test_cancelled_download_joins_blocked_fallback_before_finalize() {
     use bolt_load_tests::adapter::simple::SimpleTestAdapter;
     use smol_cancellation_token::CancellationToken;
 
-    use super::super::super::{RunnerSpawner, download_loop::DownloadLoop};
+    use super::super::super::super::{RunnerSpawner, download_loop::DownloadLoop};
     use crate::{
         adapter::DynBoltLoadAdapter,
         task::{Progress, TaskOptions},
@@ -450,7 +450,7 @@ async fn test_cancelled_download_joins_blocked_fallback_before_finalize() {
                 range: 0..0,
                 data: Bytes::new(),
             },
-            super::super::WriteReply::Awaited(ack),
+            super::super::super::WriteReply::Awaited(ack),
         ))
         .unwrap();
     let cancel = CancellationToken::new();
@@ -461,12 +461,12 @@ async fn test_cancelled_download_joins_blocked_fallback_before_finalize() {
         cancel.child_token(),
         crate::runner::DEFAULT_IDLE_TIMEOUT,
     );
-    let (events, _events_rx) = async_channel::unbounded();
+    let (reporter, _status) = crate::task::status::ProgressReporter::for_test();
     let mut download = DownloadLoop::new(
         1,
         spawner,
         &writer,
-        events,
+        reporter,
         &TaskOptions::default(),
         cancel.clone(),
     );

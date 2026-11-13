@@ -119,6 +119,89 @@ impl FaultPlan {
     }
 }
 
+/// How the range fault server (`http_server::create_range_fault_server`)
+/// answers. HEAD requests and requests without `Range` always get the whole
+/// resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeFault {
+    /// Answer range requests with 200 and the whole resource.
+    IgnoreRange,
+    /// Answer from one byte past the requested start, labelled honestly,
+    /// except to the `bytes=0-0` probe. A one-byte range at the end starts
+    /// one byte early instead.
+    ShiftedStart,
+    /// Name a total one byte too large, except to the `bytes=0-0` probe,
+    /// as if the resource changed after the probe.
+    WrongTotal,
+    /// Answer range requests with 416 and `bytes */total`.
+    Unsatisfiable,
+    /// Answer range requests with 503 and `Retry-After`
+    /// ([`CONGESTED_RETRY_AFTER_SECS`]).
+    Congested,
+    /// Mark range responses `Content-Encoding: gzip`; the body stays plain.
+    Gzip,
+    /// Serve the gzip-encoded resource to every request, despite
+    /// `Accept-Encoding: identity`. Lengths and ranges count encoded bytes,
+    /// as RFC 9110 has it.
+    EncodedRepresentation,
+    /// Cut the first range response other than the probe off halfway
+    /// through its body.
+    Truncated,
+    /// Answer the first range request other than the probe with the first
+    /// half of the requested range. From then on, answer every request with
+    /// 200 and [`RangeFault::replacement`], as if the resource were replaced
+    /// by a server that ignores ranges.
+    ReplacedAfterShortRange,
+}
+
+/// The `Retry-After` seconds of [`RangeFault::Congested`].
+pub const CONGESTED_RETRY_AFTER_SECS: u64 = 2;
+
+impl RangeFault {
+    pub const ALL: [Self; 9] = [
+        Self::IgnoreRange,
+        Self::ShiftedStart,
+        Self::WrongTotal,
+        Self::Unsatisfiable,
+        Self::Congested,
+        Self::Gzip,
+        Self::EncodedRepresentation,
+        Self::Truncated,
+        Self::ReplacedAfterShortRange,
+    ];
+
+    /// The URL path that serves this fault.
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::IgnoreRange => "/ignore-range",
+            Self::ShiftedStart => "/shifted-start",
+            Self::WrongTotal => "/wrong-total",
+            Self::Unsatisfiable => "/unsatisfiable",
+            Self::Congested => "/congested",
+            Self::Gzip => "/gzip",
+            Self::EncodedRepresentation => "/encoded-representation",
+            Self::Truncated => "/truncated",
+            Self::ReplacedAfterShortRange => "/replaced-after-short-range",
+        }
+    }
+
+    /// What [`RangeFault::ReplacedAfterShortRange`] serves once replaced:
+    /// the last sixteenth of `content`, at least one byte. It differs, and is
+    /// shorter than what the first ranges write, so a file that was not
+    /// truncated shows their bytes after it.
+    pub fn replacement(content: &[u8]) -> bytes::Bytes {
+        let len = (content.len() / 16).max(1);
+        bytes::Bytes::copy_from_slice(&content[content.len() - len..])
+    }
+
+    /// The fault served at `/{name}`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|fault| fault.path().strip_prefix('/') == Some(name))
+    }
+}
+
 /// Increments a counter for as long as it is alive.
 #[derive(Debug)]
 pub struct CounterGuard(Arc<AtomicUsize>);

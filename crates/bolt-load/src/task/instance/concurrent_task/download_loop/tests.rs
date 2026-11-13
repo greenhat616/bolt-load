@@ -27,10 +27,12 @@ use super::{
 };
 use crate::{
     adapter::{AdapterError, DynBoltLoadAdapter},
+    runner::TaskError,
     runtime::{
         DowncastLocalRuntime, DynTimer, ThreadedRuntime, ThreadedRuntimeImpl, Timer, TimerBuilder,
         TimerImpl,
     },
+    task::{StatusReceiver, status::ProgressReporter},
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -48,12 +50,12 @@ async fn test_split_after_failed_resize_does_not_allocate_tail() {
         CancellationToken::new(),
         crate::runner::DEFAULT_IDLE_TIMEOUT,
     );
-    let (event_tx, _event_rx) = async_channel::unbounded();
+    let (reporter, _status) = ProgressReporter::for_test();
     let mut download = DownloadLoop::new(
         1000,
         spawner,
         &file_writer,
-        event_tx,
+        reporter,
         &TaskOptions::default(),
         CancellationToken::new(),
     );
@@ -293,11 +295,12 @@ impl Source {
 
 /// The source whose handling ended the loop.
 fn outcome(result: &Result<()>) -> &'static str {
-    let Err(TaskInstanceError::Failed { source }) = result else {
-        panic!("unexpected loop result: {result:?}");
+    let source = match result {
+        Err(DownloadError::Cancelled) => return "cancel",
+        Err(DownloadError::Transfer { source }) => source,
+        _ => panic!("unexpected loop result: {result:?}"),
     };
     match &**source {
-        TaskError::Cancelled => "cancel",
         TaskError::NoProgress { .. } => "deadline",
         TaskError::Other { message } if message.starts_with("write failed") => "writer",
         // A rejected runner spawn is an unretryable attempt failure.
@@ -314,7 +317,7 @@ struct LoopHarness {
     file_writer: FileWriter,
     rt: ScriptedRuntime,
     cancel: CancellationToken,
-    events: async_channel::Receiver<TaskEvent>,
+    events: StatusReceiver,
 }
 
 impl LoopHarness {
@@ -333,13 +336,13 @@ impl LoopHarness {
             CancellationToken::new(),
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         );
-        let (event_tx, events) = async_channel::unbounded();
+        let (reporter, events) = ProgressReporter::for_test();
         let cancel = CancellationToken::new();
         let mut download = DownloadLoop::new(
             LOOP_TOTAL,
             spawner,
             &file_writer,
-            event_tx,
+            reporter,
             &options,
             cancel.clone(),
         );
@@ -404,11 +407,11 @@ impl LoopHarness {
     }
 }
 
-/// Drain the progress events published so far.
-fn progress_events(events: &async_channel::Receiver<TaskEvent>) -> usize {
-    std::iter::from_fn(|| events.try_recv().ok())
-        .filter(|e| matches!(e, TaskEvent::Downloading(_)))
-        .count()
+/// Whether progress was published since the last call.
+fn progress_published(events: &mut StatusReceiver) -> bool {
+    let changed = events.has_changed();
+    events.mark_unchanged();
+    changed
 }
 
 /// Pairs `(higher, lower)`: every pair of the six sources.
@@ -546,7 +549,7 @@ fn test_custom_timer_survives_other_events() {
             .runner_outcome_sampler_mut()
             .stats();
         assert_eq!(stats.connect_failed_retryable, 1, "{stats:?}");
-        assert_eq!(progress_events(&harness.events), 1);
+        assert!(progress_published(&mut harness.events));
         harness.teardown().await;
     });
 }
@@ -557,7 +560,7 @@ fn test_timer_rearms_after_consecutive_ticks() {
     on_each_executor(|| async {
         let mut harness = LoopHarness::scripted(false).await;
         let script = harness.rt.script.clone();
-        let events = harness.events.clone();
+        let mut events = harness.events.clone();
         let cancel = harness.cancel.clone();
         let wakes = Arc::new(WakeCount::default());
         let waker = futures::task::waker(wakes.clone());
@@ -570,7 +573,7 @@ fn test_timer_rearms_after_consecutive_ticks() {
                 script.permit("throughput");
                 wakes.wait_past(seen);
                 assert!(run.as_mut().poll(&mut cx).is_pending());
-                assert_eq!(progress_events(&events), 1, "tick {tick}");
+                assert!(progress_published(&mut events), "tick {tick}");
             }
             cancel.cancel();
             let Poll::Ready(result) = run.as_mut().poll(&mut cx) else {
@@ -587,15 +590,13 @@ fn test_timer_rearms_after_consecutive_ticks() {
         // Before the harness creates the timers the ticks are counted from.
         let started = Instant::now();
         let mut harness = LoopHarness::new(timers, TaskOptions::default()).await;
-        let events = harness.events.clone();
+        let mut events = harness.events.clone();
         let cancel = harness.cancel.clone();
         drop(std::thread::spawn(move || {
-            let mut ticks = 0;
-            while ticks < 3 {
-                match events.recv_blocking() {
-                    Ok(TaskEvent::Downloading(_)) => ticks += 1,
-                    Ok(_) => {}
-                    Err(_) => return,
+            // Each change needs at least one tick.
+            for _ in 0..3 {
+                if events.changed_blocking().is_err() {
+                    return;
                 }
             }
             cancel.cancel();
@@ -736,12 +737,12 @@ async fn connecting_loop(
         CancellationToken::new(),
         crate::runner::DEFAULT_IDLE_TIMEOUT,
     );
-    let (event_tx, _events) = async_channel::unbounded();
+    let (reporter, _status) = ProgressReporter::for_test();
     let mut download = DownloadLoop::new(
         total,
         spawner,
         &file_writer,
-        event_tx,
+        reporter,
         &TaskOptions::default(),
         CancellationToken::new(),
     );

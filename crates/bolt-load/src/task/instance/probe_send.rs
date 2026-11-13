@@ -6,44 +6,29 @@
 //! without `-Zhigher-ranked-assumptions` to see whether that workaround is
 //! still needed.
 
-use std::sync::Arc;
-
 use bolt_load_tests::adapter::simple::SimpleTestAdapter;
 use smol_cancellation_token::CancellationToken;
 
-use super::{concurrent_task::concurrent_attempt, singleton_task::singleton_attempt};
+use super::drive::{Attempt, run};
 use crate::{
-    adapter::{AnyAdapter, DynBoltLoadAdapter},
+    adapter::DynBoltLoadAdapter,
     runtime::ThreadedRuntimeImpl,
-    task::TaskOptions,
+    task::{TaskOptions, destination::Destination, status::StatusPublisher},
 };
 
 fn assert_send<F: Future<Output = ()> + Send + 'static>(_: &F) {}
 
-fn adapter() -> Arc<AnyAdapter> {
-    DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024))
-}
-
 #[test]
 fn attempts_are_send() {
-    let rt = ThreadedRuntimeImpl::new_tokio_rt();
-    let (event_tx, _event_rx) = async_channel::unbounded();
-    let concurrent = concurrent_attempt(
-        adapter(),
-        "concurrent.bin".into(),
-        event_tx.clone(),
-        CancellationToken::new(),
-        rt.clone(),
-        TaskOptions::default(),
-    );
-    assert_send(&concurrent);
-    let singleton = singleton_attempt(
-        adapter(),
-        "singleton.bin".into(),
-        event_tx,
-        CancellationToken::new(),
-        rt,
-        TaskOptions::default(),
-    );
-    assert_send(&singleton);
+    let attempt = Attempt {
+        adapter: DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024)),
+        destination: Destination::File("attempt.bin".into()),
+        prefer_mode: None,
+        options: TaskOptions::default(),
+        meta: None,
+        cancel_token: CancellationToken::new(),
+    };
+    let (publisher, _status) = StatusPublisher::new();
+    let attempt = run(attempt, ThreadedRuntimeImpl::new_tokio_rt(), publisher);
+    assert_send(&attempt);
 }

@@ -12,8 +12,9 @@ use super::{
     DownloadLoop, LoopEvent, RunnerTick,
 };
 use crate::{
+    adapter::{AdapterError, UnretryableError},
     runner::TaskError,
-    task::instance::{Result, TaskInstanceError},
+    task::{DownloadError, FallbackReason, instance::Result},
 };
 
 impl DownloadLoop {
@@ -31,12 +32,16 @@ impl DownloadLoop {
         if let Some(chunk) = tick.downloaded {
             self.accept_chunk(chunk)?;
         }
-        if let Some(failure) = tick.failure
-            && let Some(e) = self
+        if let Some(failure) = tick.failure {
+            if let Some(e) = range_unsupported(&failure.error) {
+                return Err(e);
+            }
+            if let Some(e) = self
                 .policy
                 .on_failure(&failure, self.manager.allocated_runner_count())
-        {
-            return Err(TaskInstanceError::new_failed(e));
+            {
+                return Err(DownloadError::transfer(e));
+            }
         }
         Ok(if tick.state == TaskState::Finished {
             ControlFlow::Break(())
@@ -58,12 +63,98 @@ impl DownloadLoop {
     }
 }
 
+/// The error that ends the concurrent mode for the single-connection
+/// fallback, when `error` shows that ranges cannot carry the file.
+///
+/// Only these exact causes count: any other range mismatch may be a changed
+/// resource, which one connection would not fix.
+fn range_unsupported(error: &TaskError) -> Option<DownloadError> {
+    let TaskError::StreamError {
+        source: source @ AdapterError::Unretryable { source: cause },
+    } = error
+    else {
+        return None;
+    };
+    let reason = match cause {
+        UnretryableError::RangeIgnored => FallbackReason::RangeIgnored,
+        UnretryableError::RangeContentCoded { .. }
+        | UnretryableError::RangeBodyTooLong { .. }
+        | UnretryableError::RangeBodyTooShort { .. }
+        | UnretryableError::BodyUndecodable { .. } => FallbackReason::ContentCoded,
+        _ => return None,
+    };
+    Some(DownloadError::RangeUnsupported {
+        reason,
+        source: source.clone(),
+    })
+}
+
 #[cold]
-fn writer_full(e: WriterFullError) -> TaskInstanceError {
-    TaskInstanceError::new_failed(TaskError::Other {
+fn writer_full(e: WriterFullError) -> DownloadError {
+    DownloadError::transfer(TaskError::Other {
         message: format!(
             "writer full (invariant violation): {:?}",
             e.pending_write.range
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bolt_load_core::adapter::{ContentRange, RetryableError};
+
+    use super::*;
+
+    fn reason(error: impl Into<AdapterError>) -> Option<FallbackReason> {
+        let error = TaskError::StreamError {
+            source: error.into(),
+        };
+        match range_unsupported(&error)? {
+            DownloadError::RangeUnsupported { reason, .. } => Some(reason),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_errors_that_rule_out_ranges_fall_back() {
+        let got = ContentRange {
+            first: 0,
+            last: 9,
+            complete: Some(10),
+        };
+        let io = || Arc::new(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        assert_eq!(
+            reason(UnretryableError::RangeIgnored),
+            Some(FallbackReason::RangeIgnored)
+        );
+        for coded in [
+            UnretryableError::RangeContentCoded {
+                coding: "gzip".into(),
+            },
+            UnretryableError::RangeBodyTooLong { got },
+            UnretryableError::RangeBodyTooShort { got, received: 4 },
+            UnretryableError::BodyUndecodable { source: io() },
+        ] {
+            assert_eq!(reason(coded), Some(FallbackReason::ContentCoded));
+        }
+        // A mismatch may be a changed resource; the others are not about
+        // ranges at all.
+        for other in [
+            AdapterError::from(UnretryableError::RangeMismatch {
+                requested: 0..10,
+                got: Some(got),
+            }),
+            UnretryableError::ContentCoded {
+                coding: "gzip".into(),
+            }
+            .into(),
+            UnretryableError::Io { source: io() }.into(),
+            RetryableError::Io { source: io() }.into(),
+        ] {
+            assert_eq!(reason(other), None);
+        }
+        assert!(range_unsupported(&TaskError::Timeout).is_none());
+    }
 }

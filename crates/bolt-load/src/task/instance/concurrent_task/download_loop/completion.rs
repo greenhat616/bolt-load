@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use super::{DownloadLoop, LoopEvent, WriteCompletion};
 use crate::{
     runner::TaskError,
-    task::instance::{Result, TaskInstanceError},
+    task::{DownloadError, instance::Result},
 };
 
 pub(super) fn check_completions(completions: Vec<WriteCompletion>) -> Result<usize> {
@@ -14,7 +14,7 @@ pub(super) fn check_completions(completions: Vec<WriteCompletion>) -> Result<usi
                 written += (c.range.end - c.range.start) as usize;
             }
             Err(e) => {
-                return Err(TaskInstanceError::new_failed(TaskError::Other {
+                return Err(DownloadError::transfer(TaskError::Other {
                     message: format!("write failed at {:?}: {e}", c.range),
                 }));
             }

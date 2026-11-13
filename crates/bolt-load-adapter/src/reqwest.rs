@@ -1,19 +1,30 @@
-use std::{pin::Pin, sync::Arc};
+use std::{
+    error::Error as _,
+    io::ErrorKind,
+    ops::Range,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_once_cell::OnceCell;
-use bolt_load_core::adapter::error::unretryable::{
-    NotFoundSnafu, ServiceUnavailableSnafu, UnauthorizedSnafu,
+use bolt_load_http::{
+    ContentCoding, RangeHeaders, check_content_coding, classify_status,
+    header::{ContentDisposition, parse_retry_after},
+    limit_range_body, validate_range_response,
 };
-use bolt_load_utils::http::ContentDisposition;
 use futures::Stream;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{
+    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_RANGE, CONTENT_TYPE, HeaderName, RANGE, RETRY_AFTER,
+};
 use snafu::IntoError;
 use url::Url;
 
 use super::{
-    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta,
+    AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange,
     error::{
-        AdapterError, RetryableError, retryable::IoSnafu as RetryableIoSnafu,
+        AdapterError, UnretryableError, retryable::IoSnafu as RetryableIoSnafu,
         unretryable::IoSnafu as UnretryableIoSnafu,
     },
 };
@@ -78,40 +89,16 @@ pub struct ReqwestError {
 
 impl From<ReqwestError> for AdapterError {
     fn from(ReqwestError { source: e }: ReqwestError) -> Self {
-        if let Some(status_code) = e.status()
-            && status_code.is_client_error()
-        {
-            match status_code {
-                reqwest::StatusCode::NOT_FOUND => {
-                    return NotFoundSnafu {}.build().into();
-                }
-                reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::UNAUTHORIZED => {
-                    return UnauthorizedSnafu {
-                        message: e.to_string(),
-                    }
-                    .build()
-                    .into();
-                }
-                reqwest::StatusCode::TOO_MANY_REQUESTS
-                | reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-                    return ServiceUnavailableSnafu {
-                        status: format!(
-                            "{} {}",
-                            status_code,
-                            status_code.canonical_reason().unwrap_or("unknown")
-                        ),
-                        description: e.to_string(),
-                    }
-                    .build()
-                    .into();
-                }
-                _ => {
-                    return RetryableError::Io {
-                        source: Arc::new(std::io::Error::other(e.to_string())),
-                    }
-                    .into();
-                }
+        // Responses go through `check_status`; this only catches a status
+        // error whose headers are already gone.
+        if let Some(status) = e.status() {
+            return classify_status(status.as_u16(), None);
+        }
+        if is_undecodable(&e) {
+            return UnretryableError::BodyUndecodable {
+                source: Arc::new(std::io::Error::new(ErrorKind::InvalidData, e.to_string())),
             }
+            .into();
         }
         if e.is_builder() || e.is_body() {
             return UnretryableIoSnafu {}
@@ -126,14 +113,75 @@ impl From<ReqwestError> for AdapterError {
     }
 }
 
+fn header<'a>(response: &'a reqwest::Response, name: &HeaderName) -> Option<&'a str> {
+    response.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Every line of a field, combined as [`RangeHeaders`] expects.
+fn combined(response: &reqwest::Response, name: &HeaderName) -> Option<String> {
+    let values: Vec<_> = response
+        .headers()
+        .get_all(name)
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()))
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// The combined `Content-Encoding`, unless it is `identity`.
+fn content_coding(response: &reqwest::Response) -> Option<String> {
+    combined(response, &CONTENT_ENCODING)
+        .filter(|value| !ContentCoding::parse_list(value).is_empty())
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    header(response, &RETRY_AFTER).and_then(|v| parse_retry_after(v, SystemTime::now()))
+}
+
+/// Classify an error status. Unlike `error_for_status`, this still sees the
+/// headers, so `Retry-After` reaches [`classify_status`].
+fn check_status(response: reqwest::Response) -> Result<reqwest::Response, AdapterError> {
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return Ok(response);
+    }
+    Err(classify_status(status.as_u16(), retry_after(&response)))
+}
+
+/// Check that a range response carries `requested`, and return its range.
+fn check_range(
+    response: &reqwest::Response,
+    requested: Range<u64>,
+    expected_total: Option<u64>,
+) -> Result<ContentRange, AdapterError> {
+    let content_range = combined(response, &CONTENT_RANGE);
+    let content_type = combined(response, &CONTENT_TYPE);
+    let content_encoding = combined(response, &CONTENT_ENCODING);
+    let headers = RangeHeaders::default()
+        .with_content_range(content_range.as_deref())
+        .with_content_type(content_type.as_deref())
+        .with_content_encoding(content_encoding.as_deref())
+        .with_retry_after(retry_after(response));
+    validate_range_response(
+        response.status().as_u16(),
+        &headers,
+        requested,
+        expected_total,
+    )
+}
+
 impl ReqwestAdapter {
     async fn perform_head(&self) -> Result<reqwest::Response, AdapterError> {
         let response = self
-            .apply_before_request(self.client.head(self.target.1.clone()))
+            .apply_before_request(
+                self.client
+                    .head(self.target.1.clone())
+                    .header(ACCEPT_ENCODING, "identity"),
+            )
             .send()
             .await
             .map_err(ReqwestError::from)?;
-        Ok(response.error_for_status().map_err(ReqwestError::from)?)
+        check_status(response)
     }
 
     pub fn before_request(
@@ -200,6 +248,32 @@ impl ReqwestAdapter {
     }
 }
 
+/// Whether the body bytes themselves could not be decoded, as opposed to a
+/// connection that broke while they were decoded.
+///
+/// A client built with a decoder reports every body error as a decode error,
+/// plain bodies included. The source chain tells the two apart: a broken
+/// connection carries a `hyper::Error`, a decoder failure only the decoder's
+/// `io::Error` (`InvalidData` for a bad header, `UnexpectedEof` for a stream
+/// that stops early). Retrying cannot fix the latter.
+fn is_undecodable(e: &reqwest::Error) -> bool {
+    if !e.is_decode() || e.is_timeout() {
+        return false;
+    }
+    let mut undecodable = false;
+    let mut source = e.source();
+    while let Some(error) = source {
+        if error.is::<hyper::Error>() {
+            return false;
+        }
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            undecodable |= matches!(io.kind(), ErrorKind::InvalidData | ErrorKind::UnexpectedEof);
+        }
+        source = error.source();
+    }
+    undecodable
+}
+
 struct ReqwestStream<'a>(AnyStream<'a, Result<bytes::Bytes, reqwest::Error>>);
 
 impl<'a> Stream for ReqwestStream<'a> {
@@ -223,46 +297,44 @@ async fn fetch_remote_meta(adapter: &ReqwestAdapter) -> Result<Context, AdapterE
             adapter
                 .client
                 .request(method.clone(), url.clone())
-                .header(RANGE, "bytes=0-0"),
+                .header(RANGE, "bytes=0-0")
+                .header(ACCEPT_ENCODING, "identity"),
         )
         .send()
         .await
         .map_err(ReqwestError::from)?;
 
-    let mut is_range_stream_available = false;
-
-    if let Ok(response) = response.error_for_status() {
-        match ReqwestAdapter::get_content_size(&response) {
-            ContentSize::ContentRange(size) => {
-                return Ok(Context {
-                    is_range_stream_available: true,
-                    meta: BoltLoadAdapterMeta {
-                        content_size: size,
-                        filename: ReqwestAdapter::suggest_filename(&response).await,
-                    },
-                });
-            }
-            ContentSize::ContentLength(0) => {
-                is_range_stream_available = true;
-            }
-            _ => {}
-        }
+    // Only a 206 that proves its offsets shows range support; a coded one
+    // does not.
+    let probed = check_range(&response, 0..1, None).ok();
+    let probe_coding = content_coding(&response);
+    let mut is_range_stream_available = probed.is_some();
+    if let Some(size) = probed.and_then(|range| range.complete) {
+        return Ok(Context {
+            is_range_stream_available,
+            meta: BoltLoadAdapterMeta::new(size)
+                .with_filename(ReqwestAdapter::suggest_filename(&response).await),
+        });
     }
 
     // Try to perform a `HEAD` request to get the meta
     let response = adapter.perform_head().await?;
-    if !is_range_stream_available && response.headers().get(ACCEPT_RANGES).is_some() {
+    // A weak signal: every range response is still checked.
+    if !is_range_stream_available
+        && header(&response, &ACCEPT_RANGES).is_some_and(|v| v.trim().eq_ignore_ascii_case("bytes"))
+    {
         is_range_stream_available = true;
     }
 
     return Ok(Context {
         is_range_stream_available,
-        meta: BoltLoadAdapterMeta {
-            content_size: ReqwestAdapter::get_content_size(&response)
+        meta: BoltLoadAdapterMeta::new(
+            ReqwestAdapter::get_content_size(&response)
                 .to_u64()
                 .unwrap_or_default(),
-            filename: ReqwestAdapter::suggest_filename(&response).await,
-        },
+        )
+        .with_filename(ReqwestAdapter::suggest_filename(&response).await)
+        .with_content_encoding(content_coding(&response).or(probe_coding)),
     });
 }
 
@@ -270,10 +342,7 @@ impl BoltLoadAdapter for ReqwestAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
         let context = self.get_context().await?;
 
-        Ok(BoltLoadAdapterMeta {
-            content_size: context.meta.content_size,
-            filename: context.meta.filename.clone(),
-        })
+        Ok(context.meta.clone())
     }
 
     async fn is_range_stream_available(&self) -> bool {
@@ -287,13 +356,18 @@ impl BoltLoadAdapter for ReqwestAdapter {
         let response = self
             .apply_before_request(
                 self.client
-                    .request(self.target.0.clone(), self.target.1.clone()),
+                    .request(self.target.0.clone(), self.target.1.clone())
+                    .header(ACCEPT_ENCODING, "identity"),
             )
             .send()
             .await
-            .map_err(ReqwestError::from)?
-            .error_for_status()
             .map_err(ReqwestError::from)?;
+        let response = check_status(response)?;
+        // A decoding client has dropped the header of what it decodes.
+        check_content_coding(
+            combined(&response, &CONTENT_ENCODING).as_deref(),
+            combined(&response, &CONTENT_TYPE).as_deref(),
+        )?;
         let stream = ReqwestStream(Box::pin(response.bytes_stream()));
         Ok(Box::pin(stream))
     }
@@ -303,15 +377,20 @@ impl BoltLoadAdapter for ReqwestAdapter {
             .apply_before_request(
                 self.client
                     .request(self.target.0.clone(), self.target.1.clone())
-                    .header(RANGE, format!("bytes={}-{}", start, end - 1)),
+                    .header(RANGE, format!("bytes={}-{}", start, end - 1))
+                    .header(ACCEPT_ENCODING, "identity"),
             )
             .send()
             .await
-            .map_err(ReqwestError::from)?
-            .error_for_status()
             .map_err(ReqwestError::from)?;
+        let expected_total = self
+            .context
+            .get()
+            .map(|context| context.meta.content_size)
+            .filter(|&size| size > 0);
+        let got = check_range(&response, start..end, expected_total)?;
         let stream = ReqwestStream(Box::pin(response.bytes_stream()));
-        Ok(Box::pin(stream))
+        Ok(limit_range_body(Box::pin(stream), got))
     }
 }
 

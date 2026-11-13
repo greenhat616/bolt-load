@@ -62,8 +62,6 @@ futures-concurrency = "7"
 pin-project-lite = "0.2"
 url = "2"
 bytes = "1"
-enum_dispatch = "0.3"
-atomic_enum = "0.3"
 tempfile = "3"
 smol-cancellation-token = "0.1"
 derive_more = { version = "2", features = ["debug"] }
@@ -122,6 +120,13 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 bolt-load-tests = { path = "../bolt-load-tests" }
+# for the adapter integration tests (`tests/range_faults.rs`); `gzip` for
+# its decoding client
+reqwest = { version = "0.13", default-features = false, features = ["gzip"] }
+# Without `gzip`, as the adapter has it; the default would turn it on.
+ureq2 = { version = "2", package = "ureq", default-features = false, features = [
+    "tls",
+] }
 
 pretty_assertions = { workspace = true }
 n0-tracing-test = { workspace = true }

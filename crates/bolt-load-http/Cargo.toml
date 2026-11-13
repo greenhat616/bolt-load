@@ -1,0 +1,28 @@
+[package]
+name = "bolt-load-http"
+description = "HTTP helpers for bolt-load adapters: status classification, range and content-coding checks, header parsing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bolt-load-core = { path = "../bolt-load-core", version = "0.2" }
+
+bytes = { workspace = true }
+futures = { workspace = true }
+
+# Header parsing
+http = "1"
+headers = "0.4"
+regex = "1"
+language-tags = "0.3"
+percent-encoding = "2.3"
+httpdate = "1"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

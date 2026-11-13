@@ -1,5 +1,7 @@
 use futures::stream::BoxStream;
+mod content_range;
 pub mod error;
+pub use content_range::{ContentRange, InvalidContentRange};
 pub use error::{AdapterError, RetryableError, UnretryableError};
 use error::{UnretryableSnafu, unretryable::RangeStreamNotSupportedSnafu};
 use snafu::ResultExt;
@@ -42,11 +44,48 @@ pub trait BoltLoadAdapter: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BoltLoadAdapterMeta {
     /// the content size
     pub content_size: u64,
     /// suggested filename
     pub filename: Option<String>,
+    /// The combined `Content-Encoding` of the metadata responses, when it is
+    /// not `identity`. The content size then counts encoded bytes, and the
+    /// task downloads over one connection until the stream ends.
+    pub content_encoding: Option<String>,
+}
+
+impl BoltLoadAdapterMeta {
+    /// Metadata for `content_size` bytes, with no suggested filename and no
+    /// content coding.
+    pub fn new(content_size: u64) -> Self {
+        Self {
+            content_size,
+            filename: None,
+            content_encoding: None,
+        }
+    }
+
+    /// Set the suggested filename.
+    pub fn with_filename(mut self, filename: Option<String>) -> Self {
+        self.filename = filename;
+        self
+    }
+
+    /// Set the content coding; an `identity` value is dropped.
+    pub fn with_content_encoding(mut self, content_encoding: Option<String>) -> Self {
+        self.content_encoding = content_encoding.filter(|value| !is_identity(value));
+        self
+    }
+}
+
+/// Whether a combined `Content-Encoding` value lists only `identity`.
+fn is_identity(content_encoding: &str) -> bool {
+    content_encoding
+        .split(',')
+        .map(str::trim)
+        .all(|coding| coding.is_empty() || coding.eq_ignore_ascii_case("identity"))
 }
 
 pub type AnyStream<'a, T> = BoxStream<'a, T>;
@@ -71,10 +110,7 @@ mod tests {
 
     impl BoltLoadAdapter for MetaOnly {
         async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
-            Ok(BoltLoadAdapterMeta {
-                content_size: 1,
-                filename: None,
-            })
+            Ok(BoltLoadAdapterMeta::new(1))
         }
 
         async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
@@ -108,5 +144,17 @@ mod tests {
                 "{err:?}"
             );
         });
+    }
+
+    #[test]
+    fn meta_drops_an_identity_coding() {
+        for value in ["", "identity", " Identity ", "identity, identity", ","] {
+            let meta = BoltLoadAdapterMeta::new(1).with_content_encoding(Some(value.into()));
+            assert_eq!(meta.content_encoding, None, "{value:?}");
+        }
+        for value in ["gzip", "identity, gzip"] {
+            let meta = BoltLoadAdapterMeta::new(1).with_content_encoding(Some(value.into()));
+            assert_eq!(meta.content_encoding.as_deref(), Some(value));
+        }
     }
 }

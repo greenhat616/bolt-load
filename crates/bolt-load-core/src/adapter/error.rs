@@ -28,21 +28,74 @@ impl From<UnretryableError> for AdapterError {
 }
 
 pub mod unretryable {
-    use std::sync::Arc;
+    use std::{ops::Range, sync::Arc, time::Duration};
 
     use snafu::prelude::*;
 
-    use super::retryable::RetryableError;
+    use super::{super::ContentRange, retryable::RetryableError};
 
     #[derive(Debug, Snafu, Clone)]
     #[snafu(visibility(pub))]
+    #[non_exhaustive]
     pub enum UnretryableError {
-        #[snafu(display("access denied: {message}"))]
-        Unauthorized { message: String },
-        #[snafu(display("resource not found"))]
-        NotFound,
-        #[snafu(display("service unavailable: {status} {description}"))]
-        ServiceUnavailable { status: String, description: String },
+        #[snafu(display("access denied ({status}): {message}"))]
+        Unauthorized { status: u16, message: String },
+        #[snafu(display("resource not found ({status})"))]
+        NotFound { status: u16 },
+        /// The server rejects the load (429/503). `retry_after` is the
+        /// server's `Retry-After`, when it sent a usable one.
+        #[snafu(display("server is congested ({status})"))]
+        Congestion {
+            status: u16,
+            retry_after: Option<Duration>,
+        },
+        /// A status with no more specific variant.
+        #[snafu(display("unexpected http status {status}"))]
+        Status { status: u16 },
+        /// The server answered a range request with the whole resource.
+        #[snafu(display("server ignored the range request"))]
+        RangeIgnored,
+        /// The response does not prove it carries the requested bytes.
+        #[snafu(display(
+            "range response does not match bytes {}-{}: {}",
+            requested.start,
+            requested.end.saturating_sub(1),
+            got.map_or_else(|| "no usable Content-Range".to_owned(), |got| got.to_string())
+        ))]
+        RangeMismatch {
+            requested: Range<u64>,
+            got: Option<ContentRange>,
+        },
+        /// The range response would match, but it is content-coded:
+        /// `Content-Range` counts encoded bytes, which are not the file's.
+        /// `coding` is the combined `Content-Encoding`.
+        #[snafu(display("range response is content-coded ({coding})"))]
+        RangeContentCoded { coding: String },
+        /// The body of a range response runs past its `Content-Range`. A
+        /// client that decodes a content-coded body and drops
+        /// `Content-Encoding` does this.
+        #[snafu(display("range response body runs past {got}; the client may have decoded it"))]
+        RangeBodyTooLong { got: ContentRange },
+        /// The body of a range response ends cleanly before its
+        /// `Content-Range` is covered. A client that decodes a body that
+        /// does not compress does this; so does a server that miscounts.
+        #[snafu(display(
+            "range response body ends after {received} bytes of {got}; the client may have \
+             decoded it"
+        ))]
+        RangeBodyTooShort { got: ContentRange, received: u64 },
+        /// The HTTP client could not decode the body, for example a
+        /// content-coded range that starts mid-stream.
+        #[snafu(display("response body cannot be decoded: {source}"))]
+        BodyUndecodable { source: Arc<std::io::Error> },
+        /// A full response is content-coded and the HTTP client left it so.
+        /// Its body is not the file. `coding` is the combined
+        /// `Content-Encoding`.
+        #[snafu(display("response is content-coded ({coding}) and was not decoded"))]
+        ContentCoded { coding: String },
+        /// 416. `total` comes from `Content-Range: bytes */total`.
+        #[snafu(display("range not satisfiable (total {total:?})"))]
+        RangeNotSatisfiable { total: Option<u64> },
         #[snafu(display("internal error: {message}"))]
         /// The error is internal. such as a http request, we do not retrieve the meta, and we call the range stream directly
         Internal { message: String },
@@ -65,6 +118,7 @@ pub mod unretryable {
         pub fn from_retryable_error(e: RetryableError) -> Self {
             match e {
                 RetryableError::Io { source: e } => Self::Io { source: e },
+                RetryableError::Status { status } => Self::Status { status },
             }
         }
     }
@@ -85,8 +139,12 @@ pub mod retryable {
 
     #[derive(Debug, Snafu, Clone)]
     #[snafu(visibility(pub))]
+    #[non_exhaustive]
     pub enum RetryableError {
         #[snafu(display("io error: {source}"))]
         Io { source: Arc<std::io::Error> },
+        /// A status worth retrying, such as 408 or a 5xx.
+        #[snafu(display("http status {status}"))]
+        Status { status: u16 },
     }
 }
