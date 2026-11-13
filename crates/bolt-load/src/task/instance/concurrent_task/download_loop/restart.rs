@@ -68,7 +68,7 @@ impl DownloadLoop {
         let stopped = self.manager.stop_runner(runner_id);
         if stopped {
             debug!("[TASK] stopping slow runner {runner_id}: {context:?}");
-            self.strategy.on_restarted();
+            self.strategy.on_restarted(now);
         }
         stopped
     }
@@ -97,7 +97,7 @@ impl DownloadLoop {
                 "[TASK] stopping silent runner {runner_id}, silent since {:?}",
                 self.manager.silent_since(runner_id, now)
             );
-            self.strategy.on_restarted();
+            self.strategy.on_restarted(now);
         }
     }
 

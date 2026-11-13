@@ -60,6 +60,8 @@
 | | C32 `feat(task): checksum and sync written blocks at checkpoints` | T21 | |
 | | C33 `feat(task): write a state file while downloading` | T21 | |
 | | C20 `feat(task): resume from a checked state file` | T21 | |
+| PR-7e 停滞之后再试探 | C40 `feat(task): hold a plateau and probe it again` | T31 | PR-6a、PR-7b；放在 PR-9d 之上（`feat/hardening-47-adaptive-window`） |
+| | C41 `bench(task): add the silent limit and the plateau scenarios` | T31 | |
 
 **合并约束**：
 
@@ -635,3 +637,20 @@
   - 注意：PR 合入之后还要再改一次，把“待合入”改成“已完成”。
 - [x] 全部完成之后，对照 IDM 的策略（`crates/bolt-load/docs/idm-improvement-plan.md` §8、`idm-strategy-full.md`）盘点 bolt-load 还缺什么，写进 design 末尾的“实现说明”，再请用户决定要不要补。见 design §14.32。
 - [x] 全部完成之后，更新 `crates/bolt-load/README.md` 和根目录 `README.md`，补充新配置项 `max_connections`、`max_attempts_per_range`、`Limits`，以及续传的说明。`Limits` 随 P2 推迟（§14.31），没有写；两份 README 都说明了跨任务的限额不在 bolt-load 里。
+
+---
+
+## T31 — 停滞之后再试探（C40、C41，D28–D31）
+
+维护者 2026-11-13 的决定：没有增益的翻倍不再让扩张永久停止，改为保持、按退避再试探（G11）；多开的 runner 不停掉（D28）。编号接在 T22 之后。
+
+- [x] C40：`DoublingStrategy` 的 `Mode::{Ramp, Hold}`、`reprobe_wait`（30 s 起，没有增益加倍，最多 300 s，有增益恢复）、待判断扩张的截止时间 `connect_timeout + 5 × grow_interval`；保持时补位到 `h`、到时间从当时的活跃数 `b ≥ h` 试探到 `min(2b, 上限)`，至少加 `⌈b/2⌉`（D31，2026-11-16）；`want` 由扩张一侧交给并发控制，对冲只看 `limit_cap`（design §9.2、§14.33）。
+- [x] C40：design §14.14、§14.18 里“停滞之后不再扩张、不补位”和“上限处无限期等待”标为已被取代；新增 §14.33、G11、D28–D31。
+- [ ] C41：bench 场景 `s5_silent_limit_4`（C36 的服务器，`Close` 和 `Hang` 两种）、`s6_plateau_then_more_bandwidth`、`s1_max32` 加长到能判断 16 → 32；重跑原有的表，更新 design §14.17。
+
+**验证**
+
+- 单元测试（注入 `now`）：保持之后到 `reprobe_at` 才试探（早 1 ns 不试探）；没有增益的试探依次等 30、60、120、240、300、300 s；有增益回到扩张、等待恢复；不确定（截止时间、加的不到一半、重启）等待不变；保持时补到 `h`、`h` 之上不加；`h = 4`、上限 6 试探到 6；`h = 8`、上限 6 要 step；`h = 8`、上限 4、6 个在跑不加；`h = 8`、上限 9 不试探；保持 4、8 个在跑时从 8 试探；补不满的扩张到截止时间结束。
+- 下载循环测试：长下载在带宽回来之后再扩张；多开的 runner 一直在跑时也到时间试探；保持时空出来的区间只领取到 `h`；保持数在上限之上时上限按 step 升到保持数为止。
+- 性质测试：新增 runner 不超过 `min(limit_cap, want)`，对冲例外但不超过 `limit_cap`；同样的操作重放结果相同。
+- 被改写的测试列出新旧断言（design §14.33）。

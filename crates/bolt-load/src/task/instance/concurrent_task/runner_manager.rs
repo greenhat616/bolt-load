@@ -867,6 +867,13 @@ impl RunnerManager {
         self.chunk_planner.min_chunk_size = size;
     }
 
+    /// See [`ChunkPlanner::population`].
+    ///
+    /// [`ChunkPlanner::population`]: super::chunk_planner::ChunkPlanner::population
+    pub(super) fn population(&self) -> u64 {
+        self.chunk_planner.population()
+    }
+
     /// The chunks of the connecting and the running runners
     pub(super) fn active_chunks(&self) -> impl Iterator<Item = &ChunkState> {
         self.chunk_planner

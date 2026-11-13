@@ -20,6 +20,8 @@ pub use backoff::Backoff;
 pub use backoff::MIN_RANGE_BACKOFF;
 pub use concurrency_control_strategy::ConcurrencyControlConfig;
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
+#[cfg(test)]
+pub use doubling_strategy::{BASE_REPROBE_WAIT, growth_deadline};
 use doubling_strategy::{DoublingStrategy, DoublingStrategyContext};
 #[cfg(test)]
 pub use doubling_strategy::{GROW_INTERVAL, MIN_GROWTH_GAIN};
@@ -81,7 +83,7 @@ impl StrategyControl {
     /// `connect_timeout` to connect.
     pub fn new(max_connections: usize, connect_timeout: Duration) -> Self {
         Self {
-            doubling_strategy: DoublingStrategy::default(),
+            doubling_strategy: DoublingStrategy::new(connect_timeout),
             concurrency_control_strategy: ConcurrencyControlStrategy::new(
                 ConcurrencyControlConfig::with_connect_timeout(connect_timeout),
                 max_connections,
@@ -90,16 +92,33 @@ impl StrategyControl {
         }
     }
 
-    /// The connections the growth side wants open.
-    fn want(&self) -> usize {
-        self.max_connections
+    /// The connections the growth side wants open, see
+    /// [`DoublingStrategy::want`].
+    pub fn want(&self) -> usize {
+        self.doubling_strategy.want(self.max_connections)
     }
 
-    /// The connections new runners may take now, see
-    /// [`ConcurrencyControlStrategy::refill_cap`].
-    pub fn refill_cap(&self, admission: &AdmissionEvidence) -> usize {
+    /// Hold `h` runners as a gainless doubling would, probed again at
+    /// `reprobe_at`.
+    #[cfg(test)]
+    pub fn hold(&mut self, h: usize, reprobe_at: Instant) {
+        self.doubling_strategy.set_hold(h, reprobe_at);
+    }
+
+    /// When the growth's hold is probed next; `None` while ramping.
+    #[cfg(test)]
+    pub fn reprobe_at(&self) -> Option<Instant> {
+        self.doubling_strategy.reprobe_at()
+    }
+
+    /// The connections the limit controller lets new runners take now,
+    /// whatever the growth wants: see
+    /// [`ConcurrencyControlStrategy::refill_cap`]. The endgame hedge is
+    /// gated by it, so it may open one connection above a hold (design
+    /// §9.6, §14.33).
+    pub fn limit_cap(&self, admission: &AdmissionEvidence) -> usize {
         self.concurrency_control_strategy
-            .refill_cap(self.want(), admission)
+            .refill_cap(self.max_connections, admission)
     }
 
     /// The connections the runners may take now, see
@@ -122,7 +141,9 @@ impl StrategyControl {
     /// is created and none is split. No runner is created for a range still
     /// backing off (design §8.1). Nothing is added while the active runners
     /// reach `min(max_concurrency, cap)`, see
-    /// [`ConcurrencyControlStrategy::refill_cap`].
+    /// [`ConcurrencyControlStrategy::refill_cap`], with what the growth
+    /// wants: the growth asks the limit controller for connections through
+    /// `want`, and adds them within its cap (design §8.3, §9.2).
     ///
     /// The doubling strategy steps on `tick`, the runners over the tick
     /// that ends at `now`.
@@ -135,9 +156,12 @@ impl StrategyControl {
         tick: &TickSample,
     ) -> Option<(&'static str, Vec<StrategyAction>)> {
         let congested = signals.congested;
+        // A probe past its deadline wants nothing more from this step on.
+        self.doubling_strategy.expire(now);
         let want = self.want();
         let mut context = Self::context(want, runner_manager, now, signals);
         let active_runners = context.active_runners;
+        let eligible_ranges = !context.available_chunks.is_empty();
         trace!("[STRATEGY] Concurrency control strategy context: {context:?}");
         let actions = self.concurrency_control_strategy.step(&mut context);
 
@@ -146,20 +170,21 @@ impl StrategyControl {
             return Some((ConcurrencyControlStrategy::name(), actions));
         }
 
-        // Growth adds runners up to `cap`, never above it: the limit
-        // controller's cap, short of a running step's trial once a refusal
-        // marked it (design §8.3).
-        let cap = self
-            .concurrency_control_strategy
-            .refill_cap(want, runner_manager.admission_mut())
+        // Growth adds runners up to the limit controller's cap, never above
+        // it, short of a running step's trial once a refusal marked it
+        // (design §8.3); within it, the growth keeps to what it wants.
+        let limit_cap = self
+            .limit_cap(runner_manager.admission_mut())
             .min(max_concurrency);
         let mut context = DoublingStrategyContext {
             now,
             active_runners,
-            max_concurrency: cap,
+            max_concurrency: limit_cap,
+            eligible_ranges,
             congested,
             all_delivering: tick.all_delivering,
             silent_runners: tick.silent,
+            stable: tick.stable,
             speed: tick.speed,
             // No speed limit before design §10.
             speed_limit: None,
@@ -169,9 +194,10 @@ impl StrategyControl {
         (!actions.is_empty()).then(|| (DoublingStrategy::name(), actions))
     }
 
-    /// The loop stopped a runner to restart its range (design §9.5).
-    pub fn on_restarted(&mut self) {
-        self.doubling_strategy.on_restarted();
+    /// The loop stopped a runner at `now` to restart its range (design
+    /// §9.5).
+    pub fn on_restarted(&mut self, now: Instant) {
+        self.doubling_strategy.on_restarted(now);
     }
 
     /// The loop added `added` runners for a [`StrategyAction::Grow`].
