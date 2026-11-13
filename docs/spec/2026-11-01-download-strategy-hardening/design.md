@@ -2910,3 +2910,87 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - codex 第一轮之后加的：reqwest 的克隆不共享探测（`clone` 时换一个新的 `OnceCell`）：`a_cloned_adapter_shares_the_validator`；range 请求失败时清掉缓存的探测（ureq2 的 `range_stream` 出错时把 `probed` 置空）：`a_failed_range_request_keeps_the_validator`。另外重跑了“meta 的验证器取自 HEAD（reqwest 回到 HEAD 的路径）”，加了断言之后照样被 `a_200_with_the_validator_sent_ignores_the_range` 抓到。
 - **自定义请求。** adapter 的 `before_request`（ureq2 还有 `call`）在 adapter 设好 `If-Range` 之后执行，可以改掉它；reqwest 客户端的默认头也可以在 `meta.validator` 是 `None` 时带上一个。响应的检查总是用缓存的 `meta.validator`，不看实际发了什么，所以这样的自定义会让另一个版本的 range 被当成这一个，或者让这一个被当成 `ResourceChanged`。行为不变（C19 起就是这样），只在两个 `before_request` 的文档和 adapter 的 README 里写明：自定义不能替换 adapter 设的 `If-Range`，也不能在没有验证器时加一个（codex 第一轮的建议）。
 - **没做的。** 任务引擎还没有用 `meta.validator` 做持久化或续传：状态文件的头部（C33）和续传的比对（C20）以后用它。`TaskBuilder::meta` 交进来的 meta 里的 `validator` 只是调用方说的，adapter 发的 `If-Range` 仍来自它自己探测的 meta；C20 比对时要用 adapter 取的新 meta，见 §11.5.7。
+
+### 14.28 检查点：块的 CRC 与数据同步（PR-9d，C32）
+
+- **范围。** §11.5.13 里 C32 的部分：writer 的 `sync`（三个后端）；写入带 CRC 段；按块的 CRC 拼接、上限和回读；已记录的块（`durable`）；串行的检查点调度（8 MiB / 2 s / teardown）和回滚；`TaskOptions` 的两个检查点字段。接收者是 crate 内部的接口，真正写状态文件的接收者在 C33；现在没有任何任务交出接收者，所以生产路径上不调度、不算 CRC、不同步，行为和性能都不变。单连接模式不在 C32：§11.5.8 规定单连接（包括回退之后）从不写状态，`On` 的单连接改走并发引擎是 C33 的事。
+- **依赖。** `crc32c`，`Cargo.toml` 写 `0.6.8`，`Cargo.lock` 用 `cargo update --precise` 锁在 0.6.8。核对（只有 crates.io 的 API 一个来源）：仓库 `zowens/crc32c`，MIT/Apache-2.0，下载约 9900 万次；0.6.8 发布于 2024-06-09，0.6.9 发布于 2026-11-02（实现时只有 8 天，没选它，以后再升）；没有运行时依赖，只有构建依赖 `rustc_version`（`Cargo.lock` 里已有）。提供 `crc32c`、`crc32c_append` 和 `crc32c_combine(crc1, crc2, len2)`；x86_64 用 SSE4.2，aarch64 用 CRC 指令，其余平台软件实现（§11.5.5）。本机（release）对内存里 256 MiB 算一次约 14 ms，约 17–18 GiB/s。
+- **writer 的 `sync`。** `FileRangeWriter::sync(&self)`：同步到目前为止已完成的写的数据，之后照常写。
+  - pool：`Command::Sync` 经队列交给一个 worker，它 `sync_data` 自己的句柄（worker 共用同一个文件，一次同步覆盖所有句柄的写）；其它 worker 照常写。第一版用克隆的句柄在单独的 `blocking` 线程上同步，第三轮审查之后改掉，见下。
+  - mmap：新命令 `Command::Sync`，唯一的 worker `mmap.flush()`：Unix 上 `msync(MS_SYNC)`，Windows 上 `FlushViewOfFile` 再 `FlushFileBuffers`（memmap2 0.9.12 的实现，已核对源码）。同步期间这个 worker 不写，见下面的基准。
+  - compio：`Command::Sync`，worker `sync_data`；已完成的写都已经落进文件。
+  - null：经队列回一个成功；slow（测试）：`sync_data`；recording（测试）：记次数，可以注入失败，并记下同步时已写的区间。
+  - trait 的默认实现返回 `Unsupported` 错误（不是成功），所以不会同步的 writer 永远不会让检查点记下没同步的数据。新错误 `FileWriterError::Sync`，`op()` 归为 `IoOp::Flush`；它只进 `warn!`，不让任务失败。
+- **每帧的 CRC 段。** `WriteCompletion` 加 `crcs: Vec<CrcSegment>`（`CrcSegment { offset, len, crc }`，`file_writer/crc.rs`）。`PendingWriter::checksum(block_size)` 打开之后，`CompletionGuard` 在写成功时对这一帧（planner 裁剪之后真正写入的字节）算 CRC32C，在块边界处拆成几段；失败的写（包括写了一部分再出错的）、被丢弃或 panic 的写一段都不带。CRC 在后端的 worker 线程（直接提交）或写任务里算，不在下载循环里算。没有打开时一段都不算。
+- **按块的段**（`checkpoint/blocks.rs` 的 `BlockCrcs`）：每个没写满的块一组按偏移排好、互不重叠也不相邻的段；成功的写到达时和左右相邻的段用 `crc32c_combine` 合并。上限：每块 64 段、合计 16384 段；超过时这一块（合计超了就挑段最多的块）丢掉段、改为回读，之后这块的段不再保存。块写满时取出它的 CRC：只剩一段且覆盖整块 → `Known(crc)`；回读 → `ReadBack`。段重叠、写满的块不是恰好一段，都只有 bug 才会出现：`debug_assert!` 抓，生产路径退回到回读（结果仍然正确）。
+- **检查点**（`checkpoint.rs` 的 `Checkpoints`，由 `DownloadLoop` 持有）：
+  - 写完成时 `note_written(range, crcs)`：段交给 `BlockCrcs`，碰到的块记为“待查”，累计写入字节。
+  - 调度：距上一次检查点开始写了 `checkpoint_bytes`（默认 8 MiB），或过了 `checkpoint_interval`（默认 2 s），而且有新完整的块（全部字节在 `written` 里、还没记过）时开始一次。在写完成、检查点结束和策略节拍（1.5 s）时检查，没有单独的计时器：没有新的写完成，就没有新完整的块（实现者的决定）。没有完整的块时不开始、不同步。
+  - 串行：同一时刻最多一个，正在运行时到期的那次等它结束之后再开始（接收者在运行中的检查点手里，结构上也开不了第二个）。检查点的 future 由循环在 writer 之后、策略节拍之前轮询，结束时是 `LoopEvent::Checkpoint`。
+  - 一次检查点（§11.5.5 的顺序）：先取出完整的块和它们的 CRC → writer `sync` → 在 `blocking` 线程上为回读的块从部分文件读出整块算 CRC（`BlockReader`，生产是 `FileBlocks(tmp_path)`）→ `receiver.record(blocks)`。成功：这些块进 `durable`（按块号的区间集合）。`sync`、回读或 `record` 失败：调用 `receiver.roll_back()`；成功则块回到“完整未记录”，带着取出时的 CRC，下一次到期的检查点再记，打 `warn!`；回滚也失败则这个任务不再做检查点（丢掉接收者和所有段），打 `warn!`。`sync` 失败也回滚（§11.5.5：第 2 或第 3 步失败都回滚）。
+  - 接收者接口：`CheckpointReceiver { record(&mut self, &[CheckpointBlock]) -> io::Result<()>; roll_back(&mut self) -> io::Result<()> }`，`CheckpointBlock { index, len, crc }`，在 `blocking` 线程上一次一个地调用。追加位置 `end`、`set_len(end)` 和 `fsync` 由 C33 的实现负责。
+  - teardown：`DownloadLoop::finish` 冲刷 writer（冲刷里完成的写照样带 CRC）之后，先等正在运行的检查点，再把剩下的完整块记一次，到期与否都记（§11.5.9 的“teardown 先做一次检查点”）。成功、失败、取消都做；`ResourceChanged` 只等正在运行的那次、不开新的，数据属于旧版本（§11.5.9 那一行是丢弃；第一轮审查之后的修改，见下）；回滚失败之后不做。
+  - 接入：`ConcurrentTaskInner::checkpoint_to(receiver)`（crate 内部，C33 调用，现在只有测试调用）；`download_to` 有接收者时建 `Checkpoints` 交给 `DownloadLoop::with_checkpoints`，后者打开 `PendingWriter` 的 CRC。
+- **`TaskOptions`。** 新增 `checkpoint_bytes: NonZeroU64`（默认 8 MiB）和 `checkpoint_interval: Duration`（默认 2 s，`validate` 拒绝 0），各有 setter，`docs/task.md` 的表里列出。结构体本来就是 `#[non_exhaustive]`。
+- **兼容性。** `TaskOptions` 的字段是加的。`file_writer` 模块为了基准是公开的：`WriteCompletion` 加了公开字段 `crcs`，`FileWriterError`（不是 `non_exhaustive`）加了变体 `Sync`，`FileRangeWriter` 加了带默认实现的 `sync`，`CrcSegment` 是新的。在外面构造 `WriteCompletion`、或者穷举匹配 `FileWriterError` 的代码会编译失败；crate 里的基准不受影响。按 §0 第 3 条算破坏兼容，提交是 `feat(task)!`（lead 决定，codex 第一轮同意）。
+- **基准。** C13 的基准（`growth_strategy`）走公开的 `Task` API，续传公开（C20）之前打不开检查点，所以 C32 没有给它加组（实现者的决定；C20 之后可以加 `Resume::On` 的一组）。改用一个 `#[ignore]` 的测试直接驱动引擎：`concurrent_task/checkpoint_bench.rs` 的 `checkpoint_overhead`，`cargo test -p bolt-load --release --lib -- --ignored --nocapture checkpoint_overhead`（默认 feature，256 MiB 用 mmap writer）。进程内 `SimpleTestAdapter` 不限速、8 条连接、临时目录里的真实文件，从开始到 writer 同步完成计时；“打开”的接收者每次检查点把 24 字节的记录追加到另一个文件并 `sync_all`，模拟 C33。三组交替运行、各 7 次（先各热身一次），中位数 / p90：
+
+  | 组 | 中位数 | p90 | 吞吐（中位数） | 比关闭 | 检查点、记录（每次） |
+  | --- | --- | --- | --- | --- | --- |
+  | 关闭（不算 CRC，只有最后一次同步） | 0.315 s | 0.333 s | 813 MiB/s | — | 0、0 |
+  | 只在 teardown（每次写算 CRC，最后多一次检查点） | 0.353 s | 0.378 s | 725 MiB/s | +12% | 1、256 |
+  | 默认（每 8 MiB 或 2 s） | 0.504 s | 0.518 s | 507 MiB/s | +60% | 32、256 |
+
+  - 环境：一台 Windows 11 机器，NTFS，临时目录所在的盘，数据只跑了一轮；关闭组自己就有双峰（0.21 s 和 0.31 s 各几次），机器很吵，数字只看量级（置信度：中）。前一轮 5 次的结果同一量级（关闭 0.208 s，默认 0.404 s）。
+  - CRC 本身：256 MiB 约 14 ms，和 0.3 s 的下载比约 5%，和“只在 teardown”组的 +12% 同一量级（那一组还多一次检查点和记录文件的同步）。
+  - 默认调度的开销主要是 32 次同步：本地不限速时 8 MiB 只要约 10 ms，检查点几乎一个接一个；mmap 后端只有一个 worker，同步期间写在它后面排队（推断，没有单独测）。网络下载的速度低得多，8 MiB 之间的时间长得多，同步占的比例相应小；这只是推断，没有测限速的场景。C33 接上真正的状态文件之后应在限速场景下再测一次，必要时调大默认的 `checkpoint_bytes`。
+- **测试。**
+  - `file_writer/crc.rs`：`test_a_frame_splits_at_block_boundaries`（块内一段、跨边界拆开、每段自己的 CRC、空帧没有段）。
+  - `checkpoint/blocks.rs`：按顺序写只有一段、最后就是整块的 CRC；一个洞两边合并；性质测试 `test_segments_merge_in_any_order`（任意切法、任意顺序，包括较短的最后一块：途中每一段都等于它覆盖的字节的 CRC、互不相邻，最后整块的 CRC 正确）；每块 64 段的上限之后回读、之后的段不再保存；合计 16384 段的上限之后挑段最多的块回读、其它块不动。
+  - `checkpoint/tests.rs`（记录的 writer 把字节写进内存，记录的接收者检查每个记录的块在记录之前已经同步过）：按字节到期、按时间到期（不到时间不开始）；没有完整的块不开始、不同步；串行（运行中到期的那次等它结束，只记之后完成的块）；同步失败 → 只有回滚、没有记录，下一次重记；记录失败 → 记录、回滚，到期之后用同样的 CRC 重记；回滚失败 → 不再有检查点，teardown 也不做；超过上限的块在同步之后回读、只读一次、CRC 正确，没超的块不读；teardown 等正在运行的那次、再记剩下的块（包括较短的最后一块）；不打开就不算 CRC、失败的写不带 CRC；每个后端（pool、null，启用时 mmap、compio）的 `sync` 成功且数据在文件里；`FileBlocks` 读区间。
+  - `download_loop/tests/checkpoint.rs`（`Harness::checkpointed`：内存里的文件、块 64 KiB、帧的内容按位置和端各不相同）：对冲（原连接先到、对冲先到两种，败方的帧丢掉）、被裁剪的帧（一个 chunk 的末尾和下一个 chunk 的开头在同一块里）、重启的区间（一个 runner 在块中间失败，另一个下完其余）之后，每个完整的块恰好记一次、CRC 等于内存里那一块的 CRC、记录之前已同步，没完整的块不记；失败的写不带 CRC、所在的块不记，前后的块照记；循环按 `checkpoint_bytes` 开始检查点、以事件结束、块进 `durable`；teardown：取消、失败时记，`ResourceChanged` 不记也不同步；没有检查点时写不带 CRC、不同步（teardown 也不）。
+  - `concurrent_task/mod.rs` 的 `the_checkpoints_of_a_download_match_its_file`：真实的下载（特性选出的 writer、真实的 runner、5 MiB + 123 字节），每一块（包括较短的最后一块）恰好记一次，CRC 等于临时文件里那一块的 CRC。
+  - `options.rs`：默认值，`checkpoint_interval` 为 0 时 `validate` 失败。
+- **变异检查**（`--all-features` 跑 bolt-load 的 `checkpoint`、`crc`、`concurrent_task::tests` 单元测试），全部被抓到：
+  - 失败的写也带 CRC：`test_crcs_only_for_successful_writes_when_asked`、`a_failed_write_is_not_recorded`；
+  - 拼接用错长度（左段的长度）：`blocks.rs` 的三个测试（含性质测试）、`test_a_block_past_the_cap_reads_back_after_the_sync`、循环里的三个 CRC 对文件的测试、`the_checkpoints_of_a_download_match_its_file`；
+  - 记录之前不同步：`test_a_checkpoint_after_enough_bytes`、`test_a_failed_sync_rolls_back_and_the_next_retries`、`test_a_failed_rollback_stops_the_checkpoints`、`test_a_block_past_the_cap_reads_back_after_the_sync` 和循环里的六个测试；
+  - 回读在同步之前：`test_a_block_past_the_cap_reads_back_after_the_sync`；
+  - 失败的检查点也把块记为 `durable`：同步失败、记录失败的两个测试；
+  - 没有接收者也算 CRC（循环总是打开 CRC）：`no_crc_and_no_sync_without_checkpoints`；
+  - 回滚失败之后照样做检查点：`test_a_failed_rollback_stops_the_checkpoints`；
+  - 没有每块 64 段的上限：`blocks.rs` 和 `checkpoint/tests.rs` 的两个上限测试；
+  - 不做 teardown 检查点：`test_the_teardown_checkpoint`、上限测试、`the_checkpoints_of_a_download_match_its_file` 和循环里的四个测试；
+  - `ResourceChanged` 也做 teardown 检查点：循环的 `the_teardown_checkpoint`；
+  - 时间不会让检查点到期：`test_a_checkpoint_after_enough_time`、`test_a_failed_record_rolls_back_and_the_next_retries`。
+  - 没有单独做“串行”的变异：接收者在运行中的检查点手里，去掉 `running` 的判断也开不了第二个。
+- **第一轮审查之后的修改**（codex 第一轮 84 分，一个 Major）：
+  - **Major：teardown 等正在运行的检查点。** 原来 `ResourceChanged` 时 `Checkpoints` 连同正在运行的检查点一起丢掉；`blocking::unblock` 的任务被丢掉时不会停，`record`、`roll_back` 或回读可能还在跑，teardown 已经在删文件。现在：
+    - `DownloadLoop::finish` 在任何结果下都先等正在运行的检查点（`Checkpoints::settle`），再交出文件；`ResourceChanged` 只是不再开新的 teardown 检查点。
+    - 检查点的阻塞部分持有这次尝试的 drain 组（C31 的 `Ownership::drain`，经 `OutputFile::drain` 交给 `Checkpoints::new`），直到它结束、并且它的返回值（接收者、结果）已经放下：返回元组里 drain 放在最后，即使 future 被丢掉、没人读结果，也是先放接收者再放 drain。panic 处理等 drain 时也就等它。
+    - 测试：`teardown_waits_for_a_running_checkpoint`（`ResourceChanged`、取消、普通失败、成功各一次：接收者停在 `record()` 里（`RecordGate`，测试放行，不靠时间），`finish` 一直挂起，放行之后才结束；`ResourceChanged` 只有那一次记录，其它三种再记 teardown 的块）；`test_a_running_checkpoint_holds_the_drain`（停在 `record()` 里时丢掉 `Checkpoints`，像 unwind 那样，drain 不结束，放行之后才结束）。
+  - **Minor：停了之后不再攒状态。** 回滚失败之后 `note_written` 直接返回，不再记段、待查的块和字节；循环收到“停止”的结果后让 `PendingWriter` 不再给之后提交的写算 CRC（`stop_checksumming`）。测试：`test_a_failed_rollback_stops_the_checkpoints` 加查停了之后再写，段、待查、待记都是 0；`no_crc_after_the_checkpoints_stopped`（循环里停了之后的写不带 CRC，状态一直是空的）。
+  - **建议：回读失败。** `MemoryBlocks` 可以注入读失败。`test_a_failed_read_back_rolls_back`：回读失败 → 只有回滚、没有记录，块仍待记，到期之后记下、CRC 正确；回滚也失败 → 停止、什么都不留。
+  - **建议：限速场景的基准。** `checkpoint_overhead` 改成三个场景（`CHECKPOINT_BENCH_SCENARIOS` 选择），并记下每次检查点的 writer `sync` 用时（测试构建里 `Checkpoints` 的 `sync_times`）。mmap 只有一个 worker，同步期间它不写，所以 `sync` 用时就是 writer 停顿的上限（推断：写可能本来就在排队以外的地方等）。每组 5 次，中位数 / p90，同一台机器，单独运行：
+
+    | 场景 | 组 | 中位数 | p90 | 比关闭 | 检查点 | 每次同步（中位数 / p90 / 最大） | 每次运行的同步合计（中位数） |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | 本地不限速，256 MiB | 关闭 | 0.317 s | 0.333 s | — | 0 | — | — |
+    | | 只在 teardown | 0.348 s | 0.376 s | +9.6% | 1 | 62.3 / 84.0 / 84.0 ms | 62 ms |
+    | | 默认 | 0.489 s | 0.506 s | +54.1% | 32 | 5.4 / 8.8 / 11.3 ms | 194 ms |
+    | 100 MiB/s，256 MiB | 关闭 | 2.407 s | 2.490 s | — | 0 | — | — |
+    | | 只在 teardown | 2.402 s | 2.411 s | −0.2% | 1 | 19.1 / 28.4 / 28.4 ms | 19 ms |
+    | | 默认 | 2.399 s | 2.400 s | −0.4% | 32 | 6.1 / 9.7 / 13.9 ms | 208 ms |
+    | 20 MiB/s，64 MiB | 关闭 | 3.121 s | 3.132 s | — | 0 | — | — |
+    | | 只在 teardown | 3.123 s | 3.128 s | +0.1% | 1 | 4.3 / 18.3 / 18.3 ms | 4 ms |
+    | | 默认 | 3.119 s | 3.123 s | −0.1% | 8 | 3.6 / 8.2 / 12.6 ms | 39 ms |
+
+    - 限速时（100 MiB/s、20 MiB/s）默认调度的开销在噪声之内：同步发生在下载进行中，单次约 4–6 ms（最大约 14 ms），每 8 MiB 一次，100 MiB/s 时约每 80 ms 一次，合计约 0.2 s / 2.4 s，没有拖慢完成时间（限速器在等，writer 有空）。
+    - 不限速的本地下载仍是 +54%：8 MiB 只要约 10 ms，检查点一个接一个，每次 5 ms 的同步占了一半的时间，加上和写抢磁盘。
+    - 只测了一台 Windows 机器上的 NTFS 和 mmap writer，没有测更慢的盘、pool 和 compio，也没有测只刷脏区间的办法；置信度：中。
+  - **留给 C33 的未决项。** C32 不改调度。C33 接上真正的状态文件、打开检查点之前，按这些数字核对默认值：本地或很快的源上 8 MiB 太频繁；可以考虑检查点之间的最小间隔（比如上一次结束后至少几百毫秒）、更大的 `checkpoint_bytes`，或者让 mmap 只刷上次以来写过的区间（`flush_range`），再测一次；也要在更慢的盘上测同步的停顿。
+  - 变异检查（编号接在前面之后）全部被抓到：`ResourceChanged` 丢掉正在运行的检查点：`teardown_waits_for_a_running_checkpoint`；阻塞部分不持有 drain：`test_a_running_checkpoint_holds_the_drain`；停了之后照样记写：`test_a_failed_rollback_stops_the_checkpoints`、`no_crc_after_the_checkpoints_stopped`；停了之后照样算 CRC：`no_crc_after_the_checkpoints_stopped`。原来的“回滚失败之后照样做检查点”改成同时去掉 `note_written` 的判断（否则没有新的完整块，什么都不会发生），被 `test_a_failed_rollback_stops_the_checkpoints`、`no_crc_after_the_checkpoints_stopped` 抓到；只去掉“停止”标志、保留 `note_written` 的判断的变异是等价的（停了之后没有新的块可记），没被抓到，这是预期的。回读失败的测试也抓到了“失败的检查点也把块记为 `durable`”和“时间不会让检查点到期”。
+- **第二轮审查之后的修改**（codex 第二轮 90 分，一个 Major）：第一轮返回的 `(receiver, outcome, drain)` 元组只在闭包正常返回时有序；阻塞任务在运行之前被丢掉、或者闭包 panic 时，闭包各自捕获的值按未规定的顺序销毁，drain 可能先于接收者或读取器放下。现在按 C31 的 `Drained` 做：接收者和读取器放进 `Work`，`start` 里就包成一个 `Drained<Work>`（drain 是它的最后一个字段），整个交给 `run`，闭包先写 `let mut held = held;` 整个拿走、整个返回；`run` 拿回之后先放读取器、再放 drain（`Drained::into_parts`），接收者交回 `Checkpoints`（它自己持有 drain）。测试（接收者和读取器各带一个探针，放下时记下 drain 是否还开着，只记不断言）：`test_the_work_drops_before_its_drain`（接收者 panic、读取器 panic、正常完成三种）、`test_a_checkpoint_dropped_before_it_ran_drops_its_work_first`（还没运行就丢掉）。变异：`Drained` 两个字段换序、返回时先放 drain 再放读取器，都被抓到；“阻塞部分不持有 drain”仍被 `test_a_running_checkpoint_holds_the_drain` 抓到。另外，测试里等闸门的地方都加了上限（`recv_timeout`、`tokio::time::timeout`）。
+- **第三轮审查之后的修改**（codex 第三轮 91 分，一个 Major）：pool 的 `sync` 原来克隆句柄、在单独的 `blocking` 线程上 `sync_data`，那个线程不持有 drain：尝试 unwind 时 worker 退出、drain 结束，panic 处理就可能在同步还拿着句柄时放锁（§11.5.4）。改为经队列（`sync_through`、`Command::Sync`），由已经持有 drain 的 worker 同步（选了这个，不另包 `Drained`：mmap、compio 本来就这样）。其它新的阻塞操作逐个核对过：mmap、compio 的同步都在持有 drain 的 worker 里；`FileBlocks` 的回读在检查点的阻塞闭包里打开、读完、关掉部分文件，闭包持有 `Drained<Work>`；slow writer（只在测试里）在调用它的 future 里同步，没有另起任务；null 没有文件。测试 `test_a_held_sync_holds_the_drain`（pool_writer.rs）：worker 停在同步前的钩子里，丢掉同步的 future 和 writer，drain 在 0.5 s 内不结束（空闲的 worker 早已退出；没有信号能说明“没结束”，所以这是唯一带时间的断言，正确的实现总是通过），放行之后结束。变异“worker 把同步交给一个不持有 drain 的线程”被它抓到。另外按建议加了 `test_an_unread_result_drops_its_work_before_its_drain`：阻塞部分完成（用一个记录唤醒的 waker 得知，不 poll 结果），丢掉 future 而不读结果，接收者和读取器都在 drain 结束之前放下；变异“闭包在返回之前就放掉 drain”被它和 `test_the_work_drops_before_its_drain` 抓到。`test_the_work_drops_before_its_drain` 的注释改为只说它覆盖的情况（结果被读走）。
+- **第四轮审查**（codex 第四轮 PASS，97 分）：剩下的 Minor 已修：`test_an_unread_result_drops_its_work_before_its_drain` 的阻塞部分可能在第一次 poll 之前就完成，第一次 poll 就是 Ready；现在接收者在 `record` 里等测试放行，第一次 poll 返回 Pending 之后才放行，再等唤醒、不读结果地丢掉 future（连续 20 次通过，变异“闭包在返回之前就放掉 drain”仍被抓到）。
+- **没做的。** 状态文件、追加位置 `end` 和 `set_len`/`fsync` 的顺序在 C33；没有任务交出接收者，生产路径上 `durable` 现在没人读；单连接不做检查点（§11.5.8）。

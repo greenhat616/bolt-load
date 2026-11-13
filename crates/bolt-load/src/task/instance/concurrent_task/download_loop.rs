@@ -31,6 +31,7 @@ use self::{
 };
 use super::{
     RunnerManager, RunnerSpawner,
+    checkpoint::{Checkpoints, Outcome},
     file_writer::{FileWriter, PendingWriter, WriteCompletion},
     runner_manager::RunnerTick,
     strategy::{
@@ -53,6 +54,8 @@ enum LoopEvent {
     /// Writes completed; `true` when the writer could not take data
     /// before they did (design §9.6).
     WriterCompleted(Option<Vec<WriteCompletion>>, bool),
+    /// The running checkpoint ended.
+    Checkpoint(Outcome),
     StrategyTimer,
     ThroughputTimer,
     Runner(RunnerTick),
@@ -80,6 +83,9 @@ pub(super) struct DownloadLoop {
     /// Each runner's rate at the strategy ticks, for the doubling
     /// strategy, the restarts and the hedge.
     rates: RunnerRates,
+    /// The checkpoints, when the task keeps a state file; without them no
+    /// CRC is computed and nothing is synced (design §11.5.5).
+    checkpoints: Option<Checkpoints>,
     /// Every strategy action applied, in order.
     #[cfg(test)]
     applied: Vec<String>,
@@ -129,10 +135,26 @@ impl DownloadLoop {
             strategy_tick: StrategyTick::new(strategy_timer.into()),
             throughput: ThroughputSampler::new(throughput_timer.into()),
             rates,
+            checkpoints: None,
             #[cfg(test)]
             applied: Vec::new(),
             #[cfg(test)]
             hedging: true,
+        }
+    }
+
+    /// Take checkpoints; the writes report the CRCs of their bytes from now
+    /// on. Call it before the loop runs.
+    pub(super) fn with_checkpoints(mut self, checkpoints: Checkpoints) -> Self {
+        self.writer.checksum(checkpoints.block_size());
+        self.checkpoints = Some(checkpoints);
+        self
+    }
+
+    /// Start a checkpoint at `now` if one is due.
+    fn maybe_checkpoint(&mut self, now: Instant) {
+        if let Some(checkpoints) = self.checkpoints.as_mut() {
+            checkpoints.maybe_start(self.manager.written(), now);
         }
     }
 
@@ -145,7 +167,8 @@ impl DownloadLoop {
         }
     }
 
-    /// Priority: cancel > deadline > writer > strategy > throughput > runner.
+    /// Priority: cancel > deadline > writer > checkpoint > strategy >
+    /// throughput > runner.
     ///
     /// The deadline source is the loop's one timer: it fires at the
     /// no-progress deadline, or earlier when a range's backoff or the
@@ -163,6 +186,11 @@ impl DownloadLoop {
         }
         if let Poll::Ready(event) = self.poll_writer(cx) {
             return Poll::Ready(event);
+        }
+        if let Some(checkpoints) = self.checkpoints.as_mut()
+            && let Poll::Ready(outcome) = checkpoints.poll(cx)
+        {
+            return Poll::Ready(LoopEvent::Checkpoint(outcome));
         }
         if let Poll::Ready(event) = self.strategy_tick.poll(cx) {
             return Poll::Ready(event);
@@ -190,8 +218,20 @@ impl DownloadLoop {
             LoopEvent::WriterCompleted(None, _) => Err(DownloadError::other(
                 "writer completion channel closed unexpectedly",
             )),
+            LoopEvent::Checkpoint(outcome) => {
+                if let Some(checkpoints) = self.checkpoints.as_mut() {
+                    checkpoints.apply(outcome);
+                    if checkpoints.is_stopped() {
+                        // No checkpoint will use them any more.
+                        self.writer.stop_checksumming();
+                    }
+                }
+                self.maybe_checkpoint(now);
+                Ok(ControlFlow::Continue(()))
+            }
             LoopEvent::StrategyTimer => {
                 self.on_strategy_tick(now);
+                self.maybe_checkpoint(now);
                 Ok(ControlFlow::Continue(()))
             }
             LoopEvent::ThroughputTimer => {
@@ -213,6 +253,7 @@ impl DownloadLoop {
             spawner,
             manager,
             writer,
+            mut checkpoints,
             ..
         } = self;
         spawner.cancel_token.cancel();
@@ -223,8 +264,23 @@ impl DownloadLoop {
         spawner.wg.wait().await;
         // The writes still in flight count once they complete, whatever
         // ended the task (design §11.1).
-        let flush_result =
-            settle_completions(writer.finish().await, |range| written.insert(range)).map(drop);
+        let flush_result = settle_completions(writer.finish().await, |range, crcs| {
+            if let Some(checkpoints) = checkpoints.as_mut() {
+                checkpoints.note_written(range.clone(), crcs);
+            }
+            written.insert(range);
+        })
+        .map(drop);
+        // A running checkpoint ends before the files are touched, whatever
+        // ended the task. The data of a changed resource is of the old
+        // version: no new checkpoint records it (design §11.5.9).
+        if let Some(mut checkpoints) = checkpoints {
+            if matches!(transfer_result, Err(DownloadError::ResourceChanged { .. })) {
+                checkpoints.settle().await;
+            } else {
+                checkpoints.finish(&written).await;
+            }
+        }
         progress.downloaded_chunks = written.into_ranges();
         transfer_result.and(flush_result)
     }

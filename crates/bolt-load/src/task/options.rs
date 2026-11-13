@@ -1,5 +1,5 @@
 use std::{
-    num::{NonZeroU32, NonZeroUsize},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     time::Duration,
 };
 
@@ -27,6 +27,11 @@ pub const DEFAULT_META_MAX_RETRIES: usize = 3;
 pub const DEFAULT_META_MIN_DELAY: Duration = Duration::from_millis(200);
 /// Default for [`MetaRetry::max_delay`].
 pub const DEFAULT_META_MAX_DELAY: Duration = Duration::from_secs(2);
+/// A resumable task takes a checkpoint after this many bytes were written
+/// since the last one (design §11.5.5).
+pub const DEFAULT_CHECKPOINT_BYTES: NonZeroU64 = NonZeroU64::new(8 << 20).unwrap();
+/// A resumable task takes a checkpoint this long after the last one.
+pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Retry policy of the metadata request, applied only to
 /// [`AdapterError::Retryable`](crate::adapter::AdapterError::Retryable) errors.
@@ -137,6 +142,13 @@ pub struct TaskOptions {
     pub connect_timeout: Duration,
     /// Retry policy of the metadata request, see [`MetaRetry`].
     pub meta_retry: MetaRetry,
+    /// A task that keeps a state file for a later resume records the
+    /// blocks it completed once this many bytes were written since its
+    /// last checkpoint (design §11.5.5).
+    pub checkpoint_bytes: NonZeroU64,
+    /// Or once this long passed since its last checkpoint, whichever comes
+    /// first. Must be non-zero.
+    pub checkpoint_interval: Duration,
 }
 
 impl Default for TaskOptions {
@@ -149,6 +161,8 @@ impl Default for TaskOptions {
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             meta_retry: MetaRetry::default(),
+            checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
         }
     }
 }
@@ -197,6 +211,16 @@ impl TaskOptions {
         self
     }
 
+    pub fn checkpoint_bytes(mut self, bytes: NonZeroU64) -> Self {
+        self.checkpoint_bytes = bytes;
+        self
+    }
+
+    pub fn checkpoint_interval(mut self, interval: Duration) -> Self {
+        self.checkpoint_interval = interval;
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<(), BuildError> {
         let reason = if self.no_progress_timeout.is_zero() {
             "no_progress_timeout must be greater than zero"
@@ -208,6 +232,8 @@ impl TaskOptions {
             "connect_timeout must be greater than zero"
         } else if let Some(reason) = self.meta_retry.validate() {
             reason
+        } else if self.checkpoint_interval.is_zero() {
+            "checkpoint_interval must be greater than zero"
         } else {
             return Ok(());
         };
@@ -231,6 +257,8 @@ mod tests {
         assert_eq!(options.stream_idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT);
         assert_eq!(options.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
         assert_eq!(options.meta_retry, MetaRetry::default());
+        assert_eq!(options.checkpoint_bytes.get(), 8 << 20);
+        assert_eq!(options.checkpoint_interval, Duration::from_secs(2));
     }
 
     #[test]
@@ -240,6 +268,7 @@ mod tests {
             TaskOptions::default().max_consecutive_failures(0),
             TaskOptions::default().stream_idle_timeout(Duration::ZERO),
             TaskOptions::default().connect_timeout(Duration::ZERO),
+            TaskOptions::default().checkpoint_interval(Duration::ZERO),
             TaskOptions::default().meta_retry(MetaRetry::default().min_delay(Duration::ZERO)),
             TaskOptions::default().meta_retry(MetaRetry::default().max_delay(Duration::ZERO)),
             TaskOptions::default().meta_retry(

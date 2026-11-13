@@ -9,7 +9,7 @@ use snafu::prelude::*;
 use super::{
     Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
     FileWriterCapability, FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
-    WriteReply, finalize_and_join,
+    WriteReply, finalize_and_join, sync_through,
 };
 
 pub struct CompioWriter {
@@ -48,6 +48,11 @@ impl FileRangeWriter for CompioWriter {
             })?;
         Ok(())
     }
+    /// The worker syncs its file; the writes that completed are done.
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        sync_through(&self.tx, &self.path).await
+    }
+
     async fn finalize(self) -> Result<(), FileWriterError> {
         let Self {
             path,
@@ -111,6 +116,9 @@ fn compio_file_writer_task(
                         reply.complete(result, path.as_path());
                     })
                     .detach();
+                }
+                Command::Sync(tx) => {
+                    let _ = tx.send(file.sync_data().await);
                 }
                 Command::Finalize(tx) => {
                     // Wait for all write tasks to finish
