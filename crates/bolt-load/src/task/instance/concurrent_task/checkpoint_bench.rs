@@ -1,5 +1,5 @@
-//! The cost of checkpoints: a local download with and without them (design
-//! §14.28).
+//! The cost of checkpoints: a local download with and without them, the
+//! records going to the real state file (design §14.28, §14.29).
 //!
 //! Checkpoints are crate-internal until a resumable task is public (C20),
 //! so the public C13 bench cannot turn them on; this ignored test drives the
@@ -15,7 +15,6 @@
 //! (64 MiB).
 
 use std::{
-    io::{Seek, SeekFrom, Write},
     num::NonZeroUsize,
     sync::{
         Arc,
@@ -24,55 +23,46 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bolt_load_core::adapter::Validator;
 use bolt_load_tests::adapter::simple::SimpleTestAdapterBuilder;
 use smol_cancellation_token::CancellationToken;
 
 use super::{
     ConcurrentTaskInner,
-    checkpoint::{CheckpointBlock, CheckpointReceiver},
+    checkpoint::{CheckpointBlock, CheckpointReceiver, MIN_SPACING},
 };
 use crate::{
     adapter::DynBoltLoadAdapter,
     runtime::ThreadedRuntimeImpl,
     task::{
         TaskOptions,
-        instance::{output_file::OutputFile, ownership::Ownership},
+        instance::{
+            output_file::OutputFile,
+            ownership::Ownership,
+            state_file::{Header, LockedFile, StateFile, encode_header},
+        },
         status::ProgressReporter,
     },
 };
 
-/// Appends a 24-byte record per block to a file and syncs it, as the state
-/// file will (design §11.5.5).
-struct FileReceiver {
-    file: std::fs::File,
-    end: u64,
+/// The real state file over a file's handle (design §11.5.5), counting
+/// the checkpoints and records it took.
+struct CountingStateFile {
+    state: StateFile,
     records: Arc<AtomicUsize>,
     checkpoints: Arc<AtomicUsize>,
 }
 
-impl CheckpointReceiver for FileReceiver {
+impl CheckpointReceiver for CountingStateFile {
     fn record(&mut self, blocks: &[CheckpointBlock]) -> std::io::Result<()> {
-        let mut bytes = Vec::with_capacity(blocks.len() * 24);
-        for block in blocks {
-            bytes.extend_from_slice(&block.index.to_le_bytes());
-            bytes.extend_from_slice(&block.len.to_le_bytes());
-            bytes.extend_from_slice(&block.crc.to_le_bytes());
-            bytes.extend_from_slice(&[1, 0, 0, 0]);
-            let crc = crc32c::crc32c(&bytes[bytes.len() - 20..]);
-            bytes.extend_from_slice(&crc.to_le_bytes());
-        }
-        self.file.seek(SeekFrom::Start(self.end))?;
-        self.file.write_all(&bytes)?;
-        self.file.sync_all()?;
-        self.end += bytes.len() as u64;
+        self.state.append(blocks)?;
         self.records.fetch_add(blocks.len(), Ordering::Relaxed);
         self.checkpoints.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn roll_back(&mut self) -> std::io::Result<()> {
-        self.file.set_len(self.end)?;
-        self.file.sync_all()
+        self.state.roll_back()
     }
 }
 
@@ -83,8 +73,31 @@ enum Group {
     Off,
     /// CRCs of every write, and one checkpoint, at teardown.
     Teardown,
-    /// The default schedule: every 8 MiB or 2 s.
+    /// Every 8 MiB or 2 s, with no spacing: C32's schedule.
+    Unspaced,
+    /// The default: every 8 MiB or 2 s, and at least [`MIN_SPACING`] after
+    /// the last checkpoint ended.
     On,
+    /// Every 32 MiB or 2 s, with no spacing.
+    Bytes32,
+}
+
+impl Group {
+    /// The options and minimum spacing of the group.
+    fn schedule(self, options: TaskOptions) -> (TaskOptions, Duration) {
+        let bytes = |mib: u64| std::num::NonZeroU64::new(mib << 20).unwrap();
+        match self {
+            Group::Off | Group::On => (options, MIN_SPACING),
+            Group::Teardown => (
+                options
+                    .checkpoint_bytes(std::num::NonZeroU64::new(u64::MAX).unwrap())
+                    .checkpoint_interval(Duration::from_secs(3600)),
+                MIN_SPACING,
+            ),
+            Group::Unspaced => (options, Duration::ZERO),
+            Group::Bytes32 => (options.checkpoint_bytes(bytes(32)), Duration::ZERO),
+        }
+    }
 }
 
 /// A source: its name, its total rate in bytes per second (`None`: as fast
@@ -142,12 +155,8 @@ async fn download(scenario: Scenario, group: Group) -> Run {
     let output = OutputFile::new(dir.path().join("file.bin"), Ownership::new());
     let tmp_path = output.tmp.clone();
     let (reporter, _status) = ProgressReporter::for_test();
-    let mut options = TaskOptions::default().max_connections(NonZeroUsize::new(8).unwrap());
-    if group == Group::Teardown {
-        options = options
-            .checkpoint_bytes(std::num::NonZeroU64::new(u64::MAX).unwrap())
-            .checkpoint_interval(Duration::from_secs(3600));
-    }
+    let (options, min_spacing) =
+        group.schedule(TaskOptions::default().max_connections(NonZeroUsize::new(8).unwrap()));
     let mut inner = ConcurrentTaskInner::new(
         DynBoltLoadAdapter::new_arc(adapter),
         output,
@@ -156,6 +165,7 @@ async fn download(scenario: Scenario, group: Group) -> Run {
         options,
         reporter,
     );
+    inner.min_spacing = Some(min_spacing);
     let records = Arc::new(AtomicUsize::new(0));
     let checkpoints = Arc::new(AtomicUsize::new(0));
     if group != Group::Off {
@@ -166,9 +176,18 @@ async fn download(scenario: Scenario, group: Group) -> Run {
             .write(true)
             .open(dir.path().join("file.bin.boltload"))
             .unwrap();
-        inner = inner.checkpoint_to(Box::new(FileReceiver {
-            file,
-            end: 0,
+        let mut state = StateFile::new(Box::new(LockedFile(Arc::new(file))));
+        let validator = Validator::StrongEtag("\"v1\"".to_owned());
+        let header = encode_header(&Header {
+            block_size: super::checkpoint::BLOCK_SIZE.get() as u32,
+            total,
+            validator: &validator,
+            source: None,
+        })
+        .unwrap();
+        state.write_header(&header).unwrap();
+        inner = inner.checkpoint_to(Box::new(CountingStateFile {
+            state,
             records: records.clone(),
             checkpoints: checkpoints.clone(),
         }));
@@ -216,7 +235,13 @@ async fn checkpoint_overhead() {
         f64::from(256) / 1024.0 / crc_time.as_secs_f64()
     );
 
-    let groups = [Group::Off, Group::Teardown, Group::On];
+    let groups = [
+        Group::Off,
+        Group::Teardown,
+        Group::Unspaced,
+        Group::On,
+        Group::Bytes32,
+    ];
     for scenario in SCENARIOS {
         if names
             .as_ref()

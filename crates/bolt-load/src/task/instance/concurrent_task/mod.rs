@@ -40,7 +40,7 @@ async fn finalize_file_writer(writer: impl FileRangeWriter, tmp_path: &Path) -> 
         .map_err(|error| file_error(tmp_path, error))
 }
 
-mod checkpoint;
+pub(crate) mod checkpoint;
 #[cfg(test)]
 mod checkpoint_bench;
 mod chunk_planner;
@@ -76,6 +76,9 @@ pub(crate) struct ConcurrentTaskInner {
     /// How long each sync of a checkpoint took, for the benchmark.
     #[cfg(test)]
     sync_times: checkpoint::SyncTimes,
+    /// The checkpoints' minimum spacing, for the benchmark.
+    #[cfg(test)]
+    min_spacing: Option<std::time::Duration>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -107,6 +110,8 @@ impl ConcurrentTaskInner {
             checkpoints: None,
             #[cfg(test)]
             sync_times: checkpoint::SyncTimes::default(),
+            #[cfg(test)]
+            min_spacing: None,
         }
     }
 
@@ -168,7 +173,15 @@ impl ConcurrentTaskInner {
             #[cfg_attr(not(test), expect(unused_mut, reason = "the benchmark sets the probe"))]
             let mut checkpoints = checkpoint::Checkpoints::new(
                 total,
-                checkpoint::Schedule::of(&self.options),
+                {
+                    #[cfg_attr(not(test), expect(unused_mut, reason = "the benchmark sets it"))]
+                    let mut schedule = checkpoint::Schedule::of(&self.options);
+                    #[cfg(test)]
+                    if let Some(spacing) = self.min_spacing {
+                        schedule.min_spacing = spacing;
+                    }
+                    schedule
+                },
                 receiver,
                 file_writer.clone(),
                 Arc::new(checkpoint::FileBlocks(tmp_path.to_path_buf())),
@@ -317,6 +330,86 @@ mod tests {
         let mut indices: Vec<u64> = recorded.iter().map(|block| block.index).collect();
         indices.sort_unstable();
         assert_eq!(indices, (0..6).collect::<Vec<_>>());
+        assert_records_match(
+            &recorded,
+            &Arc::new(std::sync::Mutex::new(content)),
+            checkpoint::BLOCK_SIZE.get(),
+        );
+    }
+
+    /// With the state file as the receiver, a real download leaves a header
+    /// followed by one valid record per block, each with the CRC of its
+    /// bytes in the temporary file, and nothing past them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_state_file_of_a_download_records_its_blocks() {
+        use bolt_load_core::adapter::Validator;
+        use bolt_load_tests::adapter::simple::SimpleTestAdapterBuilder;
+
+        use self::checkpoint::tests::assert_records_match;
+        use crate::{
+            adapter::DynBoltLoadAdapter,
+            task::instance::state_file::{
+                Header, LockedFile, RECORD_LEN, StateFile, encode_header,
+                tests::{decode_header, decode_records},
+            },
+        };
+
+        const TOTAL: u64 = 5 * (1 << 20) + 123;
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(TOTAL as usize)
+            .chunk_size(16 << 10)
+            .support_range(true)
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("file.bin");
+        let state_path = dir.path().join("file.bin.boltload");
+        let output = OutputFile::new(dest, crate::task::instance::ownership::Ownership::new());
+        let tmp_path = output.tmp.clone();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&state_path)
+            .unwrap();
+        let mut state = StateFile::new(Box::new(LockedFile(Arc::new(file))));
+        let validator = Validator::StrongEtag("\"v1\"".to_owned());
+        let header = encode_header(&Header {
+            block_size: checkpoint::BLOCK_SIZE.get() as u32,
+            total: TOTAL,
+            validator: &validator,
+            source: None,
+        })
+        .unwrap();
+        state.write_header(&header).unwrap();
+        let (reporter, _status) = ProgressReporter::for_test();
+        let options = TaskOptions::default()
+            .checkpoint_bytes(std::num::NonZeroU64::new(1 << 20).unwrap())
+            .max_connections(std::num::NonZeroUsize::new(4).unwrap());
+        let mut inner = ConcurrentTaskInner::new(
+            DynBoltLoadAdapter::new_arc(adapter),
+            output,
+            TOTAL,
+            ThreadedRuntimeImpl::new_tokio_rt(),
+            options,
+            reporter,
+        )
+        .checkpoint_to(Box::new(state));
+        inner
+            .download_to(&tmp_path, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let bytes = std::fs::read(&state_path).unwrap();
+        let decoded = decode_header(&bytes).expect("a valid header");
+        assert_eq!((decoded.total, decoded.validator), (TOTAL, validator));
+        let recorded = decode_records(&bytes, decoded.len);
+        assert_eq!(bytes.len(), decoded.len + recorded.len() * RECORD_LEN);
+        let mut indices: Vec<u64> = recorded.iter().map(|block| block.index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..6).collect::<Vec<_>>());
+        let content = std::fs::read(&tmp_path).unwrap();
         assert_records_match(
             &recorded,
             &Arc::new(std::sync::Mutex::new(content)),

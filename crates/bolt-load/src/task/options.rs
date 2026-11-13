@@ -147,7 +147,9 @@ pub struct TaskOptions {
     /// last checkpoint (design §11.5.5).
     pub checkpoint_bytes: NonZeroU64,
     /// Or once this long passed since its last checkpoint, whichever comes
-    /// first. Must be non-zero.
+    /// first. Must be non-zero. Either way, a periodic checkpoint starts no
+    /// sooner than 0.5 s after the last one ended; the one at teardown does
+    /// not wait for that.
     pub checkpoint_interval: Duration,
 }
 
