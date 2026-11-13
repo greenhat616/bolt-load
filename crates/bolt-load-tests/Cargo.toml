@@ -44,7 +44,6 @@ flate2 = "1"
 axum = "0.8.8"
 axum-extra = { version = "0.12.5", features = ["typed-header"] }
 axum-range = "1.0.0"
-portpicker = "0.1"
 
 anyhow = { workspace = true }
 snafu = { workspace = true }
