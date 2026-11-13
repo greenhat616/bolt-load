@@ -44,6 +44,7 @@
 | | C38 `fix(task): validate the connection limit's recovery steps and back them off` | | |
 | PR-7 扩张控制器 | C11 `feat(task): add the doubling growth strategy behind unstable-strategy` | T11、T12 | PR-5、PR-6 |
 | | C12 `feat(task): restart slow runners under the doubling strategy` | T13 | |
+| | C27 `feat(task): hedge a stalled range at the endgame under the doubling strategy` | T27 | |
 | | C13 `bench(task): compare the growth strategies` | T14 | |
 | PR-7b 切换默认值 | C14 `feat(task)!: make doubling the default growth strategy` | T15 | PR-7，且 G7 达标 |
 | PR-8 跨任务限额（D4） | C15 `feat(task): admit tasks and cap connections per host through shared limits` | T16 | PR-5 |
@@ -375,14 +376,71 @@
   - 剩余字节不足 `2 × min_chunk_size` 时不重启；
   - 只有 2 个 runner 时不重启。
 
+## T27 — 收尾对冲（C27，D5）
+
+- [ ] 动代码之前，先按 T13 合入后的代码，在 design §9.6 补上状态转换表（一个逻辑 chunk、两个 runner），守住那里列出的不变量，并通过评审。
+- [ ] 只在 `Doubling` 模式下生效。触发、静默的算法、仲裁、错误处理和预算见 design §9.6，默认 `hedge_idle = 2 s`。
+- [ ] runner manager 记下每个 runner 最近一次交来非空帧的时刻，spawn 时先记一次；writer 恢复可写时全部重置。
+- [ ] planner 允许一个 chunk 同时挂两个 runner：分叉后，manager 在取到第一个非空帧时一次决出胜负，败方被取消；取消不算失败，败方的数据不写入。
+- [ ] 一对 runner 算一次尝试，每次尝试最多对冲一次。先失败的一方不改 `attempts` 和 `charged`。最后一方失败时，区间才按 T9 退回并退避：`attempts` 加 1；两方都不是重启、并且至少一方是记预算的失败时，`charged` 加 1，否则不加（design §9.6、§14.13）。每一方用它自己被接受的字节数分类，所以要分别记两方被接受的字节数，不能直接用 `Released::received`。T10 的预算只比较 `charged`；最后一方是可重试的错误或 429/503 时，先查这一对的预算，再按 T10 的顺序处理它的错误；查预算和写冷却记录都用这一对的 `charged`，不用最后一方自己的 `AttemptFailure::charged`（design §9.6 的判定顺序）。胜方继承两个计数。
+
+**验证**
+
+- 单元测试（显式传入 `now`）：
+  - 触发：
+    - 收尾阶段某个 runner 静默 2 s 时发起对冲，差 1 ns 时不发起；
+    - 还有可切的活（包括剩余量够大的 Pending chunk）、没有空闲槽位、活跃 runner 已到并发上限、拥塞期间、限速开启时，都不发起；
+    - `Legacy` 模式从不对冲；
+    - 有多个候选时选静默最久的；每个 tick 最多发起一个；
+    - 还在连接的 runner 从 spawn 算静默；
+    - writer 满时不对冲；恢复可写之后，要再静默 2 s 才对冲。
+  - 仲裁：
+    - 原 runner 先交来数据时取消对冲，对冲先交来数据时取消原 runner；
+    - 两方的帧在同一次轮询里都已就绪时，原 runner 胜；
+    - 分叉时原 runner 还有排着的帧：先取到它们，原 runner 胜，这些帧照常写入；
+    - 空帧不决定胜负；
+    - 败方迟到的数据和 `Stopped` 被忽略：数据不写入，区间不释放，它的槽位恰好回收一次；
+    - 败方的生命周期通道没发 `Stopped` 就关闭：同样只回收一次槽位，区间不释放，不上报失败；
+    - 用一个记录写入区间的 writer 断言：没有任何字节被写两次。hash 正确证明不了这一点，同样的内容写两次，hash 照样正确。
+  - 错误与预算：
+    - 一方可重试失败时另一方继续，区间不退回、不退避；
+    - 原 runner 交过数据后超时，对冲还在运行：任务级连续失败计数不变；
+    - 原 runner 在分叉前交过数据，对冲 runner 在胜负分出之前失败（它自己没收到过数据）：连续失败计数加 1；
+    - 一方收到 429/503 时，立即更新 `congestion_until` 和并发控制的反馈，连续失败计数不变，另一方继续；
+    - 一方遇到 §4.3 的回退错误或其它不可重试的错误时，任务照常回退或终止；
+    - 两方都失败时只退避一次，`attempts` 加 1，`source` 是后失败那一方的错误；先失败的一方不改两个计数；
+    - `attempts` 和 `charged` 都不为 0 的区间被对冲：原 runner 胜和对冲胜两种情况下，胜方都继承这两个值；
+    - 连续几轮两方都以记预算的失败结束（例如都是没收到数据的超时），每轮 `charged` 只加 1，到 `max_attempts_per_range` 时以 `RangeExhausted` 终止；
+    - 两方每轮都收到 429/503（另有连接在途）：`attempts` 每轮加 1，`charged` 一直是 0，预算永远不会耗尽；
+    - 预算的临界点：区间的 `charged = max_attempts_per_range − 1`，原 runner 没收到数据就超时，然后对冲收到 503：
+      - 另有连接在途：任务以 `RangeExhausted { range, attempts: max_attempts_per_range, source }` 结束，`source` 是这个 503，不是被容忍后继续；
+      - 没有别的连接在途：同样以 `RangeExhausted` 结束，`source` 是这个 503，不是直接以 503 本身结束，因为先查预算；
+      - 对照：同样的顺序但 `charged = max_attempts_per_range − 2`、另有连接在途时，503 被容忍，任务继续，`congestion_until` 更新，退回区间的冷却记录 `charged = max_attempts_per_range − 1`；
+      - 反方向：`charged = max_attempts_per_range − 1`，原 runner 交过数据后超时（重启），然后对冲没收到数据就超时：这一对是 0，任务继续，冷却记录 `charged` 仍是 `max_attempts_per_range − 1`。只看对冲自己的 `AttemptFailure::charged` 会误报 `RangeExhausted`；
+    - 两方的失败按下面五种顺序各试一次，每对最多加 1：
+      - 原 runner 没收到数据就超时，然后对冲收到 429/503：`charged` 加 1；
+      - 对冲没收到数据就失败，然后原 runner 重启：`charged` 不变，和不对冲时一样，退回的区间比这次领取时短；
+      - 原 runner 重启，然后对冲以记预算的失败结束：`charged` 不变，退回的区间比这次领取时短；
+      - 两方都收到 429/503：`charged` 不变；
+      - 原 runner 交过数据之后 `ChannelClosed`，然后对冲收到 429/503：`charged` 加 1；
+    - 对冲 runner 用它自己的 0 字节分类：原 runner 在分叉前交过数据，对冲没收到数据就超时，原 runner 以 `ChannelClosed` 结束，先后顺序两种都试，`charged` 都加 1。如果拿 chunk 已下载部分判断，对冲会被误算成重启，结果是 0；
+    - 一方失败后，同一次尝试不再对冲；
+    - 对冲 runner 的 spawn 被拒绝：槽位恰好回收一次，区间不释放；
+    - 胜负未分时原 runner 从 Pending 变成 Running：这个 chunk 不被切分，T13 也不重启它。
+  - 计时：
+    - 发起对冲、败方交来的帧，都不推迟无进展截止时间；
+    - 原 runner 的空闲超时和任务的无进展截止时间落在同一刻：对冲没有推迟其中任何一个，对冲还没交来数据时，任务以 `NoProgress` 结束。
+- 集成测试：服务器让一个连接在收尾阶段停止发送但不断开，任务靠对冲完成，hash 正确，耗时远小于 runner 的空闲超时。
+
 ## T14 — 基准测试（C13）
 
-- [ ] 在 `crates/bolt-load/benches/` 新增 `growth_strategy.rs`，用 `bolt-load-tests` 的限速服务器，构造三个场景：
+- [ ] 在 `crates/bolt-load/benches/` 新增 `growth_strategy.rs`，用 `bolt-load-tests` 的限速服务器，构造四个场景：
   1. 单连接限速 1 MiB/s、总带宽 16 MiB/s；
   2. 不限速的本地高速场景；
-  3. 连接数超过 4 条就返回 429。
-- [ ] 对每个场景，记录 `Legacy` 和 `Doubling` 两种策略的完成时间、峰值连接数、429 次数。每组至少跑 10 次，取中位数和 p90。
-- [ ] 结果写进 PR-7 的描述，并作为 design §9.5 默认参数的校准依据。如果参数需要调整，同步改 design。
+  3. 连接数超过 4 条就返回 429；
+  4. 收尾阶段有一个连接停止发送但不断开（衡量 T27 的对冲）。
+- [ ] 对每个场景，记录 `Legacy` 和 `Doubling` 两种策略的完成时间、峰值连接数、429 次数。第 4 个场景另外记录对冲次数、重复收到的字节数（败方交来后被丢掉的）和取消延迟（从分出胜负到败方报告 `Stopped`）。每组至少跑 10 次，取中位数和 p90。
+- [ ] 结果写进 PR-7 的描述，并作为 design §9.5、§9.6 默认参数的校准依据。如果参数需要调整，同步改 design。
 
 **验证**
 
@@ -480,4 +538,5 @@
 ## T22 — 收尾
 
 - [ ] 每个 PR 合入之后，在 `crates/bolt-load/docs/idm-improvement-plan.md` §5 的表里，把对应的行标记为已完成，并链接到这份 spec。
+- [ ] 全部完成之后，对照 IDM 的策略（`crates/bolt-load/docs/idm-improvement-plan.md` §8、`idm-strategy-full.md`）盘点 bolt-load 还缺什么，写进 design 末尾的“实现说明”，再请用户决定要不要补。
 - [ ] 全部完成之后，更新 `crates/bolt-load/README.md` 和根目录 `README.md`，补充新配置项 `max_connections`、`max_attempts_per_range`、`Limits`，以及续传的说明。
