@@ -226,8 +226,8 @@
 
 ## T6 — 写错误结构化（C6）
 
-- [ ] 新增 `TaskError::Write { range, source: Arc<io::Error> }`，替换 `completion.rs:16-19` 里的 `Other`。
-- [ ] `StorageFull` 和 `QuotaExceeded` 在 `Display` 里给出明确提示；`FailurePolicy` 不对它们重试。
+- [x] 新增 `TaskError::Write { range, source: Arc<io::Error> }`，替换 `completion.rs:16-19` 里的 `Other`。singleton 的写是缓冲的，失败对应不到区间，仍报 `Io`（design §14.8）。
+- [x] `StorageFull` 和 `QuotaExceeded` 在 `Display` 里给出明确提示；`FailurePolicy` 不对它们重试。写失败不经过 `FailurePolicy`，下载循环遇到第一个失败的写就结束。
 
 **验证**
 
