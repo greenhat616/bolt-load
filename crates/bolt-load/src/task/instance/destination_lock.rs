@@ -34,6 +34,10 @@ use bolt_load_utils::telemetry::*;
 use fs4::{FileExt, TryLockError};
 use same_file::Handle;
 
+use super::{
+    file_steps::{FileHooks, Step},
+    state_file::sync_parent_dir,
+};
 use crate::task::{DownloadError, IoOp};
 
 /// The extension of the lock file, which will also hold the resume state.
@@ -62,7 +66,6 @@ pub(crate) enum Unsupported {
     /// Warn and go on unlocked: a task that keeps no state for resuming.
     Proceed,
     /// Fail: a task that resumes needs the lock.
-    #[cfg_attr(not(test), expect(dead_code, reason = "resume arrives with C33"))]
     Fail,
 }
 
@@ -273,7 +276,6 @@ impl DestinationLock {
     /// On Windows, the writes go through `seek_write`, which moves the
     /// handle's cursor, shared by every clone: any use of the cursor must
     /// stay serialized with them.
-    #[cfg_attr(not(test), expect(dead_code, reason = "C33b writes the state file"))]
     pub(crate) fn handle(&self) -> Option<Arc<File>> {
         self.file.clone()
     }
@@ -288,6 +290,38 @@ impl DestinationLock {
             return;
         };
         remove(&self.path);
+        unlock(&file);
+    }
+
+    /// Release the lock and leave the file: it holds the state of a
+    /// partial download kept for a later resume (design §11.5.9).
+    pub(crate) fn release_keeping(self) {
+        if let Some(file) = self.file {
+            unlock(&file);
+        }
+    }
+
+    /// Remove the lock file, sync its directory, then release the lock:
+    /// the end of a task that wrote a state file, once it completed or
+    /// discarded it (design §11.5.5, steps 6 to 8 of the completion). A
+    /// failed step is logged and the next one taken.
+    pub(crate) fn release_synced(self, hooks: &FileHooks) {
+        let Some(file) = self.file else {
+            return;
+        };
+        match hooks.before(Step::RemoveState) {
+            Ok(()) => remove(&self.path),
+            Err(e) => warn!("failed to remove {}: {e}", self.path.display()),
+        }
+        if let Err(e) = hooks
+            .before(Step::SyncDirAfterState)
+            .and_then(|()| sync_parent_dir(&self.path))
+        {
+            warn!(
+                "failed to sync the directory of {}: {e}",
+                self.path.display()
+            );
+        }
         unlock(&file);
     }
 }

@@ -209,8 +209,8 @@ resume-related fields can be added later.
   the temporary file removed. If removal fails, `leftover_temp_file` names
   the file; the error that caused the discard is not replaced. With
   `Resume::On`, a task that can be resumed keeps the temporary file and the
-  state file instead of removing them (STATUS-13; design §11.5.9; draft,
-  C20).
+  state file instead of removing them (STATUS-13; design §11.5.9;
+  implemented in C33 behind a crate-internal `Resume`, public with C20).
 - **STATUS-7** The watch sender MUST be dropped right after the terminal
   value, so `while rx.changed().await.is_ok()` ends after the receiver has
   seen it (watch delivers unseen values before `Closed`).
@@ -256,6 +256,10 @@ resume-related fields can be added later.
   §11.5.9). It is never set together with `leftover_temp_file` for the
   same file, and never once the temporary file has been renamed to the
   destination: a failure after the rename leaves the task `Finished`.
+  (C33 sets it on a crate-internal field; it becomes the public field with
+  `Resume`, in C20, a lead decision. When the invalidation of a discard
+  fails, both files stay and the partial file is reported in
+  `leftover_temp_file`, not here: the task meant to discard it.)
 
 Internal: one `pub(crate) StatusPublisher` owns the only `watch::Sender`.
 The driver owns it; transfers and samplers borrow it and never keep a clone
@@ -277,7 +281,10 @@ publishing `Initializing`:
    initialized data.
 
 Download strategy hardening, design §11.4-§11.5 (step 4 and Off's part of
-step 5 implemented in C31; the rest of step 5 is a draft for C33 and C20):
+step 5 implemented in C31; a resumable fresh start, and the lock that
+`Resume::On` requires, in C33, behind a crate-internal `Resume`; the
+resume check and the switch of `prefer_mode(Singleton)` to the concurrent
+engine in C20 and C33c):
 steps 3 and 4 become these, with everything before `info` is published:
 
 3. Resolve the destination and check the filesystem.
@@ -420,9 +427,11 @@ impl DownloadError {
   status pending (design §11.5.4). Awaiting the `Task` returns that error
   instead of resuming the unwind (`blocking` builds its tasks with
   `propagate_panic(true)`). (C31 implements the phases it reaches: before
-  the lock, while transferring, and after the rename; the others arrive
-  with C33. Before C31, workers were signalled but not joined, and the
-  temporary file was removed on a best-effort basis.)
+  the lock, while transferring, and after the rename; C33 adds a resumable
+  new start (B1, discarded) and a resumable transfer (C, both files kept,
+  the lock released without removing the state file); the resume check
+  (B2) arrives with C20. Before C31, workers were signalled but not joined,
+  and the temporary file was removed on a best-effort basis.)
 - **TASK-9** `drive_progress_bar` runs a dedicated thread that waits with
   `changed_blocking`. It calls `set_length` once the total is known, leaves
   the bar as a spinner while it is unknown, finishes or abandons the bar on
