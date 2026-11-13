@@ -43,6 +43,9 @@ pub struct TaskBuilder {
     lock_hooks: LockHooks,
     /// Whether the task keeps a state file for a later resume.
     resume: Resume,
+    /// An identity of the source, stored in the state file and compared on
+    /// resume.
+    resume_source: Option<String>,
     /// What to call before each file step of a resumable task; tests fail
     /// them.
     file_hooks: FileHooks,
@@ -51,17 +54,33 @@ pub struct TaskBuilder {
     starts: Option<super::status::Starts>,
 }
 
-/// Whether a task keeps what it downloaded when it does not finish, so
-/// that a later task can continue from it (design §11.5.2).
+/// Whether a task keeps what it downloaded when it does not finish, and
+/// continues from what an earlier task kept (design §11.5.2).
 ///
-/// Crate internal until resuming is public (C20c); tests switch it on.
+/// With [`Resume::On`], a download that can be resumed keeps two files
+/// next to the destination when it does not finish: the partial file,
+/// `<dest>.downloading`, and a state file, `<dest>.boltload`, which records
+/// the blocks written and synced so far. The next task with `Resume::On`
+/// for the same destination checks both, every kept block against its
+/// checksum, and downloads only the rest. Whether a download can be
+/// resumed is in [`TaskInfo::resumable`](super::TaskInfo::resumable); what a
+/// task continued from, in [`TaskInfo::resumed`](super::TaskInfo::resumed).
+///
+/// A task never starts over on its own: when what was kept cannot be
+/// continued, it fails with
+/// [`DownloadError::ResumeRejected`](super::DownloadError::ResumeRejected)
+/// and changes neither file. Starting over is the caller's decision, after
+/// [`discard_partial`](super::discard_partial).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum Resume {
+#[non_exhaustive]
+pub enum Resume {
     /// Start from an empty file; delete it when the task does not finish.
     #[default]
     Off,
     /// Keep the partial file and a state file when the task does not
-    /// finish, when the download is resumable (design §11.5.3).
+    /// finish; continue from them when they are there, or fail with
+    /// [`DownloadError::ResumeRejected`](super::DownloadError::ResumeRejected)
+    /// when they cannot be continued.
     On,
 }
 
@@ -78,6 +97,7 @@ impl TaskBuilder {
             meta: None,
             lock_hooks: LockHooks::default(),
             resume: Resume::Off,
+            resume_source: None,
             file_hooks: FileHooks::default(),
             #[cfg(test)]
             starts: None,
@@ -115,9 +135,11 @@ impl TaskBuilder {
         self
     }
 
-    /// Prefer a mode. `Singleton` is always honoured; `Concurrent` (the
-    /// default) is used when the size is known and the adapter supports
-    /// ranges.
+    /// Prefer a mode. `Singleton` is honoured, except by a task with
+    /// [`Resume::On`] that can be resumed: it downloads over ranges with
+    /// one connection, so that it keeps a state file (design §11.5.8).
+    /// `Concurrent` (the default) is used when the size is known and the
+    /// adapter supports ranges.
     pub fn prefer_mode(mut self, mode: DownloadMode) -> Self {
         self.prefer_mode = Some(mode);
         self
@@ -190,6 +212,15 @@ impl TaskBuilder {
             return Err(BuildError::MissingRuntime);
         }
         self.options.validate()?;
+        if self
+            .resume_source
+            .as_ref()
+            .is_some_and(|source| source.len() > super::instance::state_file::MAX_SOURCE_LEN)
+        {
+            return Err(BuildError::InvalidOptions {
+                reason: "the resume source is longer than 4096 bytes",
+            });
+        }
         self.destination
             .as_ref()
             .ok_or(BuildError::MissingDestination)?
@@ -203,10 +234,29 @@ impl TaskBuilder {
         self
     }
 
-    /// Keep a state file for a later resume, or not (design §11.5.2).
-    #[cfg(test)]
-    pub(crate) fn resume(mut self, resume: Resume) -> Self {
+    /// Keep what the download wrote when it does not finish, and continue
+    /// from what an earlier task kept, or not; see [`Resume`].
+    ///
+    /// A resume needs metadata as the adapter retrieves it: the task
+    /// retrieves it again when it finds a state file, even when
+    /// [`meta`](Self::meta) gave some. Adapters cache what they retrieved,
+    /// so on the same adapter the state file is compared with that, and a
+    /// change since is caught only by the `If-Range` of the range requests
+    /// the resume makes: one that kept every block makes none. To check
+    /// against the resource as it is now, resume with a new adapter.
+    pub fn resume(mut self, resume: Resume) -> Self {
         self.resume = resume;
+        self
+    }
+
+    /// An identity of the source, such as its URL, stored in the state
+    /// file and compared on resume: another one rejects the resume with
+    /// [`RejectReason::SourceMismatch`](super::RejectReason::SourceMismatch).
+    /// At most 4096 bytes; a longer one fails [`validate`](Self::validate).
+    /// Optional; a task without it resumes only from a state file without
+    /// one.
+    pub fn resume_source(mut self, source: impl Into<String>) -> Self {
+        self.resume_source = Some(source.into());
         self
     }
 
@@ -241,6 +291,7 @@ impl TaskBuilder {
             meta,
             lock_hooks,
             resume,
+            resume_source,
             file_hooks,
             #[cfg(test)]
             starts,
@@ -266,6 +317,7 @@ impl TaskBuilder {
             cancel_token: cancel_token.clone(),
             lock_hooks,
             resume,
+            resume_source,
             file_hooks,
         };
         let join = drive::spawn(attempt, runtime, local_runtime_builder, publisher);

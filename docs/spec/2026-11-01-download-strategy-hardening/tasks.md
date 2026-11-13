@@ -614,8 +614,8 @@
 - [x] C34：meta 带上实际用于 `If-Range` 的验证器（design §11.5.7）。
 - [x] C32：writer 的 `sync`，按 1 MiB 块的 CRC32C，串行的检查点（每 8 MiB 或 2 s、teardown 时一次）和失败时的回滚；测同步和 CRC 的开销（design §11.5.5、§11.5.6）。
 - [x] C33：`<file>.boltload` 使用带 CRC 的二进制格式（design §11.3、§11.5.5）。记录在数据同步之后才追加；新开始、完成、回退、丢弃都按 §11.5.5 的顺序；按阶段保留或删除文件，`kept_for_resume`，`discard_partial`（design §11.5.9）。
-- [ ] C20：续传前的检查，按 design §11.4、§11.5.10 的顺序执行，逐块校验 CRC；丢弃了哪些记录、为什么丢弃，都要上报（`TaskInfo::resumed`）；不能续时以 `ResumeRejected` 失败。
-- [ ] C20：新增续传入口 `TaskBuilder::resume(Resume)`（D15、D16），符合 `task-api-spec.md` 的规则（STATUS-12、STATUS-13）。
+- [x] C20：续传前的检查，按 design §11.4、§11.5.10 的顺序执行，逐块校验 CRC；丢弃了哪些记录、为什么丢弃，都要上报（`TaskInfo::resumed`）；不能续时以 `ResumeRejected` 失败。
+- [x] C20：新增续传入口 `TaskBuilder::resume(Resume)`（D15、D16），符合 `task-api-spec.md` 的规则（STATUS-12、STATUS-13）。
 
 **验证**
 

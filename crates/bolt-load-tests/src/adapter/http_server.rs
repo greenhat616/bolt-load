@@ -168,6 +168,9 @@ struct FaultState {
     stalled: Arc<AtomicBool>,
     /// The version the faults of [`RangeFault::VALIDATED`] serve, from 1.
     version: Arc<AtomicUsize>,
+    /// Where a range of [`RangeFault::Stable`] that covers it holds its
+    /// body, until the gate is released.
+    hold_at: Option<(u64, Gate)>,
     log: RequestLog,
 }
 
@@ -221,6 +224,26 @@ pub async fn create_range_fault_server_with_log(
     content: Bytes,
     hold: Option<Gate>,
 ) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>, RequestLog)> {
+    serve_faults(content, hold, None).await
+}
+
+/// [`create_range_fault_server_with_log`], where a range response of
+/// [`RangeFault::Stable`] that covers byte `position` sends the bytes
+/// before it, then holds the rest at `gate` until it is released. Every
+/// such response holds, once each; a released gate holds none.
+pub async fn create_range_fault_server_held_at(
+    content: Bytes,
+    position: u64,
+    gate: Gate,
+) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>, RequestLog)> {
+    serve_faults(content, None, Some((position, gate))).await
+}
+
+async fn serve_faults(
+    content: Bytes,
+    hold: Option<Gate>,
+    hold_at: Option<(u64, Gate)>,
+) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>, RequestLog)> {
     let (listener, port) = bind_local().await?;
     let log = RequestLog::default();
     let state = FaultState {
@@ -232,6 +255,7 @@ pub async fn create_range_fault_server_with_log(
         congested_once: Arc::new(AtomicUsize::new(0)),
         version: Arc::new(AtomicUsize::new(1)),
         hold,
+        hold_at,
         log: log.clone(),
     };
     let app = axum::Router::new()
@@ -300,6 +324,37 @@ fn partial(content: &Bytes, first: u64, last: u64, total: u64) -> Response {
         StatusCode::PARTIAL_CONTENT,
         partial_headers(first, last, total),
         body,
+    )
+        .into_response()
+}
+
+/// A 206 for `first..=last`; when it covers the position of `hold_at`, its
+/// body sends the bytes before that position, then waits at the gate.
+fn held_at(
+    content: &Bytes,
+    first: u64,
+    last: u64,
+    total: u64,
+    hold_at: Option<(u64, Gate)>,
+) -> Response {
+    let body = content.slice(first as usize..=last as usize);
+    let stream = async_stream::stream! {
+        match hold_at {
+            Some((position, gate)) if (first..=last).contains(&position) => {
+                let at = (position - first) as usize;
+                if at > 0 {
+                    yield Ok::<_, std::io::Error>(body.slice(..at));
+                }
+                gate.pass().await;
+                yield Ok(body.slice(at..));
+            }
+            _ => yield Ok(body),
+        }
+    };
+    (
+        StatusCode::PARTIAL_CONTENT,
+        partial_headers(first, last, total),
+        axum::body::Body::from_stream(stream),
     )
         .into_response()
 }
@@ -572,6 +627,9 @@ fn validated_response(
             Some((first, last)) if half => {
                 partial(&content, first, first + (last - first) / 2, len)
             }
+            Some((first, last)) if fault == Stable && !probe => {
+                held_at(&content, first, last, len, state.hold_at.clone())
+            }
             Some((first, last)) => partial(&content, first, last, len),
             None => (
                 StatusCode::RANGE_NOT_SATISFIABLE,
@@ -665,7 +723,7 @@ fn fault_response(
     let Some(fault) = fault else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if RangeFault::VALIDATED.contains(&fault) {
+    if RangeFault::VALIDATED.contains(&fault) || fault == RangeFault::Stable {
         return validated_response(fault, state, method, headers);
     }
     let encoded = fault == RangeFault::EncodedRepresentation;

@@ -33,8 +33,10 @@ The full contract, with numbered requirements, is in
 The mode is selected while the task is `Initializing`: `Singleton` when
 it is preferred via [`TaskBuilder::prefer_mode`], the metadata shows a
 content coding, or the size is unknown (zero), otherwise `Concurrent`
-when the adapter reports range stream support. [`TaskInfo::mode`]
-reports the choice.
+when the adapter reports range stream support. A preferred `Singleton`
+gives way in one case: a task with [`Resume::On`] that can be resumed
+runs `Concurrent` with one connection, so that it keeps a state file.
+[`TaskInfo::mode`] reports the choice.
 
 When ranges turn out unusable during a concurrent download (the server
 ignores them or content-codes them), the task discards what it wrote and
@@ -152,8 +154,8 @@ task that keeps a state file for a later resume: its complete blocks,
 with their CRCs, recorded once their data is synced. A periodic
 checkpoint never starts sooner than 0.5 s after the last one ended, so a
 fast source does not sync the file every few milliseconds; the checkpoint
-at teardown does not wait for that. No task keeps a state file yet,
-so they have no effect for now.
+at teardown does not wait for that. They have no effect on a task that
+keeps no state file (see Resuming).
 
 Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a
 stalled stream ends the task with `NoProgress` before its runner can time
@@ -216,6 +218,76 @@ process, so a crashed task does not keep it.
   leaving the lock file behind, empty;
   a missing permission fails it with [`DownloadError::Io`] and
   [`IoOp::Lock`].
+
+# Resuming
+
+With [`TaskBuilder::resume`]`(`[`Resume::On`]`)`, a task that does not finish
+keeps what it wrote: the temporary file and a state file,
+`<save path>.boltload`, which records every block of 1 MiB whose data was
+written and synced, with its CRC32C. [`TaskStatus::kept_for_resume`]
+names the temporary file then. The next task with `Resume::On` for the
+same destination continues from them:
+
+1. It reads the state file and compares it with the metadata the adapter
+   retrieves: the size, the validator ([`Validator`](crate::adapter::Validator)),
+   and the source given with [`TaskBuilder::resume_source`].
+2. It reads every recorded block back and checks its CRC. A block that
+   does not match, lies past the end of the file, or whose record is
+   torn, bad or contradicted, is dropped and downloaded again;
+   [`TaskInfo::resumed`] reports what was kept and what was dropped, and
+   why.
+3. It downloads the rest only, then renames the file as usual. Its first
+   `Downloading` status reports the kept bytes as progress.
+
+A task can resume when the size is known, the response is not
+content-coded, the server takes ranges and sends a usable validator (a
+strong `ETag`, or a `Last-Modified` old enough); [`TaskInfo::resumable`]
+says whether it does. Otherwise it downloads as with `Resume::Off`. A
+task that prefers one connection resumes over ranges with one connection.
+
+A task never starts over on its own. When the files cannot be continued,
+because the resource changed, the state file is bad, or the temporary
+file is gone, it fails with [`DownloadError::ResumeRejected`] and
+changes neither file. Starting over is the caller's choice:
+
+```rust,ignore
+use bolt_load::task::{DownloadError, Resume, Task, discard_partial};
+
+let task = Task::builder(adapter()).runtime(rt.clone()).save_to("big.iso").resume(Resume::On);
+match task.spawn()?.await {
+    Err(DownloadError::ResumeRejected { reason, .. }) => {
+        log::warn!("cannot resume: {reason}; starting over");
+        discard_partial("big.iso").await?;
+        Task::builder(adapter()).runtime(rt).save_to("big.iso").resume(Resume::On).spawn()?.await?;
+    }
+    other => {
+        other?;
+    }
+}
+```
+
+- Resume with a new adapter. An adapter caches the metadata it
+  retrieved, so on the same adapter the state file is compared with that,
+  and a change since is caught only by the `If-Range` of the range
+  requests the resume makes, as [`DownloadError::ResourceChanged`]; a
+  resume that kept every block makes none. A new adapter checks against
+  the resource as it is now.
+- [`discard_partial`] removes what a task kept for a destination; it fails
+  with [`DownloadError::InUse`] while a task holds it.
+- A resume needs the destination's lock: on a file system that cannot
+  lock files, a task with `Resume::On` fails with [`DownloadError::Io`]
+  and [`IoOp::Lock`].
+- The checks find what a crash, a power loss or a bad sector leaves; the
+  state file is not protected against deliberate changes. On Windows the
+  directory is not synced; NTFS journals the metadata.
+- With the ureq2 adapter, a blocking request or read still running when
+  its range is given up keeps its connection open until the call returns.
+  Until then a task can hold more connections than
+  [`TaskOptions::max_connections`], and repeated retries or restarts can
+  hold several such connections; without timeouts on the agent, a stalled
+  server can keep them open indefinitely
+  ([#207](https://github.com/greenhat616/bolt-load/issues/207)). Give the
+  agent timeouts, as the bolt-load-adapter README describes.
 
 # Attempt Steps
 
