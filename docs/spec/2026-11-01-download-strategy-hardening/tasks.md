@@ -591,15 +591,16 @@
 
 ## T20 — 验证器与 `If-Range`（C19，P3）
 
-- [ ] `BoltLoadAdapterMeta` 增加 `etag`（只保存强 ETag）和 `last_modified`；两个 adapter 都在探测阶段读取这两个值。
-- [ ] adapter 的 context 缓存（`OnceCell`）改为可以在多次尝试之间刷新。
-- [ ] 续传时，range 请求带上 `If-Range`。这时收到 `200`，返回 `ResourceChanged`，不走 T5 的回退。
+- [x] `BoltLoadAdapterMeta` 增加 `etag`（只保存强 ETag）和 `last_modified`；两个 adapter 都从探测的 GET 读取这两个值（ureq2 也发 `bytes=0-0` 探测），不用 HEAD 的。
+- [x] range 请求带上 `If-Range`（不只续传：探测之后的每个 range 请求）。收到另一个验证器的 `200`，或者验证器冲突的 `206`，返回 `ResourceChanged`，不走 T5 的回退；任务删掉临时文件，以 `DownloadError::ResourceChanged` 失败（design §14.23）。
+- 移到 #195（维护者，2026-11-09，§3 的 D12、D13 已修订，D14 移过去）：任务内从头重来、adapter 缓存的刷新（原来的 `BoltLoadAdapter::refresh`）、按请求传验证器。
 
 **验证**
 
 - 故障注入：
-  - 续传之前服务器替换了文件：任务丢弃旧数据、从头下载，最终 hash 与新文件一致；
-  - 只有弱 ETag 时，退而使用 `Last-Modified`。
+  - 下载途中服务器替换了文件：任务以 `ResourceChanged` 失败，不留文件，不回退（C19）。原来的“从头下载、最终 hash 与新文件一致”移到 #195；“续传之前被替换”留给 C20。
+  - 服务器忽略 `If-Range`、发新版本的 206：同样失败，不拼两个版本。
+  - 没有 ETag 时用 `Last-Modified`；只有弱 ETag 时什么都不发（lead 决定，2026-11-09，RFC 9110 §13.1.5，见 design §14.23）。
 
 ## T21 — 状态文件与续传（C20，P3）
 

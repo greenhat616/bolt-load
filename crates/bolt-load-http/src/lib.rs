@@ -11,7 +11,11 @@ mod coding;
 pub mod header;
 mod range;
 mod status;
+mod validator;
 
 pub use coding::{ContentCoding, codings_to_decode};
 pub use range::{RangeHeaders, limit_range_body, validate_range_response};
 pub use status::{MAX_RETRY_AFTER, classify_status};
+pub use validator::{
+    Validator, conflicts_with, has_validator, if_range_validator, is_strong_etag, strong_etag,
+};

@@ -94,6 +94,33 @@ size is then unknown until the stream ends. A coding the build cannot
 decode fails the task with `ContentCoded`. Range responses are never
 decoded: a coded range makes the task fall back to one connection.
 
+Range requests carry `If-Range` with the validator of the metadata: the
+strong `ETag` of a GET, or else its `Last-Modified` when that is at least
+a second older than its `Date`. With only a weak `ETag`, none is sent.
+When the resource changes during the download, the task removes what it
+wrote and fails with `DownloadError::ResourceChanged`. The task does not
+fall back to one connection then, since that connection could not notice
+the change.
+
+To get the new version, download it again with a fresh adapter. An
+adapter probes the resource once and keeps what it learned, its
+validator included; a cloned adapter or builder shares that, so a task on
+it fails again against the old validator. Restarting automatically is
+tracked in [#195](https://github.com/greenhat616/bolt-load/issues/195).
+
+Detection needs the adapter's `bytes=0-0` probe to succeed and carry a
+validator. When the probe fails or is rejected, or the resource has no
+usable validator, ranges carry no `If-Range` for the adapter's whole
+life, and a change goes unnoticed.
+
+**Breaking change.** `UnretryableError::ResourceChanged` and
+`DownloadError::ResourceChanged` are new. A server that answers a
+conditional range request with another version, or a part of another
+version, now fails the task instead of making it fall back to one
+connection or mixing the two versions. The ureq2 adapter now also sends a
+`bytes=0-0` GET when it retrieves the metadata, to read the validators of
+a GET.
+
 ## Concurrency Control
 
 The concurrent download engine continuously monitors runner outcomes:
