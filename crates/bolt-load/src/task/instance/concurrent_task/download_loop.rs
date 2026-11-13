@@ -28,7 +28,10 @@ use super::{
     RunnerManager, RunnerSpawner,
     file_writer::{FileWriter, PendingWriter, WriteCompletion},
     runner_manager::RunnerTick,
-    strategy::{Backoff, DEFAULT_STRATEGY_TICK_INTERVAL, FailurePolicy, StrategyControl},
+    strategy::{
+        AdmissionEvidence, Backoff, DEFAULT_STRATEGY_TICK_INTERVAL, FailurePolicy, StrategyControl,
+        streak_gap,
+    },
 };
 use crate::{
     runtime::TimerBuilder,
@@ -79,7 +82,9 @@ impl DownloadLoop {
         cancel_token: CancellationToken,
     ) -> Self {
         let max_concurrency = options.max_connections.get();
-        let manager = RunnerManager::new(total, max_concurrency);
+        let mut manager = RunnerManager::new(total, max_concurrency);
+        *manager.admission_mut() =
+            AdmissionEvidence::with_streak_gap(streak_gap(options.connect_timeout));
         let strategy = StrategyControl::new(max_concurrency);
         let policy = FailurePolicy::new(options, Instant::now());
         let writer = PendingWriter::new_direct(

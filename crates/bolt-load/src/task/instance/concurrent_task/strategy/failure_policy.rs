@@ -57,6 +57,12 @@ impl FailurePolicy {
         self.last_progress_at = now;
     }
 
+    /// When new bytes were last accepted, or when the policy was created.
+    #[inline]
+    pub fn last_progress_at(&self) -> Instant {
+        self.last_progress_at
+    }
+
     /// A successful non-empty write resets the consecutive failure count.
     pub fn on_write_ok(&mut self, written: usize) {
         if written > 0 {

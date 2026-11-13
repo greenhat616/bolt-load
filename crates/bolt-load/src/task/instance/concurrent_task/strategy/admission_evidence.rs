@@ -17,7 +17,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "the limit controller reads the evidence from the next commit"
+        reason = "the recovery steps read the rest from the next commit"
     )
 )]
 

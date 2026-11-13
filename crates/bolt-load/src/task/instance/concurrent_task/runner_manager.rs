@@ -236,8 +236,14 @@ impl RunnerManager {
         }
     }
 
+    #[cfg(test)]
     pub fn runner_outcome_sampler_mut(&mut self) -> &mut RunnerOutcomeSampler {
         &mut self.runner_outcome_sampler
+    }
+
+    /// The outcome sampler and the admission evidence, borrowed together.
+    pub fn outcome_sources_mut(&mut self) -> (&mut RunnerOutcomeSampler, &mut AdmissionEvidence) {
+        (&mut self.runner_outcome_sampler, &mut self.admission)
     }
 
     /// What ended attempts tell about the connections the server admits.
@@ -459,6 +465,12 @@ impl RunnerManager {
     #[inline]
     pub fn get_active_runners_count(&self) -> usize {
         self.chunk_planner.get_active_runners_count()
+    }
+
+    /// The runners that are running and had bytes accepted on this attempt
+    #[inline]
+    pub fn get_proven_runners_count(&self) -> usize {
+        self.chunk_planner.get_proven_runners_count()
     }
 
     /// Gets the state of the specified runner

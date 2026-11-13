@@ -27,17 +27,6 @@ pub enum RunnerOutcome {
     StreamClosed(FailureKind),
 }
 
-impl RunnerOutcome {
-    #[inline]
-    pub const fn is_unretryable(&self) -> bool {
-        matches!(
-            self,
-            Self::ConnectFailed(FailureKind::Unretryable)
-                | Self::StreamClosed(FailureKind::Unretryable)
-        )
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct OutcomeRecord {
     timestamp: Instant,
@@ -88,8 +77,6 @@ pub struct RunnerOutcomeSampler {
     time_window: Duration,
     /// The maximum number of records
     max_records: usize,
-    /// The timestamp of the last unretryable failure (for immediate response)
-    last_unretryable_at: Option<Instant>,
 }
 
 impl RunnerOutcomeSampler {
@@ -103,7 +90,6 @@ impl RunnerOutcomeSampler {
             records: VecDeque::with_capacity(max_records),
             time_window,
             max_records,
-            last_unretryable_at: None,
         }
     }
 
@@ -118,11 +104,6 @@ impl RunnerOutcomeSampler {
 
         // Clean up expired records
         self.cleanup_expired(now);
-
-        // Check if it is unretryable
-        if outcome.is_unretryable() {
-            self.last_unretryable_at = Some(now);
-        }
 
         // Add the record
         self.records.push_back(OutcomeRecord {
@@ -192,48 +173,5 @@ impl RunnerOutcomeSampler {
             }
         }
         stats
-    }
-
-    /// Check if a unretryable error occurred recently (`within` before
-    /// `now`)
-    ///
-    /// Used to trigger immediate degradation
-    pub fn has_recent_unretryable(&mut self, within: Duration, now: Instant) -> bool {
-        if self.unretryable_pending(within, now) {
-            // Clear the mark so one failure triggers degradation only once.
-            self.last_unretryable_at = None;
-            return true;
-        }
-        false
-    }
-
-    /// Whether an unretryable error occurred `within` before `now` and has
-    /// not triggered [`Self::has_recent_unretryable`] yet.
-    pub fn unretryable_pending(&self, within: Duration, now: Instant) -> bool {
-        self.last_unretryable_at
-            .is_some_and(|last| now.duration_since(last) <= within)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const WINDOW: Duration = Duration::from_secs(5);
-
-    #[test]
-    fn test_a_pending_unretryable_failure_triggers_once() {
-        let mut sampler = RunnerOutcomeSampler::with_defaults();
-        let now = Instant::now();
-        assert!(!sampler.unretryable_pending(WINDOW, now));
-        sampler.record_connect_failed(FailureKind::Unretryable);
-        let recorded = Instant::now();
-        // Peeking leaves it for the degradation.
-        assert!(sampler.unretryable_pending(WINDOW, recorded));
-        assert!(sampler.unretryable_pending(WINDOW, recorded));
-        assert!(!sampler.unretryable_pending(WINDOW, recorded + 2 * WINDOW));
-        assert!(sampler.has_recent_unretryable(WINDOW, recorded));
-        assert!(!sampler.unretryable_pending(WINDOW, recorded));
-        assert!(!sampler.has_recent_unretryable(WINDOW, recorded));
     }
 }
