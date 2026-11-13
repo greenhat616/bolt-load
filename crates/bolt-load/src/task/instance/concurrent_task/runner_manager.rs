@@ -274,7 +274,7 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 
 use super::{
     ChunkPlanner, PlannerGuard,
-    chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SideFailure},
+    chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SideFailure, WrittenSet},
     strategy::{
         AdmissionClass, AdmissionEvidence, AttemptPhase, charges_range, classify, is_restart,
     },
@@ -761,10 +761,16 @@ impl RunnerManager {
         self.chunk_planner.get_total_downloaded()
     }
 
-    /// Gets the downloaded ranges
+    /// The write of `range` completed, see [`ChunkPlanner::note_written`].
     #[inline]
-    pub fn get_downloaded_ranges(&self) -> Vec<Range<u64>> {
-        self.chunk_planner.get_downloaded_ranges()
+    pub fn note_written(&mut self, range: Range<u64>) {
+        self.chunk_planner.note_written(range);
+    }
+
+    /// The accepted bytes written to the file (design §11.1).
+    #[inline]
+    pub fn written(&self) -> &WrittenSet {
+        self.chunk_planner.written()
     }
 
     /// Gets the available ranges

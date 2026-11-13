@@ -43,12 +43,25 @@ pub struct Progress {
     /// It requires the single-thread task can finished until the stream is None
     pub total: Option<u64>,
 
-    /// the current downloaded size
+    /// The bytes received so far. A concurrent task counts them once it
+    /// accepted them, before they are written: they may run ahead of
+    /// [`Self::downloaded_chunks`].
     pub downloaded: u64,
 
-    /// the downloaded chunks,
-    /// for the single-thread task, it is the downloaded chunk
-    /// for the concurrent task, it is the downloaded chunks
+    /// The byte ranges whose writes completed successfully, in order
+    /// (design §11.1). A concurrent task reports them as the writer confirms
+    /// them, so while writes are in flight they hold fewer bytes than
+    /// [`Self::downloaded`]; a task that ended, failed or cancelled included,
+    /// reports those confirmed before its teardown. A failed write may still
+    /// have put part of its bytes in the file; they are not reported. The
+    /// ranges say nothing of durability, and a failed or cancelled task
+    /// deletes its temporary file. A single-connection task reports
+    /// `0..downloaded`.
+    ///
+    /// Migration: a concurrent task used to report the ranges it had
+    /// received here (design §14.21). For a total of the bytes received,
+    /// use [`Self::downloaded`]; read these as the ranges confirmed
+    /// written.
     pub downloaded_chunks: DownloadedChunks,
 }
 

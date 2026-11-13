@@ -491,6 +491,18 @@ fn test_loop_priority_pairs() {
 fn test_custom_timer_survives_other_events() {
     on_each_executor(|| async {
         let mut harness = LoopHarness::scripted(false).await;
+        // Only accepted bytes are written (design §11.1): a byte accepted,
+        // and written over and over.
+        let held = harness
+            .download
+            .manager
+            .allocate_runner_with_chunk(0..1)
+            .unwrap();
+        harness
+            .download
+            .manager
+            .update_progress(held.runner_id, 1)
+            .unwrap();
         // Writes and a connecting runner stay parked until the timer waits.
         while !harness.download.writer.is_full() {
             harness
@@ -500,7 +512,7 @@ fn test_custom_timer_survives_other_events() {
                 .unwrap();
         }
         let writes = harness.rt.take_parked();
-        harness.download.spawn_runner(0..LOOP_TOTAL, Instant::now());
+        harness.download.spawn_runner(1..LOOP_TOTAL, Instant::now());
         let connecting = harness.rt.take_parked();
         let script = harness.rt.script.clone();
         let cancel = harness.cancel.clone();
@@ -1247,6 +1259,7 @@ mod hedge;
 mod restart;
 mod retry;
 mod silent;
+mod written;
 
 /// Random sequences of the loop's steps, including failures that back their
 /// range off, congestion, growth and time passing.
