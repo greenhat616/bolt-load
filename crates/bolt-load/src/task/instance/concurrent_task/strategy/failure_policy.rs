@@ -571,4 +571,49 @@ mod tests {
         assert!(p.on_failure(&failure, 0).is_none());
         assert_eq!(p.consecutive, 1);
     }
+
+    /// A runner stopped for being slow is classified like a timeout
+    /// (design §9.5, §14.15): after accepted bytes it is a restart, neither
+    /// charged nor a consecutive failure, however often; without, it is
+    /// charged and counted, so the range's budget ends it.
+    #[test]
+    fn test_a_slow_runner_is_classified_like_a_timeout() {
+        let slow = |attempts, charged, received| {
+            AttemptFailure::slow(
+                1,
+                Released {
+                    range: 100..200,
+                    attempts,
+                    charged,
+                    received,
+                },
+            )
+        };
+        let mut p = budget_policy(1, 2);
+        for attempts in 1..=8 {
+            let restart = slow(attempts, 0, 10);
+            assert!(restart.slow && restart.retryable, "{restart:?}");
+            assert!(matches!(restart.error, TaskError::Timeout), "{restart:?}");
+            assert_eq!(restart.charged, 0);
+            assert!(p.on_failure(&restart, 0).is_none());
+        }
+        assert_eq!(p.consecutive, 0);
+
+        let mut p = budget_policy(3, 2);
+        let stalled = slow(3, 0, 0);
+        assert_eq!(stalled.charged, 1);
+        assert!(p.on_failure(&stalled, 0).is_none());
+        assert_eq!(p.consecutive, 1);
+        match p.on_failure(&slow(4, 1, 0), 0) {
+            Some(TaskError::RangeExhausted {
+                range,
+                attempts: 2,
+                source,
+            }) => {
+                assert_eq!(range, 100..200);
+                assert!(matches!(*source, TaskError::Timeout), "{source:?}");
+            }
+            other => panic!("expected RangeExhausted, got {other:?}"),
+        }
+    }
 }

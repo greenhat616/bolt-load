@@ -5,12 +5,18 @@
 //!
 //! | Phase | Priority |
 //! |---|---|
-//! | `Connecting` | cancel > control > connect timeout > connection |
+//! | `Connecting` | cancel > stop > control > connect timeout > connection |
 //! | `PublishingStarted` | lifecycle vacancy |
-//! | `Streaming`, reading | cancel > control > idle timeout > stream |
-//! | `Streaming`, emitting | cancel > control > data vacancy |
+//! | `Streaming`, reading | cancel > stop > control > idle timeout > stream |
+//! | `Streaming`, emitting | cancel > stop > control > data vacancy |
 //! | `Draining` | cancel > drained or consumer closed > drain timeout |
 //! | `PublishingStopped` | lifecycle vacancy |
+//!
+//! The stop, the runner's own (see
+//! [`TaskRunnerBuilder::stop_token`](super::TaskRunnerBuilder::stop_token)),
+//! ends it like the cancel, but only before it decided how it ends: an
+//! emission whose push is followed by the end of the stream, an error or a
+//! failed control signal is not stopped, and neither is the drain.
 
 use std::{
     future::{Future, poll_fn},
@@ -87,6 +93,8 @@ pub(super) struct RunnerLoop<'a> {
     phase: Phase,
     /// Allocated once per run.
     cancelled: Cancelled,
+    /// The runner's own stop, if it has one; allocated once per run.
+    stopped: Option<Cancelled>,
 }
 
 impl TaskRunner {
@@ -126,6 +134,10 @@ impl TaskRunner {
 impl<'a> RunnerLoop<'a> {
     pub(super) fn new(runner: &'a mut TaskRunner) -> Self {
         let cancelled = Box::pin(runner.cancel_token.clone().cancelled_owned());
+        let stopped = runner
+            .stop_token
+            .clone()
+            .map(|stop| Box::pin(stop.cancelled_owned()));
         let phase = match runner.input {
             RunnerInput::Connected(_) => Phase::PublishingStarted,
             RunnerInput::Connecting(_) => Phase::Connecting(ConnectingState::new(
@@ -138,6 +150,7 @@ impl<'a> RunnerLoop<'a> {
             runner,
             phase,
             cancelled,
+            stopped,
         }
     }
 
@@ -169,6 +182,9 @@ impl<'a> RunnerLoop<'a> {
                 if let Poll::Ready(()) = self.poll_cancel(cx) {
                     return Poll::Ready(Step::Cancelled);
                 }
+                if let Poll::Ready(()) = self.poll_stop(cx) {
+                    return Poll::Ready(Step::Cancelled);
+                }
                 if let Poll::Ready(event) = self.runner.poll_control(cx) {
                     return Poll::Ready(Step::Control(event));
                 }
@@ -181,6 +197,9 @@ impl<'a> RunnerLoop<'a> {
             Phase::Streaming(state) if state.is_emitting() => self.poll_emit(cx).map(Step::Emitted),
             Phase::Streaming(_) => {
                 if let Poll::Ready(()) = self.poll_cancel(cx) {
+                    return Poll::Ready(Step::Cancelled);
+                }
+                if let Poll::Ready(()) = self.poll_stop(cx) {
                     return Poll::Ready(Step::Cancelled);
                 }
                 if let Poll::Ready(event) = self.runner.poll_control(cx) {
@@ -200,6 +219,15 @@ impl<'a> RunnerLoop<'a> {
     #[inline]
     fn poll_cancel(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         self.cancelled.as_mut().poll(cx)
+    }
+
+    /// Pending forever without a stop of its own.
+    #[inline]
+    fn poll_stop(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match &mut self.stopped {
+            Some(stopped) => stopped.as_mut().poll(cx),
+            None => Poll::Pending,
+        }
     }
 
     pub(super) fn handle_step(&mut self, step: Step) {

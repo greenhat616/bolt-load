@@ -3,6 +3,7 @@
 mod cancel;
 mod completion;
 mod deadline;
+mod restart;
 mod retry;
 mod runner;
 mod strategy_tick;
@@ -74,7 +75,7 @@ pub(super) struct DownloadLoop {
     strategy_tick: StrategyTick,
     throughput: ThroughputSampler,
     /// Each runner's rate at the strategy ticks; only the doubling
-    /// strategy samples it.
+    /// strategy samples it, and restarts slow runners on it.
     rates: Option<RunnerRates>,
     /// Every strategy action applied, in order.
     #[cfg(test)]

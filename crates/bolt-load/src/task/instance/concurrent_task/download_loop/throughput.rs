@@ -1,14 +1,14 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::{
     super::{
         chunk_planner::ChunkStatus,
         runner_manager::{MeterSnapshot, RunnerManager},
-        strategy::TickSample,
+        strategy::{SLOW_WINDOW, TickSample},
     },
     DownloadLoop, LoopEvent,
 };
@@ -17,7 +17,8 @@ use crate::{
     task::{Progress, RunnerId, Speed, instance::sampler::SpeedSampler},
 };
 
-/// Each runner's rate between strategy ticks (design §9.2, §9.3).
+/// Each runner's rate between strategy ticks (design §9.2, §9.3), and over
+/// the slow window (design §9.5).
 ///
 /// Sampled at every tick with the tick's `now`, from the bytes the planner
 /// accepted: the task's total, and each connecting or running runner's
@@ -27,10 +28,26 @@ use crate::{
 /// sample on the same chunk, told by the chunk's generation: a split keeps
 /// it, so the runner keeps its rate; a new claim gets a new one, even by
 /// the same ID at the same start.
-#[derive(Debug, Default)]
+///
+/// The samples of the last `window` are kept for the bytes over it, see
+/// [`Self::window_bytes`].
+#[derive(Debug)]
 pub(super) struct RunnerRates {
-    last: Option<RatesSample>,
+    /// The samples from the latest one at least `window` before the last
+    /// one, oldest first.
+    history: VecDeque<RatesSample>,
     tick: TickSample,
+    window: Duration,
+}
+
+impl Default for RunnerRates {
+    fn default() -> Self {
+        Self {
+            history: VecDeque::new(),
+            tick: TickSample::default(),
+            window: SLOW_WINDOW,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -38,9 +55,19 @@ struct RatesSample {
     at: Instant,
     /// The bytes accepted from every runner so far.
     total: u64,
-    /// Each active runner's chunk generation and the bytes accepted into
-    /// it.
-    runners: HashMap<RunnerId, (u64, u64)>,
+    /// Each active runner's attempt.
+    runners: HashMap<RunnerId, RunnerSample>,
+}
+
+/// One runner's attempt at a sample.
+#[derive(Debug, Clone, Copy)]
+struct RunnerSample {
+    /// The generation of its chunk.
+    generation: u64,
+    /// The bytes accepted into its chunk.
+    accepted: u64,
+    /// Whether it had connected.
+    running: bool,
 }
 
 impl RunnerRates {
@@ -52,11 +79,10 @@ impl RunnerRates {
             total: manager.get_total_downloaded(),
             runners: HashMap::new(),
         };
+        let last = self.history.back();
         let mut all_delivering = true;
         let mut rates = HashMap::new();
-        let elapsed = self
-            .last
-            .as_ref()
+        let elapsed = last
             .map(|last| now.saturating_duration_since(last.at).as_secs_f64())
             .filter(|&elapsed| elapsed > 0.0);
         for chunk in manager.active_chunks() {
@@ -64,28 +90,37 @@ impl RunnerRates {
                 continue;
             };
             let accepted = chunk.downloaded.end - chunk.downloaded.start;
+            let running = chunk.status == ChunkStatus::Running;
             // The same attempt, or a new one starting from nothing.
-            let previous = self
-                .last
-                .as_ref()
+            let previous = last
                 .and_then(|last| last.runners.get(&runner_id))
-                .filter(|&&(generation, _)| generation == chunk.generation)
-                .map(|&(_, previous)| previous);
-            all_delivering &=
-                chunk.status == ChunkStatus::Running && accepted > previous.unwrap_or(0);
+                .filter(|previous| previous.generation == chunk.generation)
+                .map(|previous| previous.accepted);
+            all_delivering &= running && accepted > previous.unwrap_or(0);
             if let (Some(previous), Some(elapsed)) = (previous, elapsed) {
                 rates.insert(runner_id, (accepted - previous) as f64 / elapsed);
             }
-            sample
-                .runners
-                .insert(runner_id, (chunk.generation, accepted));
+            sample.runners.insert(
+                runner_id,
+                RunnerSample {
+                    generation: chunk.generation,
+                    accepted,
+                    running,
+                },
+            );
         }
-        let speed = self
-            .last
-            .as_ref()
+        let speed = last
             .zip(elapsed)
             .map(|(last, elapsed)| (sample.total - last.total) as f64 / elapsed);
-        self.last = Some(sample);
+        self.history.push_back(sample);
+        // The next window starts at the latest sample a window back.
+        while self
+            .history
+            .get(1)
+            .is_some_and(|next| next.at + self.window <= now)
+        {
+            self.history.pop_front();
+        }
         self.tick = TickSample {
             speed,
             all_delivering,
@@ -94,9 +129,45 @@ impl RunnerRates {
         &self.tick
     }
 
+    /// What the runners did over the tick that ended at the last sample.
+    pub(super) fn tick(&self) -> &TickSample {
+        &self.tick
+    }
+
     /// The rate of `runner_id` at the last sample, if it had one.
     pub(super) fn rate(&self, runner_id: RunnerId) -> Option<f64> {
         self.tick.rates.get(&runner_id).copied()
+    }
+
+    /// The bytes the planner accepted from each runner over a full window
+    /// at the last sample (design §9.5).
+    ///
+    /// The window starts at the latest sample at least `window` before the
+    /// last one, the same for every runner; a runner has a full window
+    /// when it was running the same attempt at both samples. A runner
+    /// younger than the window, one that was still connecting at its
+    /// start, and one on a new attempt since have none. At 1.5 s ticks a
+    /// 10 s window spans 10.5 s.
+    pub(super) fn window_bytes(&self) -> Vec<(RunnerId, u64)> {
+        let Some(last) = self.history.back() else {
+            return Vec::new();
+        };
+        let Some(start) = self
+            .history
+            .iter()
+            .rev()
+            .find(|sample| sample.at + self.window <= last.at)
+        else {
+            return Vec::new();
+        };
+        last.runners
+            .iter()
+            .filter_map(|(&runner_id, now)| {
+                let then = start.runners.get(&runner_id)?;
+                (then.running && then.generation == now.generation)
+                    .then(|| (runner_id, now.accepted - then.accepted))
+            })
+            .collect()
     }
 }
 
@@ -375,6 +446,79 @@ mod tests {
         distinct.sort_unstable();
         distinct.dedup();
         assert_eq!(distinct.len(), 3, "{generations:?}");
+    }
+
+    /// A runner has bytes over a window once it ran the same attempt a full
+    /// window before the last sample, not a nanosecond earlier. The window
+    /// starts at the latest sample a window back, so at 1.5 s ticks it
+    /// spans 10.5 s, and only the samples since are kept.
+    #[test]
+    fn test_window_bytes_need_a_full_window() {
+        const NANO: Duration = Duration::from_nanos(1);
+        let mut manager = RunnerManager::new(100 * MIB, 4);
+        let _slot = manager.allocate_runner_with_chunk(0..50 * MIB).unwrap();
+        let mut sampler = RunnerRates::default();
+        let t0 = Instant::now();
+        sampler.sample(&manager, t0);
+        assert_eq!(sampler.window_bytes(), []);
+        manager.update_progress(0, 5 * MIB).unwrap();
+        sampler.sample(&manager, t0 + SLOW_WINDOW - NANO);
+        assert_eq!(sampler.window_bytes(), []);
+        manager.update_progress(0, 5 * MIB).unwrap();
+        sampler.sample(&manager, t0 + SLOW_WINDOW);
+        assert_eq!(sampler.window_bytes(), [(0, 10 * MIB)]);
+
+        let mut sampler = RunnerRates::default();
+        for n in 0..=20 {
+            manager.update_progress(0, MIB).unwrap();
+            sampler.sample(&manager, t0 + TICK * n);
+            let bytes = sampler.window_bytes();
+            if n < 7 {
+                assert_eq!(bytes, [], "tick {n}");
+            } else {
+                assert_eq!(bytes, [(0, 7 * MIB)], "tick {n}");
+                assert_eq!(sampler.history.len(), 8, "tick {n}");
+            }
+        }
+    }
+
+    /// Only a running attempt has bytes over a window: not a runner that was
+    /// still connecting at the start of the window, nor one on a new
+    /// attempt since. A split keeps it.
+    #[test]
+    fn test_window_bytes_belong_to_a_running_attempt() {
+        let mut manager = RunnerManager::new(100 * MIB, 4);
+        let _first = manager.allocate_runner_with_chunk(0..40 * MIB).unwrap();
+        let _second = manager
+            .allocate_runner_with_chunk(40 * MIB..60 * MIB)
+            .unwrap();
+        // Runner 2 connects.
+        assert!(manager.allocate_chunk(60 * MIB..80 * MIB, 2));
+        let mut sampler = RunnerRates::default();
+        let t0 = Instant::now();
+        sampler.sample(&manager, t0);
+        manager.mark_started(2);
+        sampler.sample(&manager, t0 + TICK);
+
+        // Runner 0 is split; runner 1 fails before a byte, and its ID
+        // claims the same start again.
+        manager.resize_runner(0, 10 * MIB).unwrap();
+        manager.release_runner_full(1, false).unwrap();
+        let _retry = manager
+            .allocate_runner_with_chunk(40 * MIB..60 * MIB)
+            .unwrap();
+        for runner_id in 0..3 {
+            manager.update_progress(runner_id, 2 * MIB).unwrap();
+        }
+        sampler.sample(&manager, t0 + SLOW_WINDOW);
+        let mut bytes = sampler.window_bytes();
+        assert_eq!(bytes, [(0, 2 * MIB)]);
+
+        // Runner 2 was running at the start of this window.
+        sampler.sample(&manager, t0 + TICK + SLOW_WINDOW);
+        bytes = sampler.window_bytes();
+        bytes.sort_by_key(|&(runner_id, _)| runner_id);
+        assert_eq!(bytes, [(0, 2 * MIB), (2, 2 * MIB)]);
     }
 
     /// Two samples at once span no time: no speed and no rate.
