@@ -604,7 +604,7 @@ tests and the loom models. Where it differs from or refines §4:
 | Item | Implementation |
 |---|---|
 | Destination errors during `Initializing` | `DownloadError::InvalidDestination { path, reason }` mirrors `BuildError::InvalidDestination`; metadata read errors other than "not found" are `Io { op: Inspect }`. |
-| File errors | Singleton: `Io` with `Create`, `Allocate`, `Write`, `Flush` on the temporary path; its writes are buffered, so a failed write may surface on the flush. Concurrent: a failed write is `Transfer(Write { range, source })`, keeping the io error; creating, sizing and finalizing the file still map to `Transfer(Other { message })`. A full disk or an exceeded quota adds a hint to the `Io` and `Write` messages. A failed rename is `Io { op: Rename, path: dest }`. |
+| File errors | Singleton: `Io` with `Create`, `Allocate`, `Write`, `Flush` on the temporary path; its writes are buffered, so a failed write may surface on the flush. Concurrent: a failed write is `Transfer(Write { range, source })`, keeping the io error; creating and sizing the file are `Io` with `Create` and `Allocate`, and finalizing it (joining the writer workers, then syncing) is `Io` with `Flush`, on the temporary path. A full disk or an exceeded quota adds a hint to the `Io` and `Write` messages. A failed rename is `Io { op: Rename, path: dest }`. |
 | Singleton connect failure | `Transfer(StreamError { source })`, keeping the adapter's error (previously `StreamFailed`). |
 | `Task::status()` | Returns a receiver that has seen only the initial `Pending` value, so `while rx.changed().await.is_ok()` also reports a task that already ended. |
 | `TaskBuilder::cached_meta` | Added: reads the metadata from `meta` or a completed `retrieve_meta`. |
