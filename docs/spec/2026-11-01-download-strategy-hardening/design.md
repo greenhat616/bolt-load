@@ -870,3 +870,96 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `SplitGivenTask` 找不到 runner 就 panic；
     - 恢复旧的 QuickStart 闸门；
     - 恢复旧的 Normal 闸门。
+
+### 14.12 区间退避与 Retry-After（PR-6，C9）
+
+- **做法。**
+  - 数据模型：可用区间仍是 chunk 之间的空隙，`get_available_ranges` 的含义不变。`ChunkPlanner` 旁边加了一张表 `cooldowns: BTreeMap<u64, Cooldown { end, attempts, not_before }>`，只记失败后退回的区间。
+    - 记录总在空隙里，互不重叠，也不相接，相接的会合并。
+    - 不在任何记录里的可用字节是“新的”：`attempts = 0`，随时可以领取。
+    - `not_before` 过了以后，记录仍然保留，直到被领取，这样 `attempts` 才能带进 chunk。
+    - 新增 `get_eligible_ranges(now)`：空隙减去还没结束的冷却。结束了的冷却和旁边的新字节连成一段。
+  - `attempts`：
+    - `ChunkState` 增加 `attempts`，表示这个区间之前失败过几次。领取时，取它覆盖到的记录里最大的 `attempts`，新字节算 0。
+    - `mark_failed` 改为返回 `Released { range, attempts }`，`attempts` 是 `chunk.attempts + 1`，饱和加。
+    - 合并：退回的区间和它重叠或相接的记录合成一条，`attempts` 取较大值，`not_before` 取较晚值。这样任何字节都不会早于它原来的 `not_before` 被领取。旁边的新字节不并进来，仍然是新的。
+    - 部分领取：领取的部分带走覆盖到的记录里最大的 `attempts`；记录在领取范围以外的部分，保留原来的 `attempts` 和 `not_before`。正常流程不会领取冷却中的区间（见门控），只有直接调用才会出现。
+    - 切分：后半段从 0 开始。`resize` 让出的尾部原来属于 chunk，没有记录；`split_chunk` 的新 chunk 也从 0 开始。原 chunk 保留自己的 `attempts`。
+  - 两步记录：runner manager 处理失败时只释放区间，`AttemptFailure` 带上 `range` 和 `attempts`。下载循环在 `on_runner` 里拿到 `now`，再算退避、写记录，两步之间没有别的代码运行。任务取消时 runner 不报失败，所以不退避。T10 可以直接拿 `AttemptFailure::attempts` 和 `max_attempts_per_range` 比较。
+  - 退避函数：backon 1.6.0（`Cargo.lock`）的 `ExponentialBuilder`，最小 0.5 s，×2，最大 30 s，`with_jitter()`。
+    - 第 n 次失败（从 1 数）的基础延迟是 `min(0.5 s × 2^(n−1), 30 s)`。
+    - backon 的抖动是加性的：`d + d × U[0, 1)`，结果落在 `[d, 2d)`；而且抖动加在 `max_delay` 截断之后。所以和 `meta.rs` 一样，结果再截到 30 s。第 n 次的等待在 `[d, min(2d, 30 s)]` 之间，从第 7 次起恒为 30 s。
+    - 测试用 `Backoff::without_jitter()`（只在测试里有）验证精确值；开着抖动时验证上下界。
+  - `congestion_until`：遇到 `Congestion { retry_after }` 时，延迟是 `min(max(retry_after, backoff), 120 s)`；没有 `Retry-After` 时就是 backoff。这个区间的 `not_before` 和任务级的 `congestion_until` 取同一个时刻。`congestion_until` 只会推后，不会提前。
+  - 门控：
+    - 拥塞期间，`StrategyControl::execute` 交给并发控制的可用区间为空：它仍然可以降并发，但不会下发 `CreateTask`。dynamic 策略的切分也跳过，因为切分也要开新连接。
+    - 不拥塞时，并发控制只拿到 `get_eligible_ranges(now)`。
+    - `DownloadLoop::spawn_runner` 和 `split` 自己也检查：拥塞时什么都不做，`spawn_runner` 还跳过和冷却记录重叠的区间。策略、唤醒和直接调用都绕不过。
+    - `find_chunk_to_split` 只看可领取的区间。
+  - 唤醒点：
+    - 放在 `DeadlineSource` 里，没有新增事件源，事件优先级不变。计时器设在“无进展的截止时间”和“下一个可能开新连接的时刻”中较早的那个。
+    - 下一个可能开新连接的时刻：拥塞中取 `congestion_until`；否则取晚于 `now` 的最早的 `not_before`。
+    - 失败退避时，如果新的唤醒时刻早于计时器，就立即把计时器提前。
+    - 醒来后调用 `StrategyControl::create_tasks`：只做并发控制在下一个 tick 会做的创建，每个可领取的区间一个 runner，最多到空闲槽位数，不推进任何策略的状态。第一次 step 之前不创建。一个不可重试的失败（比如 503）还没被下一个 step 拿去降并发时，也不创建；否则唤醒先把连接补满，降级就会把补满后的数当成新上限。为此 `RunnerOutcomeSampler` 新增了只读的 `unretryable_pending`。
+    - 只设置晚于 `now` 的时刻。因为没有空闲槽位而没建成的区间不会让循环空转，由 1.5 s 的 tick 接手。
+  - `now` 的传递：`handle_event` 取一次 `Instant::now()`，传给 `on_deadline`、`on_strategy_tick`、`on_runner`、`apply`、`split` 和 `spawn_runner`。`ConcurrencyControlContext` 增加 `now`，`has_recent_unretryable` 改为传入 `now`。sampler 记录结果时仍然在内部取当前时间，没有改。
+  - 测试服务器：`bolt-load-tests` 新增 `RangeFault::CongestedOnce`：除探测外的第二个 range 请求回 503 和 `Retry-After: 2`，其它 range 响应限速 4 MiB/s，让任务在第一个连接还在传输时切分。新增 `create_range_fault_server_with_log(content, hold)`，返回服务器收到的请求和到达时间。`hold` 是可选的 `fault::Gate`：给了它，`CongestedOnce` 除探测外的第一个 range 响应先发出响应头，再把 body 停在这个 gate 上，直到测试放行；其它用法传 `None`，行为不变。`EncodedRepresentation` 用的 gzip 内容改为第一次用到时才编码，大文件的测试不再白白压缩一遍。
+- **与 §8.1 的偏差。**
+  - 没有用 `AvailableRange` 列表，而是在空隙旁边放冷却表。规则相同：`attempts` 跟着区间走，切分从 0 开始，合并取较大值。
+  - §8.1 没定的两条：合并时 `not_before` 取较晚值；部分领取的规则见上。
+  - `attempts` 是 `u32`，不是 `u8`。
+  - 第一次失败的基础延迟是 0.5 s，即 backon 的第一个延迟；§8.1 的 `0.5 s × 2^n` 在 n = 1 时是 1 s。
+  - 不是满抖动（AWS 的 full jitter 在 `[0, d]` 里取值）。用的是 backon 的加性抖动，再截到 30 s，见上。
+  - 唤醒时刻：§8.1 说取最早的 `not_before` 和 `congestion_until` 中较早的那个。拥塞期间这里直接取 `congestion_until`，因为更早结束的冷却醒来也什么都做不了。
+  - §8.1 只要求 `ConcurrencyControlStrategy` 跳过冷却区间。这里 `spawn_runner` 和 `split` 也检查；`find_chunk_to_split` 也跳过冷却区间，否则冷却期间（最长 30 s，拥塞时 120 s）dynamic 策略一直不会切分。
+  - 唤醒后的创建要等不可重试的失败被降级的 step 用掉，见上。
+- **已知限制。**
+  - `Retry-After` 最多等 120 s，比默认的 `no_progress_timeout`（60 s）长。如果这期间没有别的连接在下载，任务会以 `NoProgress` 结束。这里没有改无进展的判定。
+  - 并发控制收到不可重试的失败后，下一个 step 只降并发、不创建 runner。503 之后，最早要到这个 step 之后才会重连；`Retry-After` 比 tick 间隔短时，实际等待可能更长。`wake_up_before_the_degradation_leaves_the_retry_to_a_later_tick` 按显式时间走了一遍这个顺序。
+  - 任务开始时只有一个完整的未分配区间，要等 dynamic 策略切分，才会第一次同时开两个连接。切分取决于速度采样和上一次的速度：QuickStart 阶段要求 `|speed − 2 × 上一次的速度|` 超过阈值，Normal 阶段要求 `|speed − (上一次的速度 + 每连接速度)|` 超过阈值。切分还要求剩余区间够大（QuickStart 至少 `max(2 × speed, 2 × min_chunk_size)`，Normal 至少 `min_chunk_size`）、并发够用（QuickStart 要求活跃 runner 数翻倍后不超过上限，Normal 要求小于上限），并且有空闲槽位。这些都由运行时的采样决定，公开 API 没法强制：慢机器上第一个连接可能在切分之前就下完了，503 根本不会出现。所以 503 场景的测试放在下载循环里，由测试自己切分（见验证）。原来通过公开 API 的 `retry_after_holds_back_new_connections` 删掉了。
+- **验证。**
+  - `Backoff` 的单元测试：不加抖动时依次是 0.5、1、2、4、8、16、30、30 s；加抖动时 200 次取样都在 `[d, min(2d, 30 s)]` 之内，并且确实有抖动；`Retry-After: 2` 时 `not_before` 和 `congestion_until` 都是 `now + 2 s`，`now + 2 s − 1 ns` 时仍拥塞；取 `Retry-After` 和 backoff 中较长的；120 s 上限；`congestion_until` 不会提前。
+  - `ChunkPlanner` 的单元测试（显式传入 `now`）：
+    - 失败的区间在 `not_before − 1 ns` 时不可领取，在 `not_before` 时可以，并且和后面的新字节连成一段；
+    - 重新领取的区间带上失败次数，再失败时继续往上数；
+    - 部分领取带走 `attempts`，剩下的两段保留原来的冷却；
+    - 相邻的失败区间合并，`attempts` 取较大值，`not_before` 取较晚值，补上中间的空隙后三段合成一段；
+    - 切分出的后半段 `attempts` 为 0，旁边的冷却不受影响；
+    - 冷却中的区间不是切分候选，冷却结束后才是；
+    - `PlannerGuard` 回滚时冷却表一起恢复。
+  - 并发控制：第一次 step 之前、不可重试的失败还没被 step 用掉时，`create_tasks` 不创建；降级之后按空闲槽位创建。
+  - 下载循环的确定性测试（显式传入 `now`）：
+    - 连接中的 runner 丢失后，区间冷却 0.5–1 s，计时器设在冷却结束时；`not_before − 1 ns` 时 tick 和唤醒都不领取，计时器仍设在原处；`not_before` 时唤醒领取它，`attempts` 为 1，计时器回到无进展截止时间。第二次失败冷却 1–2 s，由 tick 领取，`attempts` 为 2。
+    - 一个 runner 在传输、另一个收到 503 和 `Retry-After: 2`：任务继续，`congestion_until` 和区间的 `not_before` 都是 `t0 + 2 s`。在 `t0`、`t0 + 1 s`、`t0 + 2 s − 1 ns`，`CreateTask`、`SplitGivenTask`、`SplitAllTask`、2 MiB/s 下的 tick 和唤醒都不开新连接；到 `t0 + 2 s`，切分和创建都成功。
+    - 拥塞结束时唤醒为退回的区间建 runner，不等 tick；拥塞期间唤醒什么都不做。
+    - 冷却结束时没有空闲槽位：唤醒什么都不建，计时器回到无进展截止时间，不会空转；腾出槽位后由 tick 创建。
+    - 已知限制的顺序：503 不带 `Retry-After`，冷却 0.5–1 s，比 tick 间隔短。冷却结束时有空闲槽位，但降级还没发生：唤醒什么都不建，计时器回到无进展截止时间（晚于冷却结束），不会在同一时刻反复醒来；下一个 tick 只把并发降到 1，不建 runner；再下一个 tick 才为退回的区间建 runner，`attempts` 为 1。
+    - 一个真实计时器的测试：循环自己运行，丢失的 runner 在冷却结束后被重建，期间没有任何策略 tick。它要等真实时间（约 0.5–1 s，等的是循环自己的计时器）；下面 T4 的 503 场景测试也要等真实时间，其余测试都显式传入 `now`。
+  - 性质测试：T8 的 `split_properties` 加了失败（可重试，或 503 带 0–4 s 或不带 `Retry-After`）、时间流逝（0–5 s）和唤醒三种操作。除了原来的断言，每一步之后还检查：
+    - 冷却记录都在空隙里，非空，`attempts ≥ 1`，相接的已合并；
+    - 计时器不晚于下一个可能开新连接的时刻；
+    - 新建的 runner 不是在拥塞期间建的，没有领取冷却中的区间，`attempts` 等于它领取到的记录里最大的 `attempts`；
+    - 失败时 `attempts` 加 1，退回的区间冷却至少 0.5 s。
+  - T4 的 503 场景：`retry_after_holds_back_the_requests_to_the_server`，下载循环用真实计时器、reqwest adapter 和故障服务器的 `CongestedOnce` 下载 8 MiB，需要 `reqwest` 和 `tokio` 两个 feature。
+    - 顺序由测试决定，不靠时间赛跑：
+      - 服务器带着一个 gate 启动。第一个 runner 收到响应头，body 停在 gate 上。
+      - 测试自己逐个处理循环的事件（`poll_event` 和 `handle_event`），直到第一个 runner 进入 Running，然后切分它。切分出的请求是第二个，也就是被拒的那个。
+      - 测试继续逐个处理事件，直到循环记下拥塞。这时断言：只占着 1 个槽位，第一个 runner 仍是 Running，一个字节都还没收到。所以 503 被处理时，一定还有连接在途，`FailurePolicy` 不会因此结束任务。
+      - 然后测试放行 gate，再交给 `run()` 跑完。
+    - 从服务器记录的请求时间判断：503 之后的每个请求都至少晚 2 s，被拒的区间确实重试了，文件 hash 正确。前两个请求的范围和状态码也有断言，前提不成立时会直接说明。
+    - 收尾先于断言：先 `finish`、`finalize` 并停掉服务器，再检查结果。服务器的句柄在 drop 时 abort，测试 panic 时也不会留着服务器，或者让临时文件一直被占用。
+    - 去掉 gate 再跑，“503 被处理时只有第一个 runner 在途、还没收到数据”这条断言就会失败。
+    - 实测：503 在 0.9–1.3 ms，1.5 s 的 tick 降级，重试在 2.003–2.018 s，是唤醒触发的；连跑 5 次，每次约 3.05 s。
+    - `range_faults_never_complete_with_wrong_content` 也通过公开 API 跑 `CongestedOnce`：256 KiB 的文件不会切分，所以正常完成。
+  - 已有测试：没有断言依赖“失败后立即重试”，断言都没有改；签名变了的调用点只是加上 `now` 参数。`termination.rs` 里重试相关的测试（重试次数用完、暂时失败后恢复、连接超时后重试）都通过。
+  - 变异检查，每种都有测试失败：
+    - 不退避（可重试的失败不冷却）：`failed_range_waits_for_its_backoff`、`loop_retries_after_the_backoff_without_a_tick`、`wake_up_without_a_free_slot_does_not_spin`、性质测试和 `Backoff` 的单元测试；
+    - 失败时 `attempts` 不加 1：4 个 `ChunkPlanner` 测试、5 个下载循环测试和性质测试；
+    - 合并时不取较大的 `attempts`，或不取较晚的 `not_before`：`test_adjacent_cooldowns_merge`；
+    - 不记录拥塞：`retry_after_holds_back_every_new_connection`、`wake_up_before_the_degradation_leaves_the_retry_to_a_later_tick` 和 4 个 `Backoff` 测试；
+    - 失败后不提前计时器：5 个下载循环测试和性质测试；
+    - 醒来后不创建 runner：3 个下载循环测试；
+    - `spawn_runner` 不跳过冷却区间：性质测试；
+    - `split` 不检查拥塞：`retry_after_holds_back_every_new_connection`；
+    - 领取时不带上 `attempts`：4 个 `ChunkPlanner` 测试、4 个下载循环测试和性质测试；
+    - 唤醒创建不等降级：`test_create_tasks_waits_for_the_first_step_and_the_degradation` 和 `wake_up_before_the_degradation_leaves_the_retry_to_a_later_tick`。

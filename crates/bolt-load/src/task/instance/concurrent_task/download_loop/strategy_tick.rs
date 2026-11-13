@@ -1,6 +1,7 @@
 use std::{
     ops::Range,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use bolt_load_utils::telemetry::*;
@@ -29,23 +30,25 @@ impl StrategyTick {
 
 impl DownloadLoop {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    pub(super) fn on_strategy_tick(&mut self) {
+    pub(super) fn on_strategy_tick(&mut self, now: Instant) {
         let Some((strategy_name, actions)) = self.strategy.execute(
             self.max_concurrency,
             self.throughput.speed,
             self.throughput.per_runner_speed,
             &mut self.manager,
+            now,
+            self.backoff.is_congested(now),
         ) else {
             return;
         };
         for action in actions {
             trace!("[TASK] applying strategy: {strategy_name}, action: {action:?}");
-            self.apply(action);
+            self.apply(action, now);
         }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    pub(super) fn apply(&mut self, action: StrategyAction) {
+    pub(super) fn apply(&mut self, action: StrategyAction, now: Instant) {
         match action {
             // Split current all task into two separate tasks
             StrategyAction::SplitAllTask(planned_chunk_size) => {
@@ -53,7 +56,7 @@ impl DownloadLoop {
                 let states = self.manager.get_incomplete_states(Some(planned_chunk_size));
                 for (runner_id, incomplete_range) in states {
                     trace!("split task: {runner_id}, {incomplete_range:?}");
-                    self.split(runner_id, incomplete_range);
+                    self.split(runner_id, incomplete_range, now);
                 }
             }
             // Split the given task into two separate tasks
@@ -63,7 +66,7 @@ impl DownloadLoop {
                     trace!("[TASK] skip splitting runner {task_id}: it has no chunk");
                     return;
                 };
-                self.split(task_id, state.incomplete_range());
+                self.split(task_id, state.incomplete_range(), now);
             }
             // Change the max concurrency
             StrategyAction::ChangeMaxConcurrency(new_max_concurrency) => {
@@ -73,7 +76,7 @@ impl DownloadLoop {
             // Create background runners for specific range
             StrategyAction::CreateTask(range) => {
                 trace!("[TASK] Strategy: create task: {range:?}");
-                self.spawn_runner(range);
+                self.spawn_runner(range, now);
             }
         }
     }
@@ -84,11 +87,24 @@ impl DownloadLoop {
     /// shrunk when the second half can be handed over; without a free slot
     /// nothing changes. Should the second half not be allocated after all,
     /// it stays unassigned, for the strategy to create a runner for.
+    ///
+    /// The new runner opens a connection, so nothing is split while the
+    /// task is congested at `now`. The second half was part of a chunk,
+    /// so it is never backing off.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(skip_all, fields(runner_id, range))
     )]
-    pub(super) fn split(&mut self, runner_id: RunnerId, incomplete_range: Range<u64>) {
+    pub(super) fn split(
+        &mut self,
+        runner_id: RunnerId,
+        incomplete_range: Range<u64>,
+        now: Instant,
+    ) {
+        if self.backoff.is_congested(now) {
+            trace!("[TASK] skip splitting runner {runner_id}: the task is congested");
+            return;
+        }
         let Some(slot) = self.manager.try_reserve_slot() else {
             trace!("[TASK] skip splitting runner {runner_id}: no runner slot is free");
             return;
@@ -105,9 +121,21 @@ impl DownloadLoop {
         );
     }
 
-    /// Spawn a runner for `range`; without a free slot, or when `range` is
-    /// taken, nothing changes.
-    pub(super) fn spawn_runner(&mut self, range: Range<u64>) {
+    /// Spawn a runner for `range`; without a free slot, when `range` is
+    /// taken, while the task is congested at `now`, or while part of
+    /// `range` is backing off, nothing changes.
+    pub(super) fn spawn_runner(&mut self, range: Range<u64>, now: Instant) {
+        if self.backoff.is_congested(now) {
+            trace!("[TASK] skip spawning a runner for {range:?}: the task is congested");
+            return;
+        }
+        if let Some(until) = self.manager.cooling_until(&range, now) {
+            trace!(
+                "[TASK] skip spawning a runner for {range:?}: backing off for {:?}",
+                until - now
+            );
+            return;
+        }
         let Some(slot) = self.manager.try_reserve_slot() else {
             trace!("[TASK] skip spawning a runner for {range:?}: no runner slot is free");
             return;

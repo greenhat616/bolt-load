@@ -194,18 +194,46 @@ impl RunnerOutcomeSampler {
         stats
     }
 
-    /// Check if a unretryable error occurred recently (within the specified time)
+    /// Check if a unretryable error occurred recently (`within` before
+    /// `now`)
     ///
     /// Used to trigger immediate degradation
-    pub fn has_recent_unretryable(&mut self, within: Duration) -> bool {
-        let now = Instant::now();
-        if let Some(last) = self.last_unretryable_at
-            && now.duration_since(last) <= within
-        {
+    pub fn has_recent_unretryable(&mut self, within: Duration, now: Instant) -> bool {
+        if self.unretryable_pending(within, now) {
             // Clear the mark so one failure triggers degradation only once.
             self.last_unretryable_at = None;
             return true;
         }
         false
+    }
+
+    /// Whether an unretryable error occurred `within` before `now` and has
+    /// not triggered [`Self::has_recent_unretryable`] yet.
+    pub fn unretryable_pending(&self, within: Duration, now: Instant) -> bool {
+        self.last_unretryable_at
+            .is_some_and(|last| now.duration_since(last) <= within)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn test_a_pending_unretryable_failure_triggers_once() {
+        let mut sampler = RunnerOutcomeSampler::with_defaults();
+        let now = Instant::now();
+        assert!(!sampler.unretryable_pending(WINDOW, now));
+        sampler.record_connect_failed(FailureKind::Unretryable);
+        let recorded = Instant::now();
+        // Peeking leaves it for the degradation.
+        assert!(sampler.unretryable_pending(WINDOW, recorded));
+        assert!(sampler.unretryable_pending(WINDOW, recorded));
+        assert!(!sampler.unretryable_pending(WINDOW, recorded + 2 * WINDOW));
+        assert!(sampler.has_recent_unretryable(WINDOW, recorded));
+        assert!(!sampler.unretryable_pending(WINDOW, recorded));
+        assert!(!sampler.has_recent_unretryable(WINDOW, recorded));
     }
 }
