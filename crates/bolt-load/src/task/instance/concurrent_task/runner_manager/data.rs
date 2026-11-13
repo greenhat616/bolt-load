@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use async_ringbuf::traits::Consumer;
+use async_ringbuf::traits::{Consumer, Observer};
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use futures::{Stream, task::AtomicWaker};
@@ -110,6 +110,18 @@ impl DataAggregator {
             }
         }
         None
+    }
+
+    /// Whether `runner_id` has frames queued that the aggregator has not
+    /// taken yet; the frames stay where they are.
+    pub fn has_queued(&self, runner_id: RunnerId) -> bool {
+        self.map.get(&runner_id).is_some_and(|(_, receiver)| {
+            !receiver
+                .0
+                .lock()
+                .expect("a data receiver is never poisoned")
+                .is_empty()
+        })
     }
 
     #[cfg(test)]

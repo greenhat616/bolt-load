@@ -53,13 +53,17 @@ fn runners(download: &DownloadLoop, status: ChunkStatus) -> Vec<crate::task::Run
 }
 
 /// Start the connecting runners, and let every running one deliver
-/// `bytes`.
+/// `bytes`. A runner that delivers at every tick reads all along: it is
+/// never silent.
 fn deliver(download: &mut DownloadLoop, bytes: u64) {
     for runner_id in runners(download, ChunkStatus::Pending) {
         download.manager.mark_started(runner_id);
     }
     for runner_id in runners(download, ChunkStatus::Running) {
         download.manager.update_progress(runner_id, bytes).unwrap();
+        if let Some(reads) = download.manager.read_activity(runner_id) {
+            reads.start_emitting();
+        }
     }
 }
 
@@ -307,6 +311,7 @@ async fn doubling_waits_for_every_runner_and_the_congestion() {
     let tick = super::super::super::strategy::TickSample {
         speed: Some(MIB as f64),
         all_delivering: true,
+        silent: false,
         rates: Default::default(),
     };
     let grows_at = |download: &mut DownloadLoop, now: Instant| {
@@ -462,6 +467,58 @@ async fn doubling_to_the_limit_does_not_refill_before_it_is_judged() {
         download.on_strategy_tick(judging + TICK * n);
         assert_eq!(download.manager.get_active_runners_count(), 7, "tick {n}");
     }
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A doubling below the limit is not held by a runner that stalls with a
+/// chunk too small for the silent restart, while the others still have
+/// plenty to split, so the hedge waits too (design §9.6, §14.19, M1): the
+/// tick lets the silent runner off and drops the doubling it cannot
+/// measure, and the growth goes on.
+#[tokio::test]
+async fn a_small_stalled_chunk_does_not_freeze_the_growth() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 8).await;
+    let t0 = Instant::now();
+    // Start the connecting runners; every running one but `stalled`
+    // delivers a MiB, noted at `now`.
+    let feed = |download: &mut DownloadLoop, stalled: Option<crate::task::RunnerId>, now| {
+        for runner_id in runners(download, ChunkStatus::Pending) {
+            download.manager.mark_started(runner_id);
+        }
+        for runner_id in runners(download, ChunkStatus::Running) {
+            if Some(runner_id) != stalled {
+                download.manager.update_progress(runner_id, MIB).unwrap();
+                download.manager.note_delivery(runner_id, now);
+                download
+                    .manager
+                    .read_activity(runner_id)
+                    .unwrap()
+                    .note_at(now);
+            }
+        }
+    };
+    download.on_strategy_tick(t0);
+    for n in 1..=3 {
+        feed(&mut download, None, t0 + TICK * n);
+        download.on_strategy_tick(t0 + TICK * n);
+    }
+    // 1, 2, then 4 at 4.5 s: a doubling below the limit, to be judged.
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+
+    // Runner 0 gets to a MiB short of its end and stalls there.
+    let left = download.manager.get_runner_state(0).unwrap().remaining();
+    download.manager.update_progress(0, left - MIB).unwrap();
+    feed(&mut download, Some(0), t0 + TICK * 4);
+    download.on_strategy_tick(t0 + TICK * 4);
+    assert_eq!(download.manager.get_active_runners_count(), 4, "too early");
+    feed(&mut download, Some(0), t0 + TICK * 5);
+    download.on_strategy_tick(t0 + TICK * 5);
+    assert!(download.rates.as_ref().unwrap().tick().silent);
+    assert_eq!(download.manager.get_active_runners_count(), 8);
+    assert!(!download.manager.is_stopping(0), "left to the hedge");
     assert_covered(&download);
     drop(download);
     file_writer.finalize().await.unwrap();
@@ -691,6 +748,7 @@ async fn doubling_opens_no_trial_for_a_marked_step() {
     let tick = super::super::super::strategy::TickSample {
         speed: Some(4.0 * MIB as f64),
         all_delivering: true,
+        silent: false,
         rates: Default::default(),
     };
     let late = now + 3 * TICK;

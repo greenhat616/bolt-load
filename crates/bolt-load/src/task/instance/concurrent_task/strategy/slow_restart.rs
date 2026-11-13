@@ -20,6 +20,11 @@ use crate::task::RunnerId;
 pub const SLOW_WINDOW: Duration = Duration::from_secs(10);
 /// A runner that delivered less than this share of the median is slow.
 pub const SLOW_RATIO: f64 = 0.25;
+/// How long a running runner may go without delivering a frame or reading
+/// any of its body before it is restarted, with no window and no median
+/// needed (design §14.19): three strategy ticks, past the hedge's 2 s idle
+/// time.
+pub const SILENT_RESTART_AFTER: Duration = Duration::from_millis(4500);
 /// The fewest judged runners a median is taken of.
 ///
 /// Every judged runner is active, so this is condition 3 of design §9.5,

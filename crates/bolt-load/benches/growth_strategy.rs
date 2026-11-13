@@ -26,7 +26,8 @@
 //!
 //! Recorded per run: completion time (from `spawn`), peak open connections
 //! and 429s (from the adapter), hedges, decided pairs, the losers' cancel
-//! latency (from the decision to the loser's `Stopped`) and slow restarts
+//! latency (from the decision to the loser's `Stopped`), restarts and the
+//! stops the silent restart requested
 //! (from the crate's tracing events), the duplicate bytes (bytes the
 //! adapter sent beyond the file size) and, with a stall, how long the
 //! stalled offset waits until a connection requests it again.
@@ -268,6 +269,10 @@ fn install_probe() -> Probe {
     // except the frames of a beaten runner.
     let mut targets = Targets::new()
         .with_target(format!("{CONCURRENT}::download_loop::hedge"), Level::DEBUG)
+        .with_target(
+            format!("{CONCURRENT}::download_loop::restart"),
+            Level::DEBUG,
+        )
         .with_target(format!("{CONCURRENT}::runner_manager"), Level::TRACE);
     if tracing_all() {
         targets = targets
@@ -288,7 +293,7 @@ fn id_after(message: &str, prefix: &str) -> Option<u64> {
 
 /// The messages the probe reads, and the source files that emit them: a
 /// message renamed in the crate fails here instead of reading as zero.
-const PROBED: [(&str, &str); 7] = [
+const PROBED: [(&str, &str); 8] = [
     (HEDGE_SOURCE, "\"[TASK] hedging runner {owner}"),
     (
         DATA_SOURCE,
@@ -311,11 +316,17 @@ const PROBED: [(&str, &str); 7] = [
         LIFECYCLE_SOURCE,
         "\"runner {runner_id} stopped for being slow, released range",
     ),
+    (
+        RESTART_SOURCE,
+        "\"[TASK] stopping silent runner {runner_id}",
+    ),
 ];
 const HEDGE_SOURCE: &str =
     include_str!("../src/task/instance/concurrent_task/download_loop/hedge.rs");
 const DATA_SOURCE: &str =
     include_str!("../src/task/instance/concurrent_task/runner_manager/data.rs");
+const RESTART_SOURCE: &str =
+    include_str!("../src/task/instance/concurrent_task/download_loop/restart.rs");
 const LIFECYCLE_SOURCE: &str =
     include_str!("../src/task/instance/concurrent_task/runner_manager/lifecycle.rs");
 
@@ -344,6 +355,7 @@ fn check_parser() {
         (40, "[TASK] hedging runner 5, silent since Some(..)"),
         (50, "runner 5 wins its pair over hedge 13"),
         (60, "beaten runner 7 ended"),
+        (68, "[TASK] stopping silent runner 6, silent since Some(..)"),
         (
             70,
             "runner 6 stopped for being slow, released range: Some(0..1)",
@@ -357,7 +369,7 @@ fn check_parser() {
         (counts.hedges, counts.decisions, counts.late_loser_frames),
         (3, 3, 1)
     );
-    assert_eq!(counts.slow_restarts, 1);
+    assert_eq!((counts.slow_restarts, counts.silent_restarts), (1, 1));
     assert_eq!(
         counts.cancel_latencies,
         [Duration::from_millis(3), Duration::from_millis(4)]
@@ -374,7 +386,12 @@ struct EventCounts {
     /// queued when it is stopped are dropped with its receiver, without an
     /// event, and are not counted.
     late_loser_frames: usize,
+    /// Runners stopped and released by the slow or the silent restart.
     slow_restarts: usize,
+    /// The stops the silent restart requested. Not a subset of
+    /// `slow_restarts`: a runner asked to stop may finish or fail before
+    /// it notices.
+    silent_restarts: usize,
     cancel_latencies: Vec<Duration>,
     /// Decisions without their loser's end, and loser ends without a
     /// decision.
@@ -408,6 +425,8 @@ fn count_events(events: &[(Instant, String)]) -> EventCounts {
             counts.late_loser_frames += 1;
         } else if message.contains("stopped for being slow") {
             counts.slow_restarts += 1;
+        } else if message.starts_with("[TASK] stopping silent runner") {
+            counts.silent_restarts += 1;
         }
     }
     counts.unmatched += decided.len();
@@ -425,6 +444,7 @@ struct Run {
     duplicate_bytes: u64,
     late_loser_frames: usize,
     slow_restarts: usize,
+    silent_restarts: usize,
     cancel_latencies: Vec<Duration>,
     unmatched: usize,
     /// From the stall until a connection requests the stalled offset again.
@@ -511,6 +531,7 @@ async fn run_once(
         duplicate_bytes: adapter.served_bytes().saturating_sub(scenario.size),
         late_loser_frames: counts.late_loser_frames,
         slow_restarts: counts.slow_restarts,
+        silent_restarts: counts.silent_restarts,
         cancel_latencies: counts.cancel_latencies,
         unmatched: counts.unmatched,
         stall_wait,
@@ -590,7 +611,7 @@ fn report(scenario: &Scenario, strategy: GrowthStrategy, runs: &[Run]) {
         "n/a".into()
     };
     println!(
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         scenario.name,
         strategy_name(strategy),
         col(&|run| run.secs, 2),
@@ -604,6 +625,7 @@ fn report(scenario: &Scenario, strategy: GrowthStrategy, runs: &[Run]) {
         counted_summary(latencies, 2),
         waits,
         col(&|run| run.slow_restarts as f64, 1),
+        col(&|run| run.silent_restarts as f64, 1),
         runs.iter().map(|run| run.unmatched).sum::<usize>(),
         col(&|run| (scenario.size as f64 / MIB as f64) / run.secs, 1),
     );
@@ -645,9 +667,9 @@ fn main() {
 
     println!(
         "| scenario | strategy | time s | peak conns | 429s | hedges | decided | duplicate KiB | \
-         cancel latency ms | stall wait s | slow restarts | unmatched | MiB/s |"
+         cancel latency ms | stall wait s | restarts | silent stop requests | unmatched | MiB/s |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     let mut verdicts = Vec::new();
     for scenario in scenarios() {
         if names
@@ -669,8 +691,8 @@ fn main() {
                     runtime.block_on(run_once(&scenario, &template, strategy, &probe, dir.path()));
                 eprintln!(
                     "{} {} #{round}: {:.2} s, peak {}, 429s {}, hedges {} (decided {}), duplicate \
-                     {} KiB ({} late loser frames dropped), cancel {:?}, stall wait {:?}, slow \
-                     restarts {}, unmatched {}",
+                     {} KiB ({} late loser frames dropped), cancel {:?}, stall wait {:?}, \
+                     restarts {} (silent stop requests {}), unmatched {}",
                     scenario.name,
                     strategy_name(strategy),
                     run.secs,
@@ -683,6 +705,7 @@ fn main() {
                     run.cancel_latencies,
                     run.stall_wait,
                     run.slow_restarts,
+                    run.silent_restarts,
                     run.unmatched,
                 );
                 results[index].push(run);

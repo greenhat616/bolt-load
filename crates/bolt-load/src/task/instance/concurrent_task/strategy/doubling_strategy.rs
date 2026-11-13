@@ -46,8 +46,12 @@ pub struct TickSample {
     /// first sample.
     pub speed: Option<f64>,
     /// Whether no runner is connecting and every running one had bytes
-    /// accepted in the tick.
+    /// accepted in the tick, or is silent: none accepted for at least the
+    /// hedge's idle time (design §9.2, §14.19).
     pub all_delivering: bool,
+    /// Whether a running runner had no bytes accepted in the tick and was
+    /// let off as silent: the tick's speed leaves its share out.
+    pub silent: bool,
     /// The rate of each runner that was already running the same chunk at
     /// the previous sample, in bytes per second.
     pub rates: HashMap<RunnerId, f64>,
@@ -85,6 +89,8 @@ pub struct DoublingStrategyContext {
     pub congested: bool,
     /// See [`TickSample::all_delivering`].
     pub all_delivering: bool,
+    /// See [`TickSample::silent`].
+    pub silent_runners: bool,
     /// See [`TickSample::speed`].
     pub speed: Option<f64>,
     /// The task's speed limit; `None` until there is one (design §10).
@@ -163,7 +169,11 @@ impl DoublingStrategy {
             // measure it. A doubling to the limit waits for them, and
             // nothing refills meanwhile; one below the limit has no
             // verdict, and the strategy grows on.
-            if active < growth.runners {
+            //
+            // A silent runner adds nothing to the speed, so a tick with one
+            // does not measure the growth either, and the same rules apply
+            // (design §14.19).
+            if active < growth.runners || context.silent_runners {
                 if growth.at_limit {
                     self.unjudged = Some(growth);
                     return 0;
@@ -195,6 +205,20 @@ impl DoublingStrategy {
             max_concurrency: context.max_concurrency,
         });
         target - active
+    }
+
+    /// The loop stopped a runner for being slow or silent, to restart its
+    /// range (design §9.5): a pending doubling, at the limit or below it,
+    /// is dropped without a verdict. The tick has a runner fewer, or one
+    /// the loop gave up on, and a doubling held at the limit would keep the
+    /// restarted range from being split (design §14.18, §14.19).
+    pub fn on_restarted(&mut self) {
+        if let Some(growth) = self.unjudged.take() {
+            debug!(
+                "[STRATEGY] a restart drops the doubling to {} runners unjudged",
+                growth.runners
+            );
+        }
     }
 
     /// The loop added `added` runners for the last step's
@@ -257,6 +281,7 @@ mod tests {
             max_concurrency: 8,
             congested: false,
             all_delivering: true,
+            silent_runners: false,
             speed: Some(speed),
             speed_limit: None,
         }
@@ -400,6 +425,34 @@ mod tests {
         }
     }
 
+    /// A restart drops the doubling to the limit that waited for its
+    /// runners, without a verdict, and the strategy grows on; one that
+    /// lost a runner that finished waits on (design §14.18, §14.19). Below
+    /// the limit, a restart drops the doubling too, even with as many
+    /// runners as it made.
+    #[test]
+    fn test_a_restart_drops_the_doubling_it_waits_for() {
+        let t0 = Instant::now();
+        let at =
+            |n: u32, runners: usize, speed: f64, max_concurrency: usize| DoublingStrategyContext {
+                max_concurrency,
+                ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
+            };
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, at(0, 4, 40.0, 8)), 4);
+        // One of the eight finished: the doubling waits.
+        assert_eq!(grow(&mut strategy, at(1, 7, 35.0, 8)), 0);
+        // One is restarted: the doubling is dropped, and the slot refilled.
+        strategy.on_restarted();
+        assert_eq!(grow(&mut strategy, at(2, 6, 30.0, 8)), 2);
+
+        // Below the limit, with its eight, no faster: dropped, not judged.
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, at(0, 4, 40.0, 16)), 4);
+        strategy.on_restarted();
+        assert_eq!(grow(&mut strategy, at(1, 8, 40.0, 16)), 8);
+    }
+
     /// A doubling below the limit that loses runners before a tick
     /// measures it gets no verdict, and the strategy grows on (design
     /// §14.14, §14.18): runners that finished leave no range for a new
@@ -442,6 +495,43 @@ mod tests {
         assert_eq!(grow(&mut strategy, at(2, 7, 16)), 0);
         // Judged once eight deliver, and the risen limit lets it grow.
         assert_eq!(grow(&mut strategy, at(3, 8, 16)), 8);
+    }
+
+    /// A tick with a silent runner, let off by the sample, does not measure
+    /// a doubling: its speed leaves the silent runner's share out. Below
+    /// the limit the doubling is dropped without a verdict and the strategy
+    /// grows on; one that reached the limit holds until a tick without one
+    /// (design §14.19).
+    #[test]
+    fn test_a_tick_with_a_silent_runner_judges_nothing() {
+        let t0 = Instant::now();
+        let at = |n: u32, runners: usize, speed: f64, silent: bool| DoublingStrategyContext {
+            max_concurrency: 8,
+            silent_runners: silent,
+            ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
+        };
+        // Below the limit: no verdict, however slow, and the growth goes on.
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(
+            grow(&mut strategy, at(0, 2, 20.0, true)),
+            2,
+            "the first growth"
+        );
+        assert_eq!(grow(&mut strategy, at(1, 4, 20.0, true)), 4, "no plateau");
+
+        // To the limit: held through silent ticks, judged on a clean one.
+        for (speed, refill) in [(40.0, 0), (80.0, 1)] {
+            let mut strategy = DoublingStrategy::default();
+            assert_eq!(grow(&mut strategy, at(0, 4, 40.0, false)), 4);
+            assert_eq!(grow(&mut strategy, at(1, 8, 100.0, true)), 0, "held");
+            assert_eq!(grow(&mut strategy, at(2, 7, 100.0, true)), 0, "held");
+            assert_eq!(grow(&mut strategy, at(3, 8, speed, false)), 0, "judged");
+            assert_eq!(
+                grow(&mut strategy, at(4, 7, 100.0, false)),
+                refill,
+                "{speed}"
+            );
+        }
     }
 
     /// A loop that reports more runners than asked, past the limit of the
