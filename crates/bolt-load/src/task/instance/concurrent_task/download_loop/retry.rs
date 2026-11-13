@@ -31,9 +31,7 @@ impl DownloadLoop {
     /// backoff, or the task's congestion, ended by `now`.
     pub(super) fn retry_backed_off(&mut self, now: Instant) {
         let signals = self.signals(now);
-        let actions =
-            self.strategy
-                .create_tasks(self.max_concurrency, &mut self.manager, now, signals);
+        let actions = self.strategy.create_tasks(&mut self.manager, now, signals);
         for action in actions {
             trace!("[TASK] retrying after a backoff: {action:?}");
             self.apply(action, now);

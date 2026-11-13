@@ -13,14 +13,6 @@
 //! it with its `now`. A pending instant reads as unknown, and an unknown
 //! value leads to no action.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the recovery steps read the rest from the next commit"
-    )
-)]
-
 use std::{
     collections::HashSet,
     time::{Duration, Instant},
@@ -399,6 +391,10 @@ impl AdmissionEvidence {
     }
 
     /// The most attempts proven at once since the limit was last lowered.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "for the range budget's exemption (design §8.3)")
+    )]
     pub fn proven_window(&self) -> usize {
         self.proven_window
     }

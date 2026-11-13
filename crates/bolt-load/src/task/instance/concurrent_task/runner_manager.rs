@@ -105,16 +105,13 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 use super::{
     ChunkPlanner, PlannerGuard,
     chunk_planner::{ChunkState, ChunkStatus, Resize, SplitCandidate},
-    strategy::{AdmissionEvidence, AttemptPhase, RunnerOutcomeSampler, classify},
+    strategy::{AdmissionEvidence, AttemptPhase, classify},
 };
 use crate::{
     runner::{
         DataFrameReceiver, LifecycleReceiver, LimitReceiver, LimitSender, TaskError, limit_mailbox,
     },
-    task::{
-        RunnerId,
-        instance::{Generator, concurrent_task::strategy::RunnerFailureKind},
-    },
+    task::{RunnerId, instance::Generator},
 };
 
 mod data;
@@ -188,8 +185,6 @@ pub struct RunnerManager {
     limit_senders: HashMap<RunnerId, LimitSender>,
     /// Runners whose spawn was rejected, reported by the next tick
     spawn_failures: VecDeque<(RunnerId, SpawnFailed)>,
-    /// Sampler for tracking the outcome of the runners
-    runner_outcome_sampler: RunnerOutcomeSampler,
     /// What ended attempts tell about the connections the server admits
     admission: AdmissionEvidence,
     /// Lifecycle aggregator for runners' lifecycle events
@@ -219,7 +214,6 @@ impl RunnerManager {
             chunk_planner: ChunkPlanner::new(total),
             limit_senders: HashMap::with_capacity(max_concurrency),
             spawn_failures: VecDeque::new(),
-            runner_outcome_sampler: RunnerOutcomeSampler::with_defaults(),
             admission: AdmissionEvidence::default(),
             lifecycle_aggregator: LifecycleAggregator::with_capacity(max_concurrency),
             connecting_data: HashMap::with_capacity(max_concurrency),
@@ -234,16 +228,6 @@ impl RunnerManager {
             runners: self.meters.len(),
             bytes: self.meters.values_mut().map(std::mem::take).sum(),
         }
-    }
-
-    #[cfg(test)]
-    pub fn runner_outcome_sampler_mut(&mut self) -> &mut RunnerOutcomeSampler {
-        &mut self.runner_outcome_sampler
-    }
-
-    /// The outcome sampler and the admission evidence, borrowed together.
-    pub fn outcome_sources_mut(&mut self) -> (&mut RunnerOutcomeSampler, &mut AdmissionEvidence) {
-        (&mut self.runner_outcome_sampler, &mut self.admission)
     }
 
     /// What ended attempts tell about the connections the server admits.
@@ -609,7 +593,6 @@ impl RunnerManager {
         self.chunk_planner
             .mark_finished(runner_id)
             .expect("chunk planner should not fail");
-        self.runner_outcome_sampler.record_completed();
 
         if self.chunk_planner.is_complete() {
             trace!("[TASK] all chunks finished");
@@ -1000,9 +983,9 @@ mod tests {
         assert!(manager.get_runner_state(0).is_none());
         assert_eq!(manager.get_available_ranges(), vec![0..1000]);
         assert!(manager.is_empty());
-        let stats = manager.runner_outcome_sampler_mut().stats();
-        assert_eq!(stats.connect_failed_unretryable, 1);
-        assert_eq!(stats.stream_closed_unretryable, 0);
+        // An unretryable connect failure is no evidence.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert!(!manager.admission().congestion_pending());
     }
 
     #[tokio::test]
@@ -1066,7 +1049,8 @@ mod tests {
 
         assert!(manager.tick().await.failure.is_none());
         assert_eq!(manager.get_available_ranges(), vec![0..1000]);
-        assert_eq!(manager.runner_outcome_sampler_mut().stats().total, 0);
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert!(!manager.admission().congestion_pending());
     }
 
     #[tokio::test]
@@ -1078,9 +1062,9 @@ mod tests {
         let failure = manager.tick_lifecycle_only().await.failure.unwrap();
         assert!(matches!(failure.error, TaskError::ChannelClosed));
         assert!(failure.retryable);
-        let stats = manager.runner_outcome_sampler_mut().stats();
-        assert_eq!(stats.connect_failed_retryable, 1);
-        assert_eq!(stats.stream_closed_retryable, 0);
+        // A lost connect is no refusal.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert_eq!(manager.admission().connected(), 0);
     }
 
     #[tokio::test]
@@ -1103,13 +1087,9 @@ mod tests {
         assert!(!failure.retryable);
         assert!(manager.is_empty());
         assert_eq!(manager.get_available_ranges(), vec![0..1000]);
-        assert_eq!(
-            manager
-                .runner_outcome_sampler_mut()
-                .stats()
-                .connect_failed_unretryable,
-            1
-        );
+        // A rejected spawn is no evidence.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert!(!manager.admission().congestion_pending());
         // Nothing else is left to report.
         assert!(futures::poll!(std::pin::pin!(manager.tick())).is_pending());
     }
@@ -1410,9 +1390,10 @@ mod tests {
         assert_eq!(manager.get_available_ranges(), vec![0..64]);
         assert!(manager.is_empty());
 
-        let stats = manager.runner_outcome_sampler_mut().stats();
-        assert_eq!(stats.stream_closed_retryable, 1);
-        assert_eq!(stats.stream_closed_unretryable, 0);
+        // A timeout after `Started` is no evidence; the runner is no
+        // longer connected.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert_eq!(manager.admission().connected(), 0);
 
         runner_handle.await.unwrap();
     }

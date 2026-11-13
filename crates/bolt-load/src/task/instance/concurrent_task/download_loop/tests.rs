@@ -547,12 +547,12 @@ fn test_custom_timer_survives_other_events() {
             ["strategy", "strategy", "strategy", "throughput"]
         );
         assert!(harness.download.writer.is_idle());
-        let stats = harness
-            .download
-            .manager
-            .runner_outcome_sampler_mut()
-            .stats();
-        assert_eq!(stats.connect_failed_retryable, 1, "{stats:?}");
+        // The lost connection was handled: its range backs off once.
+        let cooldowns = harness.download.manager.cooldowns();
+        assert!(
+            matches!(cooldowns[..], [(_, ref cooldown)] if cooldown.attempts == 1),
+            "{cooldowns:?}"
+        );
         assert!(progress_published(&mut harness.events));
         harness.teardown().await;
     });

@@ -531,6 +531,31 @@ struct AvailableRange {
 
 **迟到的 tick。** 距上一个 tick 超过两个间隔的 tick 是迟到的。循环先轮询 tick 再轮询 runner，卡顿之后 tick 看到的状态可能马上被排队的生命周期事件改掉，所以迟到的 tick 不执行静默规则。
 
+**恢复：一次一步，要验证，按退避拉开（D22）。**
+
+- 两个控制器之间只交换两个数：扩张一侧给出 `want`（目前恒为 `max_connections`），并发控制给出 `limit_cap`，step 进行中是 `limit + 1`，否则是 `limit`。`cap = min(limit_cap, want, max_connections)`，能新增的 runner 数一律按 `free = cap.saturating_sub(active)` 计算：建 runner、唤醒后的创建、dynamic 策略的切分都一样。`active > cap` 是合法状态，多出来的 runner 不会被停掉，下完自己的块就结束。
+- 上限只能通过 step 升高。step 是对 `limit + 1` 的一次试探，在策略 tick 上开始，要求同时满足：没有 step 在进行；没有拥塞在挡新连接；`want > limit` 且 `limit < max_connections`；`now ≥ due`；`connected ≥ limit`；tick 不迟到。如果已经有超过 `limit` 个连接在活动，step 不新开连接，直接评判现有的连接：上一个 step 留下的试探连接就这样被下一个 step 计入，既不停掉也不忽略。
+- step 有四个出口，每个 tick 按顺序检查：
+
+| 检查 | 结果 |
+| --- | --- |
+| step 开始之后分类到一次被佐证的拒绝或一次拥塞 | 拒绝 |
+| step 开始之后分类到一次没有佐证的拒绝（迟到的 tick 不看这一条） | 不确定 |
+| `now ≥ started_at + STEP_DEADLINE` | 不确定 |
+| `connected ≥ limit + 1` 连续保持了 `T_OBS`，此刻 `proven ≥ limit + 1`，tick 不迟到 | 接受 |
+
+| 结果 | `limit` | 等待 | 下一个 `due` |
+| --- | --- | --- | --- |
+| 接受 | `limit + 1` | 回到基础值 | `now` |
+| 拒绝 | 不变（拥塞时再按拥塞规则降） | 加倍，不超过上限 | `now + 等待`；拥塞时从拥塞结束算起 |
+| 不确定 | 不变 | 不变 | `now + 等待` |
+
+- step 被标记之后（被佐证或没有佐证的拒绝、拥塞），到下一个 tick 判定它之前，补充 runner 和切分都按 `limit` 而不是 `limit + 1` 计算：试探的区间退避结束得比 tick 早，也不会再开第二个试探；低于 `limit` 的连接照常补上。
+- 两个标记按程序顺序记录，不比较时间：`begin_step()` 清空，之后分类到的拒绝或拥塞才会置位。和 step 同一个 `now`、但在它之前处理的拒绝不会拒绝它。
+- 连续占满的起点来自生命周期，不来自 tick 碰巧看到的数：让 `connected` 达到 `limit + 1` 的那次 `Started` 把它标为待盖章；step 开始时已经达到，就取 step 的开始时间；任何一次 `release_runner` 让数目跌破，立即清空，还没盖章的也一样。所以一个 runner 在一个 tick 之后结束、替补在下一个 tick 之前连上，时钟重新开始；计时从试探连接连上算起，不从 step 开始算起。
+- 静默降级之后，`due` 是降级时刻加基础等待；拥塞之后，`due` 从拥塞结束算起。任何结果之后，下一个 step 都在 300 s 之内到期。拒绝永远不会升高上限，只有被接受的 step 会，每次加 1。
+- `max_connections = 1` 时不会有 step，也不会降级。
+
 **常量（D23）。**
 
 | 常量 | 值 |
@@ -539,6 +564,9 @@ struct AvailableRange {
 | 确认 | 第三次拒绝之后一个 tick 间隔的进度 |
 | `STREAK_GAP` | `2 × connect_timeout + 30 s`（默认 90 s），容得下连续三次连接超时；溢出时取 `Duration::MAX` |
 | 迟到的 tick | 距上一个 tick 超过 2 个间隔 |
+| `T_OBS` | 连续占满 15 s（原来的 `recovery_observation_period`） |
+| `STEP_DEADLINE` | `connect_timeout + T_OBS + 2` 个 tick（默认 48 s）；溢出时取 `Duration::MAX`，这样的截止时间永远到不了 |
+| step 之间的等待 | 30 s（原来的 `recovery_delay`），每次拒绝加倍，上限 300 s |
 
 都没有校准，留给基准测试。
 
@@ -1044,3 +1072,36 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `split` 不检查拥塞：`retry_after_holds_back_every_new_connection`；
     - 领取时不带上 `attempts`：4 个 `ChunkPlanner` 测试、4 个下载循环测试和性质测试；
     - 唤醒创建不等降级：`test_create_tasks_waits_for_the_first_step_and_the_degradation` 和 `wake_up_before_the_degradation_leaves_the_retry_to_a_later_tick`。
+
+### 14.12a 静默的连接上限（PR-6a，C35–C38）
+
+- **做法。**
+  - C35：新增 `strategy/admission_evidence.rs`，`RunnerManager` 持有它。生命周期的 `Started` 分支和 `mark_started` 调 `on_started`，`release_runner` 调 `on_ended`。每个结束的尝试都经过 `record_attempt_end(phase, error)`：连接失败（含 spawn 失败）、runner 丢失、传输中的失败；取消不算失败，不经过它。佐证用的“已证实”数来自 `ChunkPlanner::get_proven_runners_count()`：`Running` 且本次尝试 `downloaded` 非空的块。`on_runner` 开头先 `stamp(now)`。连续拒绝分两部分：已盖章的和还没盖章的；盖章时先检查已盖章的最近一次拒绝是否已过 `STREAK_GAP`，过了就丢掉，再并入新的拒绝，所以间隔之后才到的拒绝不会续上过期的一轮，不必等 tick。这一步不读证据，行为不变。
+  - C36：`bolt-load-tests` 新增 `create_limited_range_server(content, limit, mode, bytes_per_sec)` 和 `LimitMode::{Close, Hang}`。用 axum 的 `Listener` 包一层：超过上限的连接，`Close` 在接受后立即关闭，`Hang` 接受后一直持有、不读也不答。`ConnectionLog` 记录每个连接的服务、关闭和拒绝，以及同时服务的连接数。range 响应按给定速率发送，原来的限速响应改为同一个 `paced` 函数。
+  - C37：并发控制读证据。`StrategyControl::execute` 和 `create_tasks` 改为接收 `LoopSignals`（拥塞、最近进度、writer 能否接收），`FailurePolicy` 新增 `last_progress_at()`。拥塞规则取代立即降级，静默规则取代按失败率的降级，在 `Normal` 和 `Degraded` 里都执行；旧的恢复仍然读 sampler。`RunnerOutcomeSampler` 的 `unretryable_pending` 和 `has_recent_unretryable` 删掉，由证据的 `congestion_pending` 和 `take_congestion` 代替。
+  - C38：并发控制改为 §8.3 的 step；`ConcurrencyControlContext` 增加 `want`、`congestion_until`，去掉 `max_concurrency`，`LoopSignals` 增加 `congestion_until`。`StrategyControl` 记住 `max_connections` 作为 `want`，dynamic 策略的切分闸门改为 `min(max_concurrency, cap)`。删掉旧的 `Degraded`、`Recovering`、失败率阈值、`degradation_step`、`min_samples`，以及 `RunnerOutcomeSampler` 和它的全部记录点；`strategy/` 的非测试代码里不再有 `Instant::now()`。
+- **与 §8.3 之外的约定的偏差。**
+  - 被接受的 step 不再下发 `ChangeMaxConcurrency`：新的 `limit` 等于原来的 `limit_cap`，循环的上限不用变。
+  - 不带 step 的拥塞也把 `due` 推到拥塞结束加当前等待之后：服务器刚说过已满，不马上试探。
+  - 迟到的 tick 只处理拒绝和截止时间，没有佐证的拒绝留给下一个 tick。
+  - 测试里的 writer 改为每次写入一个任务、停在测试的 runtime 里：循环自己的 writer 把写入交给后台线程，完成的时机测试控制不了，重放就不确定。
+  - G10 的端到端测试由测试自己切分出第四个连接：任务只有在 dynamic 策略的速度采样需要时才会切分，测试无法强制（§14.12 的同一限制）。
+- **验证。**
+  - 单元测试（注入 `now`）：
+    - 证据：分类表的每一行；同水平的连接结束连续拒绝，较低水平的不结束，开始之前的成功不算；没盖章的时刻读作未知；丢失会清掉没盖章的占满；step 开始时已占满就从开始算起；标记按程序顺序；降级截断 `proven_window`。
+    - manager：分类经过生命周期，13 种结束方式；`Started` 两条路径都记录；完成、失败、丢失、取消都离开 `connected`。
+    - 并发控制（`strategy/concurrency_control_strategy/tests.rs`）：三次拒绝加进度才降，降过还能再降，旧的成功稀释不了，没有进度不降，`STREAK_GAP` 后失效，没有佐证不算，带数据的短流不降，拥塞不升高上限，迟到的 tick 和满 writer 不降；step 要 `want`、到期、`connected ≥ limit`、没有拥塞；从试探连接的 `Started` 算 15 s 才接受；两个 tick 之间的替换、writer 满时的丢失都会重新计时；迟到的 tick 不接受；截止时间结束为不确定且等待不变；下一个 step 计入留下的试探连接，不新开连接；同一时刻之前处理的拒绝不拒绝 step；被佐证的拒绝拒绝，没有佐证的不确定，拥塞拒绝并降级、从拥塞结束算起；拒绝的 step 依次相隔 30、60、120、240、300、300 s；一个连接永远不 step。
+    - 原有的三个单元测试保留断言，只改准备步骤：`test_immediate_degradation_never_drops_to_zero` 和 `test_create_tasks_waits_for_the_first_step_and_the_degradation` 把 sampler 里的不可重试结果换成证据里的拥塞；`test_a_pending_unretryable_failure_triggers_once` 改为证据的 `take_congestion` 测试。
+  - 下载循环（`download_loop/tests/admission.rs`，健康的 runner 由测试驱动，循环自己建的 runner 通过拒绝或不应答的 adapter 连接，经过生命周期结束）：
+    - 8 个里服务器接受 4 个、其余被拒绝或不应答：在第三次拒绝之后第一个间隔一个 tick 的 tick 降到 4，之后 25 s 内没有新连接。
+    - 同样的场景跑 300 s：只有 step 的试探连接超过 4，每个 step 一个，都被拒绝，每个 step 在到期后的第一个 tick 开始，拒绝之后的等待依次加倍；上限在 4 和 5 之间交替，从不更高。
+    - 传输中的 503 在下一个 step 降到 4，之后 25 s 不升；step 进行中的 503 拒绝它，等待加倍并从拥塞结束算起。
+    - 丢失的 runner、四个连接同时断开后重连被拒、拒绝与成功交替：上限都不变。
+    - writer 满 15 s，期间拒绝照常到达、runner 的结束照常处理，但不接收数据，静默规则等待；写入完成后的下一个 tick 降级。
+    - 性质测试：连接、交付、完成、拒绝、带数据后失败、丢失、拥塞、填满和清空 writer、按时和迟到的 tick、唤醒，128 组，每组最多 400 步。测试自己维护已连接的 runner 和 step 的连续占满（从它报告的事件算），用这个模型而不是证据判断：模型和证据的连接数、占满起点必须一致；上限在 `[1, max_connections]` 之内，新增 runner 不超过 cap；只在按时的 tick、模型的连续占满达到 15 s 之后加 1；静默降级只在 writer 能接收数据、第三次拒绝之后有进度时发生，拥塞立即降；step 在截止之后的第一个 tick 结束；传输中的失败、丢失、完成和 writer 不产生证据，也不改上限；循环的上限等于 cap；同样的操作在同样的时刻重放，下发的动作序列相同。
+  - 端到端（reqwest、tokio、C36 的服务器，真实计时器）：`max_connections = 8`，服务器限 3、每个连接 256 KiB/s，`Close` 和 `Hang`（连接超时 300 ms）各一次：下载完成，BLAKE3 正确，服务器同时服务的连接不超过 3，上限从 8 降到 3，之后不再升高；第一个 step 至少在降级 30 s 之后开始，两者都是并发控制自己的决策时刻（循环处理事件时的 `now`）（G10）。服务器的记录不和循环的时刻比较：不应答的连接，服务器记下拒绝的时间可能晚于循环的时刻。step 开了哪些试探、什么时候开，只在注入时间的测试里断言。每个约 20 s。
+  - 已有测试：`retry.rs` 的断言都没有改。manager 测试里读 sampler 的断言改读证据（旧：`connect_failed_*`、`stream_closed_*`、`total` 的计数；新：连续拒绝为 0、没有待处理的拥塞、`connected` 为 0）；`test_custom_timer_survives_other_events` 改为断言丢失的连接让它的区间退避了一次。
+  - 回归：两次拒绝在 0.1 s 和 0.2 s，tick 每 1.5 s 一次，第三次在 90.3 s（间隔已过、下一个 tick 之前），之后有进度：不降级（证据和并发控制各一个测试）。`connect_timeout = Duration::MAX` 时 `STREAK_GAP` 和 `STEP_DEADLINE` 饱和，不 panic，step 只按标记或接受结束。
+  - 回归：step 的试探在它的 tick 被拒、区间只退避 1 s（比 tick 短），唤醒时不再开第二个试探，下一个 tick 拒绝这个 step（下载循环）；被标记的 step 在 tick 之前不补试探的位置，低于 `limit` 的照常补（单元，两种标记）。去掉这条规则，两个测试都失败。
+  - 变异检查：接受时不看连续占满，4 个单元测试和性质测试失败；释放时不清空占满，性质测试失败。
+- **已知限制。** 见 §8.3 的“不做的事”和 §12。

@@ -70,6 +70,9 @@ pub(super) struct DownloadLoop {
     deadline: DeadlineSource,
     strategy_tick: StrategyTick,
     throughput: ThroughputSampler,
+    /// Every strategy action applied, in order.
+    #[cfg(test)]
+    applied: Vec<String>,
 }
 
 impl DownloadLoop {
@@ -85,7 +88,7 @@ impl DownloadLoop {
         let mut manager = RunnerManager::new(total, max_concurrency);
         *manager.admission_mut() =
             AdmissionEvidence::with_streak_gap(streak_gap(options.connect_timeout));
-        let strategy = StrategyControl::new(max_concurrency);
+        let strategy = StrategyControl::new(max_concurrency, options.connect_timeout);
         let policy = FailurePolicy::new(options, Instant::now());
         let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),
@@ -110,6 +113,8 @@ impl DownloadLoop {
             deadline,
             strategy_tick: StrategyTick::new(strategy_timer.into()),
             throughput: ThroughputSampler::new(throughput_timer.into()),
+            #[cfg(test)]
+            applied: Vec::new(),
         }
     }
 

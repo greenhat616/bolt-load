@@ -36,6 +36,7 @@ impl DownloadLoop {
     pub(super) fn signals(&self, now: Instant) -> LoopSignals {
         LoopSignals {
             congested: self.backoff.is_congested(now),
+            congestion_until: self.backoff.congestion_until(),
             last_progress_at: self.policy.last_progress_at(),
             writer_ready: self.writer.can_write(),
         }
@@ -62,6 +63,8 @@ impl DownloadLoop {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(super) fn apply(&mut self, action: StrategyAction, now: Instant) {
+        #[cfg(test)]
+        self.applied.push(format!("{action:?}"));
         match action {
             // Split current all task into two separate tasks
             StrategyAction::SplitAllTask(planned_chunk_size) => {

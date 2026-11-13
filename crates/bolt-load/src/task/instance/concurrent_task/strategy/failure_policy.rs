@@ -1,7 +1,7 @@
 //! Decides when a concurrent task must give up.
 //!
-//! Independent from concurrency tuning: the rolling outcome sampler forgets
-//! old samples and cannot serve as a retry budget.
+//! Independent from concurrency tuning: the admission evidence keeps no
+//! history and cannot serve as a retry budget.
 
 use std::{
     sync::Arc,

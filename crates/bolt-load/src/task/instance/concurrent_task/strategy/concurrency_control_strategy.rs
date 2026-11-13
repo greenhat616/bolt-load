@@ -7,9 +7,7 @@ use std::{
 };
 
 use super::{
-    DEFAULT_STRATEGY_TICK_INTERVAL, Strategy, StrategyAction,
-    admission_evidence::AdmissionEvidence,
-    runner_outcome_sampler::{OutcomeStats, RunnerOutcomeSampler},
+    DEFAULT_STRATEGY_TICK_INTERVAL, Strategy, StrategyAction, admission_evidence::AdmissionEvidence,
 };
 
 /// Corroborated refusals in a row before the silent rule lowers the limit.
@@ -18,56 +16,65 @@ const REFUSALS_IN_A_ROW: usize = 3;
 #[derive(Debug, Clone)]
 /// The configuration for the concurrency control strategy
 pub struct ConcurrencyControlConfig {
-    /// The threshold for triggering degradation
-    pub failure_rate_threshold: f64,
-    /// The time to wait for recovery after degradation
-    pub recovery_delay: Duration,
-    /// The observation period for recovery
-    pub recovery_observation_period: Duration,
-    /// The number of concurrency to decrease each time of degradation
-    pub degradation_step: usize,
-    /// The number of concurrency to increase each time of recovery
-    pub recovery_step: usize,
     /// The minimum concurrency
     pub min_concurrency: usize,
+    /// The wait before the first step, and after an accepted one
+    pub base_wait: Duration,
+    /// The longest wait between steps, however many were rejected
+    pub max_wait: Duration,
+    /// How long a step's trial must stay connected without a break
+    pub observation: Duration,
+    /// When a step that is still undecided ends, counted from its start
+    pub step_deadline: Duration,
     /// The interval of the strategy tick: progress one interval after the
     /// third refusal confirms a streak, and a tick more than two intervals
     /// after the previous one is late.
     pub tick_interval: Duration,
 }
 
+impl ConcurrencyControlConfig {
+    /// The defaults for runners that may take `connect_timeout` to connect.
+    pub fn with_connect_timeout(connect_timeout: Duration) -> Self {
+        let observation = Duration::from_secs(15);
+        let tick_interval = DEFAULT_STRATEGY_TICK_INTERVAL;
+        Self {
+            min_concurrency: 1,
+            base_wait: Duration::from_secs(30),
+            max_wait: Duration::from_secs(300),
+            observation,
+            // Time to connect, to be observed, and two ticks to see it.
+            // A deadline past what an instant can hold is never reached.
+            step_deadline: connect_timeout
+                .saturating_add(observation)
+                .saturating_add(2 * tick_interval),
+            tick_interval,
+        }
+    }
+}
+
 impl Default for ConcurrencyControlConfig {
     fn default() -> Self {
-        Self {
-            failure_rate_threshold: 0.3,
-            recovery_delay: Duration::from_secs(30),
-            recovery_observation_period: Duration::from_secs(15),
-            degradation_step: 1,
-            recovery_step: 1,
-            min_concurrency: 1,
-            tick_interval: DEFAULT_STRATEGY_TICK_INTERVAL,
-        }
+        Self::with_connect_timeout(crate::runner::DEFAULT_CONNECT_TIMEOUT)
     }
 }
 
 /// The context for the concurrency control strategy
 #[derive(derive_more::Debug)]
 pub struct ConcurrencyControlContext<'a> {
-    /// The current maximum concurrency
-    pub max_concurrency: usize,
+    /// The connections the growth side wants open
+    pub want: usize,
     /// The current active runner count
     pub active_runners: usize,
     /// The runners that are running and had bytes accepted
     pub proven_runners: usize,
-    /// The sampler
-    #[debug(skip)]
-    pub sampler: &'a mut RunnerOutcomeSampler,
     /// What ended attempts tell about the connections the server admits
     #[debug(skip)]
     pub admission: &'a mut AdmissionEvidence,
     /// The ranges a runner may be created for now: none while a congestion
     /// holds back new connections, and no range still backing off.
     pub available_chunks: Vec<Range<u64>>,
+    /// Until when a congestion holds back new connections
+    pub congestion_until: Option<Instant>,
     /// When a non-empty frame was last accepted
     pub last_progress_at: Instant,
     /// Whether the writer can take data
@@ -76,73 +83,104 @@ pub struct ConcurrencyControlContext<'a> {
     pub now: Instant,
 }
 
-/// The state of the concurrency control strategy
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum StrategyState {
-    /// Normal operation
-    Normal,
-    /// Degraded
-    Degraded {
-        target_concurrency: usize,
-        degraded_at: Instant,
-    },
-    /// Recovering
-    Recovering {
-        trial_concurrency: usize,
-        started_at: Instant,
-        /// The number of failures at the start of recovery, for comparison
-        initial_failures: usize,
-    },
-}
-
+/// The limit controller (design §8.3).
+///
+/// `limit` is what the server is believed to admit. The only way above it
+/// is a step, a trial of one more connection, which ends rejected,
+/// inconclusive or accepted; while it runs the cap is `limit + 1`.
 #[derive(Debug)]
 pub struct ConcurrencyControlStrategy {
     config: ConcurrencyControlConfig,
-    state: StrategyState,
-    initial_max_concurrency: usize,
+    max_connections: usize,
+    limit: usize,
+    /// When the running step began.
+    step: Option<Instant>,
+    /// When the next step may begin; any time before the first.
+    due: Option<Instant>,
+    /// The wait after a rejected step, doubled by each.
+    wait: Duration,
     first_execute: bool,
     /// The previous step's time, to tell a late tick.
     last_tick: Option<Instant>,
 }
 
 impl ConcurrencyControlStrategy {
-    pub fn new(config: ConcurrencyControlConfig, initial_max_concurrency: usize) -> Self {
+    pub fn new(config: ConcurrencyControlConfig, max_connections: usize) -> Self {
+        let wait = config.base_wait;
         Self {
             config,
-            state: StrategyState::Normal,
-            initial_max_concurrency,
+            max_connections,
+            limit: max_connections,
+            step: None,
+            due: None,
+            wait,
             first_execute: true,
             last_tick: None,
         }
     }
 
     #[cfg(test)]
-    pub fn with_default_config(initial_max_concurrency: usize) -> Self {
-        Self::new(ConcurrencyControlConfig::default(), initial_max_concurrency)
+    pub fn with_default_config(max_connections: usize) -> Self {
+        Self::new(ConcurrencyControlConfig::default(), max_connections)
+    }
+
+    /// `limit + 1` while a step runs, else `limit`.
+    fn limit_cap(&self) -> usize {
+        self.limit + usize::from(self.step.is_some())
+    }
+
+    /// The connections the runners may take with `want` wanted:
+    /// `min(limit_cap, want, max_connections)`.
+    pub fn cap(&self, want: usize) -> usize {
+        self.limit_cap().min(want).min(self.max_connections)
+    }
+
+    /// The connections new runners may take now, with `want` wanted: the
+    /// [cap](Self::cap), except that a running step already marked rejected
+    /// or unclear opens no other trial before its next tick decides it.
+    /// Runners below the limit are still replaced.
+    pub fn refill_cap(&self, want: usize, admission: &AdmissionEvidence) -> usize {
+        if self.step.is_some() && (admission.step_rejected() || admission.step_unclear()) {
+            self.limit.min(want).min(self.max_connections)
+        } else {
+            self.cap(want)
+        }
+    }
+
+    /// The limit, the start of the running step, when the next step is due
+    /// and the wait after a rejection.
+    #[cfg(test)]
+    pub fn state(&self) -> (usize, Option<Instant>, Option<Instant>, Duration) {
+        (self.limit, self.step, self.due, self.wait)
     }
 
     /// The congestion rule: a 429/503 lowers the limit to the active
-    /// runners, and never raises it.
-    #[inline]
+    /// runners, and never raises it. It rejects a running step, and the
+    /// next step waits for the end of the congestion's hold.
     fn handle_congestion(
         &mut self,
         context: &mut ConcurrencyControlContext,
-        now: Instant,
     ) -> Vec<StrategyAction> {
+        let now = context.now;
         // Never degrade to zero: with no active runner nothing would be scheduled again.
-        let new_concurrency = context.max_concurrency.min(
+        let lowered = self.limit.min(
             context
                 .active_runners
                 .max(self.config.min_concurrency)
                 .max(1),
         );
-        context.admission.on_lowered(new_concurrency);
-        self.state = StrategyState::Degraded {
-            target_concurrency: new_concurrency,
-            degraded_at: now,
-        };
-
-        vec![StrategyAction::ChangeMaxConcurrency(new_concurrency)]
+        if self.step.take().is_some() {
+            context.admission.end_step();
+            self.wait = (self.wait * 2).min(self.config.max_wait);
+        }
+        if lowered < self.limit {
+            self.limit = lowered;
+            context.admission.on_lowered(lowered);
+        }
+        let hold_end = context.congestion_until.map_or(now, |until| until.max(now));
+        let due = hold_end + self.wait;
+        self.due = Some(self.due.map_or(due, |current| current.max(due)));
+        vec![StrategyAction::ChangeMaxConcurrency(self.limit)]
     }
 
     /// The silent rule: the limit the evidence lowers the current one to,
@@ -163,129 +201,84 @@ impl ConcurrencyControlStrategy {
             return None;
         }
         let connected = admission.connected();
-        (1..context.max_concurrency)
+        (1..self.limit)
             .contains(&connected)
             .then(|| connected.max(self.config.min_concurrency).max(1))
     }
 
-    /// Lower the limit to `new_concurrency` by the silent rule.
-    fn lower_silently(
+    /// Decide the running step, which began at `started_at`: rejected,
+    /// inconclusive or accepted, checked in that order; `None` while it
+    /// runs on. A late tick acts only on rejections and the deadline.
+    fn judge_step(
+        &self,
+        context: &ConcurrencyControlContext,
+        started_at: Instant,
+        late: bool,
+    ) -> Option<StepOutcome> {
+        let admission = &*context.admission;
+        let now = context.now;
+        if admission.step_rejected() {
+            return Some(StepOutcome::Rejected);
+        }
+        if !late && admission.step_unclear() {
+            return Some(StepOutcome::Inconclusive);
+        }
+        if started_at
+            .checked_add(self.config.step_deadline)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return Some(StepOutcome::Inconclusive);
+        }
+        let occupied = admission
+            .occupied_since()
+            .is_some_and(|since| now.saturating_duration_since(since) >= self.config.observation);
+        (!late && occupied && context.proven_runners > self.limit).then_some(StepOutcome::Accepted)
+    }
+
+    /// End the running step as `outcome`.
+    fn end_step(
         &mut self,
         context: &mut ConcurrencyControlContext,
-        new_concurrency: usize,
-        now: Instant,
+        outcome: StepOutcome,
         actions: &mut Vec<StrategyAction>,
     ) {
+        let now = context.now;
+        self.step = None;
+        context.admission.end_step();
         bolt_load_utils::telemetry::trace!(
-            "[CONTROL STRATEGY] refused connects: lowered to {new_concurrency}"
+            "[CONTROL STRATEGY] step to {} {outcome:?}",
+            self.limit + 1
         );
-        context.admission.on_lowered(new_concurrency);
-        self.state = StrategyState::Degraded {
-            target_concurrency: new_concurrency,
-            degraded_at: now,
-        };
-        actions.push(StrategyAction::ChangeMaxConcurrency(new_concurrency));
-    }
-
-    fn handle_degraded_state(
-        &mut self,
-        stats: &OutcomeStats,
-        now: Instant,
-        target_concurrency: usize,
-        degraded_at: Instant,
-        actions: &mut Vec<StrategyAction>,
-    ) {
-        // if the recovery delay has not passed, do not recover
-        if now.duration_since(degraded_at) < self.config.recovery_delay {
-            return;
-        }
-
-        let recovery_threshold = self.config.failure_rate_threshold * 0.5;
-        if stats.failure_rate() < recovery_threshold {
-            let trial =
-                (target_concurrency + self.config.recovery_step).min(self.initial_max_concurrency);
-
-            if trial > target_concurrency {
-                self.state = StrategyState::Recovering {
-                    trial_concurrency: trial,
-                    started_at: now,
-                    initial_failures: stats.total_failures(),
-                };
-                actions.push(StrategyAction::ChangeMaxConcurrency(trial));
-            } else {
-                // if the trial concurrency is already the maximum value, return to normal state
-                self.state = StrategyState::Normal;
+        match outcome {
+            StepOutcome::Accepted => {
+                self.limit += 1;
+                self.wait = self.config.base_wait;
+                self.due = Some(now);
             }
+            StepOutcome::Rejected => {
+                self.wait = (self.wait * 2).min(self.config.max_wait);
+                self.due = Some(now + self.wait);
+            }
+            StepOutcome::Inconclusive => self.due = Some(now + self.wait),
+        }
+        // An accepted step keeps the cap: the trial's slot is the limit's.
+        if outcome != StepOutcome::Accepted {
+            actions.push(StrategyAction::ChangeMaxConcurrency(self.limit));
         }
     }
 
-    fn handle_recovering_state(
-        &mut self,
-        stats: &OutcomeStats,
-        now: Instant,
-        trial_concurrency: usize,
-        started_at: Instant,
-        initial_failures: usize,
-        actions: &mut Vec<StrategyAction>,
-    ) {
-        let elapsed = now.duration_since(started_at);
-
-        // if the failure rate has increased during recovery, immediately rollback
-        if stats.failure_rate() >= self.config.failure_rate_threshold {
-            let fallback = trial_concurrency
-                .saturating_sub(self.config.degradation_step)
-                .max(self.config.min_concurrency);
-
-            self.state = StrategyState::Degraded {
-                target_concurrency: fallback,
-                degraded_at: now,
-            };
-            actions.push(StrategyAction::ChangeMaxConcurrency(fallback));
-            return;
-        }
-
-        if elapsed >= self.config.recovery_observation_period {
-            // if there are new failures during recovery, continue recovery
-            let new_failures = stats.total_failures().saturating_sub(initial_failures);
-            let recovery_samples = stats.total.saturating_sub(initial_failures);
-
-            // if the failure rate is low during recovery, continue recovery
-            let recovery_failure_rate = if recovery_samples > 0 {
-                new_failures as f64 / recovery_samples as f64
-            } else {
-                0.0
-            };
-
-            if recovery_failure_rate < self.config.failure_rate_threshold {
-                // if the recovery is successful, continue recovery
-                if trial_concurrency < self.initial_max_concurrency {
-                    // continue to increase the concurrency
-                    let next_trial = (trial_concurrency + self.config.recovery_step)
-                        .min(self.initial_max_concurrency);
-
-                    self.state = StrategyState::Recovering {
-                        trial_concurrency: next_trial,
-                        started_at: now,
-                        initial_failures: stats.total_failures(),
-                    };
-                    actions.push(StrategyAction::ChangeMaxConcurrency(next_trial));
-                } else {
-                    // if the recovery is successful, return to normal state
-                    self.state = StrategyState::Normal;
-                }
-            } else {
-                // if the recovery is failed, rollback the concurrency
-                let fallback = trial_concurrency
-                    .saturating_sub(self.config.recovery_step)
-                    .max(self.config.min_concurrency);
-
-                self.state = StrategyState::Degraded {
-                    target_concurrency: fallback,
-                    degraded_at: now,
-                };
-                actions.push(StrategyAction::ChangeMaxConcurrency(fallback));
-            }
-        }
+    /// Whether a step may begin: none runs, no congestion holds, more is
+    /// wanted and allowed, it is due, and the limit's runners are
+    /// connected. Not at a late tick.
+    fn may_step(&self, context: &ConcurrencyControlContext, late: bool) -> bool {
+        let now = context.now;
+        !late
+            && self.step.is_none()
+            && context.congestion_until.is_none_or(|until| now >= until)
+            && context.want > self.limit
+            && self.limit < self.max_connections
+            && self.due.is_none_or(|due| now >= due)
+            && context.admission.connected() >= self.limit
     }
 
     /// The runners a step would create once the concurrency needs no
@@ -299,32 +292,33 @@ impl ConcurrencyControlStrategy {
         if self.first_execute || context.admission.congestion_pending() {
             return Vec::new();
         }
-        Self::fill_free_slots(context)
+        self.fill_free_slots(context)
     }
 
-    /// One runner per available range, up to the free slots.
-    fn fill_free_slots(context: &ConcurrencyControlContext) -> Vec<StrategyAction> {
+    /// One runner per available range, up to the free slots:
+    /// `refill_cap.saturating_sub(active)`.
+    fn fill_free_slots(&self, context: &ConcurrencyControlContext) -> Vec<StrategyAction> {
         context
             .available_chunks
             .iter()
             .take(
-                context
-                    .max_concurrency
+                self.refill_cap(context.want, context.admission)
                     .saturating_sub(context.active_runners),
             )
             .map(|chunk| StrategyAction::CreateTask(chunk.clone()))
             .collect()
     }
+}
 
-    /// Get the current state
-    #[expect(dead_code, reason = "debugging aid for the strategy state")]
-    pub fn current_state(&self) -> &str {
-        match self.state {
-            StrategyState::Normal => "normal",
-            StrategyState::Degraded { .. } => "degraded",
-            StrategyState::Recovering { .. } => "recovering",
-        }
-    }
+/// How a step ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepOutcome {
+    /// One more connection held for the observation period, and delivers.
+    Accepted,
+    /// A corroborated refusal or a congestion since the step began.
+    Rejected,
+    /// An uncorroborated refusal, or the deadline.
+    Inconclusive,
 }
 
 impl Strategy for ConcurrencyControlStrategy {
@@ -337,6 +331,9 @@ impl Strategy for ConcurrencyControlStrategy {
         "concurrency_control"
     }
 
+    /// In order: the first runners; the stamp; a pending congestion; the
+    /// running step's exits; without a step, the silent rule and then the
+    /// start of a step; otherwise one runner per available range.
     #[inline]
     fn step(&mut self, context: &mut Self::Context<'_>) -> Vec<StrategyAction> {
         let now = context.now;
@@ -348,12 +345,7 @@ impl Strategy for ConcurrencyControlStrategy {
         // Create background runners for all available chunks according to the current concurrency
         if self.first_execute {
             self.first_execute = false;
-            return context
-                .available_chunks
-                .iter()
-                .take(context.max_concurrency)
-                .map(|chunk| StrategyAction::CreateTask(chunk.clone()))
-                .collect();
+            return self.fill_free_slots(context);
         }
 
         // A streak with no refusal for its gap ends at the stamp.
@@ -362,482 +354,33 @@ impl Strategy for ConcurrencyControlStrategy {
 
         if context.admission.take_congestion() {
             bolt_load_utils::telemetry::trace!("[CONTROL STRATEGY] congestion, degraded");
-            return self.handle_congestion(context, now);
+            return self.handle_congestion(context);
         }
 
         let mut actions = Vec::new();
-        let stats = context.sampler.stats();
-
-        match self.state {
-            StrategyState::Normal => {
-                if let Some(new_concurrency) = self.silent_limit(context, late) {
-                    self.lower_silently(context, new_concurrency, now, &mut actions);
-                }
+        if let Some(started_at) = self.step {
+            if let Some(outcome) = self.judge_step(context, started_at, late) {
+                self.end_step(context, outcome, &mut actions);
             }
-            StrategyState::Degraded {
-                target_concurrency,
-                degraded_at,
-            } => {
-                if let Some(new_concurrency) = self.silent_limit(context, late) {
-                    self.lower_silently(context, new_concurrency, now, &mut actions);
-                } else {
-                    self.handle_degraded_state(
-                        &stats,
-                        now,
-                        target_concurrency,
-                        degraded_at,
-                        &mut actions,
-                    );
-                }
-            }
-            StrategyState::Recovering {
-                trial_concurrency,
-                started_at,
-                initial_failures,
-            } => {
-                self.handle_recovering_state(
-                    &stats,
-                    now,
-                    trial_concurrency,
-                    started_at,
-                    initial_failures,
-                    &mut actions,
-                );
-            }
-        }
-
-        if !actions.is_empty() {
-            return actions;
+        } else if let Some(lowered) = self.silent_limit(context, late) {
+            bolt_load_utils::telemetry::trace!(
+                "[CONTROL STRATEGY] refused connects: lowered to {lowered}"
+            );
+            self.limit = lowered;
+            context.admission.on_lowered(lowered);
+            self.due = Some(now + self.config.base_wait);
+            actions.push(StrategyAction::ChangeMaxConcurrency(lowered));
+        } else if self.may_step(context, late) {
+            self.step = Some(now);
+            context.admission.begin_step(self.limit + 1, now);
+            actions.push(StrategyAction::ChangeMaxConcurrency(self.limit + 1));
         }
 
         // When the active runners are less than the max concurrency, create background runners for all available chunks
-        Self::fill_free_slots(context)
+        actions.extend(self.fill_free_slots(context));
+        actions
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{super::admission_evidence::AdmissionClass, *};
-
-    const TICK: Duration = DEFAULT_STRATEGY_TICK_INTERVAL;
-    const SECOND: Duration = Duration::from_secs(1);
-
-    /// The evidence and the sampler a context borrows.
-    #[derive(Default)]
-    struct Sources {
-        sampler: Option<RunnerOutcomeSampler>,
-        admission: AdmissionEvidence,
-    }
-
-    impl Sources {
-        fn context(
-            &mut self,
-            max_concurrency: usize,
-            active_runners: usize,
-            available_chunks: Vec<Range<u64>>,
-            now: Instant,
-        ) -> ConcurrencyControlContext<'_> {
-            ConcurrencyControlContext {
-                max_concurrency,
-                active_runners,
-                proven_runners: active_runners,
-                sampler: self
-                    .sampler
-                    .get_or_insert_with(RunnerOutcomeSampler::with_defaults),
-                admission: &mut self.admission,
-                available_chunks,
-                last_progress_at: now,
-                writer_ready: true,
-                now,
-            }
-        }
-    }
-
-    fn congest(admission: &mut AdmissionEvidence) {
-        admission.on_attempt_ended(AdmissionClass::Congestion, 1, 1);
-    }
-
-    #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
-    fn test_immediate_degradation_never_drops_to_zero() {
-        let mut strategy = ConcurrencyControlStrategy::with_default_config(4);
-        let mut sources = Sources::default();
-        let mut context = sources.context(4, 0, vec![0..100], Instant::now());
-        // The first step only schedules the initial runners.
-        strategy.step(&mut context);
-
-        congest(context.admission);
-        context.now = Instant::now();
-        let actions = strategy.step(&mut context);
-        assert!(
-            matches!(actions.as_slice(), [StrategyAction::ChangeMaxConcurrency(n)] if *n >= 1),
-            "unexpected actions: {actions:?}"
-        );
-    }
-
-    fn created(actions: &[StrategyAction]) -> Vec<Range<u64>> {
-        actions
-            .iter()
-            .map(|action| match action {
-                StrategyAction::CreateTask(range) => range.clone(),
-                other => panic!("unexpected action: {other:?}"),
-            })
-            .collect()
-    }
-
-    /// Between steps, runners are created only as a step would create them,
-    /// and only once the step lowered the limit for a congestion.
-    #[test]
-    #[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
-    fn test_create_tasks_waits_for_the_first_step_and_the_degradation() {
-        let mut strategy = ConcurrencyControlStrategy::with_default_config(4);
-        let mut sources = Sources::default();
-        let mut context =
-            sources.context(4, 1, vec![0..10, 20..30, 40..50, 60..70], Instant::now());
-        assert!(strategy.create_tasks(&context).is_empty());
-        strategy.step(&mut context);
-
-        // Three free slots.
-        assert_eq!(
-            created(&strategy.create_tasks(&context)),
-            [0..10, 20..30, 40..50]
-        );
-        context.active_runners = 4;
-        assert!(strategy.create_tasks(&context).is_empty());
-
-        context.active_runners = 1;
-        congest(context.admission);
-        context.now = Instant::now();
-        assert!(strategy.create_tasks(&context).is_empty());
-        // Still pending: `create_tasks` left it to the step.
-        let actions = strategy.step(&mut context);
-        assert!(
-            matches!(
-                actions.as_slice(),
-                [StrategyAction::ChangeMaxConcurrency(1)]
-            ),
-            "unexpected actions: {actions:?}"
-        );
-        context.max_concurrency = 1;
-        context.active_runners = 0;
-        assert_eq!(created(&strategy.create_tasks(&context)), [0..10]);
-    }
-
-    /// A strategy past its first step at `t0`, with a limit of `limit`,
-    /// and `connected` runners connected.
-    fn started(
-        limit: usize,
-        connected: usize,
-        t0: Instant,
-    ) -> (ConcurrencyControlStrategy, Sources) {
-        let mut strategy = ConcurrencyControlStrategy::with_default_config(limit);
-        let mut sources = Sources::default();
-        for id in 0..connected {
-            sources.admission.on_started(id, id);
-        }
-        strategy.step(&mut sources.context(limit, connected, Vec::new(), t0));
-        (strategy, sources)
-    }
-
-    /// `n` refusals, each with `connected` others in flight and one proven.
-    fn refuse(admission: &mut AdmissionEvidence, n: usize) {
-        let others = admission.connected();
-        for _ in 0..n {
-            admission.on_attempt_ended(AdmissionClass::Refused, 1, others);
-        }
-    }
-
-    /// The step at `now`, after the last progress at `progress`; returns
-    /// the new limit, if the step changed it.
-    fn tick_at(
-        strategy: &mut ConcurrencyControlStrategy,
-        sources: &mut Sources,
-        limit: usize,
-        now: Instant,
-        progress: Instant,
-    ) -> Option<usize> {
-        let active = sources.admission.connected();
-        let mut context = sources.context(limit, active, Vec::new(), now);
-        context.last_progress_at = progress;
-        changed_limit(&strategy.step(&mut context))
-    }
-
-    fn changed_limit(actions: &[StrategyAction]) -> Option<usize> {
-        actions.iter().find_map(|action| match action {
-            StrategyAction::ChangeMaxConcurrency(n) => Some(*n),
-            _ => None,
-        })
-    }
-
-    #[test]
-    fn test_three_refusals_and_progress_lower_the_limit() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        refuse(&mut sources.admission, 2);
-        sources.admission.stamp(t0);
-        // Two are not enough, whatever the progress.
-        assert_eq!(
-            tick_at(&mut strategy, &mut sources, 16, t0 + TICK, t0 + TICK),
-            None
-        );
-        refuse(&mut sources.admission, 1);
-        let third = t0 + TICK + SECOND;
-        sources.admission.stamp(third);
-        // Progress before one tick interval after the third does not
-        // confirm it.
-        for now in [third + SECOND, third + TICK] {
-            assert_eq!(
-                tick_at(
-                    &mut strategy,
-                    &mut sources,
-                    16,
-                    now,
-                    third + TICK - SECOND / 2
-                ),
-                None,
-                "at {:?}",
-                now - third
-            );
-        }
-        assert_eq!(
-            tick_at(
-                &mut strategy,
-                &mut sources,
-                16,
-                third + 2 * TICK,
-                third + TICK
-            ),
-            Some(4)
-        );
-    }
-
-    #[test]
-    fn test_a_lowered_limit_is_lowered_again() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        refuse(&mut sources.admission, 3);
-        assert_eq!(
-            tick_at(&mut strategy, &mut sources, 16, t0 + TICK, t0 + TICK),
-            None,
-            "the stamp of this step is the third refusal's"
-        );
-        assert_eq!(
-            tick_at(
-                &mut strategy,
-                &mut sources,
-                16,
-                t0 + 2 * TICK,
-                t0 + 2 * TICK
-            ),
-            Some(4)
-        );
-        // Two runners are lost, and their reconnects are refused.
-        sources.admission.on_ended(0);
-        sources.admission.on_ended(1);
-        refuse(&mut sources.admission, 3);
-        let third = t0 + 3 * TICK;
-        sources.admission.stamp(third);
-        assert_eq!(
-            tick_at(&mut strategy, &mut sources, 4, third + TICK, third + TICK),
-            Some(2)
-        );
-        // Not below what is connected.
-        refuse(&mut sources.admission, 3);
-        let third = third + 2 * TICK;
-        sources.admission.stamp(third);
-        assert_eq!(
-            tick_at(&mut strategy, &mut sources, 2, third + TICK, third + TICK),
-            None
-        );
-    }
-
-    #[test]
-    fn test_old_successes_do_not_dilute_a_streak() {
-        let t0 = Instant::now();
-        let mut strategy = ConcurrencyControlStrategy::with_default_config(8);
-        let mut sources = Sources::default();
-        strategy.step(&mut sources.context(8, 0, Vec::new(), t0));
-        // Twenty connects with seven others in flight, then the server
-        // goes from eight to seven.
-        for id in 0..20 {
-            sources.admission.on_started(id, 7);
-            if id >= 7 {
-                sources.admission.on_ended(id);
-            }
-        }
-        assert_eq!(sources.admission.connected(), 7);
-        refuse(&mut sources.admission, 3);
-        sources.admission.stamp(t0);
-        assert_eq!(
-            tick_at(&mut strategy, &mut sources, 8, t0 + TICK, t0 + TICK),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn test_no_progress_after_the_refusals_keeps_the_limit() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        refuse(&mut sources.admission, 5);
-        sources.admission.stamp(t0);
-        for n in 1..40 {
-            assert_eq!(
-                tick_at(&mut strategy, &mut sources, 16, t0 + TICK * n, t0),
-                None,
-                "tick {n}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_a_streak_expires_before_it_is_confirmed() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        refuse(&mut sources.admission, 3);
-        sources.admission.stamp(t0);
-        let gap = Duration::from_secs(90);
-        let mut now = t0;
-        while now < t0 + gap {
-            now += TICK;
-            tick_at(&mut strategy, &mut sources, 16, now, t0);
-        }
-        assert_eq!(sources.admission.streak_count(), 0);
-        assert_eq!(
-            tick_at(&mut strategy, &mut sources, 16, now + TICK, now + TICK),
-            None
-        );
-    }
-
-    /// Two refusals at 0.1 and 0.2 s, ticks every 1.5 s, and a third
-    /// refusal at 90.3 s, after the 90 s gap but before the next tick:
-    /// it starts a new streak, and the progress after it lowers nothing.
-    #[test]
-    fn test_a_refusal_after_the_gap_does_not_revive_the_streak() {
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        for at in [100, 200] {
-            refuse(&mut sources.admission, 1);
-            sources.admission.stamp(t0 + ms(at));
-        }
-        let mut now = t0;
-        while now + TICK <= t0 + ms(90_300) {
-            now += TICK;
-            assert_eq!(tick_at(&mut strategy, &mut sources, 16, now, t0), None);
-        }
-        // Handled by the loop at its own time, before the next tick.
-        refuse(&mut sources.admission, 1);
-        sources.admission.stamp(t0 + ms(90_300));
-        for _ in 0..4 {
-            now += TICK;
-            assert_eq!(
-                tick_at(&mut strategy, &mut sources, 16, now, now),
-                None,
-                "at {:?}",
-                now - t0
-            );
-        }
-        assert_eq!(sources.admission.streak_count(), 1);
-    }
-
-    #[test]
-    fn test_uncorroborated_refusals_count_for_nothing() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        for _ in 0..5 {
-            sources
-                .admission
-                .on_attempt_ended(AdmissionClass::Refused, 0, 4);
-        }
-        sources.admission.stamp(t0);
-        assert_eq!(
-            tick_at(
-                &mut strategy,
-                &mut sources,
-                16,
-                t0 + 2 * TICK,
-                t0 + 2 * TICK
-            ),
-            None
-        );
-    }
-
-    /// A stream that ends short after its bytes is no evidence, so it
-    /// lowers nothing; the old rule degraded at once for it.
-    #[test]
-    fn test_a_short_stream_with_bytes_does_not_lower_the_limit() {
-        use super::super::admission_evidence::{AttemptPhase, classify};
-        use crate::runner::TaskError;
-
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        let class = classify(AttemptPhase::Streaming, &TaskError::SmallerThanTotalSize);
-        for _ in 0..5 {
-            sources.admission.on_attempt_ended(class, 4, 4);
-        }
-        for n in 1..4 {
-            assert_eq!(
-                tick_at(
-                    &mut strategy,
-                    &mut sources,
-                    16,
-                    t0 + TICK * n,
-                    t0 + TICK * n
-                ),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn test_a_congestion_never_raises_the_limit() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(4, 4, t0);
-        congest(&mut sources.admission);
-        // Six active, which a limit of four allowed before it was set.
-        let mut context = sources.context(4, 6, Vec::new(), t0 + TICK);
-        assert_eq!(changed_limit(&strategy.step(&mut context)), Some(4));
-        congest(&mut sources.admission);
-        let mut context = sources.context(4, 2, Vec::new(), t0 + 2 * TICK);
-        assert_eq!(changed_limit(&strategy.step(&mut context)), Some(2));
-    }
-
-    /// At a late tick, queued events may be about to change what the
-    /// evidence shows: the silent rule waits for the next tick.
-    #[test]
-    fn test_a_late_tick_lowers_nothing() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        refuse(&mut sources.admission, 3);
-        sources.admission.stamp(t0);
-        let late = t0 + 2 * TICK + SECOND;
-        assert_eq!(tick_at(&mut strategy, &mut sources, 16, late, late), None);
-        assert_eq!(
-            tick_at(&mut strategy, &mut sources, 16, late + TICK, late),
-            Some(4)
-        );
-    }
-
-    /// While the writer takes no data, the progress it would accept is
-    /// unknown: the silent rule waits.
-    #[test]
-    fn test_a_full_writer_lowers_nothing() {
-        let t0 = Instant::now();
-        let (mut strategy, mut sources) = started(16, 4, t0);
-        refuse(&mut sources.admission, 3);
-        sources.admission.stamp(t0);
-        let mut context = sources.context(16, 4, Vec::new(), t0 + TICK);
-        context.writer_ready = false;
-        assert_eq!(changed_limit(&strategy.step(&mut context)), None);
-        assert_eq!(
-            tick_at(
-                &mut strategy,
-                &mut sources,
-                16,
-                t0 + 2 * TICK,
-                t0 + 2 * TICK
-            ),
-            Some(4)
-        );
-    }
-}
+mod tests;

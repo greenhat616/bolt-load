@@ -32,6 +32,7 @@ const TICK: Duration = DEFAULT_STRATEGY_TICK_INTERVAL;
 const SECOND: Duration = Duration::from_secs(1);
 /// What every running runner delivers at each tick.
 const DELIVERED: u64 = 64 << 10;
+const NANO: Duration = Duration::from_nanos(1);
 
 /// How the server answers the connects of the runners the loop spawns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,7 +169,35 @@ async fn admission_loop(
         CancellationToken::new(),
     );
     download.backoff = Backoff::without_jitter();
+    // Every write parks in the test's runtime, so the test decides when it
+    // completes; the loop's own writer hands writes to background workers.
+    download.writer = PendingWriter::new(
+        Arc::new(file_writer.clone()),
+        ThreadedRuntimeImpl::new_other_rt(rt.clone()),
+        max_connections,
+    );
     (download, file_writer)
+}
+
+/// Complete the parked `writes`, hand their completions to the loop, and
+/// complete the writes that dispatches in turn, until the writer is idle.
+fn drain(
+    download: &mut DownloadLoop,
+    rt: &ScriptedRuntime,
+    writes: &mut Vec<FutureObj<'static, ()>>,
+) {
+    while !download.writer.is_idle() {
+        for write in writes.drain(..) {
+            futures::executor::block_on(write);
+        }
+        while let Some(LoopEvent::WriterCompleted(Some(completions))) =
+            std::future::poll_fn(|cx| download.poll_writer(cx)).now_or_never()
+        {
+            download.record_completions(completions).unwrap();
+        }
+        // The write the writer held back, dispatched once a slot freed.
+        writes.extend(rt.take_parked());
+    }
 }
 
 /// A loop driven event by event in the test's own time.
@@ -185,6 +214,8 @@ struct Sim {
     connecting: Vec<(Instant, FutureObj<'static, ()>)>,
     /// The runners the server admitted, kept so that they stay connected.
     admitted: Vec<FutureObj<'static, ()>>,
+    /// Writes parked by [`Self::fill_writer`].
+    writes: Vec<FutureObj<'static, ()>>,
     now: Instant,
     next_tick: Instant,
     /// When the loop spawned each runner.
@@ -221,6 +252,7 @@ impl Sim {
             healthy: runners,
             connecting: Vec::new(),
             admitted: Vec::new(),
+            writes: Vec::new(),
             now: t0,
             next_tick: t0 + TICK,
             spawned: Vec::new(),
@@ -253,8 +285,12 @@ impl Sim {
             .collect()
     }
 
-    /// Every running runner delivers, and its bytes are written.
+    /// Every running runner delivers, and its bytes are written; nothing
+    /// while the writer is full, as the loop then polls no data.
     fn deliver(&mut self) {
+        if !self.download.writer.can_write() {
+            return;
+        }
         for runner_id in self.runners(ChunkStatus::Running) {
             self.download
                 .manager
@@ -303,7 +339,12 @@ impl Sim {
                 self.download.manager.mark_started(runner_id);
             }
         }
-        while let Some(tick) = self.download.manager.tick().now_or_never() {
+        // As the loop polls its runners: data only while the writer can
+        // take it.
+        while let Some(LoopEvent::Runner(tick)) = {
+            let download = &mut self.download;
+            std::future::poll_fn(|cx| download.poll_runner(cx)).now_or_never()
+        } {
             if let Some(failure) = &tick.failure {
                 self.failures.push((now, failure.error.clone()));
             }
@@ -313,6 +354,25 @@ impl Sim {
                 .expect("the task goes on");
             assert!(flow.is_continue());
         }
+    }
+
+    /// Fill the writer with writes, which stay parked: it takes no more
+    /// data.
+    fn fill_writer(&mut self) {
+        self.settle();
+        while self.download.writer.can_write() {
+            self.download
+                .writer
+                .write_range(0..1, bytes::Bytes::from_static(b"x"))
+                .unwrap();
+        }
+        self.writes.extend(self.rt.take_parked());
+        assert!(!self.download.writer.can_write());
+    }
+
+    /// Complete the parked writes, and hand their completions to the loop.
+    fn drain_writer(&mut self) {
+        drain(&mut self.download, &self.rt, &mut self.writes);
     }
 
     /// Drop the admitted runners: their streams close.
@@ -530,6 +590,609 @@ async fn interleaved_stops_and_refusals_keep_the_limit() {
     sim.teardown().await;
 }
 
+/// The ticks of `sim` at which a step began, and at which it ended, with
+/// the limit controller's state right after each tick.
+#[derive(Debug, Default)]
+struct Steps {
+    began: Vec<Instant>,
+    /// When each ended, and when the next was due then.
+    ended: Vec<(Instant, Instant)>,
+}
+
+impl Sim {
+    /// Run tick by tick until `end`, and record the steps.
+    fn run_recording_steps(&mut self, end: Instant, steps: &mut Steps) {
+        while self.next_tick <= end {
+            let tick = self.next_tick;
+            let before = self.download.strategy.limit_state().1;
+            self.run_until(tick);
+            let (_, step, due, _) = self.download.strategy.limit_state();
+            match (before, step) {
+                (None, Some(began)) => steps.began.push(began),
+                (Some(_), None) => steps.ended.push((tick, due.unwrap())),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The silent limit of design §8.3 over 300 s of the loop's time: after
+/// the lowering to the four connected runners, the only connects above
+/// four are one per step, each refused, and each step rejected.
+///
+/// Each step begins at the first tick at or after its due time: the
+/// lowering's time plus the base wait, then the rejection's tick plus the
+/// wait, which doubles. Asserted against the recorded rejections and due
+/// times, not against fixed seconds.
+#[tokio::test]
+async fn a_silent_limit_settles_at_the_connected_runners() {
+    for server in [Server::Refuses, Server::Hangs] {
+        let mut sim = Sim::new(server, 8, &eighths(4)).await;
+        let t0 = sim.t0();
+        let mut steps = Steps::default();
+        let horizon = match server {
+            Server::Hangs => 3 * DEFAULT_CONNECT_TIMEOUT + 10 * SECOND,
+            _ => 10 * SECOND,
+        };
+        sim.run_until(t0 + horizon);
+        let (lowered_at, 4) = sim.limits[1] else {
+            panic!("{server:?}: {:?}", sim.limits);
+        };
+        let failures = sim.failures.len();
+        let spawned = sim.spawned.len();
+        sim.run_recording_steps(lowered_at + 300 * SECOND, &mut steps);
+
+        let base = Duration::from_secs(30);
+        assert!(steps.began.len() >= 3, "{server:?}: {steps:?}");
+        let mut due = lowered_at + base;
+        for (n, began) in steps.began.iter().enumerate() {
+            assert_eq!(*began, first_tick_from(t0, due), "{server:?}: step {n}");
+            let Some(&(ended, next_due)) = steps.ended.get(n) else {
+                break;
+            };
+            assert_eq!(
+                next_due,
+                ended + base * 2u32.pow(n as u32 + 1),
+                "{server:?}"
+            );
+            due = next_due;
+        }
+        // One connect a step, refused, and it rejected the step.
+        let trials = &sim.spawned[spawned..];
+        assert_eq!(trials, &steps.began[..], "{server:?}");
+        let refusals: Vec<_> = sim.failures[failures..].iter().map(|f| f.0).collect();
+        assert_eq!(refusals.len(), steps.ended.len(), "{server:?}");
+        // Each rejected at the tick that follows the refusal.
+        for (refused, (ended, _)) in refusals.iter().zip(&steps.ended) {
+            assert!(
+                *refused <= *ended && *ended <= *refused + TICK,
+                "{server:?}: refused {refused:?}, ended {ended:?}"
+            );
+        }
+        if server == Server::Hangs {
+            for (refused, began) in refusals.iter().zip(&steps.began) {
+                assert_eq!(*refused, *began + DEFAULT_CONNECT_TIMEOUT);
+            }
+        }
+        // The cap alternates between the limit and one more, never higher.
+        assert!(
+            sim.limits[2..]
+                .iter()
+                .enumerate()
+                .all(|(n, (_, limit))| *limit == if n % 2 == 0 { 5 } else { 4 }),
+            "{server:?}: {:?}",
+            sim.limits
+        );
+        assert_eq!(sim.download.strategy.limit_state().0, 4);
+        sim.teardown().await;
+    }
+}
+
+/// A step's trial on a range that failed once is refused just after the
+/// step's tick; its backoff of 1 s ends before the next tick. The wake-up
+/// at the end of the backoff opens no second trial: the step is already
+/// rejected, and the next tick ends it.
+#[tokio::test]
+async fn a_rejected_step_opens_no_second_trial_before_its_tick() {
+    let mut sim = Sim::new(Server::Refuses, 8, &whole(4)).await;
+    let t0 = sim.t0();
+    sim.run_until(t0 + TICK);
+    // A 503 on one of the four lowers the limit to the other three.
+    sim.fail_healthy(3, congestion());
+    let mut steps = Steps::default();
+    sim.run_recording_steps(sim.next_tick, &mut steps);
+    let (_, 3) = sim.limits[1] else {
+        panic!("{:?}", sim.limits);
+    };
+    let spawned = sim.spawned.len();
+    while steps.began.is_empty() {
+        assert!(sim.now < t0 + 40 * SECOND, "no step began");
+        sim.run_recording_steps(sim.next_tick, &mut steps);
+    }
+    let began = steps.began[0];
+    // The trial, on the range of the 503, refused at the step's tick.
+    assert_eq!(sim.spawned[spawned..], [began]);
+    assert_eq!(sim.failures.last().unwrap().0, began);
+    // Its range backs off for 1 s, less than a tick.
+    let retry = sim.download.next_retry(began).unwrap();
+    assert!(retry < began + TICK, "{:?}", retry - began);
+    sim.run_recording_steps(began + TICK, &mut steps);
+    assert_eq!(sim.spawned[spawned..], [began], "a second trial opened");
+    assert_eq!(steps.ended.len(), 1, "{steps:?}");
+    assert_eq!(steps.ended[0].0, began + TICK);
+    sim.teardown().await;
+}
+
+/// A 503 in the body stream of a healthy runner while a step's trial is
+/// connecting rejects the step: the wait doubles, counted from the end of
+/// the congestion's hold, and the limit is not raised.
+#[tokio::test]
+async fn a_streaming_congestion_rejects_a_running_step() {
+    let mut sim = Sim::new(Server::Hangs, 8, &eighths(4)).await;
+    let t0 = sim.t0();
+    let mut steps = Steps::default();
+    sim.run_until(t0 + 3 * DEFAULT_CONNECT_TIMEOUT + 10 * SECOND);
+    let (lowered_at, 4) = sim.limits[1] else {
+        panic!("{:?}", sim.limits);
+    };
+    sim.run_recording_steps(lowered_at + 40 * SECOND, &mut steps);
+    let [began] = steps.began[..] else {
+        panic!("{steps:?}");
+    };
+    assert!(steps.ended.is_empty());
+    sim.fail_healthy(0, congestion());
+    let hold_end = sim.download.backoff.congestion_until().unwrap();
+    sim.run_recording_steps(sim.next_tick, &mut steps);
+    let [(ended, due)] = steps.ended[..] else {
+        panic!("{steps:?}");
+    };
+    assert!(ended > began);
+    assert_eq!(due, hold_end.max(ended) + Duration::from_secs(60));
+    // The trial still connects: four are active, so the limit stays.
+    assert_eq!(sim.download.strategy.limit_state().0, 4);
+    assert_eq!(sim.limit(), 4);
+    sim.teardown().await;
+}
+
+/// The writer is full for 15 s while refusals arrive beside the four that
+/// deliver: the loop still handles every runner's end, but accepts no data,
+/// so the silent rule waits. Once the writes complete, the next tick lowers
+/// the limit.
+#[tokio::test]
+async fn a_full_writer_holds_the_silent_rule_until_it_drains() {
+    let mut sim = Sim::new(Server::Refuses, 8, &eighths(4)).await;
+    let t0 = sim.t0();
+    sim.fill_writer();
+    sim.run_until(t0 + 15 * SECOND);
+    assert!(sim.failures.len() >= 3, "{:?}", sim.failures);
+    assert!(sim.download.manager.admission().streak_count() >= 3);
+    assert_eq!(sim.limits.len(), 1, "{:?}", sim.limits);
+    assert_eq!(sim.download.policy.last_progress_at(), t0);
+
+    let drained_at = sim.now;
+    sim.drain_writer();
+    sim.run_until(drained_at + 3 * TICK);
+    assert_eq!(
+        sim.limits[1..],
+        [(first_tick_from(t0, drained_at + NANO), 4)]
+    );
+    sim.teardown().await;
+}
+
+/// Random sequences of connects, refusals, losses, congestion, failures
+/// after bytes, completions, writer backpressure and ticks, on time and
+/// late, through the manager's lifecycle handling (design §8.3).
+///
+/// The test keeps its own model of the connected runners and of the
+/// running step's occupancy, from the events it reports, and checks the
+/// invariants against the model, not against the evidence.
+mod admission_properties {
+    use std::collections::BTreeSet;
+
+    use pretty_assertions::assert_eq;
+    use proptest::prelude::*;
+
+    use super::{super::super::super::strategy::ConcurrencyControlConfig, *};
+
+    const MAX_CONNECTIONS: usize = 6;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// The `n`th connecting runner reports `Started`.
+        Connect(usize),
+        /// Every running runner delivers, unless the writer is full.
+        Deliver,
+        /// The `n`th running runner finishes.
+        Complete(usize),
+        /// The `n`th connecting runner is refused.
+        Refuse(usize),
+        /// The `n`th running runner fails after its bytes.
+        FailAfterBytes(usize),
+        /// The `n`th connecting or running runner is lost.
+        Lose(usize),
+        /// The `n`th connecting or running runner gets a 503.
+        Congest(usize),
+        /// Writes fill the writer, which then takes no data.
+        FillWriter,
+        /// The parked writes complete, and the loop takes their completions.
+        DrainWriter,
+        /// A strategy tick one interval after the previous, at `speed` MiB/s.
+        Tick(u64),
+        /// A strategy tick three intervals after the previous.
+        LateTick(u64),
+        /// The loop wakes to retry the ranges whose backoff ended.
+        Retry,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            4 => any::<usize>().prop_map(Op::Connect),
+            6 => Just(Op::Deliver),
+            1 => any::<usize>().prop_map(Op::Complete),
+            2 => any::<usize>().prop_map(Op::Refuse),
+            1 => any::<usize>().prop_map(Op::FailAfterBytes),
+            1 => any::<usize>().prop_map(Op::Lose),
+            1 => any::<usize>().prop_map(Op::Congest),
+            1 => Just(Op::FillWriter),
+            2 => Just(Op::DrainWriter),
+            30 => (0..8u64).prop_map(Op::Tick),
+            1 => (0..8u64).prop_map(Op::LateTick),
+            1 => Just(Op::Retry),
+        ]
+    }
+
+    fn nth<T: Copy>(items: &[T], n: usize) -> Option<T> {
+        (!items.is_empty()).then(|| items[n % items.len()])
+    }
+
+    fn io() -> TaskError {
+        TaskError::StreamError {
+            source: AdapterError::Retryable {
+                source: RetryableError::Io {
+                    source: Arc::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+                },
+            },
+        }
+    }
+
+    /// What the invariants compare, taken before and after each step.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Snapshot {
+        limit: usize,
+        step: Option<Instant>,
+        due: Option<Instant>,
+        cap: usize,
+        active: usize,
+        allocated: usize,
+        loop_limit: usize,
+        streak: usize,
+        third: Option<Instant>,
+        congestion_pending: bool,
+        rejected: bool,
+        unclear: bool,
+        writer_ready: bool,
+        last_progress_at: Instant,
+        /// The model's occupancy of the running step.
+        occupied_since: Option<Instant>,
+    }
+
+    struct Prop {
+        download: DownloadLoop,
+        _file_writer: FileWriter,
+        rt: ScriptedRuntime,
+        now: Instant,
+        /// The runners the loop spawned, parked and never polled.
+        runners: Vec<FutureObj<'static, ()>>,
+        /// The writes parked by [`Op::FillWriter`].
+        writes: Vec<FutureObj<'static, ()>>,
+        /// The model: the runners the test reported `Started` for and has
+        /// not ended since.
+        connected: BTreeSet<crate::task::RunnerId>,
+        /// The model: since when the running step's trial has been
+        /// connected without a break.
+        occupied_since: Option<Instant>,
+    }
+
+    impl Prop {
+        /// The runners stay parked; the test reports their lifecycle events
+        /// itself.
+        fn new(rt: ScriptedRuntime, max_connections: usize, t0: Instant) -> Self {
+            let (mut download, file_writer) =
+                futures::executor::block_on(admission_loop(&rt, false, max_connections));
+            download.policy.on_progress(t0);
+            Self {
+                download,
+                _file_writer: file_writer,
+                rt,
+                now: t0,
+                runners: Vec::new(),
+                writes: Vec::new(),
+                connected: BTreeSet::new(),
+                occupied_since: None,
+            }
+        }
+
+        fn snapshot(&self) -> Snapshot {
+            let (limit, step, due, _) = self.download.strategy.limit_state();
+            let admission = self.download.manager.admission();
+            Snapshot {
+                limit,
+                step,
+                due,
+                cap: self.download.strategy.cap(),
+                active: self.download.manager.get_active_runners_count(),
+                allocated: self.download.manager.allocated_runner_count(),
+                loop_limit: self.download.max_concurrency,
+                streak: admission.streak_count(),
+                third: admission.third_refusal_at(),
+                congestion_pending: admission.congestion_pending(),
+                rejected: admission.step_rejected(),
+                unclear: admission.step_unclear(),
+                writer_ready: self.download.writer.can_write(),
+                last_progress_at: self.download.policy.last_progress_at(),
+                occupied_since: self.occupied_since,
+            }
+        }
+
+        fn runners(&self, statuses: &[ChunkStatus]) -> Vec<crate::task::RunnerId> {
+            (0..MAX_CONNECTIONS)
+                .filter(|&id| {
+                    self.download
+                        .manager
+                        .get_runner_state(id)
+                        .is_some_and(|state| statuses.contains(&state.status))
+                })
+                .collect()
+        }
+
+        /// Hand `tick` to the loop; `false` once the task ends.
+        fn on_runner(&mut self, tick: RunnerTick) -> bool {
+            match self.download.on_runner(tick, self.now) {
+                Ok(flow) => flow.is_continue(),
+                Err(_) => false,
+            }
+        }
+
+        fn tick(&mut self, intervals: u32, speed: u64) {
+            self.now += TICK * intervals;
+            self.download.throughput.speed = (speed << 20) as f64;
+            let active = self.download.manager.get_active_runners_count().max(1);
+            self.download.throughput.per_runner_speed = (speed << 20) as f64 / active as f64;
+            self.download.on_strategy_tick(self.now);
+        }
+
+        /// Report `item` for runner `id`, and update the model.
+        fn report(&mut self, id: crate::task::RunnerId, item: LifecycleEvent) -> bool {
+            if matches!(item, LifecycleEvent::Started) {
+                self.connected.insert(id);
+            } else {
+                self.connected.remove(&id);
+            }
+            let tick = self.download.manager.inject_lifecycle(id, item);
+            self.on_runner(tick)
+        }
+
+        /// Apply `op`; `false` once the task ends.
+        fn apply(&mut self, op: &Op) -> bool {
+            use ChunkStatus::{Pending, Running};
+
+            let going_on = match *op {
+                Op::Connect(n) => match nth(&self.runners(&[Pending]), n) {
+                    Some(id) => self.report(id, LifecycleEvent::Started),
+                    None => true,
+                },
+                Op::Deliver => {
+                    // Under backpressure the loop polls no data.
+                    if self.download.writer.can_write() {
+                        for id in self.runners(&[Running]) {
+                            self.download
+                                .manager
+                                .update_progress(id, DELIVERED)
+                                .unwrap();
+                        }
+                        self.download.policy.on_progress(self.now);
+                    }
+                    true
+                }
+                Op::Complete(n) => match nth(&self.runners(&[Running]), n) {
+                    Some(id) => {
+                        self.download.manager.update_progress(id, u64::MAX).unwrap();
+                        self.report(id, LifecycleEvent::finished())
+                    }
+                    None => true,
+                },
+                Op::Refuse(n) => match nth(&self.runners(&[Pending]), n) {
+                    Some(id) => self.report(id, LifecycleEvent::failed(io())),
+                    None => true,
+                },
+                Op::FailAfterBytes(n) => match nth(&self.runners(&[Running]), n) {
+                    Some(id) => self.report(id, LifecycleEvent::failed(reset())),
+                    None => true,
+                },
+                Op::Lose(n) => match nth(&self.runners(&[Pending, Running]), n) {
+                    Some(id) => {
+                        self.connected.remove(&id);
+                        let tick = self.download.manager.inject_lost(id);
+                        self.on_runner(tick)
+                    }
+                    None => true,
+                },
+                Op::Congest(n) => match nth(&self.runners(&[Pending, Running]), n) {
+                    Some(id) => self.report(id, LifecycleEvent::failed(congestion())),
+                    None => true,
+                },
+                Op::FillWriter => {
+                    self.runners.extend(self.rt.take_parked());
+                    while self.download.writer.can_write() {
+                        self.download
+                            .writer
+                            .write_range(0..1, bytes::Bytes::from_static(b"x"))
+                            .unwrap();
+                    }
+                    self.writes.extend(self.rt.take_parked());
+                    true
+                }
+                Op::DrainWriter => {
+                    drain(&mut self.download, &self.rt, &mut self.writes);
+                    true
+                }
+                Op::Tick(speed) => {
+                    self.tick(1, speed);
+                    true
+                }
+                Op::LateTick(speed) => {
+                    self.tick(3, speed);
+                    true
+                }
+                Op::Retry => {
+                    self.download.retry_backed_off(self.now);
+                    true
+                }
+            };
+            self.runners.extend(self.rt.take_parked());
+            going_on
+        }
+
+        /// Update the model's occupancy after an operation, from the step
+        /// the controller runs and the runners the model has connected.
+        fn update_occupancy(&mut self, before: Option<Instant>) {
+            let (limit, step, _, _) = self.download.strategy.limit_state();
+            let reached = self.connected.len() > limit;
+            self.occupied_since = match step {
+                None => None,
+                Some(began) if before != Some(began) => reached.then_some(began),
+                Some(_) if !reached => None,
+                Some(_) => self.occupied_since.or(Some(self.now)),
+            };
+        }
+    }
+
+    /// Run `ops`; returns the snapshot after each, and every action the
+    /// loop applied, until the task ended.
+    fn run(max_connections: usize, t0: Instant, ops: &[Op]) -> (Vec<Snapshot>, Vec<String>) {
+        let rt = ScriptedRuntime::new(TimerKind::Scripted);
+        let mut prop = Prop::new(rt, max_connections, t0);
+        let config = ConcurrencyControlConfig::default();
+        // The first tick creates the first runner.
+        prop.download.on_strategy_tick(t0);
+        let mut before = prop.snapshot();
+        let mut snapshots = Vec::new();
+        for op in ops {
+            let going_on = prop.apply(op);
+            prop.update_occupancy(before.step);
+            let after = prop.snapshot();
+            check(&prop, &config, max_connections, op, &before, &after);
+            snapshots.push(after.clone());
+            if !going_on {
+                break;
+            }
+            before = after;
+        }
+        (snapshots, std::mem::take(&mut prop.download.applied))
+    }
+
+    /// The invariants of design §8.3 across one operation.
+    fn check(
+        prop: &Prop,
+        config: &ConcurrencyControlConfig,
+        max_connections: usize,
+        op: &Op,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) {
+        let now = prop.now;
+        let ticked = matches!(op, Op::Tick(_) | Op::LateTick(_));
+        let late = matches!(op, Op::LateTick(_));
+        // The model and the evidence agree on what is connected, and on
+        // the occupancy.
+        let admission = prop.download.manager.admission();
+        assert_eq!(admission.connected(), prop.connected.len(), "{op:?}");
+        assert_eq!(admission.occupied_since(), after.occupied_since, "{op:?}");
+        // 1. The limit stays within bounds; nothing is added at the cap.
+        assert!((1..=max_connections).contains(&after.limit), "{after:?}");
+        if after.allocated > before.allocated {
+            assert!(
+                after.active <= after.cap,
+                "{op:?} added runners above the cap: {before:?} -> {after:?}"
+            );
+        }
+        // 2, 3. It rises only by one, when a step is accepted: an on-time
+        // tick, after the model's unbroken occupancy for the observation
+        // period.
+        if after.limit > before.limit {
+            assert_eq!(after.limit, before.limit + 1, "{op:?}");
+            assert!(ticked && !late, "{op:?} raised the limit");
+            assert!(before.step.is_some(), "raised without a step");
+            let since = before.occupied_since.expect("occupied");
+            assert!(now - since >= config.observation, "{before:?}");
+            assert!(!before.congestion_pending && !before.rejected);
+        }
+        // 4. The silent rule lowers only with progress after the third
+        // refusal, and a writer that takes data; a congestion lowers at
+        // once.
+        if after.limit < before.limit {
+            assert!(ticked, "{op:?} lowered the limit");
+            if !before.congestion_pending {
+                assert!(!late && before.step.is_none(), "{op:?}: {before:?}");
+                assert!(before.writer_ready, "lowered behind a full writer");
+                assert!(before.streak >= 3, "{before:?}");
+                let third = before.third.expect("the third refusal was stamped");
+                assert!(before.last_progress_at >= third + config.tick_interval);
+            }
+        }
+        // 5. A step ends at the first tick at or after its deadline.
+        if ticked
+            && let Some(began) = before.step
+            && now >= began + config.step_deadline
+        {
+            assert_ne!(after.step, Some(began), "the step outlived its deadline");
+        }
+        // 6. Failures after `Started`, losses, completions and the writer
+        // create no refusal evidence and change no limit.
+        if matches!(
+            op,
+            Op::FailAfterBytes(_)
+                | Op::Lose(_)
+                | Op::Complete(_)
+                | Op::FillWriter
+                | Op::DrainWriter
+        ) {
+            assert!(after.streak <= before.streak, "{op:?}");
+            assert_eq!(after.congestion_pending, before.congestion_pending);
+            assert_eq!(
+                (after.rejected, after.unclear),
+                (before.rejected, before.unclear)
+            );
+        }
+        if !ticked {
+            assert_eq!(
+                (after.limit, after.step),
+                (before.limit, before.step),
+                "{op:?}"
+            );
+        }
+        // The loop's limit follows the controller's cap.
+        assert_eq!(after.loop_limit, after.cap, "{op:?}");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn the_limit_moves_only_on_its_evidence(
+            max_connections in 1..=MAX_CONNECTIONS,
+            ops in prop::collection::vec(op(), 1..400),
+        ) {
+            let t0 = Instant::now();
+            let first = run(max_connections, t0, &ops);
+            // 8. The same operations at the same instants apply the same
+            // actions.
+            let second = run(max_connections, t0, &ops);
+            prop_assert_eq!(first, second);
+        }
+    }
+}
+
 #[cfg(all(feature = "reqwest", feature = "tokio"))]
 mod fault_server {
     use bolt_load_tests::adapter::{
@@ -542,6 +1205,9 @@ mod fault_server {
     use super::{super::super::super::strategy::StrategyAction, *};
     use crate::task::Progress;
 
+    /// The limit controller's state, see `StrategyControl::limit_state`.
+    type LimitState = (usize, Option<Instant>, Option<Instant>, Duration);
+
     /// Aborts the server task when dropped, also when a test panics.
     struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -553,10 +1219,12 @@ mod fault_server {
 
     /// Handle the loop's events one by one until `done` holds, or until
     /// the loop ends when `done` is `None`; record each change of the
-    /// limit and when it happened.
+    /// limit, and each change of the limit controller's state, whose
+    /// instants are the loop's own.
     async fn drive(
         download: &mut DownloadLoop,
         limits: &mut Vec<(Instant, usize)>,
+        states: &mut Vec<LimitState>,
         mut done: Option<&mut dyn FnMut(&DownloadLoop) -> bool>,
     ) -> Result<()> {
         loop {
@@ -567,6 +1235,10 @@ mod fault_server {
             let flow = download.handle_event(event)?;
             if download.max_concurrency != limits.last().unwrap().1 {
                 limits.push((Instant::now(), download.max_concurrency));
+            }
+            let state = download.strategy.limit_state();
+            if states.last() != Some(&state) {
+                states.push(state);
             }
             if flow.is_break() {
                 return match done {
@@ -641,16 +1313,29 @@ mod fault_server {
             CancellationToken::new(),
         );
         let mut limits = vec![(Instant::now(), download.max_concurrency)];
+        let mut states = vec![download.strategy.limit_state()];
 
         // The first step creates the first runner.
         download.on_strategy_tick(Instant::now());
         let driven = within_a_minute(async {
-            drive(&mut download, &mut limits, Some(&mut |d| running(d, 0))).await?;
+            drive(
+                &mut download,
+                &mut limits,
+                &mut states,
+                Some(&mut |d| running(d, 0)),
+            )
+            .await?;
             download.apply(StrategyAction::SplitGivenTask(0), Instant::now());
-            drive(&mut download, &mut limits, Some(&mut |d| running(d, 1))).await?;
+            drive(
+                &mut download,
+                &mut limits,
+                &mut states,
+                Some(&mut |d| running(d, 1)),
+            )
+            .await?;
             // Both split: a fourth connection.
             download.apply(StrategyAction::SplitAllTask(1), Instant::now());
-            drive(&mut download, &mut limits, None).await
+            drive(&mut download, &mut limits, &mut states, None).await
         })
         .await;
         let mut progress = Progress::default();
@@ -666,14 +1351,42 @@ mod fault_server {
             calculate_blake3(&content)
         );
         assert!(log.max_open() <= 3, "{mode:?}: {:?}", log.events());
-        // Lowered to the three first; what recovery does after that is
-        // asserted in the tests with injected time.
+        // Lowered to the three first; the cadence of recovery is asserted
+        // in the tests with injected time.
         assert!(
             limits.starts_with(&[(limits[0].0, 8)]) && limits.get(1).is_some_and(|l| l.1 == 3),
             "{mode:?}: limits {limits:?}"
         );
+        assert!(
+            states.iter().all(|(limit, ..)| *limit == 3 || *limit == 8),
+            "{mode:?}: the limit rose: {states:?}"
+        );
+        // The controller's own instants, taken before it acted: when it
+        // lowered the limit, and when each step began.
+        let base = Duration::from_secs(30);
+        let lowered_at = states
+            .iter()
+            .find(|(limit, ..)| *limit == 3)
+            .and_then(|(_, _, due, _)| *due)
+            .expect("the lowering sets the next step's due time")
+            - base;
+        let steps: Vec<Instant> = states
+            .windows(2)
+            .filter_map(|pair| match (pair[0].1, pair[1].1) {
+                (None, Some(began)) => Some(began),
+                _ => None,
+            })
+            .collect();
+        // The server's log is compared with nothing the loop recorded: when
+        // the server logs a connection it turned away may lag the loop's
+        // instants, as with a connect that is never answered. Which
+        // connections the steps opened, and when, is asserted with
+        // injected time.
         let turned_away = log.turned_away();
         assert!(turned_away.len() >= 3, "{mode:?}: {turned_away:?}");
+        if let Some(&first) = steps.first() {
+            assert!(first >= lowered_at + base, "{mode:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
