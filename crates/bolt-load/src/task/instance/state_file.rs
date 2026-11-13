@@ -3,8 +3,8 @@
 //! per block whose data was synced, appended at every checkpoint.
 //!
 //! It is the destination's lock file too (design §11.5.4), so it is read and
-//! written only through the locked handle. This module writes it; reading
-//! it back to resume is C20.
+//! written only through the locked handle. This module writes it; [`read`]
+//! reads it back.
 //!
 //! ```text
 //! header:
@@ -239,6 +239,45 @@ impl StateFile {
         Ok(())
     }
 
+    /// Replace the records after the header of `header_len` bytes with
+    /// `records`, in their order, before a resume touches the partial file
+    /// (design §11.5.5, "续传"): cut the file to the header and sync, so
+    /// the old records are gone for sure; then write the records, at most
+    /// [`CHUNK_RECORDS`](read::CHUNK_RECORDS) at a time through one buffer,
+    /// and sync. Records go after them.
+    ///
+    /// # Errors
+    ///
+    /// A step failed. The file holds the header and a prefix of
+    /// `records`, or the old records, when the cut was not taken.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the task resumes in C20b"))]
+    pub(crate) fn rewrite(
+        &mut self,
+        header_len: u64,
+        records: impl IntoIterator<Item = CheckpointBlock>,
+    ) -> io::Result<()> {
+        self.io.set_len(header_len)?;
+        self.io.sync()?;
+        self.end = header_len;
+        let mut records = records.into_iter().peekable();
+        if records.peek().is_none() {
+            return Ok(());
+        }
+        let mut batch = Vec::with_capacity(read::CHUNK_RECORDS * RECORD_LEN);
+        let mut at = header_len;
+        while records.peek().is_some() {
+            batch.clear();
+            for block in records.by_ref().take(read::CHUNK_RECORDS) {
+                batch.extend_from_slice(&encode_record(&block));
+            }
+            self.io.write_at(at, &batch)?;
+            at += batch.len() as u64;
+        }
+        self.io.sync()?;
+        self.end = at;
+        Ok(())
+    }
+
     /// Cut the file back to the end of the last checkpoint that succeeded,
     /// and sync.
     ///
@@ -306,5 +345,6 @@ pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+pub(crate) mod read;
 #[cfg(test)]
 pub(crate) mod tests;
