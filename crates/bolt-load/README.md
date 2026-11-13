@@ -106,7 +106,9 @@ The concurrent download engine continuously monitors runner outcomes:
    one additional runner and observes for 15 s before committing.
 
 Slow or stalled runners have their remaining byte ranges split and
-reassigned to new runners via the `DynamicStrategy`.
+reassigned to new runners via the `DynamicStrategy`. A split first
+reserves a slot for the new runner, so it never exceeds
+`max_connections`; without a free slot the ranges stay as they are.
 
 ## Feature Flags
 
