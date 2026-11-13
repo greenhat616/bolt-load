@@ -144,6 +144,9 @@ The engine monitors runner failure rates over a sliding window:
 | `tracing` | ✓ | Distributed tracing instrumentation |
 | `progressbar` | ✓ | `indicatif` terminal progress bars |
 | `mmap` | ✓ | Memory-mapped file writer |
+| `gzip`, `deflate` | ✓ | Decode content-coded full downloads |
+| `br` | | Decode `br` |
+| `zstd` | | Decode `zstd` (builds libzstd) |
 
 ## Custom Adapters
 
@@ -153,7 +156,7 @@ Implement `BoltLoadAdapter` to download from any source (S3, FTP, in-memory, …
 impl BoltLoadAdapter for MySource {
     async fn is_range_stream_available(&self) -> bool { true }
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> { /* ... */ }
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> { /* ... */ }
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> { /* ... */ }
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> { /* ... */ }
 }
 ```

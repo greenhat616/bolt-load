@@ -222,6 +222,11 @@ resume-related fields can be added later.
   `info`. Metadata that shows a content coding selects `Singleton` with
   `fallback: Some(ContentCoded)` at initialization, without a concurrent
   transfer, unless `prefer_mode(Singleton)` already selected it.
+- **STATUS-10** A full response that turns out to be content-coded is
+  decoded (download strategy hardening, design §4.4). The metadata's size
+  counts the coded bytes, so `total` becomes `None` before the first byte
+  is counted, and `Finished` reports the decoded size. `info` does not
+  change.
 
 Internal: one `pub(crate) StatusPublisher` owns the only `watch::Sender`.
 The driver owns it; transfers and samplers borrow it and never keep a clone
