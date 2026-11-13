@@ -11,7 +11,9 @@ mod concurrency_control_strategy;
 mod dynamic_strategy;
 mod failure_policy;
 
-pub use admission_evidence::{AdmissionEvidence, AttemptPhase, classify, streak_gap};
+pub use admission_evidence::{
+    AdmissionClass, AdmissionEvidence, AttemptPhase, classify, streak_gap,
+};
 pub use backoff::Backoff;
 #[cfg(test)]
 pub use backoff::MIN_RANGE_BACKOFF;
@@ -19,6 +21,7 @@ pub use concurrency_control_strategy::ConcurrencyControlConfig;
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
+pub(super) use failure_policy::charges_range;
 
 use super::chunk_planner::SplitCandidate;
 

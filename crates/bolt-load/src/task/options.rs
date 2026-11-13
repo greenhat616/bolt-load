@@ -1,4 +1,7 @@
-use std::{num::NonZeroUsize, time::Duration};
+use std::{
+    num::{NonZeroU32, NonZeroUsize},
+    time::Duration,
+};
 
 use super::BuildError;
 
@@ -11,6 +14,8 @@ pub const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 /// The default is `max(8, 2 × max_connections)`, so a single failed wave of
 /// parallel connections cannot exhaust the budget.
 pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: usize = 8;
+/// Default for [`TaskOptions::max_attempts_per_range`].
+pub const DEFAULT_MAX_ATTEMPTS_PER_RANGE: NonZeroU32 = NonZeroU32::new(5).unwrap();
 /// Default for [`TaskOptions::stream_idle_timeout`].
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = crate::runner::DEFAULT_IDLE_TIMEOUT;
 /// Default for [`TaskOptions::connect_timeout`].
@@ -101,6 +106,27 @@ pub struct TaskOptions {
     /// `None` takes `max(8, 2 × max_connections)` when the task starts, see
     /// [`Self::resolved_max_consecutive_failures`].
     pub max_consecutive_failures: Option<usize>,
+    /// Fail the concurrent task with
+    /// [`TaskError::RangeExhausted`](crate::runner::TaskError::RangeExhausted)
+    /// once this many failures of a single range count against it, however
+    /// well the other connections go. 1 fails the task with the first one.
+    ///
+    /// A range counts on from its failures when it is retried; a range
+    /// split off a running one starts at none. A restart, a timeout or a
+    /// dropped stream after the attempt delivered bytes, does not count:
+    /// that range only backs off, and `no_progress_timeout` still bounds
+    /// it. Neither does a `Congestion` failure (429/503), nor a refused
+    /// connect above what the server was seen to admit: a connect that
+    /// failed before it started, while another attempt had delivered bytes
+    /// and at least as many other attempts were in flight as had delivered
+    /// bytes at once since the connection limit was last lowered. Every
+    /// other retryable failure counts, a lost runner even after it
+    /// delivered bytes.
+    ///
+    /// While refusals stay exempt, nothing bounds them per range: the
+    /// task then ends when the other connections have downloaded the rest,
+    /// or by `no_progress_timeout` or `max_consecutive_failures`.
+    pub max_attempts_per_range: NonZeroU32,
     /// A runner reports a retryable `Timeout` when its upstream yields no
     /// non-empty data for this long. Must be non-zero.
     pub stream_idle_timeout: Duration,
@@ -119,6 +145,7 @@ impl Default for TaskOptions {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
             max_consecutive_failures: None,
+            max_attempts_per_range: DEFAULT_MAX_ATTEMPTS_PER_RANGE,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             meta_retry: MetaRetry::default(),
@@ -148,6 +175,11 @@ impl TaskOptions {
         self.max_consecutive_failures.unwrap_or_else(|| {
             DEFAULT_MAX_CONSECUTIVE_FAILURES.max(self.max_connections.get().saturating_mul(2))
         })
+    }
+
+    pub fn max_attempts_per_range(mut self, limit: NonZeroU32) -> Self {
+        self.max_attempts_per_range = limit;
+        self
     }
 
     pub fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -195,6 +227,7 @@ mod tests {
         assert_eq!(options.no_progress_timeout, DEFAULT_NO_PROGRESS_TIMEOUT);
         assert_eq!(options.max_consecutive_failures, None);
         assert_eq!(options.resolved_max_consecutive_failures(), 16);
+        assert_eq!(options.max_attempts_per_range.get(), 5);
         assert_eq!(options.stream_idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT);
         assert_eq!(options.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
         assert_eq!(options.meta_retry, MetaRetry::default());

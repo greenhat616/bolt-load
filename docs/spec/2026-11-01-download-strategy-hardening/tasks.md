@@ -36,7 +36,8 @@
 | PR-5 连接上限 | C7 `feat(task)!: make the connection limit configurable` | T7 | — |
 | | C8 `fix(task): reserve a runner slot before splitting a chunk` | T8 | |
 | PR-6 退避与预算 | C9 `feat(task): back off failed ranges and honour Retry-After` | T9 | PR-1、PR-5 |
-| | C10 `feat(task): budget failures per range` | T10 | |
+| | C10 `feat(task)!: budget failures per range` | T10 | |
+| | C39 `fix(task): do not charge a range for a refusal above the proven window` | T10 | PR-6a |
 | PR-6a 静默限连 | C35 `refactor(task): record how connects end beside the outcome sampler` | T30 | PR-6（C9） |
 | | C36 `test(tests): add a silent connection limit to the fault server` | | |
 | | C37 `fix(task): lower the connection limit after refused connects` | | |
@@ -316,11 +317,12 @@
 
 ## T10 — 每区间预算（C10）
 
-- [ ] `FailurePolicy` 改为三层（design §8.2）：
+- [x] `FailurePolicy` 改为三层（design §8.2）：
   - 收到过数据之后的 `Timeout` 或断流，不计入连续失败；
-  - `attempts >= max_attempts_per_range` 时，返回 `TaskError::RangeExhausted { range, source }`；
+  - `charged >= max_attempts_per_range` 时，返回 `TaskError::RangeExhausted { range, attempts, source }`。`charged` 是区间记到预算上的失败数，重启和 429/503 都不记；决定退避的 `attempts` 不参与比较（design §14.13）；
   - 任务级连续失败计数保持不变。
-- [ ] 新增 `TaskOptions::max_attempts_per_range`，默认 5。
+- [x] 新增 `TaskOptions::max_attempts_per_range`，默认 5。类型是 `NonZeroU32`，`TaskBuilder` 也有同名的设置方法（design §14.13）。
+- [x] C39：在已证实窗口之上的拒绝不记预算（design §14.13a、D27）。
 
 **验证**
 

@@ -23,8 +23,15 @@ pub struct ChunkState {
     /// Runner status
     pub status: ChunkStatus,
     /// Failed attempts on the range before this chunk's, carried over from
-    /// the [`Cooldown`]s it was claimed from (design §8.1).
+    /// the [`Cooldown`]s it was claimed from (design §8.1). They only set
+    /// the backoff.
     pub attempts: u32,
+    /// The failures among `attempts` charged to the range's failure budget,
+    /// carried over the same way (design §14.13): the retryable failures
+    /// that were not restarts. A restart, a timeout or a dropped stream
+    /// after the attempt delivered bytes, is never charged, and neither is
+    /// a congestion rejection (429/503).
+    pub charged: u32,
 }
 
 /// The backoff of an available range that failed runners gave back
@@ -38,18 +45,22 @@ pub struct Cooldown {
     pub end: u64,
     /// Failed attempts on the range.
     pub attempts: u32,
+    /// The failures among `attempts` charged to the range's failure budget,
+    /// see [`ChunkState::charged`].
+    pub charged: u32,
     /// The range may not be claimed before this instant.
     pub not_before: Instant,
 }
 
 impl Cooldown {
-    /// One cooldown for two that overlap or touch: the larger attempts and
+    /// One cooldown for two that overlap or touch: the larger counts and
     /// the later `not_before`, so no byte is claimed earlier than either
     /// allowed.
     fn merge(self, other: Self) -> Self {
         Self {
             end: self.end.max(other.end),
             attempts: self.attempts.max(other.attempts),
+            charged: self.charged.max(other.charged),
             not_before: self.not_before.max(other.not_before),
         }
     }
@@ -62,6 +73,13 @@ pub struct Released {
     pub range: Range<u64>,
     /// Failed attempts on `range`, the released one included.
     pub attempts: u32,
+    /// Failures on `range` charged to its budget before the released
+    /// attempt. Whether that one is charged depends on how it failed
+    /// (design §8.2), which the planner does not know.
+    pub charged: u32,
+    /// Bytes the planner accepted from the failed attempt, after clipping
+    /// to its chunk; they stay downloaded.
+    pub received: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +149,7 @@ impl ChunkState {
             runner_id,
             status,
             attempts: 0,
+            charged: 0,
         }
     }
 
@@ -276,9 +295,10 @@ impl ChunkPlanner {
 
         // Create new chunk state, counting on from the failed attempts on it
         let start = range.start;
-        let attempts = self.take_cooldowns(&range);
+        let (attempts, charged) = self.take_cooldowns(&range);
         let chunk_state = ChunkState {
             attempts,
+            charged,
             ..ChunkState::new(range, runner_id, status)
         };
         self.chunks.insert(start, chunk_state);
@@ -365,16 +385,21 @@ impl ChunkPlanner {
 
         if let Some(mut chunk) = self.chunks.remove(&range) {
             let attempts = chunk.attempts.saturating_add(1);
+            let charged = chunk.charged;
+            // A chunk is claimed by one attempt and starts empty.
+            let received = chunk.downloaded.end - chunk.downloaded.start;
             // Return the unfinished portion
             let unfinished = chunk.downloaded.end..chunk.allocated.end;
 
             // If nothing was downloaded, remove the chunk entirely
-            if chunk.downloaded.start == chunk.downloaded.end {
+            if received == 0 {
                 let allocated = chunk.allocated.clone();
                 // Chunk is already removed, just return the range
                 Ok(Released {
                     range: allocated,
                     attempts,
+                    charged,
+                    received,
                 })
             } else {
                 // Keep the downloaded portion as a finished chunk
@@ -386,6 +411,8 @@ impl ChunkPlanner {
                 Ok(Released {
                     range: unfinished,
                     attempts,
+                    charged,
+                    received,
                 })
             }
         } else {
@@ -394,12 +421,19 @@ impl ChunkPlanner {
     }
 
     /// Back the available `range` off: it may be claimed again from
-    /// `not_before`, and has failed `attempts` times.
+    /// `not_before`, and has failed `attempts` times, `charged` of them
+    /// charged to its budget.
     ///
     /// It merges with the cooldowns it overlaps or touches into one, which
-    /// takes the larger attempts and the later `not_before`. Fresh bytes
-    /// next to it stay fresh.
-    pub fn cool_down(&mut self, range: Range<u64>, attempts: u32, not_before: Instant) {
+    /// takes the larger counts and the later `not_before`. Fresh bytes next
+    /// to it stay fresh.
+    pub fn cool_down(
+        &mut self,
+        range: Range<u64>,
+        attempts: u32,
+        charged: u32,
+        not_before: Instant,
+    ) {
         if range.is_empty() {
             return;
         }
@@ -413,6 +447,7 @@ impl ChunkPlanner {
         let mut merged = Cooldown {
             end: range.end,
             attempts,
+            charged,
             not_before,
         };
         if let Some((&before, &cooldown)) = self.cooldowns.range(..range.start).next_back()
@@ -444,17 +479,19 @@ impl ChunkPlanner {
     }
 
     /// Take `range` out of the cooldowns, for a chunk claiming it; returns
-    /// the most failed attempts among the cooldowns it overlaps, 0 for fresh
-    /// bytes. What is left of them outside `range` keeps its backoff.
-    fn take_cooldowns(&mut self, range: &Range<u64>) -> u32 {
+    /// the most failed and the most charged attempts among the cooldowns it
+    /// overlaps, 0 for fresh bytes. What is left of them outside `range`
+    /// keeps its backoff.
+    fn take_cooldowns(&mut self, range: &Range<u64>) -> (u32, u32) {
         let starts: Vec<u64> = self.overlapping_cooldowns(range).collect();
-        let mut attempts = 0;
+        let (mut attempts, mut charged) = (0, 0);
         for start in starts {
             let cooldown = self
                 .cooldowns
                 .remove(&start)
                 .expect("the start was just found");
             attempts = attempts.max(cooldown.attempts);
+            charged = charged.max(cooldown.charged);
             if start < range.start {
                 self.cooldowns.insert(
                     start,
@@ -468,7 +505,7 @@ impl ChunkPlanner {
                 self.cooldowns.insert(range.end, cooldown);
             }
         }
-        attempts
+        (attempts, charged)
     }
 
     /// The latest instant a cooldown overlapping `range` holds it back
@@ -1903,7 +1940,8 @@ mod tests {
     const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
     const NANO: std::time::Duration = std::time::Duration::from_nanos(1);
 
-    /// Fail runner `runner_id` at `now` and back its range off for `delay`.
+    /// Fail runner `runner_id` at `now`, charging the failure to its range,
+    /// and back its range off for `delay`.
     fn fail(
         planner: &mut ChunkPlanner,
         runner_id: RunnerId,
@@ -1911,14 +1949,21 @@ mod tests {
         delay: std::time::Duration,
     ) -> Released {
         let released = planner.mark_failed(runner_id).unwrap();
-        planner.cool_down(released.range.clone(), released.attempts, now + delay);
+        planner.cool_down(
+            released.range.clone(),
+            released.attempts,
+            released.charged + 1,
+            now + delay,
+        );
         released
     }
 
+    /// A cooldown whose failures were all charged, as [`fail`] charges them.
     fn cooldown(end: u64, attempts: u32, not_before: Instant) -> Cooldown {
         Cooldown {
             end,
             attempts,
+            charged: attempts,
             not_before,
         }
     }
@@ -1934,7 +1979,9 @@ mod tests {
             fail(&mut planner, 1, now, SECOND),
             Released {
                 range: 30..100,
-                attempts: 1
+                attempts: 1,
+                charged: 0,
+                received: 30,
             }
         );
 
@@ -1979,7 +2026,7 @@ mod tests {
         let now = Instant::now();
         let end = now + SECOND;
         let mut planner = ChunkPlanner::new(1000);
-        planner.cool_down(100..400, 2, end);
+        planner.cool_down(100..400, 2, 2, end);
         assert!(planner.allocate_chunk(200..300, Some(1)));
         assert_eq!(planner.get_runner_state(1).unwrap().attempts, 2);
         assert_eq!(
@@ -2012,11 +2059,11 @@ mod tests {
         let mut planner = ChunkPlanner::new(1000);
         assert!(planner.allocate_chunk(100..200, Some(1)));
         // Runner 2 counts on from two failed attempts.
-        planner.cool_down(200..300, 2, now);
+        planner.cool_down(200..300, 2, 2, now);
         assert!(planner.allocate_chunk(200..300, Some(2)));
         fail(&mut planner, 1, now, 3 * SECOND);
         fail(&mut planner, 2, now, SECOND);
-        planner.cool_down(400..500, 1, now + SECOND);
+        planner.cool_down(400..500, 1, 1, now + SECOND);
         assert_eq!(
             planner.cooldowns(),
             vec![
@@ -2025,7 +2072,7 @@ mod tests {
             ]
         );
         // Filling the gap merges all three.
-        planner.cool_down(300..400, 1, now);
+        planner.cool_down(300..400, 1, 1, now);
         assert_eq!(
             planner.cooldowns(),
             vec![(100..500, cooldown(500, 3, now + 3 * SECOND))]
@@ -2045,7 +2092,7 @@ mod tests {
     fn test_split_range_starts_without_attempts() {
         let now = Instant::now();
         let mut planner = ChunkPlanner::new(1000);
-        planner.cool_down(0..500, 2, now);
+        planner.cool_down(0..500, 2, 2, now);
         assert!(planner.allocate_chunk(0..500, Some(1)));
         assert!(planner.allocate_chunk(500..1000, Some(2)));
         planner.mark_running(1).unwrap();
@@ -2089,11 +2136,59 @@ mod tests {
         );
     }
 
+    /// The charged failures follow the attempts' rules on their own: the
+    /// larger of each when merged or claimed, none for a split.
+    #[test]
+    fn test_charged_failures_are_carried_like_attempts() {
+        let now = Instant::now();
+        let mut planner = ChunkPlanner::new(1000);
+        planner.cool_down(0..100, 3, 1, now);
+        planner.cool_down(100..200, 1, 1, now);
+        planner.cool_down(150..300, 2, 2, now);
+        assert_eq!(
+            planner.cooldowns(),
+            vec![(
+                0..300,
+                Cooldown {
+                    end: 300,
+                    attempts: 3,
+                    charged: 2,
+                    not_before: now,
+                }
+            )]
+        );
+
+        assert!(planner.allocate_chunk(50..250, Some(1)));
+        let state = planner.get_runner_state(1).unwrap();
+        assert_eq!((state.attempts, state.charged), (3, 2));
+        // The planner reports the charges before the failure.
+        planner.mark_running(1).unwrap();
+        planner.update_progress(1, 50).unwrap();
+        assert_eq!(
+            planner.mark_failed(1).unwrap(),
+            Released {
+                range: 100..250,
+                attempts: 4,
+                charged: 2,
+                received: 50,
+            }
+        );
+
+        // What is left of the cooldown after 250 carries both counts.
+        assert!(planner.allocate_chunk(250..1000, Some(2)));
+        let state = planner.get_runner_state(2).unwrap();
+        assert_eq!((state.attempts, state.charged), (3, 2));
+        planner.mark_running(2).unwrap();
+        planner.split_chunk(2, 500, 3).unwrap();
+        let state = planner.get_runner_state(3).unwrap();
+        assert_eq!((state.attempts, state.charged), (0, 0));
+    }
+
     #[test]
     fn test_guard_drop_restores_cooldowns() {
         let now = Instant::now();
         let mut planner = ChunkPlanner::new(1000);
-        planner.cool_down(0..500, 1, now + SECOND);
+        planner.cool_down(0..500, 1, 1, now + SECOND);
         {
             let mut guard = PlannerGuard::new(&mut planner);
             assert!(guard.planner().allocate_chunk(0..1000, Some(1)));

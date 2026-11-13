@@ -139,6 +139,7 @@ async fn admission_loop(
     rt: &ScriptedRuntime,
     hangs: bool,
     max_connections: usize,
+    budget: u32,
 ) -> (DownloadLoop, FileWriter) {
     let file_writer = FileWriter::new_with_kind(Path::new(""), TOTAL, FileRangeWriterKind::Null)
         .await
@@ -158,8 +159,9 @@ async fn admission_loop(
         spawner
     };
     let (reporter, _status) = ProgressReporter::for_test();
-    let options =
-        TaskOptions::default().max_connections(NonZeroUsize::new(max_connections).unwrap());
+    let options = TaskOptions::default()
+        .max_connections(NonZeroUsize::new(max_connections).unwrap())
+        .max_attempts_per_range(std::num::NonZeroU32::new(budget).unwrap());
     let mut download = DownloadLoop::new(
         TOTAL,
         spawner,
@@ -222,6 +224,13 @@ struct Sim {
     spawned: Vec<Instant>,
     /// When the loop handled each failed attempt, and its error.
     failures: Vec<(Instant, TaskError)>,
+    /// The charged failures of each failure's range, this one included,
+    /// and whether it was exempt, in the order of `failures`.
+    charges: Vec<(u32, bool)>,
+    /// The error that ended the task, which stops the run.
+    ended: Option<DownloadError>,
+    /// Whether the running runners deliver at each tick.
+    delivering: bool,
     /// The loop's limit, and each change with its time.
     limits: Vec<(Instant, usize)>,
 }
@@ -231,9 +240,24 @@ impl Sim {
     /// `healthy` that has delivered bytes; the first tick at `t0` creates
     /// runners for the rest.
     async fn new(server: Server, max_connections: usize, healthy: &[Range<u64>]) -> Self {
+        // Most tests are about the connection limit: the range budget is
+        // left out of the way.
+        Self::build(server, max_connections, healthy, u32::MAX, true).await
+    }
+
+    /// [`Self::new`] with `budget` charged failures allowed per range;
+    /// unless `proven`, the healthy runners deliver only from the first
+    /// tick after `t0`.
+    async fn build(
+        server: Server,
+        max_connections: usize,
+        healthy: &[Range<u64>],
+        budget: u32,
+        proven: bool,
+    ) -> Self {
         let rt = ScriptedRuntime::new(TimerKind::Scripted);
         let (mut download, file_writer) =
-            admission_loop(&rt, server == Server::Hangs, max_connections).await;
+            admission_loop(&rt, server == Server::Hangs, max_connections, budget).await;
         let t0 = Instant::now();
         let mut runners = Vec::new();
         for range in healthy {
@@ -257,9 +281,14 @@ impl Sim {
             next_tick: t0 + TICK,
             spawned: Vec::new(),
             failures: Vec::new(),
+            charges: Vec::new(),
+            ended: None,
+            delivering: true,
             limits: vec![(t0, max_connections)],
         };
-        sim.deliver();
+        if proven {
+            sim.deliver();
+        }
         sim.download.on_strategy_tick(t0);
         sim.settle();
         sim
@@ -288,7 +317,7 @@ impl Sim {
     /// Every running runner delivers, and its bytes are written; nothing
     /// while the writer is full, as the loop then polls no data.
     fn deliver(&mut self) {
-        if !self.download.writer.can_write() {
+        if !self.delivering || !self.download.writer.can_write() {
             return;
         }
         for runner_id in self.runners(ChunkStatus::Running) {
@@ -347,13 +376,26 @@ impl Sim {
         } {
             if let Some(failure) = &tick.failure {
                 self.failures.push((now, failure.error.clone()));
+                self.charges.push((failure.charged, failure.exempt));
             }
-            let flow = self
-                .download
-                .on_runner(tick, now)
-                .expect("the task goes on");
-            assert!(flow.is_continue());
+            match self.download.on_runner(tick, now) {
+                Ok(flow) => assert!(flow.is_continue()),
+                Err(error) => {
+                    self.ended = Some(error);
+                    return;
+                }
+            }
         }
+    }
+
+    /// Healthy runner `n` receives the rest of its chunk and finishes.
+    fn complete_healthy(&mut self, n: usize) {
+        self.download.manager.update_progress(n, u64::MAX).unwrap();
+        self.healthy[n]
+            .lifecycle
+            .try_push(LifecycleEvent::finished())
+            .unwrap();
+        self.settle();
     }
 
     /// Fill the writer with writes, which stay parked: it takes no more
@@ -394,7 +436,7 @@ impl Sim {
     /// wake-ups for backed-off ranges and the ends of the connect timeouts.
     /// A wake-up at the time of a tick comes first.
     fn run_until(&mut self, end: Instant) {
-        loop {
+        while self.ended.is_none() {
             let timeout = (self.server == Server::Hangs)
                 .then(|| {
                     self.connecting
@@ -442,6 +484,7 @@ impl Sim {
     }
 
     async fn teardown(self) {
+        assert!(self.ended.is_none(), "the task ended: {:?}", self.ended);
         drop(self.download);
         self.file_writer.finalize().await.unwrap();
     }
@@ -723,6 +766,210 @@ async fn a_rejected_step_opens_no_second_trial_before_its_tick() {
     sim.teardown().await;
 }
 
+// ── The range budget and the proven window (design §14.13) ─────────
+
+/// Four healthy runners on four eighths, delivering, and the rest of the
+/// file refused for every connect the loop makes, with `budget` charged
+/// failures allowed per range.
+async fn refused_rest(budget: u32) -> Sim {
+    Sim::build(Server::Refuses, 8, &eighths(4), budget, true).await
+}
+
+/// Each refusal of the silent limit comes beside four proven runners, with
+/// four others in flight: above the proven window, so never charged. The
+/// task settles at four for 300 s, whatever the budget, steps included.
+#[tokio::test]
+async fn refusals_above_the_proven_window_are_not_charged() {
+    for budget in [1, 2, 3, 5] {
+        let mut sim = refused_rest(budget).await;
+        let t0 = sim.t0();
+        sim.run_until(t0 + 300 * SECOND);
+        assert!(sim.ended.is_none(), "budget {budget}: {:?}", sim.ended);
+        assert_eq!(sim.limits[1].1, 4, "budget {budget}");
+        assert!(sim.charges.len() >= 5, "budget {budget}");
+        assert!(
+            sim.charges
+                .iter()
+                .all(|&(charged, exempt)| charged == 0 && exempt),
+            "budget {budget}: {:?}",
+            sim.charges
+        );
+        sim.teardown().await;
+    }
+}
+
+/// A fifth runner, proven beside the four, resets after its bytes, and the
+/// server admits only the four from then on. Its range is refused with
+/// four others in flight, fewer than the five proven: inside the window,
+/// so each refusal is charged, and the B-th ends the task. The four stop
+/// delivering, so no lowering intervenes.
+#[tokio::test]
+async fn a_refused_range_inside_the_proven_window_is_exhausted() {
+    for budget in [1, 2, 3, 5] {
+        let mut sim = Sim::build(Server::Refuses, 8, &whole(5), budget, true).await;
+        let t0 = sim.t0();
+        sim.run_until(t0 + TICK);
+        assert_eq!(sim.download.manager.admission().proven_window(), 5);
+        sim.delivering = false;
+        sim.fail_healthy(4, reset());
+        sim.run_until(t0 + 30 * SECOND);
+        let Some(DownloadError::Transfer { source }) = sim.ended.take() else {
+            panic!("budget {budget}: the task goes on: {:?}", sim.charges);
+        };
+        let TaskError::RangeExhausted { attempts, .. } = &*source else {
+            panic!("budget {budget}: {source:?}");
+        };
+        assert_eq!(*attempts, budget);
+        // The restart, then one charge a refusal.
+        let charged: Vec<_> = sim.charges.iter().map(|&(charged, _)| charged).collect();
+        assert_eq!(charged, (0..=budget).collect::<Vec<_>>(), "budget {budget}");
+        assert_eq!(sim.limits.len(), 1);
+        sim.teardown().await;
+    }
+}
+
+/// A range whose connects were never proven is exempt while it is refused
+/// above the window. Once the limit is lowered to the four, the window is
+/// four; when one of them finishes, its next retry has three others in
+/// flight, inside the window, and is charged once.
+#[tokio::test]
+async fn a_range_never_proven_is_charged_once_inside_the_window() {
+    let mut sim = refused_rest(5).await;
+    let t0 = sim.t0();
+    sim.run_until(t0 + 10 * SECOND);
+    assert_eq!(sim.limits[1].1, 4);
+    assert!(sim.charges.iter().all(|&(charged, _)| charged == 0));
+    assert_eq!(sim.download.manager.admission().proven_window(), 4);
+    let before = sim.charges.len();
+    // One of the four completes: a slot is free below the limit.
+    sim.complete_healthy(0);
+    sim.run_until(t0 + 25 * SECOND);
+    assert!(sim.ended.is_none(), "{:?}", sim.ended);
+    let after = &sim.charges[before..];
+    assert!(!after.is_empty(), "the range was not retried");
+    assert_eq!(after[0], (1, false), "{after:?}");
+    sim.teardown().await;
+}
+
+/// The four healthy runners of a resumed start on alternate eighths, with
+/// the four unassigned eighths between them.
+fn alternate_eighths() -> Vec<Range<u64>> {
+    (0..4u64)
+        .map(|i| 2 * i * TOTAL / 8..(2 * i + 1) * TOTAL / 8)
+        .collect()
+}
+
+/// The same start when the four first deliver at the first tick, 1.5 s in:
+/// until then every refusal is uncorroborated and charged. Without jitter
+/// the ranges are retried at 0.5 s and 1.5 s, the second before the tick's
+/// delivery, so a budget of two or three ends the task before any
+/// corroboration; five has two to spare, and its later refusals are exempt.
+#[tokio::test]
+async fn a_resumed_start_with_late_delivery_charges_until_corroborated() {
+    for budget in [2, 3, 5] {
+        let mut sim = Sim::build(Server::Refuses, 8, &alternate_eighths(), budget, false).await;
+        let t0 = sim.t0();
+        sim.run_until(t0 + 20 * SECOND);
+        let charged = |sim: &Sim| sim.charges.iter().map(|&(charged, _)| charged).max();
+        if budget <= 3 {
+            let Some(DownloadError::Transfer { source }) = sim.ended.take() else {
+                panic!("budget {budget}: the task goes on: {:?}", sim.charges);
+            };
+            assert!(
+                matches!(&*source, TaskError::RangeExhausted { attempts, .. } if *attempts == budget),
+                "budget {budget}: {source:?}"
+            );
+            assert!(sim.charges.iter().all(|&(_, exempt)| !exempt));
+        } else {
+            assert!(sim.ended.is_none(), "{:?}", sim.ended);
+            assert_eq!(charged(&sim), Some(3), "{:?}", sim.charges);
+            assert!(sim.charges[12..].iter().all(|&(_, exempt)| exempt));
+            assert_eq!(sim.limits[1].1, 4);
+        }
+        sim.teardown().await;
+    }
+}
+
+/// A resumed start opens a connect for every unassigned range before any
+/// runner delivers: each refusal then is uncorroborated and charged once.
+/// A budget of one ends the task there; a larger one goes on, the next
+/// refusals come beside the delivering runners above the window, and the
+/// limit is lowered to the four. This needs the runners to deliver before
+/// the first retries; see the test with late delivery.
+#[tokio::test]
+async fn a_resumed_start_charges_its_first_refusals() {
+    let healthy = alternate_eighths();
+    for budget in [1, 2, 3, 5] {
+        let mut sim = Sim::build(Server::Refuses, 8, &healthy, budget, false).await;
+        let t0 = sim.t0();
+        if budget == 1 {
+            let Some(DownloadError::Transfer { source }) = sim.ended.take() else {
+                panic!("the task goes on");
+            };
+            assert!(matches!(
+                &*source,
+                TaskError::RangeExhausted { attempts: 1, .. }
+            ));
+            sim.teardown().await;
+            continue;
+        }
+        let first: Vec<_> = sim.charges.clone();
+        assert_eq!(first, [(1, false); 4], "budget {budget}");
+        // Then the four deliver.
+        sim.deliver();
+        sim.run_until(t0 + 20 * SECOND);
+        assert!(sim.ended.is_none(), "budget {budget}: {:?}", sim.ended);
+        assert!(
+            sim.charges[4..]
+                .iter()
+                .all(|&(charged, exempt)| charged == 1 && exempt),
+            "budget {budget}: {:?}",
+            sim.charges
+        );
+        assert_eq!(sim.limits[1].1, 4, "budget {budget}");
+        sim.teardown().await;
+    }
+}
+
+/// Eight proven runners, then the server goes from eight to seven: one of
+/// them resets after its bytes, and its range, retried alone, is refused
+/// with seven others in flight, inside the window of eight. Each refusal
+/// is charged until three in a row and progress lower the limit to the
+/// seven, which clamps the window; the range is then left to the steps.
+/// A budget of up to three ends the task at its B-th charge; five has one
+/// to spare.
+#[tokio::test]
+async fn a_shrinking_limit_charges_until_it_is_lowered() {
+    for budget in [1, 2, 3, 5] {
+        let mut sim = Sim::build(Server::Refuses, 8, &whole(8), budget, true).await;
+        let t0 = sim.t0();
+        sim.run_until(t0 + TICK);
+        assert_eq!(sim.download.manager.admission().proven_window(), 8);
+        sim.fail_healthy(7, reset());
+        sim.run_until(t0 + 30 * SECOND);
+        let charged: Vec<_> = sim.charges[1..]
+            .iter()
+            .map(|&(charged, _)| charged)
+            .collect();
+        if budget <= 3 {
+            let Some(DownloadError::Transfer { source }) = sim.ended.take() else {
+                panic!("budget {budget}: the task goes on: {charged:?}");
+            };
+            assert!(
+                matches!(&*source, TaskError::RangeExhausted { attempts, .. } if *attempts == budget),
+                "budget {budget}: {source:?}"
+            );
+            assert_eq!(charged, (1..=budget).collect::<Vec<_>>());
+        } else {
+            assert!(sim.ended.is_none(), "{:?}", sim.ended);
+            assert_eq!(sim.limits[1].1, 7, "{:?}", sim.limits);
+            let max = *charged.iter().max().unwrap();
+            assert!((3..budget).contains(&max), "{charged:?}");
+        }
+        sim.teardown().await;
+    }
+}
+
 /// A 503 in the body stream of a healthy runner while a step's trial is
 /// connecting rejects the step: the wait doubles, counted from the end of
 /// the congestion's hold, and the limit is not raised.
@@ -898,7 +1145,7 @@ mod admission_properties {
         /// itself.
         fn new(rt: ScriptedRuntime, max_connections: usize, t0: Instant) -> Self {
             let (mut download, file_writer) =
-                futures::executor::block_on(admission_loop(&rt, false, max_connections));
+                futures::executor::block_on(admission_loop(&rt, false, max_connections, u32::MAX));
             download.policy.on_progress(t0);
             Self {
                 download,
@@ -963,13 +1210,28 @@ mod admission_properties {
 
         /// Report `item` for runner `id`, and update the model.
         fn report(&mut self, id: crate::task::RunnerId, item: LifecycleEvent) -> bool {
+            let refusal = matches!(
+                &item,
+                LifecycleEvent::Stopped(crate::runner::StoppedReason::Failed(error))
+                    if matches!(error, TaskError::StreamError { source: AdapterError::Retryable { .. } })
+            ) && !self.connected.contains(&id);
             if matches!(item, LifecycleEvent::Started) {
                 self.connected.insert(id);
             } else {
                 self.connected.remove(&id);
             }
+            let charged = self.charged(id);
             let tick = self.download.manager.inject_lifecycle(id, item);
+            check_charge(charged, &tick, refusal);
             self.on_runner(tick)
+        }
+
+        /// The charged failures of runner `id`'s range before it fails.
+        fn charged(&self, id: crate::task::RunnerId) -> u32 {
+            self.download
+                .manager
+                .get_runner_state(id)
+                .map_or(0, |state| state.charged)
         }
 
         /// Apply `op`; `false` once the task ends.
@@ -1012,7 +1274,9 @@ mod admission_properties {
                 Op::Lose(n) => match nth(&self.runners(&[Pending, Running]), n) {
                     Some(id) => {
                         self.connected.remove(&id);
+                        let charged = self.charged(id);
                         let tick = self.download.manager.inject_lost(id);
+                        check_charge(charged, &tick, false);
                         self.on_runner(tick)
                     }
                     None => true,
@@ -1064,6 +1328,22 @@ mod admission_properties {
                 Some(_) if !reached => None,
                 Some(_) => self.occupied_since.or(Some(self.now)),
             };
+        }
+    }
+
+    /// Invariant 7: the range's charged failures grow only by a failure
+    /// that is not exempt, at most once per attempt; only a refusal is
+    /// exempt, and a refusal that is not exempt is charged.
+    fn check_charge(before: u32, tick: &RunnerTick, refusal: bool) {
+        let Some(failure) = &tick.failure else {
+            return;
+        };
+        let grown = failure.charged - before;
+        assert!(grown <= 1, "{failure:?}");
+        if failure.exempt {
+            assert!(refusal && grown == 0, "{failure:?}");
+        } else if refusal {
+            assert_eq!(grown, 1, "{failure:?}");
         }
     }
 
@@ -1225,6 +1505,7 @@ mod fault_server {
         download: &mut DownloadLoop,
         limits: &mut Vec<(Instant, usize)>,
         states: &mut Vec<LimitState>,
+        charges: &mut Vec<u32>,
         mut done: Option<&mut dyn FnMut(&DownloadLoop) -> bool>,
     ) -> Result<()> {
         loop {
@@ -1232,6 +1513,13 @@ mod fault_server {
                 return Ok(());
             }
             let event = std::future::poll_fn(|cx| download.poll_event(cx)).await;
+            if let LoopEvent::Runner(RunnerTick {
+                failure: Some(failure),
+                ..
+            }) = &event
+            {
+                charges.push(failure.charged);
+            }
             let flow = download.handle_event(event)?;
             if download.max_concurrency != limits.last().unwrap().1 {
                 limits.push((Instant::now(), download.max_concurrency));
@@ -1264,6 +1552,16 @@ mod fault_server {
             .manager
             .get_runner_state(runner_id)
             .is_some_and(|state| state.status == ChunkStatus::Running)
+    }
+
+    /// Whether runner `runner_id` runs and had bytes accepted.
+    fn proven(download: &DownloadLoop, runner_id: crate::task::RunnerId) -> bool {
+        download
+            .manager
+            .get_runner_state(runner_id)
+            .is_some_and(|state| {
+                state.status == ChunkStatus::Running && !state.downloaded.is_empty()
+            })
     }
 
     /// The silent limit of design §8.3 against the fault server, with the
@@ -1314,6 +1612,7 @@ mod fault_server {
         );
         let mut limits = vec![(Instant::now(), download.max_concurrency)];
         let mut states = vec![download.strategy.limit_state()];
+        let mut charges = Vec::new();
 
         // The first step creates the first runner.
         download.on_strategy_tick(Instant::now());
@@ -1322,6 +1621,7 @@ mod fault_server {
                 &mut download,
                 &mut limits,
                 &mut states,
+                &mut charges,
                 Some(&mut |d| running(d, 0)),
             )
             .await?;
@@ -1330,12 +1630,13 @@ mod fault_server {
                 &mut download,
                 &mut limits,
                 &mut states,
-                Some(&mut |d| running(d, 1)),
+                &mut charges,
+                Some(&mut |d| proven(d, 0) && proven(d, 1)),
             )
             .await?;
-            // Both split: a fourth connection.
+            // Both split: a fourth connection, refused beside two proven.
             download.apply(StrategyAction::SplitAllTask(1), Instant::now());
-            drive(&mut download, &mut limits, &mut states, None).await
+            drive(&mut download, &mut limits, &mut states, &mut charges, None).await
         })
         .await;
         let mut progress = Progress::default();
@@ -1351,6 +1652,12 @@ mod fault_server {
             calculate_blake3(&content)
         );
         assert!(log.max_open() <= 3, "{mode:?}: {:?}", log.events());
+        // Every refusal came beside proven connections, above the proven
+        // window: no range was charged (design §14.13).
+        assert!(
+            !charges.is_empty() && charges.iter().all(|c| *c == 0),
+            "{mode:?}: {charges:?}"
+        );
         // Lowered to the three first; the cadence of recovery is asserted
         // in the tests with injected time.
         assert!(
