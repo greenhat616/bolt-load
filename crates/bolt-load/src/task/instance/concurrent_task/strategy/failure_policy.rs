@@ -1,7 +1,7 @@
 //! Decides when a concurrent task must give up.
 //!
-//! Independent from concurrency tuning: the rolling outcome sampler forgets
-//! old samples and cannot serve as a retry budget.
+//! Independent from concurrency tuning: the admission evidence keeps no
+//! history and cannot serve as a retry budget.
 
 use std::{
     sync::Arc,
@@ -55,6 +55,12 @@ impl FailurePolicy {
     #[inline]
     pub fn on_progress(&mut self, now: Instant) {
         self.last_progress_at = now;
+    }
+
+    /// When new bytes were last accepted, or when the policy was created.
+    #[inline]
+    pub fn last_progress_at(&self) -> Instant {
+        self.last_progress_at
     }
 
     /// A successful non-empty write resets the consecutive failure count.

@@ -105,16 +105,13 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 use super::{
     ChunkPlanner, PlannerGuard,
     chunk_planner::{ChunkState, ChunkStatus, Resize, SplitCandidate},
-    strategy::RunnerOutcomeSampler,
+    strategy::{AdmissionEvidence, AttemptPhase, classify},
 };
 use crate::{
     runner::{
         DataFrameReceiver, LifecycleReceiver, LimitReceiver, LimitSender, TaskError, limit_mailbox,
     },
-    task::{
-        RunnerId,
-        instance::{Generator, concurrent_task::strategy::RunnerFailureKind},
-    },
+    task::{RunnerId, instance::Generator},
 };
 
 mod data;
@@ -188,8 +185,8 @@ pub struct RunnerManager {
     limit_senders: HashMap<RunnerId, LimitSender>,
     /// Runners whose spawn was rejected, reported by the next tick
     spawn_failures: VecDeque<(RunnerId, SpawnFailed)>,
-    /// Sampler for tracking the outcome of the runners
-    runner_outcome_sampler: RunnerOutcomeSampler,
+    /// What ended attempts tell about the connections the server admits
+    admission: AdmissionEvidence,
     /// Lifecycle aggregator for runners' lifecycle events
     lifecycle_aggregator: LifecycleAggregator,
     /// Data receivers of connecting runners, polled only once their runner
@@ -217,7 +214,7 @@ impl RunnerManager {
             chunk_planner: ChunkPlanner::new(total),
             limit_senders: HashMap::with_capacity(max_concurrency),
             spawn_failures: VecDeque::new(),
-            runner_outcome_sampler: RunnerOutcomeSampler::with_defaults(),
+            admission: AdmissionEvidence::default(),
             lifecycle_aggregator: LifecycleAggregator::with_capacity(max_concurrency),
             connecting_data: HashMap::with_capacity(max_concurrency),
             data_aggregator: DataAggregator::with_capacity(max_concurrency),
@@ -233,8 +230,30 @@ impl RunnerManager {
         }
     }
 
-    pub fn runner_outcome_sampler_mut(&mut self) -> &mut RunnerOutcomeSampler {
-        &mut self.runner_outcome_sampler
+    /// What ended attempts tell about the connections the server admits.
+    pub fn admission_mut(&mut self) -> &mut AdmissionEvidence {
+        &mut self.admission
+    }
+
+    #[cfg(test)]
+    pub(super) fn admission(&self) -> &AdmissionEvidence {
+        &self.admission
+    }
+
+    /// Record that runner `runner_id` reported `Started`.
+    fn record_started(&mut self, runner_id: RunnerId) {
+        let others = self.allocated_runner_count().saturating_sub(1);
+        self.admission.on_started(runner_id, others);
+    }
+
+    /// Record what an attempt that ended in `phase` with `error` tells
+    /// about the server's admission, once its chunk and its slot are given
+    /// back (design §8.3).
+    fn record_attempt_end(&mut self, phase: AttemptPhase, error: &TaskError) {
+        let proven = self.chunk_planner.get_proven_runners_count();
+        let others = self.allocated_runner_count();
+        self.admission
+            .on_attempt_ended(classify(phase, error), proven, others);
     }
 
     // ==================== ID Generator Related Methods ====================
@@ -268,6 +287,7 @@ impl RunnerManager {
         self.connecting_data.remove(&runner_id);
         self.data_aggregator.unregister(runner_id);
         self.id_generator.release(runner_id);
+        self.admission.on_ended(runner_id);
     }
 
     /// Gets the number of currently allocated runners
@@ -431,6 +451,12 @@ impl RunnerManager {
         self.chunk_planner.get_active_runners_count()
     }
 
+    /// The runners that are running and had bytes accepted on this attempt
+    #[inline]
+    pub fn get_proven_runners_count(&self) -> usize {
+        self.chunk_planner.get_proven_runners_count()
+    }
+
     /// Gets the state of the specified runner
     #[inline]
     pub fn get_runner_state(&self, runner_id: RunnerId) -> Option<&ChunkState> {
@@ -567,7 +593,6 @@ impl RunnerManager {
         self.chunk_planner
             .mark_finished(runner_id)
             .expect("chunk planner should not fail");
-        self.runner_outcome_sampler.record_completed();
 
         if self.chunk_planner.is_complete() {
             trace!("[TASK] all chunks finished");
@@ -611,6 +636,7 @@ impl RunnerManager {
         if let Some(data_rx) = self.connecting_data.remove(&runner_id) {
             self.data_aggregator.register(runner_id, data_rx);
         }
+        self.record_started(runner_id);
     }
 
     /// The allocated range of every chunk.
@@ -957,9 +983,9 @@ mod tests {
         assert!(manager.get_runner_state(0).is_none());
         assert_eq!(manager.get_available_ranges(), vec![0..1000]);
         assert!(manager.is_empty());
-        let stats = manager.runner_outcome_sampler_mut().stats();
-        assert_eq!(stats.connect_failed_unretryable, 1);
-        assert_eq!(stats.stream_closed_unretryable, 0);
+        // An unretryable connect failure is no evidence.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert!(!manager.admission().congestion_pending());
     }
 
     #[tokio::test]
@@ -1023,7 +1049,8 @@ mod tests {
 
         assert!(manager.tick().await.failure.is_none());
         assert_eq!(manager.get_available_ranges(), vec![0..1000]);
-        assert_eq!(manager.runner_outcome_sampler_mut().stats().total, 0);
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert!(!manager.admission().congestion_pending());
     }
 
     #[tokio::test]
@@ -1035,9 +1062,9 @@ mod tests {
         let failure = manager.tick_lifecycle_only().await.failure.unwrap();
         assert!(matches!(failure.error, TaskError::ChannelClosed));
         assert!(failure.retryable);
-        let stats = manager.runner_outcome_sampler_mut().stats();
-        assert_eq!(stats.connect_failed_retryable, 1);
-        assert_eq!(stats.stream_closed_retryable, 0);
+        // A lost connect is no refusal.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert_eq!(manager.admission().connected(), 0);
     }
 
     #[tokio::test]
@@ -1060,13 +1087,9 @@ mod tests {
         assert!(!failure.retryable);
         assert!(manager.is_empty());
         assert_eq!(manager.get_available_ranges(), vec![0..1000]);
-        assert_eq!(
-            manager
-                .runner_outcome_sampler_mut()
-                .stats()
-                .connect_failed_unretryable,
-            1
-        );
+        // A rejected spawn is no evidence.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert!(!manager.admission().congestion_pending());
         // Nothing else is left to report.
         assert!(futures::poll!(std::pin::pin!(manager.tick())).is_pending());
     }
@@ -1367,9 +1390,10 @@ mod tests {
         assert_eq!(manager.get_available_ranges(), vec![0..64]);
         assert!(manager.is_empty());
 
-        let stats = manager.runner_outcome_sampler_mut().stats();
-        assert_eq!(stats.stream_closed_retryable, 1);
-        assert_eq!(stats.stream_closed_unretryable, 0);
+        // A timeout after `Started` is no evidence; the runner is no
+        // longer connected.
+        assert_eq!(manager.admission().streak_count(), 0);
+        assert_eq!(manager.admission().connected(), 0);
 
         runner_handle.await.unwrap();
     }
@@ -1512,5 +1536,186 @@ mod tests {
                 bytes: 5
             }
         );
+    }
+
+    // ==================== Admission evidence (design §8.3) ====================
+
+    /// How the attempt beside a proven runner ends.
+    enum End {
+        Connecting(TaskError),
+        Streaming(TaskError),
+        LostConnecting,
+        LostStreaming,
+        SpawnFailed,
+    }
+
+    /// A manager whose runner 0 runs and has delivered bytes.
+    async fn manager_with_a_proven_runner() -> (
+        RunnerManager,
+        crate::runner::LifecycleSender,
+        crate::runner::DataFrameSender,
+    ) {
+        let mut manager = RunnerManager::new(1000, 4);
+        let (mut lifecycle_tx, mut data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        manager.tick().await;
+        push_frame(&mut data_tx, 10).await;
+        assert!(manager.tick().await.downloaded.is_some());
+        assert_eq!(manager.chunk_planner.get_proven_runners_count(), 1);
+        (manager, lifecycle_tx, data_tx)
+    }
+
+    /// The corroborated refusals and the congestion an attempt on
+    /// `500..1000` leaves, once it ended as `end` beside a proven runner.
+    async fn evidence_of(end: End) -> (usize, bool) {
+        let (mut manager, _proven, _data) = manager_with_a_proven_runner().await;
+        if let End::SpawnFailed = end {
+            manager
+                .spawn_runner_with_chunk(500..1000, |_, _| {
+                    Err(SpawnFailed {
+                        message: "runtime is shut down".to_string(),
+                    })
+                })
+                .unwrap();
+            assert!(manager.tick_lifecycle_only().await.failure.is_some());
+        } else {
+            let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 500..1000).unwrap();
+            if matches!(end, End::Streaming(_) | End::LostStreaming) {
+                lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+                manager.tick_lifecycle_only().await;
+                assert!(manager.admission().is_connected(1));
+            }
+            match end {
+                End::Connecting(error) | End::Streaming(error) => {
+                    lifecycle_tx
+                        .try_push(LifecycleEvent::failed(error))
+                        .unwrap();
+                }
+                End::LostConnecting | End::LostStreaming => drop(lifecycle_tx),
+                End::SpawnFailed => unreachable!("handled above"),
+            }
+            assert!(manager.tick_lifecycle_only().await.failure.is_some());
+        }
+        assert!(!manager.admission().is_connected(1));
+        let admission = manager.admission_mut();
+        (admission.streak_count(), admission.take_congestion())
+    }
+
+    /// One case per row of the classification (design §8.3), through the
+    /// lifecycle: only a connect that failed with an io error or timed out
+    /// is a refusal, and a congestion counts in either phase.
+    #[tokio::test]
+    async fn test_ended_attempts_are_classified_through_the_lifecycle() {
+        use bolt_load_core::adapter::{AdapterError, RetryableError};
+
+        use crate::adapter::UnretryableError;
+
+        let io = || TaskError::StreamError {
+            source: AdapterError::Retryable {
+                source: RetryableError::Io {
+                    source: std::sync::Arc::new(std::io::Error::other("refused")),
+                },
+            },
+        };
+        let status = || TaskError::StreamError {
+            source: AdapterError::Retryable {
+                source: RetryableError::Status { status: 502 },
+            },
+        };
+        let congestion = || TaskError::StreamError {
+            source: AdapterError::Unretryable {
+                source: UnretryableError::Congestion {
+                    status: 503,
+                    retry_after: None,
+                },
+            },
+        };
+        let refused = (1, false);
+        let congested = (0, true);
+        let nothing = (0, false);
+        for (name, end, expected) in [
+            ("connect io", End::Connecting(io()), refused),
+            (
+                "connect timeout",
+                End::Connecting(TaskError::Timeout),
+                refused,
+            ),
+            ("connect 503", End::Connecting(congestion()), congested),
+            ("streaming 503", End::Streaming(congestion()), congested),
+            ("connect status", End::Connecting(status()), nothing),
+            (
+                "connect unretryable",
+                End::Connecting(unretryable_stream_error()),
+                nothing,
+            ),
+            ("connect lost", End::LostConnecting, nothing),
+            ("spawn failed", End::SpawnFailed, nothing),
+            (
+                "streaming timeout",
+                End::Streaming(TaskError::Timeout),
+                nothing,
+            ),
+            ("streaming reset", End::Streaming(io()), nothing),
+            (
+                "short stream",
+                End::Streaming(TaskError::SmallerThanTotalSize),
+                nothing,
+            ),
+            ("streaming status", End::Streaming(status()), nothing),
+            ("streaming lost", End::LostStreaming, nothing),
+        ] {
+            assert_eq!(evidence_of(end).await, expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_started_is_recorded_on_either_path() {
+        let mut manager = RunnerManager::new(1000, 4);
+        let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        let _parked = spawn_test_runner(&mut manager, 500..1000).unwrap();
+        assert_eq!(manager.admission().connected(), 0);
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        manager.tick().await;
+        assert!(manager.admission().is_connected(0));
+        manager.mark_started(1);
+        assert!(manager.admission().is_connected(1));
+        assert_eq!(manager.admission().connected(), 2);
+    }
+
+    /// Every way a runner ends releases it, and leaves the connected set.
+    #[tokio::test]
+    async fn test_every_end_leaves_connected() {
+        let mut manager = RunnerManager::new(1000, 4);
+        let mut senders = Vec::new();
+        for i in 0..4 {
+            let (mut lifecycle_tx, data_tx) =
+                spawn_test_runner(&mut manager, i * 250..(i + 1) * 250).unwrap();
+            lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+            manager.tick_lifecycle_only().await;
+            senders.push((lifecycle_tx, data_tx));
+        }
+        assert_eq!(manager.admission().connected(), 4);
+
+        let mut senders = senders.into_iter();
+        let mut end = |event: Option<LifecycleEvent>| {
+            let (mut lifecycle_tx, data_tx) = senders.next().unwrap();
+            match event {
+                Some(event) => {
+                    lifecycle_tx.try_push(event).unwrap();
+                    (Some(lifecycle_tx), data_tx)
+                }
+                None => (None, data_tx),
+            }
+        };
+        let _finished = end(Some(LifecycleEvent::finished()));
+        let _failed = end(Some(LifecycleEvent::failed(TaskError::Timeout)));
+        let _lost = end(None);
+        let _cancelled = end(Some(LifecycleEvent::failed(TaskError::Cancelled)));
+        for left in (0..4).rev() {
+            manager.tick_lifecycle_only().await;
+            assert_eq!(manager.admission().connected(), left);
+        }
+        assert!(manager.is_empty());
+        assert!((0..4).all(|id| !manager.admission().is_connected(id)));
     }
 }

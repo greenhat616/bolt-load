@@ -217,6 +217,15 @@ impl ChunkPlanner {
             .count()
     }
 
+    /// The runners that are running and had at least one byte accepted on
+    /// this attempt (design §8.3).
+    pub fn get_proven_runners_count(&self) -> usize {
+        self.chunks
+            .values()
+            .filter(|c| c.status == ChunkStatus::Running && !c.downloaded.is_empty())
+            .count()
+    }
+
     /// Allocate a pending chunk or idle chunk based on the runner id
     #[inline]
     pub fn allocate_chunk(&mut self, range: Range<u64>, runner_id: Option<RunnerId>) -> bool {

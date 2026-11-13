@@ -1,10 +1,12 @@
 use std::{
     io::{BufWriter, Seek, Write},
     ops::Bound,
+    pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -17,7 +19,9 @@ use rand::RngExt;
 use tempfile::tempfile;
 use tokio::net::TcpListener;
 
-use super::fault::{CONGESTED_RETRY_AFTER_SECS, Gate, RangeFault, THROTTLED_BYTES_PER_SEC};
+use super::fault::{
+    CONGESTED_RETRY_AFTER_SECS, Gate, LimitMode, RangeFault, THROTTLED_BYTES_PER_SEC,
+};
 
 /// Create a random file with given size, useful for testing
 pub fn create_random_file(size: usize) -> std::io::Result<std::fs::File> {
@@ -305,6 +309,19 @@ fn truncated(content: &Bytes, first: u64, last: u64, total: u64) -> Response {
 /// A 206 for `first..=last`, sent at [`THROTTLED_BYTES_PER_SEC`]. With
 /// `hold`, the body waits at the gate; the headers are sent before.
 fn throttled(content: &Bytes, first: u64, last: u64, total: u64, hold: Option<Gate>) -> Response {
+    paced(content, first, last, total, hold, THROTTLED_BYTES_PER_SEC)
+}
+
+/// A 206 for `first..=last`, sent at `bytes_per_sec`. With `hold`, the
+/// body waits at the gate; the headers are sent before.
+fn paced(
+    content: &Bytes,
+    first: u64,
+    last: u64,
+    total: u64,
+    hold: Option<Gate>,
+    bytes_per_sec: u64,
+) -> Response {
     const FRAME: usize = 64 * 1024;
     let body = content.slice(first as usize..=last as usize);
     let stream = async_stream::stream! {
@@ -315,7 +332,7 @@ fn throttled(content: &Bytes, first: u64, last: u64, total: u64, hold: Option<Ga
         let mut sent = 0;
         while sent < body.len() {
             // Paced from the start, so coarse timers keep the average rate.
-            let due = Duration::from_secs_f64(sent as f64 / THROTTLED_BYTES_PER_SEC as f64);
+            let due = Duration::from_secs_f64(sent as f64 / bytes_per_sec as f64);
             tokio::time::sleep_until(start + due).await;
             let end = (sent + FRAME).min(body.len());
             yield Ok::<_, std::io::Error>(body.slice(sent..end));
@@ -447,6 +464,235 @@ fn fault_response(
         .headers_mut()
         .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response
+}
+
+/// What happened to a connection of a limited server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionEventKind {
+    /// Accepted and served.
+    Opened,
+    /// A served connection closed.
+    Closed,
+    /// Turned away, as the limit was reached.
+    TurnedAway,
+}
+
+/// An event of [`ConnectionLog`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionEvent {
+    pub at: Instant,
+    pub kind: ConnectionEventKind,
+    /// The connections served once the event happened.
+    pub open: usize,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionLogInner {
+    events: Vec<ConnectionEvent>,
+    open: usize,
+}
+
+/// The connections a limited server served, closed and turned away, in
+/// order.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionLog(Arc<Mutex<ConnectionLogInner>>);
+
+impl ConnectionLog {
+    pub fn events(&self) -> Vec<ConnectionEvent> {
+        self.0.lock().unwrap().events.clone()
+    }
+
+    /// The connections served now.
+    pub fn open(&self) -> usize {
+        self.0.lock().unwrap().open
+    }
+
+    /// The most connections served at once.
+    pub fn max_open(&self) -> usize {
+        self.events()
+            .iter()
+            .map(|event| event.open)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// When each connection that was turned away arrived.
+    pub fn turned_away(&self) -> Vec<Instant> {
+        self.events()
+            .iter()
+            .filter(|event| event.kind == ConnectionEventKind::TurnedAway)
+            .map(|event| event.at)
+            .collect()
+    }
+
+    /// Serve one more connection, unless `limit` are served.
+    fn admit(&self, limit: usize) -> bool {
+        let mut inner = self.0.lock().unwrap();
+        let admitted = inner.open < limit;
+        let kind = if admitted {
+            inner.open += 1;
+            ConnectionEventKind::Opened
+        } else {
+            ConnectionEventKind::TurnedAway
+        };
+        let open = inner.open;
+        inner.events.push(ConnectionEvent {
+            at: Instant::now(),
+            kind,
+            open,
+        });
+        admitted
+    }
+
+    fn close(&self) {
+        let mut inner = self.0.lock().unwrap();
+        inner.open -= 1;
+        let open = inner.open;
+        inner.events.push(ConnectionEvent {
+            at: Instant::now(),
+            kind: ConnectionEventKind::Closed,
+            open,
+        });
+    }
+}
+
+/// A served connection of a limited server, counted until it closes.
+struct LimitedStream {
+    inner: tokio::net::TcpStream,
+    log: ConnectionLog,
+}
+
+impl Drop for LimitedStream {
+    fn drop(&mut self) {
+        self.log.close();
+    }
+}
+
+impl tokio::io::AsyncRead for LimitedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for LimitedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Accepts every connection, and serves at most `limit` at once.
+struct LimitedListener {
+    inner: TcpListener,
+    limit: usize,
+    mode: LimitMode,
+    log: ConnectionLog,
+    /// The connections [`LimitMode::Hang`] turned away, never answered.
+    held: Vec<tokio::net::TcpStream>,
+}
+
+impl axum::serve::Listener for LimitedListener {
+    type Io = LimitedStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (inner, addr) = axum::serve::Listener::accept(&mut self.inner).await;
+            if self.log.admit(self.limit) {
+                let log = self.log.clone();
+                return (LimitedStream { inner, log }, addr);
+            }
+            match self.mode {
+                LimitMode::Close => drop(inner),
+                LimitMode::Hang => self.held.push(inner),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+#[derive(Clone)]
+struct LimitedState {
+    content: Bytes,
+    bytes_per_sec: u64,
+}
+
+async fn limited_handler(
+    axum::extract::State(state): axum::extract::State<LimitedState>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let len = state.content.len() as u64;
+    let mut response = if method == Method::HEAD || !headers.contains_key(header::RANGE) {
+        state.content.clone().into_response()
+    } else if let Some((first, last)) = requested_range(&headers, len) {
+        paced(&state.content, first, last, len, None, state.bytes_per_sec)
+    } else {
+        (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+        )
+            .into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
+}
+
+/// Serve `content` at every path behind a silent connection limit: at most
+/// `limit` connections are served at once, and the others are turned away
+/// as `mode` says, without any status. Range responses are sent at
+/// `bytes_per_sec`, so that connections overlap.
+///
+/// Also returns the log of the connections, which shows how many were
+/// served at once.
+pub async fn create_limited_range_server(
+    content: Bytes,
+    limit: usize,
+    mode: LimitMode,
+    bytes_per_sec: u64,
+) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>, ConnectionLog)> {
+    let port =
+        portpicker::pick_unused_port().ok_or(anyhow::anyhow!("Failed to pick an unused port"))?;
+    let log = ConnectionLog::default();
+    let listener = LimitedListener {
+        inner: TcpListener::bind(("127.0.0.1", port)).await?,
+        limit,
+        mode,
+        log: log.clone(),
+        held: Vec::new(),
+    };
+    let app = axum::Router::new()
+        .fallback(limited_handler)
+        .with_state(LimitedState {
+            content,
+            bytes_per_sec,
+        });
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap()
+    });
+    Ok((port, handle, log))
 }
 
 #[cfg(test)]
@@ -813,6 +1059,92 @@ mod tests {
         let resp = get(format!("bytes=0-{last}")).await?;
         assert_eq!(resp.bytes().await?, content);
 
+        Ok(())
+    }
+
+    /// Two slow responses hold both connections; a third connection is
+    /// turned away as the mode says, and served once one of them closed.
+    #[tokio::test]
+    async fn limited_server_turns_away_connections_past_its_limit() -> Result<()> {
+        use super::super::fault::LimitMode;
+
+        let content = Bytes::from(vec![9u8; 256 * 1024]);
+        for mode in [LimitMode::Close, LimitMode::Hang] {
+            // 64 KiB a second: a range takes seconds, and holds its connection.
+            let (port, handle, log) =
+                create_limited_range_server(content.clone(), 2, mode, 64 * 1024).await?;
+            let _guard = ServerGuard(handle);
+            let url = format!("http://127.0.0.1:{port}/file");
+            let url = url.as_str();
+            let get = |range: &'static str| async move {
+                // A client each, so that no connection is shared.
+                Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_millis(500))
+                    .build()?
+                    .get(url)
+                    .header(RANGE, range)
+                    .send()
+                    .await
+                    .map_err(anyhow::Error::from)
+            };
+            let exchange = async {
+                let first = get("bytes=0-").await?;
+                let second = get("bytes=5-").await?;
+                assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT, "{mode:?}");
+                assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT, "{mode:?}");
+                let turned_away = get("bytes=5-9").await;
+                assert!(turned_away.is_err(), "{mode:?}: {turned_away:?}");
+                assert_eq!(log.open(), 2);
+                assert_eq!(log.turned_away().len(), 1);
+
+                drop(first);
+                while log.open() > 1 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let served = get("bytes=5-9").await?;
+                assert_eq!(served.bytes().await?, content.slice(5..10), "{mode:?}");
+                drop(second);
+                anyhow::Ok(())
+            };
+            tokio::time::timeout(Duration::from_secs(10), exchange).await??;
+            assert_eq!(log.max_open(), 2, "{mode:?}");
+            assert_eq!(log.turned_away().len(), 1, "{mode:?}");
+            let events = log.events();
+            assert!(events.windows(2).all(|pair| pair[0].at <= pair[1].at));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == ConnectionEventKind::Closed),
+                "{mode:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The paced range is the requested one, and HEAD and a plain `GET`
+    /// get the whole resource.
+    #[tokio::test]
+    async fn limited_server_serves_ranges() -> Result<()> {
+        use super::super::fault::LimitMode;
+
+        let content = Bytes::from_static(b"0123456789");
+        let (port, handle, log) =
+            create_limited_range_server(content.clone(), 1, LimitMode::Close, 1 << 20).await?;
+        let _guard = ServerGuard(handle);
+        let client = local_client()?;
+        let url = format!("http://127.0.0.1:{port}/file");
+        let resp = client.get(&url).header(RANGE, "bytes=2-4").send().await?;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers().get(CONTENT_RANGE).unwrap(), "bytes 2-4/10");
+        assert_eq!(resp.bytes().await?, "234");
+        // The same pooled connection serves the next requests.
+        let resp = client.get(&url).send().await?;
+        assert_eq!(resp.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(resp.bytes().await?, content);
+        assert_eq!(client.head(&url).send().await?.status(), StatusCode::OK);
+        assert!(log.turned_away().is_empty());
+        assert_eq!(log.max_open(), 1);
         Ok(())
     }
 }
