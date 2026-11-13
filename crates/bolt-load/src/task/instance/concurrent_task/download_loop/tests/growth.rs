@@ -10,7 +10,10 @@ use pretty_assertions::assert_eq;
 use super::{
     super::super::{
         chunk_planner::ChunkStatus,
-        strategy::{AdmissionClass, GROW_INTERVAL, MIN_GROWTH_GAIN, StrategyAction},
+        strategy::{
+            AdmissionClass, BASE_REPROBE_WAIT, GROW_INTERVAL, MIN_GROWTH_GAIN, StrategyAction,
+            growth_deadline,
+        },
     },
     *,
 };
@@ -144,6 +147,11 @@ async fn doubling_counts_only_the_splits_a_slot_took() {
     download.on_strategy_tick(t0);
     deliver(&mut download, MIB);
     download.on_strategy_tick(t0 + TICK);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    // Too early to grow; the new runner connects, so the next tick
+    // measures the two (design §14.33).
+    deliver(&mut download, MIB);
+    download.on_strategy_tick(t0 + TICK * 2);
     assert_eq!(download.manager.get_active_runners_count(), 2);
 
     // A runner that finished but has not stopped holds a slot.
@@ -307,6 +315,7 @@ async fn doubling_waits_for_every_runner_and_the_congestion() {
         speed: Some(MIB as f64),
         all_delivering: true,
         silent: false,
+        stable: true,
         rates: Default::default(),
     };
     let grows_at = |download: &mut DownloadLoop, now: Instant| {
@@ -336,9 +345,11 @@ async fn doubling_waits_for_every_runner_and_the_congestion() {
     file_writer.finalize().await.unwrap();
 }
 
-/// A growth that gained under 10% stops the growth for good.
+/// A growth that gained under 10% holds the runners it doubled from
+/// (design §14.33): the one it added runs on, nothing is added while two
+/// run, however fast the task gets, and the growth wants one connection.
 #[tokio::test]
-async fn doubling_stops_at_a_plateau() {
+async fn doubling_holds_at_a_plateau() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
     let (mut download, file_writer) = growth_loop(&rt, 8).await;
     let t0 = Instant::now();
@@ -353,18 +364,21 @@ async fn doubling_stops_at_a_plateau() {
     deliver(&mut download, 5 * MIB);
     download.on_strategy_tick(t0 + TICK * 3);
     assert_eq!(download.manager.get_active_runners_count(), 2);
+    assert_eq!(download.strategy.want(), 1);
     for n in 4..10 {
         deliver(&mut download, 50 * MIB);
         download.on_strategy_tick(t0 + TICK * n);
     }
     assert_eq!(download.manager.get_active_runners_count(), 2);
+    assert_eq!(download.strategy.want(), 1);
     drop(download);
     file_writer.finalize().await.unwrap();
 }
 
 /// A doubling up to the limit is judged there (design §14.18): two
-/// runners no faster than one are a plateau, so when one finishes, the
-/// other is not split to replace it, however fast it gets.
+/// runners no faster than one hold one, so when one finishes, the other
+/// is not split to replace it, however fast it gets, until the hold is
+/// probed 30 s after the verdict (design §14.33).
 #[tokio::test]
 async fn doubling_judges_the_doubling_at_the_limit() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
@@ -383,11 +397,579 @@ async fn doubling_judges_the_doubling_at_the_limit() {
     // Runner 1 finishes and stops.
     download.manager.update_progress(1, u64::MAX).unwrap();
     download.manager.release_runner_full(1, true).unwrap();
-    for n in 4..10 {
-        deliver(&mut download, 50 * MIB);
+    // The verdict at 4.5 s: the probe at 34.5 s.
+    for n in 4..23 {
+        deliver(&mut download, 20 * MIB);
         download.on_strategy_tick(t0 + TICK * n);
         assert_eq!(download.manager.get_active_runners_count(), 1, "tick {n}");
     }
+    deliver(&mut download, 20 * MIB);
+    download.on_strategy_tick(t0 + TICK * 23);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    assert_eq!(download.strategy.want(), 2);
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// [`deliver_each`], every running runner reading all along: none is
+/// silent.
+fn deliver_reading(download: &mut DownloadLoop, bytes: impl Fn(u64) -> u64) {
+    deliver_each(download, bytes);
+    for runner_id in runners(download, ChunkStatus::Running) {
+        if let Some(reads) = download.manager.read_activity(runner_id) {
+            reads.start_emitting();
+        }
+    }
+}
+
+/// Grow 1, 2, 4 under `max_connections = 8`, the task's speed growing
+/// with its runners up to two; the doubling to four gains nothing, and
+/// holds two. Every tick, the running runners deliver
+/// `bytes(running)` each. Returns the loop, the time of the verdict, and
+/// the writer.
+async fn held_at_two(
+    rt: &ScriptedRuntime,
+    bytes: impl Fn(u64) -> u64,
+) -> (DownloadLoop, Instant, FileWriter) {
+    let (mut download, file_writer) = growth_loop(rt, 8).await;
+    let t0 = Instant::now();
+    download.on_strategy_tick(t0);
+    for n in 1..=5 {
+        deliver_reading(&mut download, &bytes);
+        download.on_strategy_tick(t0 + TICK * n);
+    }
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 2);
+    (download, t0 + TICK * 5, file_writer)
+}
+
+/// The task's speed: a MiB a tick per runner, up to two MiB a tick.
+fn two_mib_a_tick(running: u64) -> u64 {
+    2 * MIB / running.max(2)
+}
+
+/// Complete and stop the running runner with the least left.
+fn complete_the_smallest(download: &mut DownloadLoop) {
+    let running = runners(download, ChunkStatus::Running);
+    let smallest = *running
+        .iter()
+        .min_by_key(|&&id| download.manager.get_runner_state(id).unwrap().remaining())
+        .unwrap();
+    download
+        .manager
+        .update_progress(smallest, u64::MAX)
+        .unwrap();
+    download
+        .manager
+        .release_runner_full(smallest, true)
+        .unwrap();
+}
+
+/// A long download whose bandwidth returns (design §14.33): a gainless
+/// doubling from two holds two; the two it added finish, and the hold is
+/// probed 30 s after the verdict. By then the server serves twice as
+/// much: the probe gains, and the ramp doubles on to the limit.
+#[tokio::test]
+async fn a_long_download_grows_again_when_capacity_returns() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+    complete_the_smallest(&mut download);
+    complete_the_smallest(&mut download);
+    let probe = judged + Duration::from_secs(30);
+    let mut now = judged;
+    while now + TICK < probe {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(now);
+        assert_eq!(download.manager.get_active_runners_count(), 2, "{now:?}");
+    }
+    assert_eq!(now + TICK, probe);
+    deliver_reading(&mut download, two_mib_a_tick);
+    download.on_strategy_tick(probe);
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 4);
+
+    // A MiB a tick per runner now, judged at the first tick 2 s later.
+    let mut active = Vec::new();
+    for n in 1..=4 {
+        deliver_reading(&mut download, |_| MIB);
+        download.on_strategy_tick(probe + TICK * n);
+        active.push(download.manager.get_active_runners_count());
+    }
+    assert_eq!(active, [4, 8, 8, 8]);
+    assert_eq!(download.strategy.want(), 8);
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A hold is probed from the runners active at its time, more than it
+/// holds when the runners a gainless doubling added still run (design
+/// §14.33, D31): a doubling from two to four gains nothing, all four run
+/// on, and 30 s after the verdict the probe doubles the four to the limit
+/// of eight. With the bandwidth doubled by then it gains and ramps on;
+/// without, it holds the four it probed from.
+#[tokio::test]
+async fn a_hold_is_probed_from_the_runners_still_running() {
+    for (bytes_after, want_after) in [(MIB, 8), (MIB / 4, 4)] {
+        let rt = ScriptedRuntime::new(TimerKind::Scripted);
+        let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+        let probe = judged + Duration::from_secs(30);
+        let mut now = judged;
+        while now + TICK < probe {
+            now += TICK;
+            deliver_reading(&mut download, two_mib_a_tick);
+            download.on_strategy_tick(now);
+            assert_eq!(download.manager.get_active_runners_count(), 4, "{now:?}");
+            assert_eq!(download.strategy.want(), 2);
+        }
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(probe);
+        assert_eq!(download.manager.get_active_runners_count(), 8);
+        assert_eq!(download.strategy.want(), 8);
+
+        // Judged at the first tick 2 s later: eight MiB a tick in all, or
+        // the same two.
+        for n in 1..=2 {
+            deliver_reading(&mut download, |_| bytes_after);
+            download.on_strategy_tick(probe + TICK * n);
+        }
+        assert_eq!(download.manager.get_active_runners_count(), 8);
+        assert_eq!(
+            download.strategy.want(),
+            want_after,
+            "{bytes_after} B a tick"
+        );
+        assert_covered(&download);
+        drop(download);
+        file_writer.finalize().await.unwrap();
+    }
+}
+
+/// Let the pending runners connect, and each running one deliver
+/// `bytes(runner_id)`, reading all along.
+fn deliver_by_runner(download: &mut DownloadLoop, bytes: impl Fn(crate::task::RunnerId) -> u64) {
+    for runner_id in runners(download, ChunkStatus::Pending) {
+        download.manager.mark_started(runner_id);
+    }
+    for runner_id in runners(download, ChunkStatus::Running) {
+        download
+            .manager
+            .update_progress(runner_id, bytes(runner_id))
+            .unwrap();
+        if let Some(reads) = download.manager.read_activity(runner_id) {
+            reads.start_emitting();
+        }
+    }
+}
+
+/// Two of the four runners of a hold of two finish in the tick that
+/// reaches the probe time, the bandwidth now a MiB a tick per runner
+/// (design §14.33). The tick's speed counts their last bytes, so it does
+/// not measure the two left: the probe waits a tick, starts from the
+/// two at two MiB a tick, gains with four at four, and the ramp doubles
+/// on to the limit. Started at the tick with the finished runners, it
+/// would have compared the four with the six or so MiB of that tick and
+/// held two for 60 s.
+#[tokio::test]
+async fn a_probe_waits_out_a_tick_in_which_runners_finished() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+    let probe = judged + Duration::from_secs(30);
+    let mut now = judged;
+    while now + TICK < probe {
+        now += TICK;
+        deliver_reading(&mut download, |_| MIB);
+        download.on_strategy_tick(now);
+        assert_eq!(download.manager.get_active_runners_count(), 4, "{now:?}");
+    }
+    deliver_reading(&mut download, |_| MIB);
+    complete_the_smallest(&mut download);
+    complete_the_smallest(&mut download);
+    download.on_strategy_tick(probe);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    assert_eq!(download.strategy.want(), 2);
+
+    deliver_reading(&mut download, |_| MIB);
+    download.on_strategy_tick(probe + TICK);
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 4);
+    // The new runners connect in the next tick; the one after judges.
+    for n in 2..=3 {
+        deliver_reading(&mut download, |_| MIB);
+        download.on_strategy_tick(probe + TICK * n);
+    }
+    assert_eq!(download.strategy.reprobe_at(), None, "a gain: ramping");
+    assert_eq!(download.strategy.want(), 8);
+    assert_eq!(download.manager.get_active_runners_count(), 8);
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A runner of a hold of two connects in the tick that reaches the probe
+/// time, after a refill replaced one that finished two ticks before, and
+/// delivers a little of it (design §14.33). The tick does not measure the two: the probe
+/// waits a tick, starts from the two at two MiB a tick, and with the
+/// bandwidth unchanged four gain nothing: a hold of two again, its wait
+/// doubled to 60 s. Started at the tick with the new runner, it would
+/// have compared the four with about one MiB a tick and ramped on.
+#[tokio::test]
+async fn a_probe_waits_out_a_tick_in_which_a_runner_connected() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+    complete_the_smallest(&mut download);
+    complete_the_smallest(&mut download);
+    let probe = judged + Duration::from_secs(30);
+    let mut now = judged;
+    while now + TICK * 3 < probe {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(now);
+        assert_eq!(download.manager.get_active_runners_count(), 2, "{now:?}");
+    }
+    // One finishes; the hold refills its slot by a split, 2 s before the
+    // probe time or more, so the probe is not held back by the interval.
+    deliver_reading(&mut download, two_mib_a_tick);
+    complete_the_smallest(&mut download);
+    download.on_strategy_tick(probe - TICK * 2);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    let new = runners(&download, ChunkStatus::Pending);
+    assert_eq!(new.len(), 1);
+    // Still connecting a tick later.
+    let old = runners(&download, ChunkStatus::Running);
+    for &runner_id in &old {
+        download.manager.update_progress(runner_id, MIB).unwrap();
+    }
+    download.on_strategy_tick(probe - TICK);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+
+    // It connects and delivers 64 KiB of the tick, the other a MiB.
+    deliver_by_runner(&mut download, |id| {
+        if new.contains(&id) { 64 << 10 } else { MIB }
+    });
+    download.on_strategy_tick(probe);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    assert_eq!(download.strategy.want(), 2);
+
+    deliver_reading(&mut download, two_mib_a_tick);
+    download.on_strategy_tick(probe + TICK);
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 4);
+    let verdict = probe + TICK * 3;
+    for n in 2..=3 {
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(probe + TICK * n);
+    }
+    assert_eq!(download.strategy.want(), 2, "no gain: a hold of two");
+    assert_eq!(
+        download.strategy.reprobe_at(),
+        Some(verdict + Duration::from_secs(60))
+    );
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A runner that comes and goes between two ticks, on 8 MiB split off
+/// the end of a chunk, leaves the same four runners at both ends of the
+/// tick that would judge the doubling from two to four, and its bytes in
+/// that tick's speed (design §14.33). The tick judges nothing; the next
+/// one finds no gain and holds two. Judged at the first, the eight extra
+/// MiB would have read as a gain and the ramp would have doubled to
+/// eight.
+#[tokio::test]
+async fn a_runner_that_came_and_went_defers_the_verdict() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, file_writer) = growth_loop(&rt, 8).await;
+    let t0 = Instant::now();
+    download.on_strategy_tick(t0);
+    for n in 1..=4 {
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(t0 + TICK * n);
+    }
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 8);
+
+    // Runner 0's last 8 MiB, run and finished by another runner.
+    let state = download.manager.get_runner_state(0).unwrap();
+    let end = state.allocated.end;
+    let remaining = end - state.downloaded.end;
+    download
+        .manager
+        .resize_runner(0, remaining - 8 * MIB)
+        .unwrap();
+    let transient = download
+        .manager
+        .allocate_runner_with_chunk(end - 8 * MIB..end)
+        .unwrap();
+    download
+        .manager
+        .update_progress(transient.runner_id, 8 * MIB)
+        .unwrap();
+    download
+        .manager
+        .release_runner_full(transient.runner_id, true)
+        .unwrap();
+    deliver_reading(&mut download, two_mib_a_tick);
+    download.on_strategy_tick(t0 + TICK * 5);
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 8, "not judged yet");
+    assert_eq!(download.strategy.reprobe_at(), None);
+
+    deliver_reading(&mut download, two_mib_a_tick);
+    let judged = t0 + TICK * 6;
+    download.on_strategy_tick(judged);
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 2, "no gain: a hold of two");
+    assert_eq!(
+        download.strategy.reprobe_at(),
+        Some(judged + Duration::from_secs(30))
+    );
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A hold whose runners change all the time from its probe time on:
+/// every other tick one of its two fails, and a runner is created for its
+/// range and connects by the next tick (design §14.33). No tick
+/// measures the two, so the probe is not made; a growth deadline after
+/// the first due tick it is inconclusive, and the next is due the same
+/// 30 s later. Nothing is added above the two meanwhile, and the strategy
+/// decides once a tick. Once the churn stops, the next due time probes.
+#[tokio::test]
+async fn churn_defers_a_probe_for_a_bounded_time() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+    complete_the_smallest(&mut download);
+    complete_the_smallest(&mut download);
+    let probe = judged + Duration::from_secs(30);
+    let mut now = judged;
+    while now + TICK < probe {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(now);
+    }
+    let deadline = growth_deadline(crate::runner::DEFAULT_CONNECT_TIMEOUT);
+    let mut inconclusive_at = None;
+    let mut now = probe;
+    for n in 0.. {
+        deliver_reading(&mut download, two_mib_a_tick);
+        if n % 2 == 0 {
+            let victim = runners(&download, ChunkStatus::Running)[0];
+            download.manager.release_runner_full(victim, false).unwrap();
+        }
+        download.on_strategy_tick(now);
+        assert!(download.manager.get_active_runners_count() <= 2, "{now:?}");
+        assert_eq!(download.strategy.want(), 2);
+        if download.strategy.reprobe_at() != Some(probe) {
+            inconclusive_at = Some(now);
+            break;
+        }
+        assert!(now < probe + deadline + TICK * 2, "no end by {now:?}");
+        now += TICK;
+    }
+    // Inconclusive within a tick or two of the deadline, the wait
+    // unchanged.
+    let inconclusive_at = inconclusive_at.unwrap();
+    assert!(inconclusive_at >= probe + deadline, "{inconclusive_at:?}");
+    assert_eq!(
+        download.strategy.reprobe_at(),
+        Some(inconclusive_at + BASE_REPROBE_WAIT)
+    );
+
+    // The churn stops: the probe comes at the next due time.
+    let next = inconclusive_at + BASE_REPROBE_WAIT;
+    loop {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(now);
+        if now >= next {
+            break;
+        }
+        assert_eq!(download.manager.get_active_runners_count(), 2, "{now:?}");
+    }
+    assert_eq!(download.manager.get_active_runners_count(), 4);
+    assert_eq!(download.strategy.want(), 4);
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A search for a tick to probe from ends at its deadline even when the
+/// limit controller acts at every tick after it began, so the doubling
+/// strategy never steps (design §14.33): before each tick a runner fails,
+/// and the controller creates a runner for its range. The probe is
+/// inconclusive at the first tick at or past the deadline, the wait
+/// unchanged; nothing is added above the two.
+#[tokio::test]
+async fn controller_actions_do_not_hold_off_the_end_of_a_search() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+    complete_the_smallest(&mut download);
+    complete_the_smallest(&mut download);
+    let probe = judged + Duration::from_secs(30);
+    let fail_one = |download: &mut DownloadLoop| {
+        let victim = runners(download, ChunkStatus::Running)[0];
+        download.manager.release_runner_full(victim, false).unwrap();
+    };
+    let mut now = judged;
+    while now + TICK < probe {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        if now + TICK >= probe {
+            // The controller replaces it, at the tick before the probe's.
+            fail_one(&mut download);
+        }
+        download.on_strategy_tick(now);
+        assert_eq!(download.manager.get_active_runners_count(), 2);
+    }
+    // The replacement connects in the probe's tick: no tick measured the
+    // two, and the search begins.
+    deliver_reading(&mut download, two_mib_a_tick);
+    download.on_strategy_tick(probe);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    assert_eq!(download.strategy.reprobe_at(), Some(probe));
+
+    let deadline = growth_deadline(crate::runner::DEFAULT_CONNECT_TIMEOUT);
+    let creates = |download: &DownloadLoop| {
+        download
+            .applied
+            .iter()
+            .filter(|action| action.starts_with("CreateTask"))
+            .count()
+    };
+    let mut now = probe;
+    let ended = loop {
+        now += TICK;
+        assert!(now < probe + deadline + TICK, "no end by {now:?}");
+        deliver_reading(&mut download, two_mib_a_tick);
+        fail_one(&mut download);
+        let before = creates(&download);
+        download.on_strategy_tick(now);
+        assert_eq!(creates(&download), before + 1, "the controller acts");
+        assert_eq!(download.manager.get_active_runners_count(), 2);
+        assert_eq!(download.strategy.want(), 2);
+        if download.strategy.reprobe_at() != Some(probe) {
+            break now;
+        }
+    };
+    assert!(ended >= probe + deadline, "{ended:?}");
+    assert_eq!(
+        download.strategy.reprobe_at(),
+        Some(ended + BASE_REPROBE_WAIT)
+    );
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A hold creates runners for unassigned ranges only up to its runners
+/// (design §14.33): two of the four of a gainless doubling fail and leave
+/// their ranges unassigned, which wait while the two the hold wants run;
+/// once one of those fails too, one range is claimed, without a split.
+#[tokio::test]
+async fn a_hold_leaves_unassigned_ranges_above_its_runners() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+    let failed = runners(&download, ChunkStatus::Running);
+    for &runner_id in &failed[2..] {
+        download
+            .manager
+            .release_runner_full(runner_id, false)
+            .unwrap();
+    }
+    let mut now = judged;
+    for _ in 0..8 {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(now);
+        assert_eq!(download.manager.get_active_runners_count(), 2);
+    }
+    let unassigned = download.manager.get_eligible_ranges(now);
+    assert_eq!(unassigned.len(), 2);
+
+    download
+        .manager
+        .release_runner_full(failed[0], false)
+        .unwrap();
+    now += TICK;
+    deliver_reading(&mut download, two_mib_a_tick);
+    download.on_strategy_tick(now);
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    let eligible = download.manager.get_eligible_ranges(now);
+    assert_eq!(eligible.len(), 2, "{eligible:?}");
+    assert_eq!(
+        download
+            .applied
+            .iter()
+            .filter(|action| action.starts_with("Grow"))
+            .count(),
+        2,
+        "the doublings to two and four"
+    );
+    assert_covered(&download);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A hold of eight with the limit lowered to six by a 503 asks the limit
+/// controller for steps (design §8.3, §14.33): each step's trial is a
+/// split of the hold's refill, and the limit climbs to the hold's eight
+/// and no further, though `max_connections` is 16.
+#[tokio::test]
+async fn a_hold_above_the_limit_climbs_by_steps() {
+    const RUNNERS: u64 = 6;
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, file_writer) = growth_loop(&rt, 16).await;
+    let chunk = TOTAL / RUNNERS;
+    let _slots: Vec<_> = (0..RUNNERS)
+        .map(|i| {
+            let end = if i + 1 == RUNNERS {
+                TOTAL
+            } else {
+                (i + 1) * chunk
+            };
+            download
+                .manager
+                .allocate_runner_with_chunk(i * chunk..end)
+                .unwrap()
+        })
+        .collect();
+    for id in 0..RUNNERS as usize {
+        download.manager.admission_mut().on_started(id, id);
+    }
+    download
+        .manager
+        .admission_mut()
+        .on_attempt_ended(AdmissionClass::Congestion, 6, 6);
+    let t0 = Instant::now();
+    download.on_strategy_tick(t0);
+    deliver_each(&mut download, |_| 64 << 10);
+    download.on_strategy_tick(t0 + TICK);
+    assert_eq!(download.max_concurrency, 6);
+    download.strategy.hold(8, t0 + Duration::from_secs(3600));
+    assert_eq!(download.strategy.want(), 8);
+
+    let mut limits = vec![download.max_concurrency];
+    for n in 2..202 {
+        deliver_each(&mut download, |_| 64 << 10);
+        download.on_strategy_tick(t0 + TICK * n);
+        let active = download.manager.get_active_runners_count();
+        assert!(
+            active <= download.max_concurrency,
+            "tick {n}: {active} runners"
+        );
+        if limits.last() != Some(&download.max_concurrency) {
+            limits.push(download.max_concurrency);
+        }
+    }
+    assert_eq!(limits, [6, 7, 8]);
+    assert_eq!(download.strategy.limit_state().0, 8);
+    assert_eq!(download.manager.get_active_runners_count(), 8);
     assert_covered(&download);
     drop(download);
     file_writer.finalize().await.unwrap();
@@ -623,6 +1205,7 @@ async fn doubling_is_the_default() {
         speed: Some(MIB as f64),
         all_delivering: true,
         silent: false,
+        stable: true,
         rates: Default::default(),
     };
     let now = Instant::now();
@@ -724,6 +1307,7 @@ async fn doubling_opens_no_trial_for_a_marked_step() {
         speed: Some(4.0 * MIB as f64),
         all_delivering: true,
         silent: false,
+        stable: true,
         rates: Default::default(),
     };
     let late = now + 3 * TICK;

@@ -61,7 +61,7 @@ impl DownloadLoop {
             || self.manager.get_active_runners_count()
                 >= self
                     .max_concurrency
-                    .min(self.strategy.refill_cap(self.manager.admission()))
+                    .min(self.strategy.limit_cap(self.manager.admission()))
             || !self.manager.get_eligible_ranges(now).is_empty()
         {
             return None;

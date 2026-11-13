@@ -1125,7 +1125,12 @@ mod admission_properties {
         limit: usize,
         step: Option<Instant>,
         due: Option<Instant>,
+        /// `min(limit_cap, want, max_connections)`, with what the growth
+        /// wants (design §14.33).
         cap: usize,
+        want: usize,
+        /// The chunks hedged by a live partner.
+        hedged: usize,
         active: usize,
         allocated: usize,
         loop_limit: usize,
@@ -1184,6 +1189,13 @@ mod admission_properties {
                 step,
                 due,
                 cap: self.download.strategy.cap(),
+                want: self.download.strategy.want(),
+                hedged: self
+                    .download
+                    .manager
+                    .active_chunks()
+                    .filter(|chunk| chunk.hedge.is_some())
+                    .count(),
                 active: self.download.manager.get_active_runners_count(),
                 allocated: self.download.manager.allocated_runner_count(),
                 loop_limit: self.download.max_concurrency,
@@ -1406,11 +1418,16 @@ mod admission_properties {
         let admission = prop.download.manager.admission();
         assert_eq!(admission.connected(), prop.connected.len(), "{op:?}");
         assert_eq!(admission.occupied_since(), after.occupied_since, "{op:?}");
-        // 1. The limit stays within bounds; nothing is added at the cap.
+        // 1. The limit stays within bounds; nothing is added at the cap,
+        // what the growth wants included. A hedge is gated by the limit's
+        // cap alone, and may open one connection above what is wanted.
         assert!((1..=max_connections).contains(&after.limit), "{after:?}");
+        let limit_cap = after.limit + usize::from(after.step.is_some());
+        assert_eq!(after.cap, limit_cap.min(after.want), "{after:?}");
         if after.allocated > before.allocated {
+            let hedges = after.hedged.saturating_sub(before.hedged);
             assert!(
-                after.active <= after.cap,
+                after.active <= after.cap + hedges && after.active <= limit_cap,
                 "{op:?} added runners above the cap: {before:?} -> {after:?}"
             );
         }
@@ -1469,8 +1486,9 @@ mod admission_properties {
                 "{op:?}"
             );
         }
-        // The loop's limit follows the controller's cap.
-        assert_eq!(after.loop_limit, after.cap, "{op:?}");
+        // The loop's limit follows the limit controller's cap, whatever the
+        // growth wants.
+        assert_eq!(after.loop_limit, limit_cap, "{op:?}");
     }
 
     proptest! {
