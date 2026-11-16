@@ -20,6 +20,13 @@
 //! - `s4c_stall_midway`: `s4_endgame_stall`, but the stall is at 40 MiB,
 //!   with more than `2 × min_chunk_size` left, among more than two runners:
 //!   the case of the slow restart (T13).
+//! - `s1_max32_long`: `s1_max32` on 256 MiB, long enough for the doubling
+//!   from 16 to 32 to be judged (design §14.18, §14.33).
+//! - `s6_plateau_then_more_bandwidth`: 1 MiB/s per connection, 2 MiB/s in
+//!   all for the first 20 s, then 8 MiB/s in all: the doubling to four
+//!   gains nothing and holds two, the bandwidth grows during the hold, and
+//!   the probe 30 s later starts from the four still running (design
+//!   §14.33, D31).
 //!
 //! `s4_nostall`, `s4a_nostall` and `s4b_nostall` run those setups without
 //! the stall, as the baseline of what it costs; `s4_nostall` is also the
@@ -28,10 +35,20 @@
 //! Recorded per run: completion time (from `spawn`), peak open connections
 //! and 429s (from the adapter), hedges, decided pairs, the losers' cancel
 //! latency (from the decision to the loser's `Stopped`), restarts and the
-//! stops the silent restart requested
+//! stops the silent restart requested, the holds a gainless doubling or
+//! probe began and the probes of a hold
 //! (from the crate's tracing events), the duplicate bytes (bytes the
 //! adapter sent beyond the file size) and, with a stall, how long the
 //! stalled offset waits until a connection requests it again.
+//!
+//! `s5_silent_limit_4` runs over HTTP instead, with the reqwest adapter
+//! against the limited server of `bolt-load-tests`
+//! (`create_limited_range_server`): 1 MiB/s per connection, at most four
+//! served at once, the others closed at accept (`Close`) or never
+//! answered (`Hang`, which the default 30 s connect timeout ends). Its own
+//! table records the completion time, the most connections the server
+//! served at once, the connections it turned away, when it turned away the
+//! first and the last, and the speed.
 //!
 //! The probe reads the crate's messages as text. It checks at start that
 //! the crate's source still has each message it reads and that its parser
@@ -56,7 +73,12 @@ use std::{
 };
 
 use bolt_load::{runtime::ThreadedRuntimeImpl, task::Task};
-use bolt_load_tests::adapter::simple::{SimpleTestAdapter, SimpleTestAdapterBuilder};
+use bolt_load_adapter::reqwest::IntoReqwestAdapter;
+use bolt_load_tests::adapter::{
+    fault::LimitMode,
+    http_server::create_limited_range_server,
+    simple::{SimpleTestAdapter, SimpleTestAdapterBuilder, create_deterministic_content},
+};
 use tracing::{Event, Level, Subscriber, field::Field};
 use tracing_subscriber::{
     Layer,
@@ -184,6 +206,27 @@ fn scenarios() -> Vec<Scenario> {
             stall_at: Some(40 * MIB),
             hedged: false,
         },
+        Scenario {
+            name: "s1_max32_long",
+            size: 256 * MIB,
+            max_connections: 32,
+            adapter: s1,
+            stall_at: None,
+            hedged: false,
+        },
+        Scenario {
+            name: "s6_plateau_then_more_bandwidth",
+            size: 160 * MIB,
+            max_connections: 8,
+            adapter: |size| {
+                limited(size)
+                    .max_per_stream_speed(MIB)
+                    .max_speed(2 * MIB)
+                    .raise_max_speed(Duration::from_secs(20), 8 * MIB)
+            },
+            stall_at: None,
+            hedged: false,
+        },
     ];
     let baselines: Vec<_> = scenarios
         .iter()
@@ -257,7 +300,11 @@ fn install_probe() -> Probe {
             format!("{CONCURRENT}::download_loop::restart"),
             Level::DEBUG,
         )
-        .with_target(format!("{CONCURRENT}::runner_manager"), Level::TRACE);
+        .with_target(format!("{CONCURRENT}::runner_manager"), Level::TRACE)
+        .with_target(
+            format!("{CONCURRENT}::strategy::doubling_strategy"),
+            Level::DEBUG,
+        );
     if tracing_all() {
         targets = targets
             .with_target(format!("{CONCURRENT}::strategy"), Level::TRACE)
@@ -277,7 +324,12 @@ fn id_after(message: &str, prefix: &str) -> Option<u64> {
 
 /// The messages the probe reads, and the source files that emit them: a
 /// message renamed in the crate fails here instead of reading as zero.
-const PROBED: [(&str, &str); 8] = [
+const PROBED: [(&str, &str); 10] = [
+    (DOUBLING_SOURCE, "before; hold {h}, probe again in {:?}\""),
+    (
+        DOUBLING_SOURCE,
+        "\"[STRATEGY] probing the hold of {h} runners from {base} towards {goal}\"",
+    ),
     (HEDGE_SOURCE, "\"[TASK] hedging runner {owner}"),
     (
         DATA_SOURCE,
@@ -313,6 +365,8 @@ const RESTART_SOURCE: &str =
     include_str!("../src/task/instance/concurrent_task/download_loop/restart.rs");
 const LIFECYCLE_SOURCE: &str =
     include_str!("../src/task/instance/concurrent_task/runner_manager/lifecycle.rs");
+const DOUBLING_SOURCE: &str =
+    include_str!("../src/task/instance/concurrent_task/strategy/doubling_strategy.rs");
 
 fn check_probed_messages() {
     for (source, message) in PROBED {
@@ -344,6 +398,15 @@ fn check_parser() {
             70,
             "runner 6 stopped for being slow, released range: Some(0..1)",
         ),
+        (
+            80,
+            "[STRATEGY] doubling to 4 runners gained too little: 2 B/s after, 2 B/s before; hold \
+             2, probe again in 30s",
+        ),
+        (
+            90,
+            "[STRATEGY] probing the hold of 2 runners from 4 towards 8",
+        ),
     ]
     .into_iter()
     .map(|(ms, message)| (at(ms), message.to_owned()))
@@ -354,6 +417,7 @@ fn check_parser() {
         (3, 3, 1)
     );
     assert_eq!((counts.slow_restarts, counts.silent_restarts), (1, 1));
+    assert_eq!((counts.holds, counts.probes), (1, 1));
     assert_eq!(
         counts.cancel_latencies,
         [Duration::from_millis(3), Duration::from_millis(4)]
@@ -376,6 +440,10 @@ struct EventCounts {
     /// `slow_restarts`: a runner asked to stop may finish or fail before
     /// it notices.
     silent_restarts: usize,
+    /// Holds a gainless doubling or probe began.
+    holds: usize,
+    /// Probes of a hold.
+    probes: usize,
     cancel_latencies: Vec<Duration>,
     /// Decisions without their loser's end, and loser ends without a
     /// decision.
@@ -411,6 +479,10 @@ fn count_events(events: &[(Instant, String)]) -> EventCounts {
             counts.slow_restarts += 1;
         } else if message.starts_with("[TASK] stopping silent runner") {
             counts.silent_restarts += 1;
+        } else if message.starts_with("[STRATEGY] doubling to") && message.contains("; hold ") {
+            counts.holds += 1;
+        } else if message.starts_with("[STRATEGY] probing the hold") {
+            counts.probes += 1;
         }
     }
     counts.unmatched += decided.len();
@@ -429,6 +501,8 @@ struct Run {
     late_loser_frames: usize,
     slow_restarts: usize,
     silent_restarts: usize,
+    holds: usize,
+    probes: usize,
     cancel_latencies: Vec<Duration>,
     unmatched: usize,
     /// From the stall until a connection requests the stalled offset again.
@@ -507,6 +581,8 @@ async fn run_once(
         late_loser_frames: counts.late_loser_frames,
         slow_restarts: counts.slow_restarts,
         silent_restarts: counts.silent_restarts,
+        holds: counts.holds,
+        probes: counts.probes,
         cancel_latencies: counts.cancel_latencies,
         unmatched: counts.unmatched,
         stall_wait,
@@ -586,7 +662,7 @@ fn report(scenario: &Scenario, runs: &[Run]) {
         "n/a".into()
     };
     println!(
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         scenario.name,
         col(&|run| run.secs, 2),
         // Counts with one decimal: the median of an even number of runs
@@ -600,9 +676,127 @@ fn report(scenario: &Scenario, runs: &[Run]) {
         waits,
         col(&|run| run.slow_restarts as f64, 1),
         col(&|run| run.silent_restarts as f64, 1),
+        col(&|run| run.holds as f64, 1),
+        col(&|run| run.probes as f64, 1),
         runs.iter().map(|run| run.unmatched).sum::<usize>(),
         col(&|run| (scenario.size as f64 / MIB as f64) / run.secs, 1),
     );
+}
+
+// ─────────────────────── the silent limit over HTTP ───────────────────────
+
+/// `s5_silent_limit_4`: a server that serves at most this many connections
+/// at once, each at [`S5_RATE`].
+const S5_LIMIT: usize = 4;
+const S5_RATE: u64 = MIB;
+/// About 50 s at four connections: long enough for the first recovery
+/// step, 30 s after the limit is lowered.
+const S5_SIZE: u64 = 192 * MIB;
+
+struct LimitedRun {
+    secs: f64,
+    max_served: usize,
+    turned_away: usize,
+    /// When the first and the last connection were turned away, from the
+    /// start.
+    first_turned_away: Option<f64>,
+    last_turned_away: Option<f64>,
+}
+
+async fn run_limited(
+    mode: LimitMode,
+    content: &bytes::Bytes,
+    probe: &Probe,
+    dir: &std::path::Path,
+) -> LimitedRun {
+    let (port, server, log) = create_limited_range_server(content.clone(), S5_LIMIT, mode, S5_RATE)
+        .await
+        .expect("the limited server");
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}/file")).expect("a URL");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a client");
+    let adapter = client.into_reqwest_adapter((reqwest::Method::GET, url));
+    let path = dir.join("download.bin");
+    probe.take();
+    let started = Instant::now();
+    let task = Task::builder(adapter)
+        .runtime(ThreadedRuntimeImpl::new_tokio_rt())
+        .save_to(&path)
+        .spawn()
+        .expect("a valid task");
+    let output = task.await.expect("the download completes");
+    let secs = started.elapsed().as_secs_f64();
+    server.abort();
+    if tracing_all() {
+        for (at, message) in probe.take() {
+            eprintln!(
+                "{:>8.3} {message}",
+                at.saturating_duration_since(started).as_secs_f64()
+            );
+        }
+    }
+    verify(&output.path, content, "s5_silent_limit_4");
+    std::fs::remove_file(&output.path).expect("remove the download");
+    let turned_away: Vec<f64> = log
+        .turned_away()
+        .iter()
+        .map(|at| at.saturating_duration_since(started).as_secs_f64())
+        .collect();
+    LimitedRun {
+        secs,
+        max_served: log.max_open(),
+        turned_away: turned_away.len(),
+        first_turned_away: turned_away.first().copied(),
+        last_turned_away: turned_away.last().copied(),
+    }
+}
+
+fn run_s5(runtime: &tokio::runtime::Runtime, runs: usize, probe: &Probe, dir: &std::path::Path) {
+    let content = bytes::Bytes::from(create_deterministic_content(S5_SIZE as usize));
+    println!();
+    println!(
+        "| scenario | mode | time s | most served | turned away | first turned away s | last \
+         turned away s | MiB/s |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for mode in [LimitMode::Close, LimitMode::Hang] {
+        let mut limited = Vec::new();
+        for round in 0..runs {
+            let run = runtime.block_on(run_limited(mode, &content, probe, dir));
+            eprintln!(
+                "s5_silent_limit_4 {mode:?} #{round}: {:.2} s, most served {}, turned away {} \
+                 (first at {:?} s, last at {:?} s)",
+                run.secs,
+                run.max_served,
+                run.turned_away,
+                run.first_turned_away,
+                run.last_turned_away,
+            );
+            assert!(
+                run.max_served <= S5_LIMIT,
+                "the server served {} at once",
+                run.max_served
+            );
+            limited.push(run);
+        }
+        let col = |f: &dyn Fn(&LimitedRun) -> f64, digits| {
+            summary(limited.iter().map(f).collect(), digits)
+        };
+        let at = |f: &dyn Fn(&LimitedRun) -> Option<f64>| {
+            summary(limited.iter().filter_map(f).collect(), 2)
+        };
+        println!(
+            "| s5_silent_limit_4 | {mode:?} | {} | {} | {} | {} | {} | {} |",
+            col(&|run| run.secs, 2),
+            col(&|run| run.max_served as f64, 1),
+            col(&|run| run.turned_away as f64, 1),
+            at(&|run| run.first_turned_away),
+            at(&|run| run.last_turned_away),
+            col(&|run| (S5_SIZE as f64 / MIB as f64) / run.secs, 1),
+        );
+    }
 }
 
 fn env_list(name: &str) -> Option<Vec<String>> {
@@ -634,9 +828,10 @@ fn main() {
 
     println!(
         "| scenario | time s | peak conns | 429s | hedges | decided | duplicate KiB | cancel \
-         latency ms | stall wait s | restarts | silent stop requests | unmatched | MiB/s |"
+         latency ms | stall wait s | restarts | silent stop requests | holds | probes | unmatched \
+         | MiB/s |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for scenario in scenarios() {
         if names
             .as_ref()
@@ -655,7 +850,7 @@ fn main() {
             eprintln!(
                 "{} #{round}: {:.2} s, peak {}, 429s {}, hedges {} (decided {}), duplicate {} KiB \
                  ({} late loser frames dropped), cancel {:?}, stall wait {:?}, restarts {} \
-                 (silent stop requests {}), unmatched {}",
+                 (silent stop requests {}), holds {}, probes {}, unmatched {}",
                 scenario.name,
                 run.secs,
                 run.peak,
@@ -668,10 +863,18 @@ fn main() {
                 run.stall_wait,
                 run.slow_restarts,
                 run.silent_restarts,
+                run.holds,
+                run.probes,
                 run.unmatched,
             );
             runs_of.push(run);
         }
         report(&scenario, &runs_of);
+    }
+    if names
+        .as_ref()
+        .is_none_or(|names| names.iter().any(|name| name == "s5_silent_limit_4"))
+    {
+        run_s5(&runtime, runs, &probe, dir.path());
     }
 }
