@@ -261,6 +261,19 @@ impl Sim {
         budget: u32,
         proven: bool,
     ) -> Self {
+        Self::build_with(server, max_connections, healthy, budget, proven, |_, _| {}).await
+    }
+
+    /// [`Self::build`], with `prepare` called at `t0` before any chunk is
+    /// allocated.
+    async fn build_with(
+        server: Server,
+        max_connections: usize,
+        healthy: &[Range<u64>],
+        budget: u32,
+        proven: bool,
+        prepare: impl FnOnce(&mut DownloadLoop, Instant),
+    ) -> Self {
         let rt = ScriptedRuntime::new(TimerKind::Scripted);
         let (mut download, file_writer) =
             admission_loop(&rt, server == Server::Hangs, max_connections, budget).await;
@@ -270,6 +283,7 @@ impl Sim {
         download.manager.set_min_chunk_size(TOTAL);
         download.hedging = false;
         let t0 = Instant::now();
+        prepare(&mut download, t0);
         let mut runners = Vec::new();
         for range in healthy {
             let mut runner = spawn_test_runner(&mut download, range.clone());
@@ -780,6 +794,163 @@ async fn a_rejected_step_opens_no_second_trial_before_its_tick() {
     assert_eq!(sim.spawned[spawned..], [began], "a second trial opened");
     assert_eq!(steps.ended.len(), 1, "{steps:?}");
     assert_eq!(steps.ended[0].0, began + TICK);
+    sim.teardown().await;
+}
+
+/// Sixteenth `i` of the file.
+fn sixteenth(i: u64) -> Range<u64> {
+    i * TOTAL / 16..(i + 1) * TOTAL / 16
+}
+
+/// The shape of the bench's s5 `Hang` (design §14.17): the server admits
+/// four connections and never answers the others. Four runners deliver on
+/// sixteenths 0, 2, 4 and 6, and the loop's connects for 1, 3, 5 and 7
+/// hang. The four finish at 20 s, before the connects time out at 30 s:
+/// no attempt is proven when the refusals are classified, and each is
+/// corroborated by the proven runners its connect was seen beside. The
+/// ranges reconnect at a lower level, which keeps the streak, are admitted
+/// and deliver: the limit is lowered to the four at the first tick one
+/// interval after the refusals. Sixteenths 9, 11, 13 and 15 back off
+/// until 40 s, as new ranges the growth would split: none of them
+/// connects while the four run.
+#[tokio::test]
+async fn hung_connects_that_outlast_the_proven_runners_lower_the_limit() {
+    let healthy = [0, 2, 4, 6].map(sixteenth);
+    let mut sim = Sim::build_with(
+        Server::Hangs,
+        8,
+        &healthy,
+        u32::MAX,
+        true,
+        |download, t0| {
+            download.manager.seed_kept(&[8, 10, 12, 14].map(sixteenth));
+            for i in [9, 11, 13, 15] {
+                download
+                    .manager
+                    .cool_down(sixteenth(i), 0, 0, t0 + 40 * SECOND);
+            }
+        },
+    )
+    .await;
+    let t0 = sim.t0();
+    assert_eq!(sim.spawned, [t0; 4]);
+    sim.run_until(t0 + 20 * SECOND);
+    for n in 0..4 {
+        sim.complete_healthy(n);
+    }
+    assert_eq!(sim.download.manager.get_proven_runners_count(), 0);
+    sim.run_until(t0 + DEFAULT_CONNECT_TIMEOUT);
+    let timed_out = t0 + DEFAULT_CONNECT_TIMEOUT;
+    assert!(
+        sim.failures
+            .iter()
+            .all(|(at, error)| *at == timed_out && matches!(error, TaskError::Timeout)),
+        "{:?}",
+        sim.failures
+    );
+    assert_eq!(sim.failures.len(), 4);
+    assert_eq!(sim.download.manager.admission().streak_count(), 4);
+    assert_eq!(sim.limits.len(), 1, "none connected yet");
+
+    // The server has room again: the four ranges reconnect and deliver.
+    sim.server = Server::Admits;
+    sim.run_until(t0 + 35 * SECOND);
+    assert_eq!(sim.spawned.len(), 8);
+    assert_eq!(
+        sim.limits[..],
+        [(t0, 8), (first_tick_from(t0, timed_out + TICK), 4)]
+    );
+    assert_eq!(sim.download.manager.admission().connected(), 4);
+
+    // It is full again: anything more would hang. The backed-off ranges
+    // are eligible from 40 s, and wait.
+    sim.server = Server::Hangs;
+    sim.run_until(t0 + 55 * SECOND);
+    assert_eq!(sim.spawned.len(), 8);
+    assert_eq!(sim.limits.len(), 2, "{:?}", sim.limits);
+    assert_eq!(sim.download.manager.get_active_runners_count(), 4);
+    assert_eq!(sim.download.manager.get_eligible_ranges(sim.now).len(), 4);
+    sim.teardown().await;
+}
+
+/// A resumed start: four runners on alternate eighths connect, and the
+/// loop's connects for the eighths between them hang. The four deliver
+/// their first bytes and finish between the first two ticks, with no
+/// spawn or failure in between: only their first accepted bytes see them
+/// proven beside the connects, which corroborates the refusals at the
+/// connect timeout. The ranges reconnect and deliver, and the limit is
+/// lowered to the four.
+#[tokio::test]
+async fn hung_connects_beside_runners_proven_between_ticks_lower_the_limit() {
+    let mut sim = Sim::build(Server::Hangs, 8, &alternate_eighths(), u32::MAX, false).await;
+    let t0 = sim.t0();
+    assert_eq!(sim.spawned, [t0; 4]);
+    assert_eq!(sim.download.manager.get_proven_runners_count(), 0);
+    sim.now = t0 + SECOND / 2;
+    for n in 0..4 {
+        // Accepted by the manager as it takes a frame from the channel.
+        let tick = sim
+            .download
+            .manager
+            .on_data_frame(n, bytes::Bytes::from_static(&[0; 1024]));
+        assert!(tick.downloaded.is_some());
+        sim.complete_healthy(n);
+    }
+    assert_eq!(sim.download.manager.get_proven_runners_count(), 0);
+    assert_eq!(sim.spawned.len(), 4);
+    sim.run_until(t0 + DEFAULT_CONNECT_TIMEOUT);
+    let timed_out = t0 + DEFAULT_CONNECT_TIMEOUT;
+    assert_eq!(sim.failures.len(), 4, "{:?}", sim.failures);
+    assert_eq!(sim.download.manager.admission().streak_count(), 4);
+
+    sim.server = Server::Admits;
+    sim.run_until(t0 + 35 * SECOND);
+    assert_eq!(
+        sim.limits[..],
+        [(t0, 8), (first_tick_from(t0, timed_out + TICK), 4)]
+    );
+    sim.teardown().await;
+}
+
+/// The same between the first two ticks, with each of the four on a
+/// range of 1 KiB that a single frame completes: the frame that proves an
+/// attempt also finishes its chunk, and still sees the connects beside it.
+#[tokio::test]
+async fn hung_connects_beside_runners_done_in_one_frame_lower_the_limit() {
+    const KIB: u64 = 1 << 10;
+    let healthy: Vec<_> = (0..4).map(|i| 2 * i * KIB..(2 * i + 1) * KIB).collect();
+    let mut sim = Sim::build(Server::Hangs, 8, &healthy, u32::MAX, false).await;
+    let t0 = sim.t0();
+    assert_eq!(sim.spawned, [t0; 4]);
+    sim.now = t0 + SECOND / 2;
+    for n in 0..4 {
+        let tick = sim
+            .download
+            .manager
+            .on_data_frame(n, bytes::Bytes::from_static(&[0; KIB as usize]));
+        assert_eq!(tick.downloaded.unwrap().range, healthy[n].clone());
+        assert_eq!(
+            sim.download.manager.get_runner_state(n).unwrap().status,
+            ChunkStatus::Finished
+        );
+        sim.healthy[n]
+            .lifecycle
+            .try_push(LifecycleEvent::finished())
+            .unwrap();
+        sim.settle();
+    }
+    assert_eq!(sim.spawned.len(), 4);
+    sim.run_until(t0 + DEFAULT_CONNECT_TIMEOUT);
+    let timed_out = t0 + DEFAULT_CONNECT_TIMEOUT;
+    assert_eq!(sim.failures.len(), 4, "{:?}", sim.failures);
+    assert_eq!(sim.download.manager.admission().streak_count(), 4);
+
+    sim.server = Server::Admits;
+    sim.run_until(t0 + 35 * SECOND);
+    assert_eq!(
+        sim.limits[..],
+        [(t0, 8), (first_tick_from(t0, timed_out + TICK), 4)]
+    );
     sim.teardown().await;
 }
 

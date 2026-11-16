@@ -201,6 +201,19 @@ pub enum Resize {
 }
 
 impl ChunkState {
+    /// Whether its attempt runs and had bytes of its own accepted.
+    ///
+    /// A hedged chunk's owner proves itself only by its own side's bytes:
+    /// a hedge handed the chunk delivered none of those before the fork
+    /// (design §9.6).
+    pub fn is_proven(&self) -> bool {
+        let own = match &self.hedge {
+            Some(hedge) => hedge.owner_bytes(&self.downloaded),
+            None => self.downloaded.end - self.downloaded.start,
+        };
+        self.status == ChunkStatus::Running && own > 0
+    }
+
     fn from_runner_id(allocated: Range<u64>, runner_id: Option<RunnerId>) -> Self {
         match runner_id {
             Some(runner_id) => Self::new_running(allocated, runner_id),
@@ -359,19 +372,14 @@ impl ChunkPlanner {
     /// The runners that are running and had at least one byte accepted on
     /// this attempt (design §8.3).
     pub fn get_proven_runners_count(&self) -> usize {
-        self.chunks
-            .values()
-            .filter(|c| {
-                // A hedged chunk's owner proves itself only by its own side's
-                // bytes: a hedge handed the chunk delivered none of those
-                // before the fork (design §9.6).
-                let own = match &c.hedge {
-                    Some(hedge) => hedge.owner_bytes(&c.downloaded),
-                    None => c.downloaded.end - c.downloaded.start,
-                };
-                c.status == ChunkStatus::Running && own > 0
-            })
-            .count()
+        self.chunks.values().filter(|c| c.is_proven()).count()
+    }
+
+    /// Whether the attempt of `runner_id` is proven, see
+    /// [`Self::get_proven_runners_count`].
+    pub fn is_proven(&self, runner_id: RunnerId) -> bool {
+        self.get_runner_state(runner_id)
+            .is_some_and(ChunkState::is_proven)
     }
 
     /// Allocate a pending chunk or idle chunk based on the runner id

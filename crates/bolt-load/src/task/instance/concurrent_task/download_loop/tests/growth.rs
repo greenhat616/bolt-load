@@ -12,7 +12,7 @@ use super::{
         chunk_planner::ChunkStatus,
         strategy::{
             AdmissionClass, BASE_REPROBE_WAIT, GROW_INTERVAL, MIN_GROWTH_GAIN, StrategyAction,
-            growth_deadline,
+            UNSEEN, growth_deadline,
         },
     },
     *,
@@ -221,7 +221,7 @@ async fn recover_a_step_at_a_time(bytes: impl Fn(u64) -> u64) -> (Vec<usize>, us
     download
         .manager
         .admission_mut()
-        .on_attempt_ended(AdmissionClass::Congestion, 8, 8);
+        .on_attempt_ended(UNSEEN, AdmissionClass::Congestion, 8, 8);
     let t0 = Instant::now();
     // The first step only creates runners; the next lowers to the eight.
     download.on_strategy_tick(t0);
@@ -945,7 +945,7 @@ async fn a_hold_above_the_limit_climbs_by_steps() {
     download
         .manager
         .admission_mut()
-        .on_attempt_ended(AdmissionClass::Congestion, 6, 6);
+        .on_attempt_ended(UNSEEN, AdmissionClass::Congestion, 6, 6);
     let t0 = Instant::now();
     download.on_strategy_tick(t0);
     deliver_each(&mut download, |_| 64 << 10);
@@ -1283,7 +1283,7 @@ async fn doubling_opens_no_trial_for_a_marked_step() {
     download
         .manager
         .admission_mut()
-        .on_attempt_ended(AdmissionClass::Congestion, 4, 4);
+        .on_attempt_ended(UNSEEN, AdmissionClass::Congestion, 4, 4);
     let t0 = Instant::now();
     download.on_strategy_tick(t0);
     deliver(&mut download, MIB);
@@ -1302,7 +1302,7 @@ async fn doubling_opens_no_trial_for_a_marked_step() {
     download
         .manager
         .admission_mut()
-        .on_attempt_ended(AdmissionClass::Refused, 0, 4);
+        .on_attempt_ended(UNSEEN, AdmissionClass::Refused, 0, 4);
     let tick = super::super::super::strategy::TickSample {
         speed: Some(4.0 * MIB as f64),
         all_delivering: true,

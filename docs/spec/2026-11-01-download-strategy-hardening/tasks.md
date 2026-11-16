@@ -62,6 +62,7 @@
 | | C20 `feat(task): resume from a checked state file` | T21 | |
 | PR-7e 停滞之后再试探 | C40 `feat(task): hold a plateau and probe it again` | T31 | PR-6a、PR-7b；放在 PR-9d 之上（`feat/hardening-47-adaptive-window`） |
 | | C41 `bench(task): add the silent limit and the plateau scenarios` | T31 | |
+| PR-6b 挂起连接的佐证 | C42 `fix(task): corroborate a refused connect by the peers it overlapped` | T32 | PR-6a、PR-7e；放在 PR-7e 之上（`fix/hardening-48-hung-connect-evidence`） |
 
 **合并约束**：
 
@@ -654,3 +655,21 @@
 - 下载循环测试：长下载在带宽回来之后再扩张；多开的 runner 一直在跑时也到时间试探；保持时空出来的区间只领取到 `h`；保持数在上限之上时上限按 step 升到保持数为止。
 - 性质测试：新增 runner 不超过 `min(limit_cap, want)`，对冲例外但不超过 `limit_cap`；同样的操作重放结果相同。
 - 被改写的测试列出新旧断言（design §14.33）。
+
+---
+
+## T32 — 挂起连接的佐证（C42，D32）
+
+维护者 2026-11-16 的决定：修 C41 的 s5 `Hang` 暴露的缺口（design §14.17）：挂起的连接到连接超时才失败，那时旁边已证实的连接都下完了，拒绝没有佐证，上限不降，扩张再翻倍一次，又挂 30 s。在栈顶单独一个 PR。规则由实现定（D32）。编号接在 T31 之后。
+
+- [x] C42：`AdmissionEvidence` 给每个连接中的尝试记下它在 spawn、策略 tick、失败和另一个尝试变成已证实时旁边有已证实的尝试时，其它在途的尝试数的最大值；它被拒时，此刻有已证实的尝试或者有这个记录，都算被佐证，`level` 取两者中较大的；`Started`、分类、取消、被打败时去掉，runner ID 再被预留时清掉。`on_attempt_ended` 带上 runner ID。区间预算的免记（D27）不变（design §8.3、§14.12a）。
+- [x] C42：design §3 的 D32、§8.3、§12、§14.12a；重跑 s5，更新 §14.17。
+
+**验证**
+
+- 单元测试：连接中看到过已证实的尝试、被拒时已经没有的拒绝算被佐证，水平是看到的最大值，更低水平的重连不结束连续拒绝，达到水平的结束；没看到过的不算；记录在释放之后、分类之前还在，`Started`、分类、重新预留之后没有；此刻和记录都有时取较大的；只靠记录佐证的拒绝拒绝进行中的 step，不免记预算。manager：第一帧被接收时旁边的连接有记录；连接中被取消时记录去掉；连接中的对冲被打败时记录去掉。
+- 下载循环测试（s5 `Hang` 的形态）：4 个已证实的 runner 在 20 s 下完，4 个挂起的连接 30 s 超时，区间重连、交数据，上限在第三次拒绝之后一个间隔的 tick 降到 4；之后 40 s 起可领取的 4 个区间不开连接。
+- 下载循环测试（两个 tick 之间）：续传的 4 个 runner 在第一、二个 tick 之间交第一批字节、下完，中间没有 spawn 和失败，挂起的连接超时时仍算被佐证，上限降到 4；4 个 runner 各一帧就下完自己的区间时也一样。
+- 已有测试（性质测试在内）都不变，只是 `on_attempt_ended` 多传一个 runner ID。
+- 变异检查：去掉记录的佐证，s5 形态的下载循环测试和 3 个单元测试失败；水平改用分类时的 `others`，s5 形态的下载循环测试和 2 个单元测试失败；变成已证实时不采样，两个 tick 之间的下载循环测试和 manager 的测试失败；一帧下完时看不到它或不把它算进已证实的数，一帧下完的下载循环测试失败；取消、被打败时不去掉记录，各自的测试失败。
+- 基准测试：s5 的 `Close` 和 `Hang` 各 10 次（design §14.17）。
