@@ -172,6 +172,86 @@ async fn test_read_activity_follows_the_body() {
     handle.abort();
 }
 
+/// A runner given a timer source stamps its read activity on that
+/// source's clock, not the standard one.
+#[tokio::test]
+async fn test_read_activity_is_stamped_on_the_timer_source_clock() {
+    use crate::runtime::{
+        ThreadedRuntimeImpl,
+        test_support::{ManualClock, ManualRuntime},
+    };
+
+    let clock = ManualClock::new();
+    clock.advance(Duration::from_secs(3600));
+    let activity = ReadActivity::default();
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let items = [patterned_frame(100), patterned_frame(BUFFER_SIZE)];
+    let (mut runner, _lifecycle_rx, data_rx) = TaskRunner::builder()
+        .stream(futures::stream::iter(items.map(Ok::<_, AdapterError>)).boxed())
+        .runner_id(1)
+        .control_signal(control_rx)
+        .cancel_token(CancellationToken::new())
+        .read_activity(activity.clone())
+        .timer_source(&ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        }))
+        .build()
+        .unwrap();
+    let handle = tokio::spawn(async move { runner.run().await });
+    let mut data_rx = pin!(data_rx);
+    let mut received = 0;
+    while let Some(frame) = timeout(Duration::from_secs(5), data_rx.next())
+        .await
+        .unwrap()
+    {
+        received += frame.data.len();
+    }
+    handle.await.unwrap();
+    assert_eq!(received, 100 + BUFFER_SIZE);
+    let stamps: Vec<_> = activity
+        .seen()
+        .into_iter()
+        .filter_map(|(last, _)| last)
+        .collect();
+    assert!(!stamps.is_empty(), "the items were stamped");
+    assert!(
+        stamps.iter().all(|&stamp| stamp == clock.now()),
+        "{stamps:?} on a clock at {:?}",
+        clock.now()
+    );
+}
+
+/// A runner keeps only a handle of its timer source: the caller still owns
+/// the runtime, and a runner dropped on a worker of that runtime shuts
+/// nothing down, which tokio forbids from within it.
+#[cfg(feature = "tokio")]
+#[test]
+fn test_a_runner_dropped_on_its_timer_source_runtime() {
+    use crate::runtime::{ThreadedRuntimeImpl, TokioThreadedRuntime};
+
+    let rt = ThreadedRuntimeImpl::new_tokio_rt();
+    let ThreadedRuntimeImpl::Tokio(TokioThreadedRuntime::Runtime(owner)) = &rt else {
+        panic!("built outside tokio, it owns its runtime");
+    };
+    let handle = owner.handle().clone();
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let (mut runner, _lifecycle_rx, _data_rx) = TaskRunner::builder()
+        .stream(futures::stream::empty().boxed())
+        .runner_id(1)
+        .control_signal(control_rx)
+        .cancel_token(CancellationToken::new())
+        .timer_source(&rt)
+        .build()
+        .unwrap();
+    let worker = handle.spawn(async move {
+        runner.run().await;
+        drop(runner);
+    });
+    let joined = handle.block_on(worker);
+    assert!(joined.is_ok(), "the worker dropped its runner: {joined:?}");
+    drop(rt);
+}
+
 /// A runner that pushed against backpressure, then reads on, is never
 /// seen silent: every state a tick could read, after the loop took a frame,
 /// has the runner pushing or stamped since (design §14.19). A tick between

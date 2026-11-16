@@ -49,7 +49,7 @@ fn delayed_timer_on(handle: &tokio::runtime::Handle, duration: Duration) -> Time
 }
 
 /// The time on `handle`'s clock: the one its timers use, paused or not.
-fn now_on(handle: &tokio::runtime::Handle) -> Instant {
+pub(super) fn now_on(handle: &tokio::runtime::Handle) -> Instant {
     let _guard = handle.enter();
     tokio::time::Instant::now().into_std()
 }

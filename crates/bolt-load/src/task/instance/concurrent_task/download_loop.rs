@@ -110,7 +110,8 @@ impl DownloadLoop {
             AdmissionEvidence::with_streak_gap(streak_gap(options.connect_timeout));
         let strategy = StrategyControl::new(max_concurrency, options.connect_timeout);
         let rates = RunnerRates::default();
-        let policy = FailurePolicy::new(options, Instant::now());
+        let now = Instant::now();
+        let policy = FailurePolicy::new(options, now);
         let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),
             spawner.rt.clone(),
@@ -133,7 +134,7 @@ impl DownloadLoop {
             cancel: CancelSource::new(cancel_token),
             deadline,
             strategy_tick: StrategyTick::new(strategy_timer.into()),
-            throughput: ThroughputSampler::new(throughput_timer.into()),
+            throughput: ThroughputSampler::new(throughput_timer.into(), now),
             rates,
             checkpoints: None,
             #[cfg(test)]
@@ -235,7 +236,7 @@ impl DownloadLoop {
             )),
             LoopEvent::Checkpoint(outcome) => {
                 if let Some(checkpoints) = self.checkpoints.as_mut() {
-                    checkpoints.apply(outcome);
+                    checkpoints.apply(outcome, now);
                     if checkpoints.is_stopped() {
                         // No checkpoint will use them any more.
                         self.writer.stop_checksumming();
@@ -250,7 +251,7 @@ impl DownloadLoop {
                 Ok(ControlFlow::Continue(()))
             }
             LoopEvent::ThroughputTimer => {
-                self.on_throughput_tick();
+                self.on_throughput_tick(now);
                 Ok(ControlFlow::Continue(()))
             }
             LoopEvent::Runner(tick) => self.on_runner(tick, now),
@@ -291,9 +292,9 @@ impl DownloadLoop {
         // version: no new checkpoint records it (design §11.5.9).
         if let Some(mut checkpoints) = checkpoints {
             if matches!(transfer_result, Err(DownloadError::ResourceChanged { .. })) {
-                checkpoints.settle().await;
+                checkpoints.settle(Instant::now).await;
             } else {
-                checkpoints.finish(&written).await;
+                checkpoints.finish(&written, Instant::now).await;
             }
         }
         progress.downloaded_chunks = written.into_ranges();

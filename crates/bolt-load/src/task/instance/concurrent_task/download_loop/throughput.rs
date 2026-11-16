@@ -258,11 +258,12 @@ pub(super) struct ThroughputSampler {
 }
 
 impl ThroughputSampler {
-    pub(super) fn new(timer: EventTimer) -> Self {
+    /// Sample on `timer`'s ticks, the first sample measuring from `now`.
+    pub(super) fn new(timer: EventTimer, now: Instant) -> Self {
         Self {
             timer,
-            sampler: SpeedSampler::new(),
-            write_sampler: SpeedSampler::new(),
+            sampler: SpeedSampler::new(now),
+            write_sampler: SpeedSampler::new(now),
             written_bytes: 0,
             per_runner_speed: 0.0,
         }
@@ -279,11 +280,11 @@ impl ThroughputSampler {
         self.written_bytes += bytes;
     }
 
-    /// Returns the download and write speed.
-    fn sample(&mut self, meters: MeterSnapshot) -> (f64, f64) {
+    /// Returns the download and write speed at `now`.
+    fn sample(&mut self, meters: MeterSnapshot, now: Instant) -> (f64, f64) {
         let MeterSnapshot { runners, mut bytes } = meters;
-        let (_, speed) = self.sampler.sample(&mut bytes);
-        let (_, write_speed) = self.write_sampler.sample(&mut self.written_bytes);
+        let (_, speed) = self.sampler.sample(&mut bytes, now);
+        let (_, write_speed) = self.write_sampler.sample(&mut self.written_bytes, now);
         self.per_runner_speed = if runners == 0 {
             0.0
         } else {
@@ -294,11 +295,12 @@ impl ThroughputSampler {
 }
 
 impl DownloadLoop {
-    /// Sample the throughput and publish a periodic progress event.
+    /// Sample the throughput at `now` and publish a periodic progress
+    /// event.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    pub(super) fn on_throughput_tick(&mut self) {
+    pub(super) fn on_throughput_tick(&mut self, now: Instant) {
         let meters = self.manager.take_meters_snapshot();
-        let (speed, write_speed) = self.throughput.sample(meters);
+        let (speed, write_speed) = self.throughput.sample(meters, now);
         self.publish_progress(speed, write_speed);
     }
 
@@ -333,6 +335,29 @@ mod tests {
         let mut rates: Vec<_> = tick.rates.iter().map(|(&id, &rate)| (id, rate)).collect();
         rates.sort_by_key(|&(id, _)| id);
         rates
+    }
+
+    /// The download and the write speed are measured over the times the
+    /// loop gives, from the one it was built at.
+    #[test]
+    fn test_throughput_measures_over_the_given_times() {
+        use crate::{
+            runtime::test_support::ManualClock, task::instance::sampler::DEFAULT_SAMPLE_INTERVAL,
+        };
+
+        let t0 = Instant::now();
+        let timer = ManualClock::new().delayed_timer(DEFAULT_SAMPLE_INTERVAL);
+        let mut sampler = ThroughputSampler::new(timer.into(), t0);
+        sampler.record_written(500);
+        let meters = MeterSnapshot {
+            runners: 2,
+            bytes: 2000,
+        };
+        assert_eq!(
+            sampler.sample(meters, t0 + Duration::from_secs(2)),
+            (1000.0, 250.0)
+        );
+        assert_eq!(sampler.per_runner_speed, 500.0);
     }
 
     /// A rate spans the time between two samples, from the bytes the

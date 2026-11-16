@@ -314,7 +314,7 @@ impl Setup {
     /// Wait for the running checkpoint and account for it.
     async fn settle(&mut self) {
         let outcome = std::future::poll_fn(|cx| self.checkpoints.poll(cx)).await;
-        self.checkpoints.apply(outcome);
+        self.checkpoints.apply(outcome, Instant::now());
     }
 
     fn durable(&self) -> Vec<Range<u64>> {
@@ -465,7 +465,7 @@ async fn test_a_failed_rollback_stops_the_checkpoints() {
         received,
         ..
     } = s;
-    checkpoints.finish(&written).await;
+    checkpoints.finish(&written, Instant::now).await;
     assert_eq!(received.calls().len(), 2);
     assert_eq!(syncs, 1);
 }
@@ -506,7 +506,7 @@ async fn test_a_block_past_the_cap_reads_back_after_the_sync() {
         syncs,
         ..
     } = s;
-    checkpoints.finish(&written).await;
+    checkpoints.finish(&written, Instant::now).await;
     assert_eq!(received.calls(), [Call::Record(vec![0, 1])]);
     assert_eq!(syncs.count(), 1);
     assert_eq!(
@@ -602,7 +602,7 @@ async fn test_the_teardown_checkpoint() {
         memory,
         ..
     } = s;
-    checkpoints.finish(&written).await;
+    checkpoints.finish(&written, Instant::now).await;
     assert_eq!(
         received.calls(),
         [Call::Record(vec![0]), Call::Record(vec![1, 2, 3, 4, 5, 6])]
@@ -940,6 +940,32 @@ async fn test_checkpoints_keep_their_minimum_spacing() {
     s.checkpoints.maybe_start(&s.written, ended + spacing);
     assert!(s.checkpoints.running.is_some(), "exactly the spacing after");
     s.settle().await;
+    assert_eq!(
+        s.received.calls(),
+        [Call::Record(vec![0]), Call::Record(vec![1])]
+    );
+}
+
+/// A checkpoint ends at the time the loop's clock reads once it ended,
+/// at teardown too, and the spacing counts from there.
+#[tokio::test]
+async fn test_checkpoints_end_at_the_given_clock() {
+    let mut s = Setup::new(1, Duration::from_secs(3600));
+    s.checkpoints.schedule.min_spacing = Duration::from_secs(10);
+    let late = s.t0 + Duration::from_secs(3600);
+    s.write(0..BLOCK).await;
+    assert!(s.maybe_start(Duration::ZERO));
+    s.checkpoints.settle(|| late).await;
+    assert_eq!(s.checkpoints.ended, Some(late));
+    s.write(BLOCK..2 * BLOCK).await;
+    let spacing = s.checkpoints.schedule.min_spacing;
+    s.checkpoints
+        .maybe_start(&s.written, late + spacing - Duration::from_nanos(1));
+    assert!(s.checkpoints.running.is_none(), "spaced from the given end");
+    s.checkpoints.maybe_start(&s.written, late + spacing);
+    assert!(s.checkpoints.running.is_some());
+    s.checkpoints.settle(|| late + spacing).await;
+    assert_eq!(s.checkpoints.ended, Some(late + spacing));
     assert_eq!(
         s.received.calls(),
         [Call::Record(vec![0]), Call::Record(vec![1])]
