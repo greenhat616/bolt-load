@@ -114,6 +114,10 @@ pub(crate) mod tests {
 
     /// Which time a step fails or is held.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        expect(dead_code, reason = "only the task tests, which need tokio, use it")
+    )]
     pub(crate) enum When {
         /// The n-th time the step comes, counted from 1.
         Nth(usize),
@@ -141,6 +145,10 @@ pub(crate) mod tests {
         panic: Arc<Mutex<Option<(Step, When)>>>,
     }
 
+    #[cfg_attr(
+        not(feature = "tokio"),
+        expect(dead_code, reason = "only the task tests, which need tokio, use it")
+    )]
     impl StepLog {
         pub(crate) fn hooks(&self) -> FileHooks {
             let this = self.clone();

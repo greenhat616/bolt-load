@@ -1811,7 +1811,7 @@ mod fault_server {
         let file_writer = FileWriter::new(&path, SIZE).await.unwrap();
         let options = TaskOptions::default().connect_timeout(Duration::from_millis(300));
         let spawner = RunnerSpawner::new(
-            ThreadedRuntimeImpl::new_tokio_rt(),
+            crate::runtime::test_support::current_tokio(),
             adapter,
             WaitGroup::new(),
             CancellationToken::new(),

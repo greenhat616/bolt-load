@@ -432,6 +432,7 @@ mod tests {
     use super::{super::CommandError, *};
     use crate::runtime::{
         DowncastLocalRuntime, DynTimer, ThreadedRuntime, Timer, TimerBuilder, TimerImpl,
+        test_support::current_tokio,
     };
 
     #[derive(Debug, Default)]
@@ -542,8 +543,7 @@ mod tests {
     #[tokio::test]
     async fn basic_write_tick_completion() {
         let writer = Arc::new(RecordingWriter::default());
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 2);
 
         assert_eq!(
             pending
@@ -568,8 +568,7 @@ mod tests {
     async fn finish_waits_for_blocked_write_task_to_exit() {
         let (release_tx, release_rx) = async_channel::unbounded();
         let writer = Arc::new(ControlledWriter::new(release_rx));
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 2);
         pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
 
         let finish = tokio::spawn(pending.finish());
@@ -597,8 +596,7 @@ mod tests {
     async fn pending_buffer_fallback_flushes_after_capacity_opens() {
         let (release_tx, release_rx) = async_channel::unbounded();
         let writer = Arc::new(ControlledWriter::new(release_rx));
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 1);
 
         assert_eq!(
             pending.write_range(0..1, Bytes::from_static(b"a")).unwrap(),
@@ -644,8 +642,7 @@ mod tests {
     async fn poll_completions_alone_flushes_the_pending_write() {
         let (release_tx, release_rx) = async_channel::unbounded();
         let writer = Arc::new(ControlledWriter::new(release_rx));
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 1);
         assert!(poll_once(&mut pending).is_pending(), "nothing is in flight");
         pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
         pending.write_range(1..2, Bytes::from_static(b"b")).unwrap();
@@ -664,8 +661,7 @@ mod tests {
     #[tokio::test]
     async fn try_tick_and_poll_completions_account_each_completion_once() {
         let writer = Arc::new(RecordingWriter::default());
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 2);
         pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
         pending.write_range(1..2, Bytes::from_static(b"b")).unwrap();
 
@@ -705,8 +701,7 @@ mod tests {
     async fn writer_full_error_boundary_rejects_third_write() {
         let (release_tx, release_rx) = async_channel::unbounded();
         let writer = Arc::new(ControlledWriter::new(release_rx));
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 1);
 
         assert_eq!(
             pending.write_range(0..1, Bytes::from_static(b"a")).unwrap(),
@@ -734,8 +729,7 @@ mod tests {
     async fn zero_capacity_is_clamped_to_one() {
         let (release_tx, release_rx) = async_channel::unbounded();
         let writer = Arc::new(ControlledWriter::new(release_rx));
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 0);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 0);
 
         assert!(!pending.is_full());
         assert_eq!(
@@ -796,8 +790,7 @@ mod tests {
     #[tokio::test]
     async fn panic_guard_decrements_in_flight_and_reports_completion() {
         let writer = Arc::new(PanicWriter);
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 1);
 
         assert_eq!(
             pending
@@ -907,8 +900,7 @@ mod tests {
     #[tokio::test]
     async fn flush_drains_all_completed_writes() {
         let writer = Arc::new(RecordingWriter::default());
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 4);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 4);
 
         for i in 0u64..4 {
             let start = i * 10;
@@ -928,8 +920,7 @@ mod tests {
     #[tokio::test]
     async fn flush_reports_write_error() {
         let writer = Arc::new(FailingWriter::new(0));
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 2);
 
         pending
             .write_range(0..10, Bytes::from_static(b"will_fail_"))
@@ -946,8 +937,7 @@ mod tests {
     async fn write_error_prevents_pending_dispatch() {
         let (release_tx, release_rx) = async_channel::unbounded();
         let writer = Arc::new(ControlledFailingWriter { release_rx });
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 1);
 
         // First write dispatched — blocks until released, then fails.
         assert_eq!(
@@ -980,8 +970,7 @@ mod tests {
     async fn error_persists_across_tick_and_flush() {
         let (release_tx, release_rx) = async_channel::unbounded();
         let writer = Arc::new(ControlledFailingWriter { release_rx });
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 1);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 1);
 
         assert_eq!(
             pending
@@ -1015,8 +1004,7 @@ mod tests {
         let writer = Arc::new(DelayWriter {
             delay: Duration::from_millis(50),
         });
-        let mut pending =
-            PendingWriter::new(Arc::clone(&writer), ThreadedRuntimeImpl::new_tokio_rt(), 2);
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), 2);
 
         // Fill capacity.
         pending.write_range(0..1, Bytes::from_static(b"a")).unwrap();
@@ -1049,11 +1037,7 @@ mod tests {
             delay: Duration::from_millis(10),
         });
         let capacity = 8;
-        let mut pending = PendingWriter::new(
-            Arc::clone(&writer),
-            ThreadedRuntimeImpl::new_tokio_rt(),
-            capacity,
-        );
+        let mut pending = PendingWriter::new(Arc::clone(&writer), current_tokio(), capacity);
 
         for i in 0u64..16 {
             while !pending.can_write() {

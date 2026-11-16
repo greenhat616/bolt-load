@@ -101,7 +101,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        runtime::ThreadedRuntimeImpl,
+        runtime::test_support::current_tokio,
         task::instance::concurrent_task::file_writer::{
             CommandError, FileRangeWriter, FileWriterError, PendingWriter,
         },
@@ -135,8 +135,7 @@ mod tests {
     /// Write 0..4, 4..8 and 8..12 through a writer that fails 4..8.
     async fn completions(kind: io::ErrorKind) -> Vec<WriteCompletion> {
         let writer = FailingWriter { range: 4..8, kind };
-        let mut pending =
-            PendingWriter::new(Arc::new(writer), ThreadedRuntimeImpl::new_tokio_rt(), 4);
+        let mut pending = PendingWriter::new(Arc::new(writer), current_tokio(), 4);
         for start in [0, 4, 8] {
             pending
                 .write_range(start..start + 4, Bytes::from_static(b"data"))
@@ -178,8 +177,7 @@ mod tests {
             range: 0..0,
             kind: io::ErrorKind::Other,
         };
-        let mut pending =
-            PendingWriter::new(Arc::new(writer), ThreadedRuntimeImpl::new_tokio_rt(), 4);
+        let mut pending = PendingWriter::new(Arc::new(writer), current_tokio(), 4);
         pending
             .write_range(0..4, Bytes::from_static(b"data"))
             .unwrap();

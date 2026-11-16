@@ -274,7 +274,7 @@ impl Setup {
         );
         let mut writer = PendingWriter::new(
             Arc::new(file_writer),
-            crate::runtime::ThreadedRuntimeImpl::new_tokio_rt(),
+            crate::runtime::test_support::current_tokio(),
             4,
         );
         writer.checksum(schedule.block_size);
@@ -618,7 +618,7 @@ async fn test_the_teardown_checkpoint() {
 async fn test_crcs_only_for_successful_writes_when_asked() {
     let (file_writer, ..) = FileWriter::in_memory(TOTAL, vec![BLOCK..2 * BLOCK]);
     let file_writer = Arc::new(file_writer);
-    let rt = crate::runtime::ThreadedRuntimeImpl::new_tokio_rt();
+    let rt = crate::runtime::test_support::current_tokio();
     let mut plain = PendingWriter::new(file_writer.clone(), rt.clone(), 4);
     plain.write_range(0..BLOCK, pattern(0, BLOCK, 1)).unwrap();
     let completions = plain.finish().await;
