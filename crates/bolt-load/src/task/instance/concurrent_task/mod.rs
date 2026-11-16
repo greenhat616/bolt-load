@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     adapter::AnyAdapter,
-    runtime::ThreadedRuntimeImpl,
+    runtime::{ThreadedRuntimeImpl, TimerBuilder},
     task::{DownloadError, Progress, TaskOptions, status::ProgressReporter},
 };
 
@@ -194,7 +194,7 @@ impl ConcurrentTaskInner {
                 file_writer.clone(),
                 Arc::new(checkpoint::FileBlocks(tmp_path.to_path_buf())),
                 self.output.drain(),
-                std::time::Instant::now(),
+                self.rt.now(),
             );
             #[cfg(test)]
             {

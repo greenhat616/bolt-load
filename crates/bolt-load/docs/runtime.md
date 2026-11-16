@@ -20,7 +20,9 @@ The module defines a trait hierarchy for async execution:
   pass it as [`TimerImpl::Custom`].
 - [`TimerBuilder`] — Factory for creating [`Timer`] instances with a
   configurable interval, whose first tick completes immediately, and for
-  one-shot [`TimerBuilder::sleep`]s such as the metadata retry backoff.
+  one-shot [`TimerBuilder::sleep`]s for a duration. The engine's own
+  one-shot waits, the metadata retry's among them, are deadlines, which a
+  custom runtime serves with [`TimerBuilder::sleep_until`], see below.
   The default `sleep` waits for the second tick of a delayed timer;
   custom runtimes should override it with their own sleep.
   [`TimerBuilder::now`] is the clock those timers run on, see below, and
@@ -69,11 +71,36 @@ timers, may panic.
 
 The tokio runtimes create their periodic timers and sleeps on their own
 handle, and read tokio's clock through it, whatever runtime the caller is
-in, or none; a periodic timer is also polled in its runtime, so a tick taken
-late schedules the next one on that runtime's clock. A task's timers are so registered with the runtime it was
-given, which is where `tokio-console` shows them, and pausing or advancing
-that runtime's clock (tokio's `test-util`) moves the engine's time. The smol
-runtimes use the standard clock.
+in, or none; a periodic timer is also polled in its runtime, so a tick
+taken late schedules the next one on that runtime's clock. A task's timers
+are so registered with the runtime it was given, which is where
+`tokio-console` shows them, and pausing or advancing that runtime's clock
+(tokio's `test-util`) moves the engine's time. The smol runtimes use the
+standard clock.
+
+The engine's periodic timers, the throughput and strategy ticks of the
+concurrent loop and the sampling of the singleton, come from
+[`TimerBuilder::create_delayed_timer`]. Its one-shot timers, the loop's
+deadline, a runner's connect, idle and drain timeouts and the waits of the
+metadata retry, are deadlines at
+an instant of that clock on the same runtime: a tokio sleep on its handle, a
+smol timer, or a custom runtime's [`TimerBuilder::sleep_until`] the target,
+started at the deadline's first poll. A deadline already reached fires
+without a sleep, and a custom one reads the clock at every poll: a sleep
+that ends late does not hold it back once the deadline is polled, though
+on the default `sleep_until` its wake-up may come only at that late end.
+Every such wait is capped at 30 years, tokio's far future, which fits
+under the clock contract above.
+
+A task's tokio runtime must therefore have its timer, `enable_time` or
+`enable_all` on its builder, and be driven for as long as the task runs, in
+either mode: a multi-thread runtime drives itself, a current-thread one only
+inside its own `block_on`, and its timers do not fire while nothing drives
+it. A task on a runtime without its timer fails with a runtime error.
+
+`async-io`'s timers on the standard clock remain in three places only: the
+metadata retry before a task has a runtime, a runner built without a timer
+source (see the runner docs), and [`timeout()`].
 
 # Feature Gates
 
@@ -85,4 +112,5 @@ runtimes use the standard clock.
 # Utilities
 
 - [`yield_now()`] — Cooperative task yielding (returns [`YieldNow`] future).
-- [`timeout()`] — Runtime-agnostic timeout wrapper using `futures-concurrency`.
+- [`timeout()`] — Runtime-agnostic timeout wrapper using `futures-concurrency`
+  and an `async-io` timer.

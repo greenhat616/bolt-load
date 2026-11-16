@@ -486,6 +486,40 @@ async fn test_panic_becomes_an_error() {
     assert!(!save_path.exists() && !tmp_path(&save_path).exists());
 }
 
+/// Panics in its stream with a message that names disabled timers, on a
+/// runtime that has them.
+#[derive(Clone)]
+struct TimersPanickingAdapter(SimpleTestAdapter);
+
+impl BoltLoadAdapter for TimersPanickingAdapter {
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
+        self.0.retrieve_meta().await
+    }
+
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
+        panic!("adapter invariant failed while retry timers are disabled");
+    }
+}
+
+/// Only tokio's own panic at a runtime without timers is a runtime error:
+/// an adapter's panic that mentions disabled timers stays `Panicked`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_panic_naming_disabled_timers_stays_a_panic() {
+    let temp_dir = TempDir::new().unwrap();
+    let save_path = temp_dir.path().join("panic.bin");
+    let task = builder(TimersPanickingAdapter(SimpleTestAdapter::new(1024)))
+        .save_to(&save_path)
+        .spawn()
+        .unwrap();
+
+    let result = watchdog(task).await;
+
+    assert!(
+        matches!(&result, Err(DownloadError::Panicked { message }) if message.contains("retry timers are disabled")),
+        "{result:?}"
+    );
+}
+
 /// Delegates to tokio but cannot provide a local runtime.
 struct NoLocalRuntime(ThreadedRuntimeImpl);
 
@@ -535,6 +569,44 @@ async fn test_missing_local_runtime_fails_the_task() {
         "{result:?}"
     );
     assert_eq!(status.borrow().state, TaskState::Failed);
+}
+
+/// A tokio runtime built without its timer fails a singleton task, whose
+/// timeouts and sampling are that runtime's timers, with a runtime error
+/// rather than a panic; the destination is not written.
+#[cfg(feature = "tokio")]
+#[test]
+fn test_a_runtime_without_its_timer_fails_the_task() {
+    use crate::runtime::TokioThreadedRuntime;
+
+    let timerless = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let driver = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let dest = temp_dir.path().join("timerless.bin");
+    let result = driver.block_on(async {
+        let task = Task::builder(SimpleTestAdapter::new(1024))
+            .runtime(ThreadedRuntimeImpl::Tokio(TokioThreadedRuntime::Handle(
+                timerless.handle().clone(),
+            )))
+            .meta(BoltLoadAdapterMeta::new(1024))
+            .prefer_mode(DownloadMode::Singleton)
+            .save_to(&dest)
+            .spawn()
+            .unwrap();
+        watchdog(task).await
+    });
+    assert!(
+        matches!(&result, Err(DownloadError::Runtime { message }) if message.contains("enable_time")),
+        "{result:?}"
+    );
+    assert!(!dest.exists());
+    assert!(!tmp_path(&dest).exists());
 }
 
 // ============================================================================
