@@ -98,6 +98,9 @@ struct Faults {
     /// Bytes in this range are sent at this many bytes per second, per
     /// stream.
     paced_region: Option<(Range<u64>, u64)>,
+    /// From this long after the first body stream, the total limit is
+    /// this many bytes per second instead of `max_speed`.
+    raised_speed: Option<(Duration, u64)>,
 }
 
 pub type GlobalRateLimiter = Arc<
@@ -272,6 +275,17 @@ impl SimpleTestAdapterBuilder {
         self
     }
 
+    /// From `after` past the adapter's first body stream, limit all the
+    /// streams together to `bytes_per_sec` instead of
+    /// [`max_speed`](Self::max_speed): a server whose bandwidth grows
+    /// during a download. Each clone from
+    /// [`SimpleTestAdapter::clone_reset_count`] counts from its own first
+    /// stream.
+    pub fn raise_max_speed(mut self, after: Duration, bytes_per_sec: u64) -> Self {
+        self.faults.raised_speed = Some((after, bytes_per_sec));
+        self
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub fn build(self) -> Result<SimpleTestAdapter, SimpleTestAdapterBuildError> {
         let Some(content_size) = self.content_size else {
@@ -283,6 +297,12 @@ impl SimpleTestAdapterBuilder {
         let rate_limiter = self
             .max_speed
             .map(|speed| rate_limiter(speed, self.speed_burst, chunk_size));
+        let raised_limiter = self.faults.raised_speed.map(|(after, speed)| {
+            (
+                after,
+                self::rate_limiter(speed, self.speed_burst, chunk_size),
+            )
+        });
 
         Ok(SimpleTestAdapter {
             content: Bytes::from(content),
@@ -293,6 +313,7 @@ impl SimpleTestAdapterBuilder {
             call_count: Arc::new(AtomicUsize::new(0)),
             filename: self.filename,
             rate_limiter,
+            raised_limiter,
             max_per_stream_speed: self.max_per_stream_speed,
             connecting_delay: self.connecting_delay,
             max_concurrent_streams: self.max_concurrent_streams,
@@ -343,6 +364,8 @@ struct Counters {
     served_bytes: Arc<AtomicU64>,
     /// The body streams created, in order.
     streams: Arc<Mutex<Vec<StreamRecord>>>,
+    /// When the first body stream was created.
+    first_stream_at: Arc<Mutex<Option<Instant>>>,
     /// Whether a stream stopped at `Faults::stall_once_at`, and when.
     stalled: Arc<AtomicBool>,
     stalled_at: Arc<Mutex<Option<Instant>>>,
@@ -361,6 +384,10 @@ pub struct SimpleTestAdapter {
     filename: Option<String>,
     #[debug(ignore)]
     rate_limiter: Option<GlobalRateLimiter>,
+    /// The total limit from this long after the first body stream on, see
+    /// [`SimpleTestAdapterBuilder::raise_max_speed`].
+    #[debug(ignore)]
+    raised_limiter: Option<(Duration, GlobalRateLimiter)>,
     /// the speed of the stream in bytes per second
     max_per_stream_speed: Option<u64>,
     /// Delay before creating a stream (simulates connection time)
@@ -399,6 +426,7 @@ impl SimpleTestAdapter {
             call_count: Arc::new(AtomicUsize::new(0)),
             filename: self.filename.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            raised_limiter: self.raised_limiter.clone(),
             max_per_stream_speed: self.max_per_stream_speed,
             connecting_delay: self.connecting_delay,
             max_concurrent_streams: self.max_concurrent_streams,
@@ -512,6 +540,15 @@ impl SimpleTestAdapter {
         let end = end.min(content.len());
         let chunk_size = self.chunk_size;
         let rate_limiter = self.rate_limiter.clone();
+        let raised_limiter = self.raised_limiter.clone().map(|(after, limiter)| {
+            let first = *self
+                .counters
+                .first_stream_at
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Instant::now);
+            (first + after, limiter)
+        });
         let burst = self.speed_burst;
         let stream_rate_limiter = self
             .max_per_stream_speed
@@ -584,8 +621,12 @@ impl SimpleTestAdapter {
                     }
                 }
                 let chunk_len = NonZeroU32::new((next - pos) as u32).unwrap();
-                if let Some(rate_limiter) = rate_limiter.clone() {
-                    rate_limiter.until_n_ready(chunk_len).await.unwrap();
+                let total_limiter = match &raised_limiter {
+                    Some((from, raised)) if Instant::now() >= *from => Some(raised.clone()),
+                    _ => rate_limiter.clone(),
+                };
+                if let Some(total_limiter) = total_limiter {
+                    total_limiter.until_n_ready(chunk_len).await.unwrap();
                 }
                 if let Some(stream_rate_limiter) = stream_rate_limiter.clone() {
                     stream_rate_limiter.until_n_ready(chunk_len).await.unwrap();
@@ -1595,6 +1636,53 @@ mod tests {
             (0, 0, 0)
         );
         assert!(fresh.streams().is_empty());
+    }
+
+    /// A total limit raised a moment after the first stream: the bytes
+    /// after it come at the raised rate.
+    #[tokio::test]
+    async fn test_raise_max_speed() {
+        tokio::time::timeout(Duration::from_secs(30), raise_max_speed())
+            .await
+            .unwrap();
+    }
+
+    async fn raise_max_speed() {
+        const SIZE: usize = 1024 * 1024;
+        let builder = || {
+            SimpleTestAdapterBuilder::new()
+                .content_size(SIZE)
+                .support_range(true)
+                .chunk_size(8 * 1024)
+                .speed_burst(Duration::from_millis(20))
+                .max_speed(128 * 1024)
+        };
+        let raised = builder()
+            .raise_max_speed(Duration::from_millis(300), 8 * 1024 * 1024)
+            .build()
+            .unwrap();
+        // The first limiter of the process calibrates its clock, which
+        // takes about 200 ms; the first stream starts the raise's clock.
+        drain(raised.range_stream(0, 1).await.unwrap()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let (bytes, ended) = drain(raised.range_stream(0, SIZE as u64).await.unwrap()).await;
+        assert_eq!((&bytes[..], ended), (&raised.content()[..], true));
+        let fast = started.elapsed();
+        // A MiB at 8 MiB/s is 125 ms; at the 128 KiB/s before the raise,
+        // 8 s.
+        assert!(fast < Duration::from_secs(2), "{fast:?}");
+
+        // A clone counts from its own first stream: still slow.
+        let clone = raised.clone_reset_count();
+        let started = Instant::now();
+        let (bytes, _) = drain(clone.range_stream(0, 64 * 1024).await.unwrap()).await;
+        assert_eq!(bytes.len(), 64 * 1024);
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// Bytes in the region come at its rate; the rest, unlimited, does not

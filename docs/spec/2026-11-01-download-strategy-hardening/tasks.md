@@ -646,7 +646,7 @@
 
 - [x] C40：`DoublingStrategy` 的 `Mode::{Ramp, Hold}`、`reprobe_wait`（30 s 起，没有增益加倍，最多 300 s，有增益恢复）、待判断扩张的截止时间 `connect_timeout + 5 × grow_interval`；保持时补位到 `h`、到时间从当时的活跃数 `b ≥ h` 试探到 `min(2b, 上限)`，至少加 `⌈b/2⌉`（D31，2026-11-16）；`want` 由扩张一侧交给并发控制，对冲只看 `limit_cap`（design §9.2、§14.33）。
 - [x] C40：design §14.14、§14.18 里“停滞之后不再扩张、不补位”和“上限处无限期等待”标为已被取代；新增 §14.33、G11、D28–D31。
-- [ ] C41：bench 场景 `s5_silent_limit_4`（C36 的服务器，`Close` 和 `Hang` 两种）、`s6_plateau_then_more_bandwidth`、`s1_max32` 加长到能判断 16 → 32；重跑原有的表，更新 design §14.17。
+- [x] C41：bench 场景 `s5_silent_limit_4`（C36 的服务器，`Close` 和 `Hang` 两种）、`s6_plateau_then_more_bandwidth`、能判断 16 → 32 的 `s1_max32_long`（256 MiB；`s1_max32` 保持 128 MiB，和以前的数字可比）；重跑原有的表，更新 design §14.17。
 
 **验证**
 
