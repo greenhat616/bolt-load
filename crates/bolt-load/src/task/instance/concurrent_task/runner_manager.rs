@@ -448,21 +448,43 @@ impl RunnerManager {
         self.admission.on_started(runner_id, others);
     }
 
-    /// Record what an attempt that ended in `phase` with `error` tells
-    /// about the server's admission, once its chunk and its slot are given
-    /// back (design §8.3).
+    /// Record what the attempt of `runner_id` that ended in `phase` with
+    /// `error` tells about the server's admission, once its chunk and its
+    /// slot are given back (design §8.3); the attempts still connecting
+    /// are seen beside the proven ones of this moment.
     ///
     /// Returns the class, and whether the failure is exempt from its
     /// range's budget, as decided with the state of this moment.
-    fn record_attempt_end(&mut self, phase: AttemptPhase, error: &TaskError) -> Admission {
+    fn record_attempt_end(
+        &mut self,
+        runner_id: RunnerId,
+        phase: AttemptPhase,
+        error: &TaskError,
+    ) -> Admission {
         let class = classify(phase, error);
         let proven = self.chunk_planner.get_proven_runners_count();
         let others = self.in_flight();
-        self.admission.on_attempt_ended(class, proven, others);
+        self.admission
+            .on_attempt_ended(runner_id, class, proven, others);
+        self.observe_connecting();
         Admission {
             class,
             exempt: self.admission.exempts(class, proven, others),
         }
+    }
+
+    /// Tell the evidence which attempts are connecting now, and how many
+    /// are proven beside them (design §8.3): at each spawn, strategy tick
+    /// and failure, and when an attempt becomes proven.
+    pub(super) fn observe_connecting(&mut self) {
+        self.observe_connecting_with(self.chunk_planner.get_proven_runners_count());
+    }
+
+    /// [`Self::observe_connecting`] with `proven` attempts proven.
+    fn observe_connecting_with(&mut self, proven: usize) {
+        let others = self.in_flight().saturating_sub(1);
+        self.admission
+            .observe_connecting(self.connecting_data.keys().copied(), proven, others);
     }
 
     // ==================== ID Generator Related Methods ====================
@@ -473,6 +495,7 @@ impl RunnerManager {
     /// stops, even after its chunk is complete.
     pub fn try_reserve_slot(&mut self) -> Option<RunnerSlot> {
         let runner_id = self.id_generator.next()?;
+        self.admission.forget(runner_id);
         let (sender, limits) = limit_mailbox();
         self.limit_senders.insert(runner_id, sender);
         Some(RunnerSlot { runner_id, limits })
@@ -585,6 +608,8 @@ impl RunnerManager {
             stop.cancel();
         }
         self.stopping.insert(loser, StopReason::Loser);
+        // A beaten side is never classified (design §8.3).
+        self.admission.forget(loser);
         self.data_aggregator.unregister(loser);
         self.connecting_data.remove(&loser);
         self.meters.remove(&loser);
@@ -977,6 +1002,7 @@ impl RunnerManager {
         match spawn(runner_id, limits) {
             Ok(channels) => {
                 self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx);
+                self.observe_connecting();
                 self.stops.insert(runner_id, channels.stop);
                 // Its silence starts at its spawn.
                 channels.reads.note_at(now);
@@ -2125,6 +2151,36 @@ mod tests {
         assert!(!manager.admission().is_connected(1));
         let admission = manager.admission_mut();
         (admission.streak_count(), admission.take_congestion())
+    }
+
+    /// The first bytes accepted of an attempt show the evidence the
+    /// connects beside it at once, though no tick may come before it
+    /// finishes (design §8.3).
+    #[tokio::test]
+    async fn test_an_attempt_that_becomes_proven_is_seen_beside_the_connects() {
+        let mut manager = RunnerManager::new(1000, 4);
+        let (mut lifecycle_tx, mut data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        manager.tick().await;
+        let (_connecting, _data) = spawn_test_runner(&mut manager, 500..1000).unwrap();
+        assert!(!manager.admission().is_seen(1), "nothing proven yet");
+        push_frame(&mut data_tx, 10).await;
+        assert!(manager.tick().await.downloaded.is_some());
+        assert!(manager.admission().is_seen(1));
+    }
+
+    /// A connect seen beside a proven runner, then cancelled, is never
+    /// classified: what it was seen beside is forgotten at once.
+    #[tokio::test]
+    async fn test_a_cancelled_connect_forgets_what_it_was_seen_beside() {
+        let (mut manager, _proven, _data) = manager_with_a_proven_runner().await;
+        let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 500..1000).unwrap();
+        assert!(manager.admission().is_seen(1));
+        lifecycle_tx
+            .try_push(LifecycleEvent::failed(TaskError::Cancelled))
+            .unwrap();
+        assert!(manager.tick_lifecycle_only().await.failure.is_none());
+        assert!(!manager.admission().is_seen(1));
     }
 
     /// One case per row of the classification (design §8.3), through the

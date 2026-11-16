@@ -12,6 +12,8 @@ mod doubling_strategy;
 mod failure_policy;
 mod slow_restart;
 
+#[cfg(test)]
+pub use admission_evidence::UNSEEN;
 pub use admission_evidence::{
     AdmissionClass, AdmissionEvidence, AttemptPhase, classify, streak_gap,
 };
@@ -156,6 +158,7 @@ impl StrategyControl {
         tick: &TickSample,
     ) -> Option<(&'static str, Vec<StrategyAction>)> {
         let congested = signals.congested;
+        runner_manager.observe_connecting();
         // A probe past its deadline wants nothing more from this step on.
         self.doubling_strategy.expire(now);
         let want = self.want();

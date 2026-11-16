@@ -1,6 +1,9 @@
 //! The limit controller with injected time (design §8.3).
 
-use super::{super::admission_evidence::AdmissionClass, *};
+use super::{
+    super::admission_evidence::{AdmissionClass, UNSEEN},
+    *,
+};
 
 const TICK: Duration = DEFAULT_STRATEGY_TICK_INTERVAL;
 const SECOND: Duration = Duration::from_secs(1);
@@ -25,7 +28,7 @@ fn context(
 }
 
 fn congest(admission: &mut AdmissionEvidence) {
-    admission.on_attempt_ended(AdmissionClass::Congestion, 1, 1);
+    admission.on_attempt_ended(UNSEEN, AdmissionClass::Congestion, 1, 1);
 }
 
 #[test]
@@ -163,14 +166,14 @@ impl Ctl {
         let others = self.admission.connected();
         for _ in 0..n {
             self.admission
-                .on_attempt_ended(AdmissionClass::Refused, 1, others);
+                .on_attempt_ended(UNSEEN, AdmissionClass::Refused, 1, others);
         }
     }
 
     fn refuse_uncorroborated(&mut self) {
         let others = self.admission.connected();
         self.admission
-            .on_attempt_ended(AdmissionClass::Refused, 0, others);
+            .on_attempt_ended(UNSEEN, AdmissionClass::Refused, 0, others);
     }
 
     /// The step at `now`, with `want` wanted; returns the new cap, if the
@@ -380,7 +383,7 @@ fn test_a_short_stream_with_bytes_does_not_lower_the_limit() {
     let mut ctl = Ctl::new(16, 4, t0);
     let class = classify(AttemptPhase::Streaming, &TaskError::SmallerThanTotalSize);
     for _ in 0..5 {
-        ctl.admission.on_attempt_ended(class, 4, 4);
+        ctl.admission.on_attempt_ended(UNSEEN, class, 4, 4);
     }
     assert_eq!(ctl.ticks(t0 + TICK, t0 + 3 * TICK), []);
 }
