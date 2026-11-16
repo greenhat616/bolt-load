@@ -3,6 +3,7 @@ use std::{rc::Rc, sync::Arc};
 
 use futures::task::{LocalSpawn, Spawn, SpawnError};
 
+mod deadline;
 mod event_timer;
 #[cfg(feature = "smol")]
 mod smol_impl;
@@ -12,6 +13,7 @@ mod timer_source;
 #[cfg(feature = "tokio")]
 mod tokio_impl;
 
+pub(crate) use deadline::{Deadline, capped_wait, instant_after};
 pub(crate) use event_timer::EventTimer;
 #[cfg(feature = "smol")]
 pub use smol_impl::*;
@@ -83,6 +85,21 @@ pub trait TimerBuilder {
         })
     }
 
+    /// Sleep until [`Self::now`] reaches `at`; a target reached ends at
+    /// once.
+    ///
+    /// The default sleeps for the time from `now()` to `at`, so it ends late
+    /// by however far the clock moved between that read and the start of
+    /// the sleep. The engine's deadlines still fire once polled at or after
+    /// their target, but on a runtime that wakes only the sleeps due, the
+    /// wake-up for the target comes no earlier than that late end. A
+    /// runtime whose clock can move meanwhile, such as a virtual clock
+    /// advanced from another thread, should override it to register `at`
+    /// itself, for exact wake-ups; the tokio and smol runtimes do.
+    fn sleep_until(&self, at: std::time::Instant) -> Sleep {
+        sleep_for_the_time_left(self, at)
+    }
+
     /// The current time on this runtime's clock.
     ///
     /// The engine reads every instant it compares with a timer of this
@@ -91,9 +108,44 @@ pub trait TimerBuilder {
     /// moved by `d`. The default is [`std::time::Instant::now`]; a runtime
     /// whose timers run on another clock, such as a paused or virtual one,
     /// overrides it.
+    ///
+    /// The engine waits at most 30 years at once: every wait it arms, a
+    /// timeout, a backoff or a metadata retry, generated with jitter or
+    /// not, is capped there. For the whole download, the clock must stay at
+    /// least 30 years plus the longest configured duration (timeouts,
+    /// metadata retry delays) before the end of what an
+    /// [`Instant`](std::time::Instant) holds, a duration over 30 years, such
+    /// as [`Duration::MAX`], counting as 30 years: so never more than 60
+    /// years. A tokio runtime's clock must likewise stay that far before
+    /// the end of its timer's range, the milliseconds a `u64` counts from
+    /// the runtime's start, so that every target fits in it too, as an
+    /// unadvanced or normally advanced runtime does. The standard clock and
+    /// smol's and tokio's, paused or not, meet this by a wide margin.
+    /// Within it, no wait the engine arms for a duration configured or sent
+    /// by a server overflows an instant or fires before its capped
+    /// deadline: a configured 31-year timeout fires at 30 years. Outside it
+    /// there is no guarantee, and the engine's arithmetic and tokio's own
+    /// timers may panic.
+    ///
+    /// [`Duration::MAX`]: std::time::Duration::MAX
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
     }
+}
+
+/// The default [`TimerBuilder::sleep_until`]: `rt`'s sleep for the time
+/// from its `now()` to `at`.
+pub(crate) fn sleep_for_the_time_left<T: TimerBuilder + ?Sized>(
+    rt: &T,
+    at: std::time::Instant,
+) -> Sleep {
+    let now = rt.now();
+    if now >= at {
+        // A sleep of nothing may not work: the default `sleep` is built on a
+        // periodic timer.
+        return Box::pin(std::future::ready(()));
+    }
+    rt.sleep(at - now)
 }
 
 /// ThreadedRuntime is a wrapper around the different multi-threaded runtime libraries.
@@ -125,6 +177,16 @@ impl TimerBuilder for ThreadedRuntimeImpl {
             #[cfg(feature = "smol")]
             ThreadedRuntimeImpl::Smol(rt) => rt.sleep(duration),
             ThreadedRuntimeImpl::Other(rt) => rt.sleep(duration),
+        }
+    }
+
+    fn sleep_until(&self, at: std::time::Instant) -> Sleep {
+        match self {
+            #[cfg(feature = "tokio")]
+            ThreadedRuntimeImpl::Tokio(rt) => rt.sleep_until(at),
+            #[cfg(feature = "smol")]
+            ThreadedRuntimeImpl::Smol(rt) => rt.sleep_until(at),
+            ThreadedRuntimeImpl::Other(rt) => rt.sleep_until(at),
         }
     }
 
@@ -303,6 +365,16 @@ impl TimerBuilder for LocalRuntimeImpl {
             #[cfg(feature = "smol")]
             LocalRuntimeImpl::Smol(rt) => rt.sleep(duration),
             LocalRuntimeImpl::Other(rt) => rt.sleep(duration),
+        }
+    }
+
+    fn sleep_until(&self, at: std::time::Instant) -> Sleep {
+        match self {
+            #[cfg(feature = "tokio")]
+            LocalRuntimeImpl::Tokio(rt) => rt.sleep_until(at),
+            #[cfg(feature = "smol")]
+            LocalRuntimeImpl::Smol(rt) => rt.sleep_until(at),
+            LocalRuntimeImpl::Other(rt) => rt.sleep_until(at),
         }
     }
 

@@ -9,6 +9,7 @@ use std::{
 use super::{
     DEFAULT_STRATEGY_TICK_INTERVAL, Strategy, StrategyAction, admission_evidence::AdmissionEvidence,
 };
+use crate::runtime::capped_wait;
 
 /// Corroborated refusals in a row before the silent rule lowers the limit.
 const REFUSALS_IN_A_ROW: usize = 3;
@@ -42,9 +43,9 @@ impl ConcurrencyControlConfig {
             base_wait: Duration::from_secs(30),
             max_wait: Duration::from_secs(300),
             observation,
-            // Time to connect, to be observed, and two ticks to see it.
-            // A deadline past what an instant can hold is never reached.
-            step_deadline: connect_timeout
+            // Time to connect, as the runners wait for it, capped at 30
+            // years, to be observed, and two ticks to see it.
+            step_deadline: capped_wait(connect_timeout)
                 .saturating_add(observation)
                 .saturating_add(2 * tick_interval),
             tick_interval,

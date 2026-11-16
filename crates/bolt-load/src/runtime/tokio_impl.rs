@@ -30,6 +30,10 @@ impl TimerBuilder for LocalTokioRuntime {
         sleep_on(self.handle(), duration)
     }
 
+    fn sleep_until(&self, at: Instant) -> Sleep {
+        sleep_until_on(self.handle(), at)
+    }
+
     fn now(&self) -> Instant {
         now_on(self.handle())
     }
@@ -40,6 +44,28 @@ impl TimerBuilder for LocalTokioRuntime {
 fn sleep_on(handle: &tokio::runtime::Handle, duration: Duration) -> Sleep {
     let _guard = handle.enter();
     Box::pin(tokio::time::sleep(duration))
+}
+
+/// A tokio sleep until `at` registered with `handle`'s timer.
+fn sleep_until_on(handle: &tokio::runtime::Handle, at: Instant) -> Sleep {
+    let _guard = handle.enter();
+    Box::pin(tokio::time::sleep_until(tokio_target(at)))
+}
+
+/// `at` as a tokio deadline. Tokio rounds a deadline up to its millisecond
+/// tick by adding just under a millisecond, which overflows within that of
+/// the end of what an [`Instant`] holds; a target there is a millisecond
+/// earlier, so it may fire up to a millisecond early. The clock contract
+/// of [`TimerBuilder::now`] keeps every target out of that millisecond, not
+/// only the clock: a target is `now` plus a configured duration capped at
+/// 30 years, or plus one of the engine's own durations of minutes at most,
+/// so it stays 30 years, less those minutes at most, before the end.
+fn tokio_target(at: Instant) -> tokio::time::Instant {
+    const MS: Duration = Duration::from_millis(1);
+    match at.checked_add(MS) {
+        Some(_) => at.into(),
+        None => (at - MS).into(),
+    }
 }
 
 /// A periodic timer registered with `handle`'s timer, whatever runtime the
@@ -133,6 +159,10 @@ impl TimerBuilder for TokioThreadedRuntime {
         sleep_on(self.handle(), duration)
     }
 
+    fn sleep_until(&self, at: Instant) -> Sleep {
+        sleep_until_on(self.handle(), at)
+    }
+
     fn now(&self) -> Instant {
         now_on(self.handle())
     }
@@ -203,6 +233,33 @@ impl Spawn for TokioThreadedRuntime {
             }
         }
         Ok(())
+    }
+}
+
+/// A one-shot timer on a tokio runtime's clock, re-armed in place.
+pub(crate) struct TokioDeadline {
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    handle: tokio::runtime::Handle,
+}
+
+impl TokioDeadline {
+    /// A timer at `at` registered with `handle`'s timer.
+    pub(crate) fn new(handle: &tokio::runtime::Handle, at: Instant) -> Self {
+        let _guard = handle.enter();
+        Self {
+            sleep: Box::pin(tokio::time::sleep_until(tokio_target(at))),
+            handle: handle.clone(),
+        }
+    }
+
+    pub(crate) fn reset(&mut self, at: Instant) {
+        let _guard = self.handle.enter();
+        self.sleep.as_mut().reset(tokio_target(at));
+    }
+
+    #[inline]
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        std::future::Future::poll(self.sleep.as_mut(), cx)
     }
 }
 

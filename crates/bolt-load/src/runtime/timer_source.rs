@@ -1,11 +1,16 @@
 //! Where a runner reads its time from.
 
-use std::{fmt, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use super::{ThreadedRuntime, ThreadedRuntimeImpl};
+use super::{Deadline, ThreadedRuntime, ThreadedRuntimeImpl, instant_after};
 
 /// The clock a runner reads, and its timeouts run on: its task's runtime's,
-/// or, for a runner built without one, the standard clock.
+/// or, for a runner built without one, the standard clock with `async-io`'s
+/// timers.
 ///
 /// It does not own a tokio or smol runtime: it holds a tokio runtime by its
 /// handle and a smol runtime by nothing, its timers needing none, so
@@ -46,6 +51,20 @@ impl TimerSource {
             #[cfg(feature = "smol")]
             Clock::Smol => Instant::now(),
             Clock::Other(rt) => rt.now(),
+        }
+    }
+
+    /// A deadline `after` `now` on the source's clock; without a runtime,
+    /// `async-io`'s timer on the standard clock.
+    pub(crate) fn deadline_after(&self, now: Instant, after: Duration) -> Deadline {
+        let at = instant_after(now, after);
+        match &self.0 {
+            Clock::Standard => Deadline::fallback(at),
+            #[cfg(feature = "tokio")]
+            Clock::Tokio(handle) => Deadline::tokio(handle, at),
+            #[cfg(feature = "smol")]
+            Clock::Smol => Deadline::smol(at),
+            Clock::Other(rt) => Deadline::custom(rt.clone(), at),
         }
     }
 }

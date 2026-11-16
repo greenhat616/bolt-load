@@ -46,6 +46,13 @@ mod emit;
 mod lifecycle;
 mod stream;
 
+/// The most steps one poll of [`TaskRunner::run`] takes before it yields,
+/// waking itself. A stream whose items are always ready, such as empty
+/// ones that leave the idle timeout running, would otherwise keep the poll
+/// going and starve a single-threaded executor, whose timer driver then
+/// never fires that timeout.
+pub(super) const MAX_STEPS_PER_POLL: usize = 64;
+
 type RunResult = Result<(), TaskRunError>;
 type Cancelled = Pin<Box<WaitForCancellationFutureOwned>>;
 
@@ -143,7 +150,7 @@ impl<'a> RunnerLoop<'a> {
             RunnerInput::Connecting(_) => Phase::Connecting(ConnectingState::new(
                 runner.connect_timeout,
                 runner.built_at,
-                runner.timer_source.now(),
+                &runner.timer_source,
             )),
             RunnerInput::Abandoned => Phase::Stopped,
         };
@@ -168,10 +175,17 @@ impl<'a> RunnerLoop<'a> {
         Poll::Ready(false)
     }
 
+    /// Run to the end, yielding after [`MAX_STEPS_PER_POLL`] steps.
     fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut steps = 0;
         while !matches!(self.phase, Phase::Stopped) {
+            if steps == MAX_STEPS_PER_POLL {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             let step = ready!(self.poll_step(cx));
             self.handle_step(step);
+            steps += 1;
         }
         Poll::Ready(())
     }
@@ -242,15 +256,21 @@ impl<'a> RunnerLoop<'a> {
                 self.begin_stop(Err(TaskError::StreamError { source }.into()));
             }
             Step::ConnectTimeout => {
+                // The time waited: the timeout capped as every wait is, by
+                // path, as the import would go unused without `tracing`.
                 warn!(
                     phase = "connecting",
-                    "runner: not connected within {:?}", self.runner.connect_timeout
+                    "runner: not connected within {:?}",
+                    crate::runtime::capped_wait(self.runner.connect_timeout)
                 );
                 self.begin_stop(Err(TaskError::Timeout.into()));
             }
             Step::Started(Ok(())) => {
                 trace!("runner: started");
-                self.phase = Phase::Streaming(StreamingState::new(self.runner.idle_timeout));
+                self.phase = Phase::Streaming(StreamingState::new(
+                    self.runner.idle_timeout,
+                    &self.runner.timer_source,
+                ));
             }
             Step::Started(Err(error)) => self.begin_stop(Err(error)),
             Step::Cancelled => {
@@ -266,7 +286,7 @@ impl<'a> RunnerLoop<'a> {
             Step::IdleTimeout => {
                 warn!(
                     "runner: no data received in the last {:?}",
-                    self.runner.idle_timeout
+                    crate::runtime::capped_wait(self.runner.idle_timeout)
                 );
                 self.flush(Continuation::IdleTimeout);
             }
