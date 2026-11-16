@@ -74,6 +74,21 @@ impl ManualClock {
         }
     }
 
+    /// How many distinct wakers wait for the clock.
+    pub(crate) fn waiting(&self) -> usize {
+        self.0.lock().unwrap().waiting.len()
+    }
+
+    /// Wait, a few real seconds at most, until something waits for the
+    /// clock: the code under test has polled its sleeps.
+    pub(crate) async fn until_waited_on(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.waiting() == 0 {
+            assert!(Instant::now() < deadline, "nothing waits for the clock");
+            async_io::Timer::after(Duration::from_millis(1)).await;
+        }
+    }
+
     /// A sleep that ends once the clock reaches `at`.
     pub(crate) fn sleep_until(&self, at: Instant) -> ManualSleep {
         ManualSleep {
