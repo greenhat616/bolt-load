@@ -6,6 +6,7 @@ use smol_cancellation_token::CancellationToken;
 
 use crate::{
     adapter::{AdapterError, AnyBytesStream},
+    runtime::TimerSource,
     task::RunnerId,
 };
 
@@ -155,6 +156,8 @@ pub struct TaskRunner {
     /// Stamped as it reads its body, see
     /// [`TaskRunnerBuilder::read_activity`].
     read_activity: Option<ReadActivity>,
+    /// See [`TaskRunnerBuilder::timer_source`].
+    timer_source: TimerSource,
 }
 
 /// When a runner was last active reading its body, shared with the loop

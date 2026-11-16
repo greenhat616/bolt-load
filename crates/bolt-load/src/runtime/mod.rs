@@ -8,12 +8,14 @@ mod event_timer;
 mod smol_impl;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod timer_source;
 #[cfg(feature = "tokio")]
 mod tokio_impl;
 
 pub(crate) use event_timer::EventTimer;
 #[cfg(feature = "smol")]
 pub use smol_impl::*;
+pub(crate) use timer_source::TimerSource;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::*;
 

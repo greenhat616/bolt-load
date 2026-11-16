@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use async_io::Timer;
@@ -42,6 +43,8 @@ pub(crate) struct SingletonTaskInner {
     adapter: Arc<AnyAdapter>,
     reporter: ProgressReporter,
     options: TaskOptions,
+    /// The runtime the runner's clock is on.
+    rt: ThreadedRuntimeImpl,
 }
 
 impl SingletonTaskInner {
@@ -49,7 +52,7 @@ impl SingletonTaskInner {
         adapter: Arc<AnyAdapter>,
         output: OutputFile,
         total: Option<u64>,
-        _rt: ThreadedRuntimeImpl,
+        rt: ThreadedRuntimeImpl,
         options: TaskOptions,
         reporter: ProgressReporter,
     ) -> Self {
@@ -60,6 +63,7 @@ impl SingletonTaskInner {
             adapter,
             reporter,
             options,
+            rt,
         }
     }
 }
@@ -115,7 +119,7 @@ impl SingletonTaskInner {
 
     /// Publish a periodic progress sample.
     fn handle_timer_tick(&self, sampler: &mut SpeedSampler, meter: &mut usize) {
-        let (_, ema_speed) = sampler.sample(meter);
+        let (_, ema_speed) = sampler.sample(meter, Instant::now());
         if self.reporter.is_observed() {
             self.reporter
                 .report(Transfer::progress(self), Speed::new(ema_speed, 0.0));
@@ -166,11 +170,12 @@ impl SingletonTaskInner {
             .cancel_token(runner_token.clone())
             .idle_timeout(self.options.stream_idle_timeout)
             .connect_timeout(self.options.connect_timeout)
+            .timer_source(&self.rt)
             .build()
             .expect("failed to build task runner");
 
         let mut meter = 0;
-        let mut sampler = SpeedSampler::new();
+        let mut sampler = SpeedSampler::new(Instant::now());
         let mut timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
         // Opened once the runner is connected; data is consumed only then.
         let mut file = None;
@@ -240,7 +245,7 @@ impl SingletonTaskInner {
                                 }
                                 file = Some(self.create_file(tmp_path).await?);
                                 // Measure the speed from the first byte on.
-                                sampler = SpeedSampler::new();
+                                sampler = SpeedSampler::new(Instant::now());
                                 timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
                                 if let Some(file_ready_tx) = file_ready_tx.take() {
                                     let _ = file_ready_tx.send(self.total);

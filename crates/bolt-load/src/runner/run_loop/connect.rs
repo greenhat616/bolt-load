@@ -20,8 +20,8 @@ pub(super) struct ConnectingState {
 }
 
 impl ConnectingState {
-    pub(super) fn new(timeout: Duration, built_at: Instant) -> Self {
-        let started_at = Instant::now();
+    /// Started at `started_at`, the runner's first poll.
+    pub(super) fn new(timeout: Duration, built_at: Instant, started_at: Instant) -> Self {
         trace!(
             "runner: first polled {:?} after it was built",
             started_at - built_at
@@ -56,7 +56,13 @@ impl RunnerLoop<'_> {
     /// Stream from `stream` once `Started` is published.
     pub(super) fn on_connected(&mut self, stream: AnyBytesStream) {
         if let Phase::Connecting(state) = &self.phase {
-            trace!("runner: connected in {:?}", state.started_at.elapsed());
+            trace!(
+                "runner: connected in {:?}",
+                self.runner
+                    .timer_source
+                    .now()
+                    .saturating_duration_since(state.started_at)
+            );
         }
         self.runner.input = RunnerInput::Connected(stream);
     }

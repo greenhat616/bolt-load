@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bolt_load_utils::telemetry::*;
@@ -132,7 +132,7 @@ impl RunnerLoop<'_> {
         let idle_timeout = self.runner.idle_timeout;
         if !item.is_empty() {
             if let Some(activity) = &self.runner.read_activity {
-                activity.note_at(Instant::now());
+                activity.note_at(self.runner.timer_source.now());
             }
             self.streaming().idle.set_after(idle_timeout);
         }
@@ -209,7 +209,7 @@ impl RunnerLoop<'_> {
             // It reads on only past a full buffer of its item, as in
             // `resume_item`; a push that ends it is no read.
             if matches!(then, Continuation::ResumeItem) && matches!(result, Ok(None)) {
-                activity.resume_reading(Instant::now());
+                activity.resume_reading(self.runner.timer_source.now());
             } else {
                 activity.stop_emitting();
             }

@@ -55,6 +55,17 @@ a runner that is still connecting.
   any length, zero included: a stream that ends without an error finishes,
   even with no bytes.
 
+# Clock
+
+A runner built with [`TaskRunnerBuilder::timer_source`] reads the time
+from that runtime's clock, as a singleton task's runner does from the
+task's runtime, paused or not. Without one, it reads the standard clock.
+The runner keeps a tokio runtime's handle, and nothing of a smol runtime,
+so dropping it shuts neither down. Of a custom runtime it keeps a clone of
+the `Arc` it is shared in: if that runtime must not be dropped where the
+runner is, for one owning the tokio runtime the runner runs on, another
+clone of it must outlive the runner.
+
 # Key Types
 
 - [`TaskRunner`] — the stream consumer itself.

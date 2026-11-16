@@ -143,6 +143,7 @@ impl<'a> RunnerLoop<'a> {
             RunnerInput::Connecting(_) => Phase::Connecting(ConnectingState::new(
                 runner.connect_timeout,
                 runner.built_at,
+                runner.timer_source.now(),
             )),
             RunnerInput::Abandoned => Phase::Stopped,
         };

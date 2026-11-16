@@ -29,7 +29,7 @@ async fn written_lags_downloaded_until_the_write_completes() {
     assert_eq!(h.chunk(a).downloaded, 0..2 * FRAME);
     assert_eq!(h.download.manager.written().ranges(), []);
     let published = |h: &mut Harness| {
-        h.download.on_throughput_tick();
+        h.download.on_throughput_tick(now);
         let progress = h.status.borrow_and_update().progress.clone();
         (progress.downloaded, progress.downloaded_chunks)
     };
