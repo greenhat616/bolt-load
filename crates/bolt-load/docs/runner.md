@@ -63,9 +63,10 @@ leaves the executor and its timers their turn.
 
 A runner built with [`TaskRunnerBuilder::timer_source`] reads the time
 from that runtime's clock and runs its connect, idle and drain timeouts
-on that runtime's timers, as a singleton task's runner does with the
-task's runtime: its timeouts follow that clock when it is paused or
-advanced. On tokio the timeouts are tokio timers of that runtime, which
+on that runtime's timers, as the runners of a task do with the task's
+runtime: the times it stamps its read activity with compare with the
+loop's on one clock, and its timeouts follow that clock when it is paused
+or advanced. On tokio the timeouts are tokio timers of that runtime, which
 `tokio-console` shows. The runner keeps a tokio runtime's handle, and
 nothing of a smol runtime, so dropping it shuts neither down. Of a custom
 runtime it keeps a clone of the `Arc` it is shared in: if that runtime

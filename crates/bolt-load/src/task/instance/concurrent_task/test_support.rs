@@ -14,7 +14,7 @@ use futures::{
 };
 
 use crate::runtime::{
-    DowncastLocalRuntime, DynTimer, ThreadedRuntime, Timer, TimerBuilder, TimerImpl,
+    DowncastLocalRuntime, DynTimer, Sleep, ThreadedRuntime, Timer, TimerBuilder, TimerImpl,
 };
 
 #[derive(Clone, Debug)]
@@ -49,6 +49,16 @@ impl DowncastLocalRuntime for FailOnSpawnRuntime {}
 impl TimerBuilder for FailOnSpawnRuntime {
     fn create_delayed_timer(&self, _duration: Duration) -> TimerImpl {
         TimerImpl::Custom(DynTimer::new_box(NoopTimer))
+    }
+
+    /// The loop's deadline, and the timeouts of the runners it spawns, on
+    /// tokio, where it spawns them.
+    fn sleep(&self, duration: Duration) -> Sleep {
+        Box::pin(tokio::time::sleep(duration))
+    }
+
+    fn now(&self) -> std::time::Instant {
+        tokio::time::Instant::now().into_std()
     }
 }
 

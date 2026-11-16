@@ -74,7 +74,6 @@ pub(crate) fn instant_after(now: Instant, after: Duration) -> Instant {
 
 impl ThreadedRuntimeImpl {
     /// A deadline at `at` on this runtime's clock.
-    #[cfg(test)]
     pub(crate) fn deadline(&self, at: Instant) -> Deadline {
         match self {
             #[cfg(feature = "tokio")]
@@ -128,7 +127,6 @@ impl Deadline {
     }
 
     /// When it fires.
-    #[cfg(test)]
     pub(crate) fn at(&self) -> Instant {
         self.at
     }

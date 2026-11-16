@@ -104,6 +104,8 @@ pub struct TaskOptions {
     /// ones included. The concurrency strategy may use fewer, never more.
     pub max_connections: NonZeroUsize,
     /// Fail the task when no new non-empty bytes are accepted for this long.
+    /// Must be non-zero. One over 30 years, such as [`Duration::MAX`], waits
+    /// 30 years, the longest the engine waits at once: never.
     pub no_progress_timeout: Duration,
     /// Fail the concurrent task after this many consecutive failed attempts
     /// without a successful non-empty write in between. Must be at least 1.

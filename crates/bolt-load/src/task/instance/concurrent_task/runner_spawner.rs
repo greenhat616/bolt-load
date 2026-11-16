@@ -78,6 +78,7 @@ impl RunnerSpawner {
             .read_activity(reads.clone())
             .idle_timeout(self.idle_timeout)
             .connect_timeout(self.connect_timeout)
+            .timer_source(&self.rt)
             .build()
             .expect("every runner input is set");
         let worker = RunnerWorker {

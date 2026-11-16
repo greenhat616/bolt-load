@@ -144,7 +144,9 @@ pub enum DownloadError {
     /// adapter suggested none.
     #[snafu(display("the adapter suggested no filename to save into the directory"))]
     MissingFilename,
-    /// The runtime could not run the task.
+    /// The runtime could not run the task: it cannot provide a local
+    /// runtime, or it is a tokio runtime built without its timer, see
+    /// [`TaskBuilder::runtime`](super::TaskBuilder::runtime).
     #[snafu(display("runtime error: {message}"))]
     Runtime { message: String },
     /// The task panicked. Its workers that hold the temporary file were

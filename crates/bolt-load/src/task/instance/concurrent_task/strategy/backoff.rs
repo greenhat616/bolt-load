@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use backon::{BackoffBuilder, ExponentialBuilder};
 
 use super::failure_policy::congestion_retry_after;
-use crate::runner::TaskError;
+use crate::{runner::TaskError, runtime::instant_after};
 
 /// The backoff before the first retry of a range.
 pub const MIN_RANGE_BACKOFF: Duration = Duration::from_millis(500);
@@ -88,10 +88,13 @@ impl Backoff {
     /// and holds back every new connection of the task until then: the
     /// server limits connections, not ranges. A later rejection never ends
     /// the hold earlier.
+    ///
+    /// The instant saturates as the runtime's deadlines do, on a clock near
+    /// the end of what an [`Instant`] holds.
     pub fn on_failure(&mut self, error: &TaskError, attempts: u32, now: Instant) -> Instant {
         let backoff = self.delay(attempts);
         let Some(retry_after) = congestion_retry_after(error) else {
-            return now + backoff;
+            return instant_after(now, backoff);
         };
         self.hold(retry_after, backoff, now)
     }
@@ -119,7 +122,7 @@ impl Backoff {
         let delay = retry_after
             .map_or(backoff, |retry_after| retry_after.max(backoff))
             .min(MAX_CONGESTION_BACKOFF);
-        let until = now + delay;
+        let until = instant_after(now, delay);
         self.congestion_until = Some(self.congestion_until.map_or(until, |held| held.max(until)));
         until
     }
@@ -205,6 +208,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// On a clock 100 ms before the end of what an `Instant` holds, a
+    /// backoff of at least half a second, and a congestion hold, saturate
+    /// instead of panicking.
+    #[test]
+    fn test_backoff_near_the_end_of_instants() {
+        let now =
+            crate::runtime::test_support::last_instant(Instant::now()) - Duration::from_millis(100);
+        let mut backoff = Backoff::without_jitter();
+        assert!(backoff.on_failure(&reset(), 1, now) > now);
+        let until = backoff.on_failure(&congestion(Some(2 * SECOND)), 1, now);
+        assert!(until > now);
+        assert_eq!(backoff.congestion_until(), Some(until));
+        assert!(backoff.hold_congestion(&congestion(None), 3, now));
     }
 
     #[test]

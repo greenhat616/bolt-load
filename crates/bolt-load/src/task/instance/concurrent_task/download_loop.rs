@@ -110,7 +110,7 @@ impl DownloadLoop {
             AdmissionEvidence::with_streak_gap(streak_gap(options.connect_timeout));
         let strategy = StrategyControl::new(max_concurrency, options.connect_timeout);
         let rates = RunnerRates::default();
-        let now = Instant::now();
+        let now = spawner.rt.now();
         let policy = FailurePolicy::new(options, now);
         let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),
@@ -121,7 +121,7 @@ impl DownloadLoop {
         let strategy_timer = spawner
             .rt
             .create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
-        let deadline = DeadlineSource::new(policy.deadline());
+        let deadline = DeadlineSource::new(&spawner.rt, policy.deadline());
         Self {
             spawner,
             manager,
@@ -217,10 +217,11 @@ impl DownloadLoop {
         self.poll_runner(cx)
     }
 
-    /// Handle `event`; the handlers take the time from here, so tests can
-    /// pass their own.
+    /// Handle `event`; the handlers take the time from here, the clock of
+    /// the task's runtime, so tests can pass their own.
     fn handle_event(&mut self, event: LoopEvent) -> Result<ControlFlow<()>> {
-        self.handle_event_at(event, Instant::now())
+        let now = self.spawner.rt.now();
+        self.handle_event_at(event, now)
     }
 
     /// Handle `event` at `now`.
@@ -291,10 +292,11 @@ impl DownloadLoop {
         // ended the task. The data of a changed resource is of the old
         // version: no new checkpoint records it (design §11.5.9).
         if let Some(mut checkpoints) = checkpoints {
+            let now = || spawner.rt.now();
             if matches!(transfer_result, Err(DownloadError::ResourceChanged { .. })) {
-                checkpoints.settle(Instant::now).await;
+                checkpoints.settle(now).await;
             } else {
-                checkpoints.finish(&written, Instant::now).await;
+                checkpoints.finish(&written, now).await;
             }
         }
         progress.downloaded_chunks = written.into_ranges();

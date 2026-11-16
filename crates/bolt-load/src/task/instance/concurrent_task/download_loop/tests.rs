@@ -31,7 +31,7 @@ use crate::{
     runner::TaskError,
     runtime::{
         DowncastLocalRuntime, DynTimer, ThreadedRuntime, ThreadedRuntimeImpl, Timer, TimerBuilder,
-        TimerImpl,
+        TimerImpl, test_support::ManualClock,
     },
     task::{StatusReceiver, status::ProgressReporter},
 };
@@ -173,6 +173,8 @@ struct ScriptedRuntime {
     parked: Arc<std::sync::Mutex<Vec<FutureObj<'static, ()>>>>,
     timers: TimerKind,
     script: TimerScript,
+    /// The clock and sleeps, the standard ones without it.
+    clock: Option<ManualClock>,
 }
 
 impl ScriptedRuntime {
@@ -182,7 +184,20 @@ impl ScriptedRuntime {
             parked: Arc::default(),
             timers,
             script: TimerScript::new(),
+            clock: None,
         }
+    }
+
+    /// Its clock and sleeps on `clock`.
+    fn on_clock(timers: TimerKind, clock: ManualClock) -> Self {
+        Self {
+            clock: Some(clock),
+            ..Self::new(timers)
+        }
+    }
+
+    fn clock(&self) -> &ManualClock {
+        self.clock.as_ref().expect("a runtime on a manual clock")
     }
 
     fn set_mode(&self, mode: SpawnMode) {
@@ -209,6 +224,23 @@ impl Spawn for ScriptedRuntime {
 impl DowncastLocalRuntime for ScriptedRuntime {}
 
 impl TimerBuilder for ScriptedRuntime {
+    /// The loop's deadline and the runners' timeouts, which the scripts do
+    /// not cover.
+    fn sleep(&self, duration: Duration) -> crate::runtime::Sleep {
+        match &self.clock {
+            Some(clock) => Box::pin(clock.sleep_until(clock.now() + duration)),
+            None => Box::pin(async move {
+                async_io::Timer::after(duration).await;
+            }),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        self.clock
+            .as_ref()
+            .map_or_else(Instant::now, ManualClock::now)
+    }
+
     fn create_delayed_timer(&self, duration: Duration) -> TimerImpl {
         match self.timers {
             TimerKind::Scripted => {
@@ -328,7 +360,10 @@ struct LoopHarness {
 
 impl LoopHarness {
     async fn new(timers: TimerKind, options: TaskOptions) -> Self {
-        let rt = ScriptedRuntime::new(timers);
+        Self::on(ScriptedRuntime::new(timers), options).await
+    }
+
+    async fn on(rt: ScriptedRuntime, options: TaskOptions) -> Self {
         let file_writer =
             FileWriter::new_with_kind(Path::new(""), LOOP_TOTAL, FileRangeWriterKind::Null)
                 .await
@@ -368,22 +403,24 @@ impl LoopHarness {
         }
     }
 
-    /// A harness whose deadline is either already due or far away.
+    /// A harness on a manual clock whose deadline is either a nanosecond
+    /// away or far away.
     async fn scripted(deadline_due: bool) -> Self {
         let options = if deadline_due {
             TaskOptions::default().no_progress_timeout(Duration::from_nanos(1))
         } else {
             TaskOptions::default()
         };
-        Self::new(TimerKind::Scripted, options).await
+        let rt = ScriptedRuntime::on_clock(TimerKind::Scripted, ManualClock::new());
+        Self::on(rt, options).await
     }
 
     /// Make `source` ready without running the loop. The deadline is
-    /// armed at construction, see [`Self::scripted`].
+    /// armed at construction a nanosecond away, see [`Self::scripted`].
     fn make_ready(&mut self, source: Source) {
         match source {
             Source::Cancel => self.cancel.cancel(),
-            Source::Deadline => {}
+            Source::Deadline => self.rt.clock().advance(Duration::from_nanos(1)),
             Source::Writer => {
                 // A rejected spawn queues a failed completion synchronously.
                 self.rt.set_mode(SpawnMode::Fail);
@@ -671,6 +708,160 @@ fn test_deadline_moved_repeatedly_before_fire() {
         assert_eq!(outcome(&result), "deadline");
         assert!(elapsed >= TIMEOUT, "fired early: {elapsed:?}");
         harness.teardown().await;
+    });
+}
+
+/// A loop on `clock`, failing without progress after `timeout`.
+async fn on_clock(clock: &ManualClock, timeout: Duration) -> LoopHarness {
+    let rt = ScriptedRuntime::on_clock(TimerKind::Scripted, clock.clone());
+    let options = TaskOptions::default().no_progress_timeout(timeout);
+    LoopHarness::on(rt, options).await
+}
+
+/// A loop on a manual clock, failing without progress after `timeout`.
+async fn on_manual_clock(timeout: Duration) -> (LoopHarness, ManualClock) {
+    let clock = ManualClock::new();
+    (on_clock(&clock, timeout).await, clock)
+}
+
+/// What one turn of [`DownloadLoop::run`] did.
+struct Turn {
+    /// Whether its event was the deadline.
+    deadline: bool,
+    result: Result<ControlFlow<()>>,
+}
+
+/// One turn of [`DownloadLoop::run`]: poll for one event and handle it. A
+/// source stuck ready then shows as the same event at every turn, where
+/// `run` would never return.
+fn turn(download: &mut DownloadLoop, cx: &mut Context<'_>) -> Poll<Turn> {
+    let event = std::task::ready!(download.poll_event(cx));
+    let deadline = matches!(event, LoopEvent::Deadline);
+    Poll::Ready(Turn {
+        deadline,
+        result: download.handle_event(event),
+    })
+}
+
+/// Whether the turn was the deadline, which the loop went on after.
+fn rearmed(turn: Poll<Turn>) -> bool {
+    matches!(
+        turn,
+        Poll::Ready(Turn {
+            deadline: true,
+            result: Ok(ControlFlow::Continue(())),
+        })
+    )
+}
+
+/// The deadline runs on the runtime's clock: it fires at the stale
+/// deadline after progress and re-arms, and fails the loop at the
+/// deadline the progress moved it to, not a nanosecond before. One event
+/// is taken per turn, so a deadline left ready fails the test instead of
+/// spinning the loop.
+#[test]
+fn test_deadline_follows_the_runtime_clock() {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    on_each_executor(|| async {
+        let (mut harness, clock) = on_manual_clock(TIMEOUT).await;
+        clock.advance(TIMEOUT / 2);
+        harness.download.policy.on_progress(clock.now());
+        let wakes = Arc::new(WakeCount::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let download = &mut harness.download;
+        assert!(turn(download, &mut cx).is_pending());
+        let seen = wakes.get();
+        clock.advance(TIMEOUT / 2);
+        assert!(wakes.get() > seen, "the stale deadline wakes the loop");
+        assert!(rearmed(turn(download, &mut cx)), "the stale deadline");
+        assert!(
+            turn(download, &mut cx).is_pending(),
+            "re-armed at the stale deadline"
+        );
+        clock.advance(TIMEOUT / 2 - Duration::from_nanos(1));
+        assert!(turn(download, &mut cx).is_pending(), "a nanosecond early");
+        let seen = wakes.get();
+        clock.advance(Duration::from_nanos(1));
+        assert!(wakes.get() > seen, "the deadline wakes the loop");
+        let Poll::Ready(Turn {
+            deadline: true,
+            result: Err(error),
+        }) = turn(download, &mut cx)
+        else {
+            panic!("not failed at the deadline");
+        };
+        assert_eq!(outcome(&Err(error)), "deadline");
+        with_watchdog(harness.teardown()).await;
+    });
+}
+
+/// An end of a backoff before the deadline wakes the loop at that end on
+/// the runtime's clock, which then re-arms for the deadline.
+#[test]
+fn test_an_earlier_wake_follows_the_runtime_clock() {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    on_each_executor(|| async {
+        let (mut harness, clock) = on_manual_clock(TIMEOUT).await;
+        let t0 = clock.now();
+        harness.download.deadline.wake_by(t0 + TIMEOUT / 5);
+        let wakes = Arc::new(WakeCount::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let download = &mut harness.download;
+        assert!(turn(download, &mut cx).is_pending());
+        clock.advance(TIMEOUT / 5 - Duration::from_nanos(1));
+        assert!(turn(download, &mut cx).is_pending(), "a nanosecond early");
+        let seen = wakes.get();
+        clock.advance(Duration::from_nanos(1));
+        assert!(wakes.get() > seen, "the end of the backoff wakes the loop");
+        assert!(rearmed(turn(download, &mut cx)), "the end of the backoff");
+        assert!(turn(download, &mut cx).is_pending());
+        assert_eq!(download.deadline.at(), t0 + TIMEOUT, "re-armed");
+        with_watchdog(harness.teardown()).await;
+    });
+}
+
+/// The deadline runs on the clock of the failure policy: on a frozen clock
+/// a minute behind the standard one, where the policy's deadline is still
+/// ten seconds away, the loop's first event is not the deadline, which a
+/// timer on the standard clock would report at once.
+#[test]
+fn test_deadline_is_on_the_policy_clock() {
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    on_each_executor(|| async {
+        let behind = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the standard clock runs for a minute");
+        let clock = ManualClock::starting_at(behind);
+        let mut harness = on_clock(&clock, TIMEOUT).await;
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        if let Poll::Ready(turn) = turn(&mut harness.download, &mut cx) {
+            assert!(!turn.deadline, "a deadline ten seconds away fired");
+        }
+        assert_eq!(harness.download.policy.deadline(), behind + TIMEOUT);
+        with_watchdog(harness.teardown()).await;
+    });
+}
+
+/// A no-progress timeout too long for an `Instant` neither panics as the
+/// loop is built nor fires: the deadline is about 30 years away.
+#[test]
+fn test_a_no_progress_timeout_past_the_end_of_instants() {
+    on_each_executor(|| async {
+        let (mut harness, clock) = on_manual_clock(Duration::MAX).await;
+        let t0 = clock.now();
+        let far = t0 + Duration::from_secs(86400 * 365 * 29);
+        assert!(harness.download.deadline.at() > far, "about 30 years away");
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        clock.advance(Duration::from_secs(86400 * 365));
+        if let Poll::Ready(turn) = turn(&mut harness.download, &mut cx) {
+            assert!(!turn.deadline, "fired a year in");
+        }
+        assert!(harness.download.policy.check(clock.now()).is_none());
+        with_watchdog(harness.teardown()).await;
     });
 }
 

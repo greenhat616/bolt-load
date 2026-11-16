@@ -106,6 +106,15 @@ impl TaskBuilder {
 
     /// The runtime the runners are spawned on and whose timer is used.
     /// Required: there is no ambient default.
+    ///
+    /// The task's timeouts, its no-progress deadline and its speed sampling,
+    /// in either mode, are that runtime's timers. A tokio runtime therefore
+    /// needs its timer, `enable_time` or `enable_all` on its builder, or the
+    /// task fails with
+    /// [`DownloadError::Runtime`](super::DownloadError::Runtime). It must
+    /// also be driven for as long as the task runs: a multi-thread runtime
+    /// drives itself, a current-thread one only inside its own `block_on`,
+    /// and its timers do not fire while nothing drives it.
     pub fn runtime(mut self, runtime: ThreadedRuntimeImpl) -> Self {
         self.runtime = Some(runtime);
         self
