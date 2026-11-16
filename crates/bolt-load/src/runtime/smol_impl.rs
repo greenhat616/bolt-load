@@ -39,6 +39,12 @@ impl TimerBuilder for SmolThreadedRuntime {
             smol::Timer::after(duration).await;
         })
     }
+
+    fn sleep_until(&self, at: std::time::Instant) -> Sleep {
+        Box::pin(async move {
+            smol::Timer::at(at).await;
+        })
+    }
 }
 
 pub struct SmolJoinHandle<T> {
@@ -145,6 +151,12 @@ impl TimerBuilder for SmolLocalRuntime {
             smol::Timer::after(duration).await;
         })
     }
+
+    fn sleep_until(&self, at: std::time::Instant) -> Sleep {
+        Box::pin(async move {
+            smol::Timer::at(at).await;
+        })
+    }
 }
 
 impl Default for SmolLocalRuntime {
@@ -166,6 +178,24 @@ impl SmolLocalRuntime {
         F: std::future::Future,
     {
         smol::future::block_on(self.rt.run(future))
+    }
+}
+
+/// A one-shot timer on the standard clock, re-armed in place.
+pub(crate) struct SmolDeadline(smol::Timer);
+
+impl SmolDeadline {
+    pub(crate) fn new(at: std::time::Instant) -> Self {
+        Self(smol::Timer::at(at))
+    }
+
+    pub(crate) fn reset(&mut self, at: std::time::Instant) {
+        self.0.set_at(at);
+    }
+
+    #[inline]
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.0).poll(cx).map(drop)
     }
 }
 

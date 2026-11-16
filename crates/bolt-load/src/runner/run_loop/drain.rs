@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    pin::Pin,
     task::{Context, Poll},
 };
 
@@ -8,7 +7,10 @@ use async_ringbuf::traits::*;
 use bolt_load_utils::telemetry::*;
 
 use super::{Cancelled, Phase, RunResult, RunnerLoop};
-use crate::runner::{DataFrameSender, TaskError, TaskRunError, TaskRunner};
+use crate::{
+    runner::{DataFrameSender, TaskError, TaskRunError, TaskRunner},
+    runtime::Deadline,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runner) enum DataDrainOutcome {
@@ -22,7 +24,7 @@ pub(in crate::runner) enum DataDrainOutcome {
 pub(super) struct DrainState {
     result: RunResult,
     /// Started on the first poll.
-    timeout: Option<async_io::Timer>,
+    timeout: Option<Deadline>,
 }
 
 impl DrainState {
@@ -66,7 +68,7 @@ fn poll_drained(data_tx: &DataFrameSender, cx: &mut Context<'_>) -> Poll<()> {
 fn poll_drain(
     runner: &TaskRunner,
     cancelled: &mut Cancelled,
-    timeout: &mut Option<async_io::Timer>,
+    timeout: &mut Option<Deadline>,
     cx: &mut Context<'_>,
 ) -> Poll<DataDrainOutcome> {
     let Some(data_tx) = runner.data_tx.as_ref() else {
@@ -78,10 +80,11 @@ fn poll_drain(
     if let Poll::Ready(()) = poll_drained(data_tx, cx) {
         return Poll::Ready(DataDrainOutcome::Drained);
     }
-    let timeout = timeout.get_or_insert_with(|| async_io::Timer::after(runner.data_drain_timeout));
-    Pin::new(timeout)
-        .poll(cx)
-        .map(|_| DataDrainOutcome::TimedOut)
+    let timeout = timeout.get_or_insert_with(|| {
+        let source = &runner.timer_source;
+        source.deadline_after(source.now(), runner.data_drain_timeout)
+    });
+    timeout.poll(cx).map(|()| DataDrainOutcome::TimedOut)
 }
 
 impl RunnerLoop<'_> {

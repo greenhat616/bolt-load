@@ -33,6 +33,10 @@ lower a known total. The runners of a concurrent task instead read only the
 latest limit the runner manager sent, so any number of limits can be sent to
 a runner that is still connecting.
 
+A runner takes a bounded number of steps per poll and then yields, waking
+itself, so a stream whose items are always ready, empty ones included,
+leaves the executor and its timers their turn.
+
 # Timeout & Error Handling
 
 - **Idle stream detection**: if no non-empty data arrives within the
@@ -55,16 +59,22 @@ a runner that is still connecting.
   any length, zero included: a stream that ends without an error finishes,
   even with no bytes.
 
-# Clock
+# Clock and Timers
 
 A runner built with [`TaskRunnerBuilder::timer_source`] reads the time
-from that runtime's clock, as a singleton task's runner does from the
-task's runtime, paused or not. Without one, it reads the standard clock.
-The runner keeps a tokio runtime's handle, and nothing of a smol runtime,
-so dropping it shuts neither down. Of a custom runtime it keeps a clone of
-the `Arc` it is shared in: if that runtime must not be dropped where the
-runner is, for one owning the tokio runtime the runner runs on, another
-clone of it must outlive the runner.
+from that runtime's clock and runs its connect, idle and drain timeouts
+on that runtime's timers, as a singleton task's runner does with the
+task's runtime: its timeouts follow that clock when it is paused or
+advanced. On tokio the timeouts are tokio timers of that runtime, which
+`tokio-console` shows. The runner keeps a tokio runtime's handle, and
+nothing of a smol runtime, so dropping it shuts neither down. Of a custom
+runtime it keeps a clone of the `Arc` it is shared in: if that runtime
+must not be dropped where the runner is, for one owning the tokio runtime
+the runner runs on, another clone of it must outlive the runner.
+
+Without a timer source, a runner reads the standard clock and its timeouts
+are `async-io` timers: a runner used on its own needs no runtime of the
+crate.
 
 # Key Types
 

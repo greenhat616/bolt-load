@@ -24,8 +24,12 @@ pub(crate) struct ManualClock(Arc<Mutex<State>>);
 #[derive(Debug)]
 struct State {
     now: Instant,
-    /// The wakers of the sleeps not due yet, woken at every advance.
-    waiting: Vec<Waker>,
+    /// The registrations of the sleeps not due yet, by id: their targets and
+    /// wakers. An advance wakes those it makes due, and only those; a sleep
+    /// dropped before takes its registration with it.
+    waiting: Vec<(u64, Instant, Waker)>,
+    /// The id of the next registration.
+    next_id: u64,
 }
 
 impl Default for ManualClock {
@@ -37,9 +41,15 @@ impl Default for ManualClock {
 impl ManualClock {
     /// A clock that starts at the standard clock's now.
     pub(crate) fn new() -> Self {
+        Self::starting_at(Instant::now())
+    }
+
+    /// A clock that starts at `now`.
+    pub(crate) fn starting_at(now: Instant) -> Self {
         Self(Arc::new(Mutex::new(State {
-            now: Instant::now(),
+            now,
             waiting: Vec::new(),
+            next_id: 0,
         })))
     }
 
@@ -47,14 +57,19 @@ impl ManualClock {
         self.0.lock().unwrap().now
     }
 
-    /// Move the clock by `by`, waking every sleep so the due ones end.
+    /// Move the clock by `by`, waking the sleeps that are due then.
     pub(crate) fn advance(&self, by: Duration) {
-        let waiting = {
+        let due: Vec<Waker> = {
             let mut state = self.0.lock().unwrap();
             state.now += by;
-            std::mem::take(&mut state.waiting)
+            let now = state.now;
+            let (due, waiting) = std::mem::take(&mut state.waiting)
+                .into_iter()
+                .partition(|(_, at, _)| *at <= now);
+            state.waiting = waiting;
+            due.into_iter().map(|(_, _, waker)| waker).collect()
         };
-        for waker in waiting {
+        for waker in due {
             waker.wake();
         }
     }
@@ -64,6 +79,7 @@ impl ManualClock {
         ManualSleep {
             clock: self.clone(),
             at,
+            id: None,
         }
     }
 
@@ -83,20 +99,42 @@ impl ManualClock {
 pub(crate) struct ManualSleep {
     clock: ManualClock,
     at: Instant,
+    /// Its registration with the clock, once polled.
+    id: Option<u64>,
 }
 
 impl Future for ManualSleep {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut state = self.clock.0.lock().unwrap();
-        if state.now >= self.at {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        let mut state = this.clock.0.lock().unwrap();
+        if state.now >= this.at {
             return Poll::Ready(());
         }
-        if !state.waiting.iter().any(|w| w.will_wake(cx.waker())) {
-            state.waiting.push(cx.waker().clone());
+        let waker = cx.waker().clone();
+        match this
+            .id
+            .and_then(|id| state.waiting.iter_mut().find(|(other, ..)| *other == id))
+        {
+            Some((_, _, registered)) => *registered = waker,
+            None => {
+                let id = state.next_id;
+                state.next_id += 1;
+                state.waiting.push((id, this.at, waker));
+                this.id = Some(id);
+            }
         }
         Poll::Pending
+    }
+}
+
+impl Drop for ManualSleep {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let mut state = self.clock.0.lock().unwrap();
+            state.waiting.retain(|(other, ..)| *other != id);
+        }
     }
 }
 
@@ -138,12 +176,87 @@ impl TimerBuilder for ManualRuntime {
         Box::pin(self.clock.sleep_until(self.clock.now() + duration))
     }
 
+    fn sleep_until(&self, at: Instant) -> Sleep {
+        Box::pin(self.clock.sleep_until(at))
+    }
+
     fn now(&self) -> Instant {
         self.clock.now()
     }
 }
 
 impl ThreadedRuntime for ManualRuntime {}
+
+/// A runtime on a [`ManualClock`] whose clock moves by `slip` as each sleep
+/// starts: as another thread could move it between the read of the clock
+/// and the start of the sleep. With `absolute`, its
+/// [`TimerBuilder::sleep_until`] registers the target itself; without, it
+/// is the default, a sleep for the time left as it read the clock.
+#[derive(Clone, Debug)]
+pub(crate) struct SlippingRuntime {
+    pub(crate) clock: ManualClock,
+    pub(crate) slip: Duration,
+    pub(crate) absolute: bool,
+}
+
+impl Spawn for SlippingRuntime {
+    fn spawn_obj(&self, future: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+        tokio::runtime::Handle::current().spawn(future);
+        Ok(())
+    }
+}
+
+impl DowncastLocalRuntime for SlippingRuntime {}
+
+impl TimerBuilder for SlippingRuntime {
+    fn create_delayed_timer(&self, duration: Duration) -> TimerImpl {
+        self.clock.delayed_timer(duration)
+    }
+
+    fn sleep(&self, duration: Duration) -> Sleep {
+        self.clock.advance(self.slip);
+        Box::pin(self.clock.sleep_until(self.clock.now() + duration))
+    }
+
+    fn sleep_until(&self, at: Instant) -> Sleep {
+        if !self.absolute {
+            return super::sleep_for_the_time_left(self, at);
+        }
+        self.clock.advance(self.slip);
+        Box::pin(self.clock.sleep_until(at))
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.now()
+    }
+}
+
+impl ThreadedRuntime for SlippingRuntime {}
+
+/// The furthest an [`Instant`] after `from` goes, to the nanosecond.
+pub(crate) fn last_instant(from: Instant) -> Instant {
+    /// The largest of `0..overflows` for which `fits` holds, `fits(0)` holding.
+    fn largest(mut overflows: u64, fits: impl Fn(u64) -> bool) -> u64 {
+        let mut largest = 0;
+        while overflows - largest > 1 {
+            let mid = largest + (overflows - largest) / 2;
+            if fits(mid) {
+                largest = mid;
+            } else {
+                overflows = mid;
+            }
+        }
+        largest
+    }
+    let secs = largest(u64::MAX, |s| {
+        from.checked_add(Duration::from_secs(s)).is_some()
+    });
+    let base = from + Duration::from_secs(secs);
+    let nanos = largest(1_000_000_000, |n| {
+        base.checked_add(Duration::from_nanos(n)).is_some()
+    });
+    base + Duration::from_nanos(nanos)
+}
 
 /// A threaded runtime on the tokio runtime the caller is in, for tests that
 /// spawn and time on it: the tokio one with the `tokio` feature, otherwise a

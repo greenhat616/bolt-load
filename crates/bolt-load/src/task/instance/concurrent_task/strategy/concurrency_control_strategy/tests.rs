@@ -335,14 +335,20 @@ fn test_a_refusal_after_the_gap_does_not_revive_the_streak() {
     assert_eq!(ctl.admission.streak_count(), 1);
 }
 
-/// A connect timeout too long for the deadline arithmetic saturates: no
-/// panic, and a step then ends only by its marks or its acceptance.
+/// A connect timeout over 30 years counts as the runners wait for it, 30
+/// years, plus the observation and two ticks: no panic, and a step then
+/// ends only by its marks or its acceptance in any time a test sees.
 #[test]
-fn test_a_huge_connect_timeout_saturates_the_step_deadline() {
+fn test_a_huge_connect_timeout_caps_the_step_deadline() {
+    let thirty_years = Duration::from_secs(86400 * 365 * 30);
+    let capped = thirty_years + Duration::from_secs(15) + 2 * TICK;
     let config = ConcurrencyControlConfig::with_connect_timeout(Duration::MAX);
-    assert_eq!(config.step_deadline, Duration::MAX);
+    assert_eq!(config.step_deadline, capped);
     let config = ConcurrencyControlConfig::with_connect_timeout(Duration::MAX - SECOND);
-    assert_eq!(config.step_deadline, Duration::MAX);
+    assert_eq!(config.step_deadline, capped);
+    let config =
+        ConcurrencyControlConfig::with_connect_timeout(thirty_years + 365 * 86400 * SECOND);
+    assert_eq!(config.step_deadline, capped);
 
     let t0 = Instant::now();
     let mut ctl = Ctl::new(8, 4, t0 - TICK);
