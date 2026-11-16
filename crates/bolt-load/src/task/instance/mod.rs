@@ -21,7 +21,8 @@ pub(crate) mod state_file;
 
 #[cfg(all(test, bolt_load_probe_send))]
 mod probe_send;
-#[cfg(test)]
+// Whole tasks run on a local runtime, here the tokio one.
+#[cfg(all(test, feature = "tokio"))]
 mod tests;
 
 use concurrent_task::ConcurrentTaskInner;

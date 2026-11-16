@@ -97,6 +97,7 @@ enum SpawnMode {
 enum TimerKind {
     /// Custom timers that tick once per permit, see [`TimerScript`].
     Scripted,
+    #[cfg(feature = "tokio")]
     Tokio,
     #[cfg(feature = "smol")]
     Smol,
@@ -213,6 +214,7 @@ impl TimerBuilder for ScriptedRuntime {
             TimerKind::Scripted => {
                 TimerImpl::Custom(DynTimer::new_box(self.script.timer(duration)))
             }
+            #[cfg(feature = "tokio")]
             TimerKind::Tokio => TimerImpl::Tokio(crate::runtime::TokioDelayedTimer::new(duration)),
             #[cfg(feature = "smol")]
             TimerKind::Smol => TimerImpl::Smol(crate::runtime::SmolDelayedTimer::new(duration)),
@@ -602,6 +604,7 @@ fn test_timer_rearms_after_consecutive_ticks() {
     });
 
     // Native: the first tick is immediate, then one per sample interval.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     let native = |timers| async move {
         // Before the harness creates the timers the ticks are counted from.
         let started = Instant::now();
@@ -626,6 +629,7 @@ fn test_timer_rearms_after_consecutive_ticks() {
         );
         harness.teardown().await;
     };
+    #[cfg(feature = "tokio")]
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -862,7 +866,7 @@ async fn test_split_handshaking_runner_keeps_the_latest_limit() {
     const TOTAL: u64 = 1 << 30;
     let (connecting, connects) = async_channel::unbounded();
     let (mut download, file_writer) = connecting_loop(
-        ThreadedRuntimeImpl::new_tokio_rt(),
+        crate::runtime::test_support::current_tokio(),
         DynBoltLoadAdapter::new_arc(HandshakeAdapter { connecting }),
         TOTAL,
         64,

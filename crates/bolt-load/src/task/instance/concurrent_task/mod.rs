@@ -325,7 +325,7 @@ mod tests {
             DynBoltLoadAdapter::new_arc(adapter),
             output,
             TOTAL,
-            ThreadedRuntimeImpl::new_tokio_rt(),
+            crate::runtime::test_support::current_tokio(),
             options,
             reporter,
         )
@@ -401,7 +401,7 @@ mod tests {
             DynBoltLoadAdapter::new_arc(adapter),
             output,
             TOTAL,
-            ThreadedRuntimeImpl::new_tokio_rt(),
+            crate::runtime::test_support::current_tokio(),
             options,
             reporter,
         )

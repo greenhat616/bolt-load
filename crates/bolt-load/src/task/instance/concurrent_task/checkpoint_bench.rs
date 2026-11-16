@@ -33,7 +33,6 @@ use super::{
 };
 use crate::{
     adapter::DynBoltLoadAdapter,
-    runtime::ThreadedRuntimeImpl,
     task::{
         TaskOptions,
         instance::{
@@ -161,7 +160,7 @@ async fn download(scenario: Scenario, group: Group) -> Run {
         DynBoltLoadAdapter::new_arc(adapter),
         output,
         total,
-        ThreadedRuntimeImpl::new_tokio_rt(),
+        crate::runtime::test_support::current_tokio(),
         options,
         reporter,
     );

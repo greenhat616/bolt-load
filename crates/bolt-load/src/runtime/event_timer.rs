@@ -59,12 +59,9 @@ impl EventTimer {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::Duration,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;
@@ -80,9 +77,10 @@ mod tests {
     }
 
     /// The first tick is due at once, the next one a period later.
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     async fn assert_ticks_once_then_waits(mut timer: EventTimer) {
         let tick = std::pin::pin!(std::future::poll_fn(|cx| timer.poll_tick(cx)));
-        let watchdog = async_io::Timer::after(Duration::from_secs(5));
+        let watchdog = async_io::Timer::after(std::time::Duration::from_secs(5));
         let ticked = matches!(
             futures::future::select(tick, watchdog).await,
             futures::future::Either::Left(_)
@@ -96,6 +94,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "tokio", feature = "smol"))]
     #[test]
     fn test_native_timers_tick_immediately_then_periodically() {
         #[cfg(feature = "tokio")]
@@ -104,12 +103,12 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let timer = TokioDelayedTimer::new(Duration::from_secs(3600));
+                let timer = TokioDelayedTimer::new(std::time::Duration::from_secs(3600));
                 assert_ticks_once_then_waits(TimerImpl::Tokio(timer).into()).await;
             });
         #[cfg(feature = "smol")]
         futures::executor::block_on(async {
-            let timer = SmolDelayedTimer::new(Duration::from_secs(3600));
+            let timer = SmolDelayedTimer::new(std::time::Duration::from_secs(3600));
             assert_ticks_once_then_waits(TimerImpl::Smol(timer).into()).await;
         });
     }

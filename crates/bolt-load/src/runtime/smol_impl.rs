@@ -269,6 +269,17 @@ mod tests {
         );
     }
 
+    /// Smol's timers run on the standard clock, which its runtimes read.
+    #[test]
+    fn test_clock_is_the_standard_clock() {
+        let before = std::time::Instant::now();
+        let threaded = SmolThreadedRuntime::build_with_threads(1).now();
+        let local = SmolLocalRuntime::new().now();
+        let after = std::time::Instant::now();
+        assert!(before <= threaded && threaded <= after);
+        assert!(before <= local && local <= after);
+    }
+
     #[test]
     fn test_dropping_a_clone_keeps_the_executor_running() {
         let rt = SmolThreadedRuntime::build_with_threads(2);

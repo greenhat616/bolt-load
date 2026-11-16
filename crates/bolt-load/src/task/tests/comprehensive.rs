@@ -505,6 +505,10 @@ impl TimerBuilder for NoLocalRuntime {
     fn sleep(&self, duration: Duration) -> Sleep {
         self.0.sleep(duration)
     }
+
+    fn now(&self) -> std::time::Instant {
+        self.0.now()
+    }
 }
 
 impl ThreadedRuntime for NoLocalRuntime {}
@@ -689,12 +693,14 @@ async fn test_zero_size_file_handling() {
 // Performance Tests
 // ============================================================================
 
+#[cfg(feature = "tokio")]
 async fn timed(task: Task) -> (TaskOutput, Duration) {
     let start_time = Instant::now();
     let output = task.await.expect("the task should succeed");
     (output, start_time.elapsed())
 }
 
+#[cfg(feature = "tokio")]
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
 async fn test_concurrent_vs_singleton_performance() {
@@ -732,6 +738,7 @@ async fn test_concurrent_vs_singleton_performance() {
     );
 }
 
+#[cfg(feature = "tokio")]
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
 async fn test_concurrent_performance_only() {

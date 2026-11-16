@@ -6,6 +6,8 @@ use futures::task::{LocalSpawn, Spawn, SpawnError};
 mod event_timer;
 #[cfg(feature = "smol")]
 mod smol_impl;
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(feature = "tokio")]
 mod tokio_impl;
 
@@ -78,6 +80,18 @@ pub trait TimerBuilder {
             timer.tick().await;
         })
     }
+
+    /// The current time on this runtime's clock.
+    ///
+    /// The engine reads every instant it compares with a timer of this
+    /// runtime from here, so the clock and the timers must share one time
+    /// domain: a sleep of `d` started at `now()` ends when `now()` has
+    /// moved by `d`. The default is [`std::time::Instant::now`]; a runtime
+    /// whose timers run on another clock, such as a paused or virtual one,
+    /// overrides it.
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
 }
 
 /// ThreadedRuntime is a wrapper around the different multi-threaded runtime libraries.
@@ -109,6 +123,16 @@ impl TimerBuilder for ThreadedRuntimeImpl {
             #[cfg(feature = "smol")]
             ThreadedRuntimeImpl::Smol(rt) => rt.sleep(duration),
             ThreadedRuntimeImpl::Other(rt) => rt.sleep(duration),
+        }
+    }
+
+    fn now(&self) -> std::time::Instant {
+        match self {
+            #[cfg(feature = "tokio")]
+            ThreadedRuntimeImpl::Tokio(rt) => rt.now(),
+            #[cfg(feature = "smol")]
+            ThreadedRuntimeImpl::Smol(rt) => rt.now(),
+            ThreadedRuntimeImpl::Other(rt) => rt.now(),
         }
     }
 }
@@ -279,6 +303,16 @@ impl TimerBuilder for LocalRuntimeImpl {
             LocalRuntimeImpl::Other(rt) => rt.sleep(duration),
         }
     }
+
+    fn now(&self) -> std::time::Instant {
+        match self {
+            #[cfg(feature = "tokio")]
+            LocalRuntimeImpl::Tokio(rt) => rt.now(),
+            #[cfg(feature = "smol")]
+            LocalRuntimeImpl::Smol(rt) => rt.now(),
+            LocalRuntimeImpl::Other(rt) => rt.now(),
+        }
+    }
 }
 
 impl LocalRuntimeBuilder for LocalRuntimeBuilderImpl {
@@ -387,6 +421,72 @@ mod tests {
         })
         .await;
         assert!(result.is_ok());
+    }
+
+    /// The clock of a custom runtime is the one both wrappers read.
+    #[test]
+    fn test_custom_clock_is_forwarded() {
+        use test_support::{ManualClock, ManualRuntime};
+
+        struct LocalOnClock(ManualClock);
+        impl LocalRuntimeExecutor for LocalOnClock {
+            fn block_on(&self, _: Box<dyn std::future::Future<Output = ()>>) {
+                unreachable!("only the clock is read")
+            }
+        }
+        impl LocalSpawn for LocalOnClock {
+            fn spawn_local_obj(
+                &self,
+                _: futures::future::LocalFutureObj<'static, ()>,
+            ) -> Result<(), SpawnError> {
+                unreachable!("only the clock is read")
+            }
+        }
+        impl TimerBuilder for LocalOnClock {
+            fn create_delayed_timer(&self, duration: std::time::Duration) -> TimerImpl {
+                self.0.delayed_timer(duration)
+            }
+            fn now(&self) -> std::time::Instant {
+                self.0.now()
+            }
+        }
+        impl LocalRuntime for LocalOnClock {}
+
+        let clock = ManualClock::new();
+        let threaded = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        });
+        let local = LocalRuntimeImpl::Other(Rc::new(LocalOnClock(clock.clone())));
+        let start = clock.now();
+        assert_eq!(threaded.now(), start);
+        assert_eq!(local.now(), start);
+        clock.advance(std::time::Duration::from_secs(3600));
+        let later = start + std::time::Duration::from_secs(3600);
+        assert_eq!(
+            threaded.now(),
+            later,
+            "the threaded wrapper reads the custom clock"
+        );
+        assert_eq!(
+            local.now(),
+            later,
+            "the local wrapper reads the custom clock"
+        );
+    }
+
+    /// A runtime that does not override the clock reads the standard one.
+    #[test]
+    fn test_default_clock_is_the_standard_clock() {
+        struct TimerOnly;
+        impl TimerBuilder for TimerOnly {
+            fn create_delayed_timer(&self, _: std::time::Duration) -> TimerImpl {
+                unreachable!("only the clock is read")
+            }
+        }
+
+        let before = std::time::Instant::now();
+        let now = TimerOnly.now();
+        assert!(before <= now && now <= std::time::Instant::now());
     }
 
     #[cfg(feature = "tokio")]

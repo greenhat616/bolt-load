@@ -23,6 +23,7 @@ The module defines a trait hierarchy for async execution:
   one-shot [`TimerBuilder::sleep`]s such as the metadata retry backoff.
   The default `sleep` waits for the second tick of a delayed timer;
   custom runtimes should override it with their own sleep.
+  [`TimerBuilder::now`] is the clock those timers run on, see below.
 
 # Enum Dispatch
 
@@ -33,6 +34,21 @@ for zero-cost polymorphism:
   `Arc<dyn ThreadedRuntime>`.
 - [`LocalRuntimeImpl`] — Dispatches to `Tokio`, `Smol`, or a custom
   `Rc<dyn LocalRuntime>`.
+
+# Clock and Timers
+
+[`TimerBuilder::now`] reads the clock of a runtime's timers. The engine
+reads every instant it compares with a timer from there, so instants and
+timers stay in one time domain. The default is the standard clock; a
+custom runtime whose timers keep their own time overrides it with them.
+
+The tokio runtimes create their periodic timers and sleeps on their own
+handle, and read tokio's clock through it, whatever runtime the caller is
+in, or none; a periodic timer is also polled in its runtime, so a tick taken
+late schedules the next one on that runtime's clock. A task's timers are so registered with the runtime it was
+given, which is where `tokio-console` shows them, and pausing or advancing
+that runtime's clock (tokio's `test-util`) moves the engine's time. The smol
+runtimes use the standard clock.
 
 # Feature Gates
 
