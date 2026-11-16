@@ -467,6 +467,15 @@ mod tests {
     fn assert_send_sync<T: ?Sized + Send + Sync>() {}
     fn assert_send<T: Send>(_: &T) {}
 
+    /// The engine's timers move with the loops and runners that own them.
+    #[test]
+    fn test_deadlines_and_timer_sources_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Deadline>();
+        assert_send_sync::<TimerSource>();
+        assert_send_sync::<ThreadedRuntimeImpl>();
+    }
+
     #[test]
     fn test_timers_and_their_ticks_are_send() {
         assert_send_sync::<TimerImpl>();

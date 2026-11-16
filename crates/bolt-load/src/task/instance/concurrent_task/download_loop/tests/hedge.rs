@@ -178,7 +178,7 @@ impl Harness {
         Self::on(ScriptedRuntime::new(TimerKind::Scripted), total, options)
     }
 
-    fn on(rt: ScriptedRuntime, total: u64, options: &TaskOptions) -> Self {
+    pub(super) fn on(rt: ScriptedRuntime, total: u64, options: &TaskOptions) -> Self {
         Self::writing(rt, total, options, Vec::new())
     }
 

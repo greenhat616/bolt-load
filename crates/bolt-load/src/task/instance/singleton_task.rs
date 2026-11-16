@@ -370,6 +370,54 @@ mod tests {
 
     const NS: Duration = Duration::from_nanos(1);
 
+    /// The singleton's runner runs its timeouts on the task's runtime: a
+    /// connect that never ends fails when that runtime's clock says so.
+    #[tokio::test]
+    async fn test_runner_times_out_on_the_task_clock() {
+        use bolt_load_tests::adapter::{fault::FaultPlan, simple::SimpleTestAdapterBuilder};
+
+        use crate::{
+            adapter::DynBoltLoadAdapter,
+            task::{instance::ownership::Ownership, status::ProgressReporter},
+        };
+
+        const CONNECT: Duration = Duration::from_secs(30);
+        let dir = tempfile::TempDir::new().unwrap();
+        let clock = ManualClock::new();
+        let rt = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        });
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(1000)
+            .full_connect_plan(FaultPlan::HangAt(0))
+            .build()
+            .unwrap();
+        let (reporter, _status) = ProgressReporter::for_test();
+        let mut inner = SingletonTaskInner::new(
+            DynBoltLoadAdapter::new_arc(adapter),
+            OutputFile::new(dir.path().join("out.bin"), Ownership::new()),
+            Some(1000),
+            rt,
+            TaskOptions::default().connect_timeout(CONNECT),
+            reporter,
+        );
+        let tmp = inner.output.tmp.clone();
+        let token = CancellationToken::new();
+        let advance = async {
+            clock.until_waited_on().await;
+            clock.advance(CONNECT);
+        };
+        let (result, ()) = futures::join!(
+            tokio::time::timeout(Duration::from_secs(5), inner.download_to(&tmp, &token)),
+            advance
+        );
+        let result = result.expect("the runner timed out on the task's clock");
+        assert!(
+            matches!(&result, Err(DownloadError::Transfer { source }) if matches!(**source, TaskError::Timeout)),
+            "{result:?}"
+        );
+    }
+
     /// On the runtime's clock, a sample is due a full period after the
     /// ticks start, then every period; so after a restart, as at
     /// `Started`.

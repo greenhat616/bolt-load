@@ -796,6 +796,117 @@ fn test_deadline_follows_the_runtime_clock() {
     });
 }
 
+/// The events take their time from the runtime's clock: a frame's
+/// progress moves the no-progress deadline from it, and the throughput is
+/// measured over it.
+#[tokio::test]
+async fn test_events_take_the_runtime_time() {
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    let clock = ManualClock::new();
+    let options = TaskOptions::default().no_progress_timeout(TIMEOUT);
+    let rt = ScriptedRuntime::on_clock(TimerKind::Scripted, clock.clone());
+    let mut h = hedge::Harness::on(rt, LOOP_TOTAL, &options);
+    let (runner_id, _ends) = h.spawn_running(0..LOOP_TOTAL, clock.now());
+    clock.advance(Duration::from_secs(2));
+    let tick = h
+        .download
+        .manager
+        .on_data_frame(runner_id, bytes::Bytes::from_static(b"12345"));
+    assert!(
+        h.download
+            .handle_event(LoopEvent::Runner(tick))
+            .unwrap()
+            .is_continue()
+    );
+    assert_eq!(h.download.policy.deadline(), clock.now() + TIMEOUT);
+    assert!(
+        h.download
+            .handle_event(LoopEvent::ThroughputTimer)
+            .unwrap()
+            .is_continue()
+    );
+    let speed = h.status.borrow_and_update().speed;
+    assert_eq!(speed.download, 2.5, "5 bytes over the 2 s since the start");
+}
+
+/// The futures of the loop and its runners, their deadlines and timers
+/// included, can move between threads.
+#[test]
+fn test_loop_and_runner_futures_are_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    fn check(download: &mut DownloadLoop, runner: &mut crate::runner::TaskRunner) {
+        assert_send(&download.run());
+        assert_send(&runner.run());
+    }
+    let _ = check;
+}
+
+/// A loop built with no tokio context, or under another runtime, runs its
+/// deadline and its ticks on its own runtime's paused clock.
+#[cfg(feature = "tokio")]
+#[test]
+fn test_loop_runs_on_its_runtime_clock_wherever_built() {
+    use crate::runtime::TokioThreadedRuntime;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    let paused = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let other = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let rt = ThreadedRuntimeImpl::Tokio(TokioThreadedRuntime::Handle(paused.handle().clone()));
+    for entered in [false, true] {
+        let (connecting, connects) = async_channel::unbounded();
+        let options = TaskOptions::default().no_progress_timeout(TIMEOUT);
+        let (mut download, file_writer, mut status) = {
+            let _guard = entered.then(|| other.enter());
+            futures::executor::block_on(loop_with_status(
+                rt.clone(),
+                DynBoltLoadAdapter::new_arc(HandshakeAdapter { connecting }),
+                LOOP_TOTAL,
+                &options,
+            ))
+        };
+        let real = Instant::now();
+        let start = rt.now();
+        let result = paused.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3600), download.run()).await
+        });
+        let elapsed = rt.now() - start;
+        let result = result.expect("the deadline fired on the paused clock");
+        assert_eq!(outcome(&result), "deadline", "entered: {entered}");
+        assert!(
+            elapsed >= TIMEOUT && elapsed < TIMEOUT + Duration::from_millis(50),
+            "entered: {entered}: {elapsed:?}"
+        );
+        assert!(real.elapsed() < Duration::from_secs(10), "no real wait");
+        // The ticks ran on that clock before the deadline ended the loop:
+        // the strategy started a runner, and the throughput was published.
+        assert!(
+            connects.try_recv().is_ok(),
+            "entered: {entered}: no runner connected"
+        );
+        assert!(
+            progress_published(&mut status),
+            "entered: {entered}: no throughput published"
+        );
+        let (cancel, wg) = (
+            download.spawner.cancel_token.clone(),
+            download.spawner.wg.clone(),
+        );
+        drop(download);
+        cancel.cancel();
+        paused.block_on(with_watchdog(wg.wait()));
+        paused
+            .block_on(with_watchdog(file_writer.finalize()))
+            .unwrap();
+    }
+}
+
 /// An end of a backoff before the deadline wakes the loop at that end on
 /// the runtime's clock, which then re-arms for the deadline.
 #[test]
@@ -953,6 +1064,17 @@ async fn loop_with_options(
     total: u64,
     options: &TaskOptions,
 ) -> (DownloadLoop, FileWriter) {
+    let (download, file_writer, _status) = loop_with_status(rt, adapter, total, options).await;
+    (download, file_writer)
+}
+
+/// [`loop_with_options`], with the receiver of the progress it publishes.
+async fn loop_with_status(
+    rt: ThreadedRuntimeImpl,
+    adapter: Arc<crate::adapter::AnyAdapter>,
+    total: u64,
+    options: &TaskOptions,
+) -> (DownloadLoop, FileWriter, StatusReceiver) {
     let file_writer = FileWriter::new_with_kind(Path::new(""), total, FileRangeWriterKind::Null)
         .await
         .unwrap();
@@ -963,7 +1085,7 @@ async fn loop_with_options(
         CancellationToken::new(),
         crate::runner::DEFAULT_IDLE_TIMEOUT,
     );
-    let (reporter, _status) = ProgressReporter::for_test();
+    let (reporter, status) = ProgressReporter::for_test();
     let download = DownloadLoop::new(
         total,
         spawner,
@@ -972,7 +1094,7 @@ async fn loop_with_options(
         options,
         CancellationToken::new(),
     );
-    (download, file_writer)
+    (download, file_writer, status)
 }
 
 /// A loop whose spawned runners are parked before their first poll, so they
