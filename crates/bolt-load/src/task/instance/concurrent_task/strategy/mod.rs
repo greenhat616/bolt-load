@@ -233,13 +233,17 @@ impl StrategyControl {
     ///
     /// No strategy steps: the runners are only those the concurrency
     /// control would create next, see
-    /// [`ConcurrencyControlStrategy::create_tasks`].
+    /// [`ConcurrencyControlStrategy::create_tasks`]. A probe past its
+    /// deadline at `now` is expired first, as at a tick: a wake-up that
+    /// comes before the tick of the same instant does not admit for it
+    /// (design §14.33).
     pub fn create_tasks(
-        &self,
+        &mut self,
         runner_manager: &mut super::RunnerManager,
         now: Instant,
         signals: LoopSignals,
     ) -> Vec<StrategyAction> {
+        self.doubling_strategy.expire(now);
         if signals.congested {
             return Vec::new();
         }

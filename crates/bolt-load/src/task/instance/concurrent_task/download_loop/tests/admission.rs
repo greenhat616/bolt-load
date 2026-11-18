@@ -1653,6 +1653,80 @@ mod admission_properties {
         }
     }
 
+    /// Invariant 1 for what `op` added: no more runners than the free slots
+    /// below the cap, `cap − allocated`, and the hedges it began, which
+    /// the limit's cap alone gates; never above that cap, neither the
+    /// active runners nor the slots held.
+    fn check_added(op: &Op, before: &Snapshot, after: &Snapshot, limit_cap: usize) {
+        if after.allocated <= before.allocated {
+            return;
+        }
+        let hedges = after.hedged.saturating_sub(before.hedged);
+        let added = after.allocated - before.allocated;
+        assert!(
+            added <= after.cap.saturating_sub(before.allocated) + hedges
+                && after.active <= limit_cap
+                && after.allocated <= limit_cap,
+            "{op:?} added runners above the cap: {before:?} -> {after:?}"
+        );
+    }
+
+    /// A hold of two, four runners and a limit's cap of six: a hedge may
+    /// bring the active runners to five, above what the growth wants.
+    #[test]
+    fn a_hedge_above_a_hold_is_legal() {
+        let t0 = Instant::now();
+        let before = Snapshot {
+            limit: 6,
+            step: None,
+            due: None,
+            cap: 2,
+            want: 2,
+            hedged: 0,
+            active: 4,
+            allocated: 4,
+            loop_limit: 6,
+            streak: 0,
+            third: None,
+            congestion_pending: false,
+            rejected: false,
+            unclear: false,
+            writer_ready: true,
+            last_progress_at: t0,
+            occupied_since: None,
+        };
+        let after = Snapshot {
+            hedged: 1,
+            active: 5,
+            allocated: 5,
+            ..before.clone()
+        };
+        check_added(&Op::Tick(1), &before, &after, 6);
+        let split = Snapshot {
+            hedged: 0,
+            ..after.clone()
+        };
+        let added = std::panic::catch_unwind(|| check_added(&Op::Tick(1), &before, &split, 6));
+        assert!(added.is_err(), "a split above the hold");
+        // Five active and a slot still held at a cap of six: a hedge would
+        // hold seven slots.
+        let held = Snapshot {
+            cap: 6,
+            want: 6,
+            active: 5,
+            allocated: 6,
+            ..before.clone()
+        };
+        let over = Snapshot {
+            hedged: 1,
+            active: 6,
+            allocated: 7,
+            ..held.clone()
+        };
+        let added = std::panic::catch_unwind(|| check_added(&Op::Tick(1), &held, &over, 6));
+        assert!(added.is_err(), "a hedge above the slots");
+    }
+
     /// Invariant 7: the range's charged failures grow only by a failure
     /// that is not exempt, at most once per attempt; only a refusal is
     /// exempt, and a refusal that is not exempt is charged.
@@ -1716,13 +1790,7 @@ mod admission_properties {
         assert!((1..=max_connections).contains(&after.limit), "{after:?}");
         let limit_cap = after.limit + usize::from(after.step.is_some());
         assert_eq!(after.cap, limit_cap.min(after.want), "{after:?}");
-        if after.allocated > before.allocated {
-            let hedges = after.hedged.saturating_sub(before.hedged);
-            assert!(
-                after.active <= after.cap + hedges && after.active <= limit_cap,
-                "{op:?} added runners above the cap: {before:?} -> {after:?}"
-            );
-        }
+        check_added(op, before, after, limit_cap);
         // 2, 3. It rises only by one, when a step is accepted: an on-time
         // tick, after the model's unbroken occupancy for the observation
         // period.

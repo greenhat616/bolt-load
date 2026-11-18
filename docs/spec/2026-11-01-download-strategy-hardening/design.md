@@ -627,13 +627,13 @@ every grow_interval (2 s, aligned with the strategy tick):
   if the last full doubling or probe is past its deadline -> drop it, no verdict
                                                            (a probe: inconclusive)
   if holding h and no probe is pending:
-    if allowed < min(h, cap) and no unassigned range is eligible
-                                                        -> split up to min(h, cap), not judged
+    if allowed < min(h, limit_cap) and no unassigned range is eligible
+                                                        -> split up to min(h, limit_cap), not judged
     else if allowed >= h and now >= reprobe_at and the tick is stable
             (else: no stable tick for growth_deadline since the first
              due tick -> inconclusive, reprobe_at = now + reprobe_wait)
-            and min(2b, cap) − b >= ⌈b/2⌉              (b = allowed)
-                                                        -> probe: split up to min(2b, cap)
+            and min(2b, limit_cap) − b >= ⌈b/2⌉        (b = allowed)
+                                                        -> probe: split up to min(2b, limit_cap)
     else                                                -> skip
   if the last full doubling or probe is not judged yet:
     if allowed < the runners right after it, or a running runner was let off as silent:
@@ -654,7 +654,9 @@ every grow_interval (2 s, aligned with the strategy tick):
     a probe that would get fewer than ⌈b/2⌉ of them waits, still due
 ```
 
-- 停滞之后（C40，PR-7e，D28–D30，2026-11-13 维护者决定，§14.33）：没有增益的翻倍不再让这次下载永久停止扩张，而是**保持**翻倍前的连接数 `h`。保持时扩张一侧的 `want` 是 `h`：没有可领取的区间时用切分补回 `h`（不判断），多出 `h` 的 runner 下完自己的块就结束，不停掉也不补位。等待（`reprobe_wait`，30 s 起）到了之后，**试探**一次：从这时的活跃数 `b ≥ h` 翻倍到 `min(2b, cap)`，至少加上 `⌈b/2⌉` 才做（D31，2026-11-16 维护者决定）；试探进行中 `want` 是试探的目标。试探有增益就回到扩张，等待恢复为 30 s；没有增益就保持 `b`，等待加倍，最多 300 s；不确定（截止时间到了、加的不到一半、低速或静默重启）时等待不变。每个待判断的扩张都有截止时间 `connect_timeout + 5 × grow_interval`（默认 40 s，`connect_timeout` 按截到 30 年的值算，§14.34）：扩张中的翻倍到时不下结论、丢掉，试探到时算不确定。
+- 停滞之后（C40，PR-7e，D28–D30，2026-11-13 维护者决定，§14.33）：没有增益的翻倍不再让这次下载永久停止扩张，而是**保持**翻倍前的连接数 `h`。保持时扩张一侧的 `want` 是 `h`：没有可领取的区间时用切分补回 `h`（不判断），多出 `h` 的 runner 下完自己的块就结束，不停掉也不补位。等待（`reprobe_wait`，30 s 起）到了之后，**试探**一次：从这时的活跃数 `b ≥ h` 翻倍到 `min(2b, limit_cap)`（`limit_cap` 是并发控制给的上限，§8.3；不用 `cap`，它已经含了 `want = h`），至少加上 `⌈b/2⌉` 才做（D31，2026-11-16 维护者决定）；试探进行中 `want` 是试探的目标。试探有增益就回到扩张，等待恢复为 30 s；没有增益就保持 `b`，等待加倍，最多 300 s；不确定（截止时间到了、加的不到一半、低速或静默重启）时等待不变。
+
+- 实现的选择（不是维护者的决定，§14.33、§14.35.3）：每个待判断的扩张都有截止时间 `connect_timeout + 5 × grow_interval`（默认 40 s，`connect_timeout` 按截到 30 年的值算，§14.34）：扩张中的翻倍到时不下结论、丢掉，试探到时算不确定。截止时间在策略 tick 上检查，也在退避结束的唤醒计算准入之前检查。
 
 - 上限处的规则（C28，2026-11-08 维护者决定，§14.18）：到了上限，上一次完整的翻倍照样判断。翻到了上限（按做出翻倍那个 tick 的上限算）、还没判断的翻倍，在活跃数回到翻倍后的数之前不扩张，所以 runner 下完不会补位（C40 起最多等到它的截止时间，§14.33）；只有低速或静默重启停掉一个 runner 时，待判断的翻倍不下结论、直接丢掉（C29，2026-11-08 维护者决定，§14.19），重启的区间被重新领取后可以再切；上限以下的翻倍少了 runner 时不下结论，照常扩张（C11 的做法）。
 - 静默的 runner 不再挡住扩张（C29，2026-11-08 维护者决定，§14.19）：一个正在运行的 runner 已经静默满 `hedge_idle`（2 s），并且它连上也至少这么久了，检查 5 就不算它。静默指 runner 没有读到 body，起点取 runner 自己记下的最近一次读（没有就是 spawn），正在推送一帧的 runner 不算静默（§9.5）；数据通道里有循环还没取走的帧的 runner 不算静默（它在交数据，只是循环落后了）；writer 满的时候谁都不算静默。静默的 runner 不贡献速度，这样的 tick 量不出翻倍的效果，所以和活跃数不够时一样处理：翻到上限的翻倍继续等，上限以下的不下结论、照常扩张。
@@ -3368,11 +3370,11 @@ G1a–G1c 是 IDM 的做法。改进方案 P2（§10）在它之上的扩展—�
     3. 别的情况（还没到时间，或者活跃数少于 `h` 而补位被挡住）不加 runner。
   - `on_grown`：试探加上至少 `⌈b/2⌉` 个才记成待判断的试探，否则立即算不确定；一个都没加（切分被拒绝）也算不确定，不更新上次扩张的时间。补位从不判断。
   - 判断沿用原来的规则：活跃数不少于试探后的数、没有静默的 runner 时判断；有增益回到 `Ramp`、`reprobe_wait` 恢复为 30 s，同一个 tick 接着按 `min(2 × 活跃数, 上限)` 翻倍；没有增益保持 `b`（试探之前的活跃数，`Growth::runners_before`），`reprobe_wait` 加倍，最多 300 s。活跃数不够或有静默的 runner 时，试探和翻到上限的翻倍一样等着。tick 不稳定时，任何待判断的扩张（扩张中的翻倍、试探）都不判断，等下一个稳定的 tick，最多等到截止时间。
-  - 截止时间：待判断的扩张记下做出它的 tick（`Growth::started_at`），截止时间是 `growth_deadline(connect_timeout) = connect_timeout + 5 × GROW_INTERVAL`（默认 40 s，饱和加法；时刻加不上时永不到期）。`DoublingStrategy::expire(now)` 在 `runners_to_add` 开头调用，`StrategyControl::execute` 在并发控制之前也调用，所以即使这个 tick 并发控制有动作、`Doubling` 不走，截止时间也在截止之后第一个 tick 生效，过期试探的目标也不再作为 `want`。扩张中的翻倍到期不下结论、丢掉，接着扩张；试探到期算不确定。
+  - 截止时间：待判断的扩张记下做出它的 tick（`Growth::started_at`），截止时间是 `growth_deadline(connect_timeout) = connect_timeout + 5 × GROW_INTERVAL`（默认 40 s，饱和加法；时刻加不上时永不到期）。`DoublingStrategy::expire(now)` 在 `runners_to_add` 开头调用，`StrategyControl::execute` 在并发控制之前也调用，所以即使这个 tick 并发控制有动作、`Doubling` 不走，截止时间也在截止之后第一个 tick 生效，过期试探的目标也不再作为 `want`。§14.35.3 起，`StrategyControl::create_tasks`（退避结束的唤醒）在计算准入之前也调用它，所以截止之后、tick 之前的唤醒也不再按试探的目标补建。扩张中的翻倍到期不下结论、丢掉，接着扩张；试探到期算不确定。
   - 不确定（截止时间、加的不到一半、低速或静默重启）：保持 `h`，`reprobe_wait` 不变，`reprobe_at` 从这一刻算起。`StrategyControl::on_restarted` 因此多了 `now` 参数。
   - 没有增益的试探之后，多开的 runner 下完自己的块；`want` 回到新的保持数 `b`，活跃数多于它时什么也不加，但下一次试探不等它们下完：到时间就从当时的活跃数试探。
   - D31 的由来（2026-11-16）：C40 的第一版要求活跃数正好是 `h` 才试探。C41 的 s6（§14.17）里 2 → 4 没有增益、保持 2，多开的 2 个是对半切出来的，块和留下的一样长，4 个一直跑到下载结束，试探一次也没有发生，带宽在 20 s 时涨到 8 MiB/s 也只用了 4 条连接（50.6 s，峰值 4）。切分总是对半，速度均匀时所有 runner 差不多同时下完，所以这不是 s6 特有的。维护者决定从当时的活跃数试探。
-  - `strategy/` 里没有 `Instant::now()`，没有新的计时器：等待和截止时间都在策略 tick 上用传入的 `now` 检查。
+  - `strategy/` 里没有 `Instant::now()`，没有新的计时器：等待和截止时间都在策略 tick 上用传入的 `now` 检查（§14.35.3 起，截止时间也在退避结束的唤醒上检查）。
 - **常量。**
 
   | 常量 | 值 |
@@ -3473,3 +3475,13 @@ G1a–G1c 是 IDM 的做法。改进方案 P2（§10）在它之上的扩展—�
 - **连续失败的预算。** 在已证实窗口之上被拒的连接不记区间预算，但仍算一次连续失败（§14.13a）。新测试 `an_exempt_refusal_still_counts_as_a_consecutive_failure`：旁边一个已证实的 runner、允许 1 次连续失败、之后没有写入，第一次免记的拒绝就以 `RetryLimitExceeded` 结束任务，来源是这次拒绝。变异：`FailurePolicy::on_failure` 对免记的失败直接返回，测试失败。
 - **G10 的范围。** G10 说服务器静默限连时任务完成，而 §14.13a 列出的开始时的情况在预算较小时以 `RangeExhausted` 结束（有测试）。G10 加上适用的条件，链到 §14.13a 和 D27。C39 的提交信息（c5dee0a）引用了表里没有的 D19，应为 D27；不改写历史，spec 正文里没有这个错误。
 - **测试的边界。** `tests/retry.rs` 里等 runner 事件和写入完成的地方都经过看门狗（10 s），回归时失败而不是挂住。
+
+#### 14.35.3 #216 的修复（C50）
+
+- **试探的截止时间也在唤醒上生效（M1）。** 截止时间原来只在策略 tick 上检查。循环先处理退避结束的唤醒、再处理同一时刻的 tick：唤醒的准入读到的 `want` 还是过期试探的目标，可以在截止之后为试探的区间开一个连接，下一个 tick 才把 `want` 降回保持数。改为 `StrategyControl::create_tasks` 先用唤醒的 `now` 调 `DoublingStrategy::expire`。测试 `a_retry_at_the_probe_deadline_admits_for_the_hold`：保持 2，从 4 个试探到 8，其中一个在连接中失败，区间的退避在试探的截止时刻结束；7 个在跑，试探一直等到截止；截止时刻的唤醒不开连接，`want` 回到 2。变异：去掉这次调用，测试失败。§9.2、§14.33 里“只在 tick 上检查”的说法已改。
+- **增益正好 10%（astra Minor 5）。** 判断原来是 `speed < before × 1.10`：分别测到的 100 和 110 B/s，乘积舍入成 `110.00000000000001`，算没有增益，等待加倍。改为留出乘积舍入误差的比较（`gained`），相对 `4 × f64::EPSILON`（约 9e-16，几个末位单位）：分别测到的 100 和 110 B/s 算增益。比这个相对容差还小的差距分不出来：测试覆盖到 1 TB/s 时一个 tick 差 1 个字节；不承诺任何量级都能分辨 1 个字节，比如每秒 2e15 字节时差 1 个字节仍算增益（astra 第三轮）。第一版用 `1e-9`，astra 对本 PR 的审查（2026-11-19）指出它放过了能测到的差距：2e9 和 2.199999998e9 B/s，一个 tick 里差 3 个字节；第二版的 `1e-12` 在 1 TB/s 时仍放过差 1 个字节的（astra 第二轮），现在是 `4 × f64::EPSILON`，几个末位单位，只盖得住乘积的舍入。新单元测试 `test_an_exact_ten_percent_gain_ramps_on`、`test_a_gain_just_short_of_ten_percent_holds` 和 `test_a_gain_one_byte_short_of_ten_percent_holds`（1.5 s 的 tick 里 1.5e12 和 1,649,999,999,999 字节）；变异：改回原来的比较，第一个失败；容差放回 `1e-9`，第二个失败；放回 `1e-12`，第三个失败。`test_growth_holds_below_a_ten_percent_gain` 的 1.0999 仍然保持。
+- **性质测试接受合法的对冲（astra Minor 4）。** 不变量 1 原来要求新增之后 `active ≤ cap + 新对冲数`：保持 2、4 个在跑、`limit_cap = 6` 时，一个对冲让活跃数到 5，`5 ≤ 2 + 1` 不成立，可它是合法的。改为比较这一步新增的数：`新增 ≤ (cap − 新增之前占着槽位的数)⁺ + 新对冲数`，并保留 `active ≤ limit_cap`，另加 `allocated ≤ limit_cap`（astra 对本 PR 的审查：5 个活跃、1 个占着槽位、`limit_cap = 6` 时，一个错误的对冲让占着的槽位到 7，原来的检查放过了它）。抽成 `check_added`，新测试 `a_hedge_above_a_hold_is_legal` 用这几个例子：对冲通过，同样的新增换成切分不通过，占着槽位超过 `limit_cap` 的对冲不通过。变异：改回原来的不等式，测试失败。
+- **s6 的正例（astra Minor 8）。** `a_hold_is_probed_from_the_runners_still_running` 和 `a_long_download_grows_again_when_capacity_returns` 在有增益之后断言 `reprobe_at() == None`（判断了、回到扩张），没有增益时断言还在保持。上限 8 时，待判断的试探和回到扩张的 `want` 都是 8，原来的断言分不出来。
+- **s5 的独立时限（astra Minor 7）。** `s5_silent_limit_4` 每一轮的 `task.await` 套上 300 s 的 tokio 时限，引擎丢了唤醒时这一轮失败，不再挂住整个基准测试；服务器在判断结果之前就停掉。
+- **公开文档。** 根目录 `README.md`、`crates/bolt-load/README.md` 和 `docs/task.md` 原来说没有增益的翻倍让扩张永久停止，改为保持、30 s 后从当时的活跃数再试探、等待加倍到 300 s、多开的 runner 不停掉（code-guide §11.4）。§9.2 的两处试探公式改用 `limit_cap`：§8.3 的 `cap` 已经含了 `want`，保持 2 时 `min(2b, cap)` 永远到不了实现的目标 8。截止时间的公式 `connect_timeout + 5 × grow_interval` 从“维护者决定”那一段移到单独的实现段落；30–300 s 的等待由 G11 记着，留在原处。
+- **不修。** 启动时不完整的 tick 作基线（M2）：早已存在，§14.33 的“与设计的偏差”已经写明。

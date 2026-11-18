@@ -89,6 +89,18 @@ pub struct TickSample {
     pub rates: HashMap<RunnerId, f64>,
 }
 
+/// Whether `after` is at least [`MIN_GROWTH_GAIN`] times `before`.
+///
+/// Compared with a relative allowance of four machine epsilons, a few
+/// units in the last place, for the rounding of the product: 100 and
+/// 110 B/s, each measured on its own, gain exactly 10%. A shortfall below
+/// that allowance is not told apart; the tests check one byte a tick at
+/// 1 TB/s.
+fn gained(before: f64, after: f64) -> bool {
+    const TOLERANCE: f64 = 4.0 * f64::EPSILON;
+    after >= before * MIN_GROWTH_GAIN * (1.0 - TOLERANCE)
+}
+
 /// The planned size of design §9.3: [`SPLIT_WINDOW`] at the split runner's
 /// own rate, `donor_speed`, or at `per_runner_speed` before the runner has
 /// a rate; never under `min_chunk_size`.
@@ -256,9 +268,9 @@ impl DoublingStrategy {
     /// A search for a tick to probe from ends at its deadline too.
     ///
     /// The step calls it first; the loop also calls it before the limit
-    /// controller steps, so that a pending probe's goal is not wanted past
-    /// its deadline, and a tick the limit controller acts in still ends
-    /// what is due.
+    /// controller steps, and before it creates runners between ticks, so
+    /// that a pending probe's goal is not wanted past its deadline, and a
+    /// tick the limit controller acts in still ends what is due.
     pub fn expire(&mut self, now: Instant) {
         self.expire_baseline(now);
         let Some(growth) = self.unjudged else {
@@ -376,7 +388,7 @@ impl DoublingStrategy {
                 // deadline (design §14.33).
                 self.unjudged = Some(growth);
                 return 0;
-            } else if speed < growth.speed_before * MIN_GROWTH_GAIN {
+            } else if !gained(growth.speed_before, speed) {
                 self.hold_after(&growth, speed, now);
                 return 0;
             } else {
@@ -790,6 +802,54 @@ mod tests {
         full.held = 2;
         assert_eq!(grow(&mut strategy, full), 0);
         assert_eq!(grow(&mut strategy, context(t0 + TICK, 2, 10.0 * MIB)), 2);
+    }
+
+    /// Speeds measured on their own, 100 and 110 B/s, gain exactly 10%,
+    /// though `100.0 * 1.10` rounds above 110: the ramp goes on.
+    #[test]
+    fn test_an_exact_ten_percent_gain_ramps_on() {
+        let t0 = Instant::now();
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, context(t0, 2, 100.0)), 2);
+        assert_eq!(
+            grow(&mut strategy, context(t0 + GROW_INTERVAL, 4, 110.0)),
+            4
+        );
+        assert_eq!(strategy.reprobe_at(), None);
+    }
+
+    /// The rounding allowance stays far below a measurable shortfall: 2e9
+    /// then 2.199999998e9 B/s, three bytes short of 10% over a tick, holds.
+    #[test]
+    fn test_a_gain_just_short_of_ten_percent_holds() {
+        let t0 = Instant::now();
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, context(t0, 2, 2e9)), 2);
+        assert_eq!(
+            grow(
+                &mut strategy,
+                context(t0 + GROW_INTERVAL, 4, 2.199_999_998e9)
+            ),
+            0
+        );
+        assert_eq!(strategy.want(8), 2);
+    }
+
+    /// One byte short of 10% over a tick of 1.5 s, at 1 TB/s: 1.5e12
+    /// bytes, then 1,649,999,999,999 bytes, holds.
+    #[test]
+    fn test_a_gain_one_byte_short_of_ten_percent_holds() {
+        let t0 = Instant::now();
+        let secs = TICK.as_secs_f64();
+        let before = 1_500_000_000_000.0 / secs;
+        let after = 1_649_999_999_999.0 / secs;
+        let mut strategy = DoublingStrategy::default();
+        assert_eq!(grow(&mut strategy, context(t0, 2, before)), 2);
+        assert_eq!(
+            grow(&mut strategy, context(t0 + GROW_INTERVAL, 4, after)),
+            0
+        );
+        assert_eq!(strategy.want(8), 2);
     }
 
     /// A speed that drops after a growth holds too; the hold is probed
