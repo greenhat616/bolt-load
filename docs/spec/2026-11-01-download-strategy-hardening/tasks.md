@@ -68,6 +68,7 @@
 | | C45 `refactor(runner): drive timeouts through runtime deadlines` | T33 | |
 | | C46 `refactor(task): drive loop deadlines and singleton sampling through the runtime` | T33 | |
 | | C47 `test(runtime): cover timer migration across engine paths` | T33 | |
+| PR-6d 审查修复 | C48 `fix(task): admit runners against held slots and spend a step's trial once` | T34 | PR-6c；放在 PR-6c 之上（`fix/hardening-50-review-fixes`） |
 
 **合并约束**：
 
@@ -707,3 +708,15 @@
   - 两者都开：`cargo test -p bolt-load --no-default-features --features tokio,smol`，864 通过、5 忽略。
   - 都不开：`cargo test -p bolt-load --no-default-features`，714 通过、4 忽略。
   - 这五种组合上 `cargo clippy -p bolt-load <同样的特性> --all-targets -- -D warnings` 和 `cargo bench -p bolt-load <同样的特性> --no-run` 都通过（cargo 对没开 smol 时用不到的 `async-broadcast` 依赖给出的警告不是编译警告，本 PR 之前就有）。`cargo test` 编译 lib、集成测试和示例；`--no-default-features` 也关掉了 `serde`、`tracing`、`progressbar`、`mmap`、`gzip`、`deflate`，要求这些特性的示例、基准测试和测试按上面的特性门跳过或忽略。
+
+---
+
+## T34 — 审查修复（C48–C51）
+
+维护者 2026-11-19 的决定：#214、#181、#216、#217 的审查（design §14.35）提出的问题在 PR-6c 之上用新的 PR 修，不重排下面的栈。维护者 2026-11-20 又决定：审查到此为止，不再做 astra 第五轮，之后的改进开 issue（#219、#220）。一个 PR、每个源 PR 一个提交是 lead 的安排；修哪些、怎么修是 lead 和实现的选择。编号接在 T33 之后。
+
+- [x] C48（#214）：准入按占着槽位的 runner 数算，占着的槽位只限制扩张加多少、不改判断；step 的第一个越过上限的尝试是试探，之后到 step 结束都按上限准入；试探结束或被打败就用掉，用掉又没连着时 step 以不确定结束；静默降级保留更晚的 `due`；G10 的端到端测试要求 step、按降级前后计数服务器拒绝的连接；§8.3、§12 的恢复时间和 D21 的归属；两个可能挂住的测试加上界，模拟的进度只在有字节被接收时记录（design §14.35.1）。
+
+**验证**
+
+- C48：`a_finished_runner_holds_its_slot_until_it_stops`、`a_lost_trial_opens_no_second_trial_in_its_step`、`test_a_beaten_hedge_in_the_trial_slot_spends_the_trial`、`test_a_spent_trial_ends_its_step_without_a_deadline`、`test_held_slots_bound_a_doubling_but_not_its_verdict`、`test_a_step_has_one_trial_through_turnover`、`test_a_probe_waits_for_the_slots_it_needs`、`test_a_silent_lowering_keeps_a_congestion_s_due_time` 各自在去掉修复的变异下失败；G10 的两个端到端测试在 `may_step` 恒为假、或静默降级把 `due` 设成降级时刻时失败。

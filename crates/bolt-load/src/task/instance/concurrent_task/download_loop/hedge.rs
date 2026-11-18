@@ -58,7 +58,7 @@ impl DownloadLoop {
         // runner is silent.
         if !self.writer.can_write()
             || self.backoff.is_congested(now)
-            || self.manager.get_active_runners_count()
+            || self.manager.allocated_runner_count()
                 >= self
                     .max_concurrency
                     .min(self.strategy.limit_cap(self.manager.admission()))

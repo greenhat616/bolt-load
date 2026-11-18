@@ -117,6 +117,10 @@ pub struct DoublingStrategyContext {
     /// unless it lowered the limit, one more while it steps. Whatever the
     /// growth wants, see [`DoublingStrategy::want`].
     pub max_concurrency: usize,
+    /// The slots of runners no longer active but not released yet: no
+    /// runner is added in them, but a growth is still judged against
+    /// `max_concurrency`.
+    pub held: usize,
     /// Whether an unassigned range may be claimed now: the limit
     /// controller creates a runner for it, so a hold does not split for
     /// that slot.
@@ -469,7 +473,6 @@ impl DoublingStrategy {
             return 0;
         };
         self.baseline_since = None;
-        debug!("[STRATEGY] probing the hold of {h} runners from {base} towards {goal}");
         self.propose(context, speed, Ask::Probe { goal });
         goal - base
     }
@@ -571,12 +574,47 @@ impl Strategy for DoublingStrategy {
         "doubling"
     }
 
+    /// Held slots bound what is added, not what is asked: the proposal,
+    /// and with it the growth's verdict, keeps `max_concurrency`. When no
+    /// slot is free, or a probe would add fewer than the half of its
+    /// runners it needs to be judged (D29, D31), nothing is proposed, and
+    /// the next tick asks again: a probe cut short by a held slot would be
+    /// inconclusive, and leave too few slots for the next one.
     fn step(&mut self, context: &mut Self::Context<'_>) -> Vec<StrategyAction> {
         self.proposal = None;
-        match self.runners_to_add(context) {
-            0 => Vec::new(),
-            runners => vec![StrategyAction::Grow(runners)],
+        let free = context
+            .max_concurrency
+            .saturating_sub(context.held)
+            .saturating_sub(context.active_runners);
+        let runners = self.runners_to_add(context).min(free);
+        // A probe is logged once it is made: the benchmark counts these.
+        let probe = match self.proposal {
+            Some(Proposal {
+                ask: Ask::Probe { goal },
+                active_runners,
+                ..
+            }) => Some((goal, active_runners)),
+            _ => None,
+        };
+        let short_probe = probe.is_some_and(|(_, base)| runners < base.div_ceil(2));
+        if runners == 0 || short_probe {
+            if let Some((goal, base)) = probe {
+                debug!(
+                    "[STRATEGY] the probe from {base} towards {goal} runners waits: {free} slots \
+                     free"
+                );
+            }
+            self.proposal = None;
+            return Vec::new();
         }
+        if let Some((goal, base)) = probe {
+            let h = match self.mode {
+                Mode::Hold { h, .. } => h,
+                Mode::Ramp => base,
+            };
+            debug!("[STRATEGY] probing the hold of {h} runners from {base} towards {goal}");
+        }
+        vec![StrategyAction::Grow(runners)]
     }
 }
 
@@ -595,6 +633,7 @@ mod tests {
             now,
             active_runners,
             max_concurrency: 8,
+            held: 0,
             eligible_ranges: false,
             congested: false,
             all_delivering: true,
@@ -647,6 +686,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |n: u32, runners: usize| DoublingStrategyContext {
             max_concurrency: 6,
+            held: 0,
             ..context(t0 + GROW_INTERVAL * n, runners, runners as f64 * MIB)
         };
         assert_eq!(grow(&mut strategy, at(0, 1)), 1);
@@ -663,6 +703,7 @@ mod tests {
             let mut strategy = DoublingStrategy::default();
             let mut context = DoublingStrategyContext {
                 max_concurrency: limit,
+                held: 0,
                 ..context(t0, runners, MIB)
             };
             assert_eq!(asked(&mut strategy, &mut context), 0, "{runners}/{limit}");
@@ -670,6 +711,7 @@ mod tests {
         let mut strategy = DoublingStrategy::default();
         let mut context = DoublingStrategyContext {
             max_concurrency: 3,
+            held: 0,
             ..context(t0, 2, MIB)
         };
         assert_eq!(asked(&mut strategy, &mut context), 1);
@@ -698,6 +740,56 @@ mod tests {
             let now = t0 + GROW_INTERVAL * n;
             assert_eq!(grow(&mut strategy, context(now, 4, 100.0 * MIB)), 0);
         }
+    }
+
+    /// Held slots bound what a doubling adds, not how it is judged: at a
+    /// limit of five with one slot held, two runners double to four, a
+    /// doubling below the limit. One of the four finishes before the
+    /// verdict, so the doubling is dropped and the growth goes on, as it
+    /// would without the held slot.
+    #[test]
+    fn test_held_slots_bound_a_doubling_but_not_its_verdict() {
+        let t0 = Instant::now();
+        let mut strategy = DoublingStrategy::default();
+        let mut first = context(t0, 2, 10.0 * MIB);
+        first.max_concurrency = 5;
+        first.held = 1;
+        assert_eq!(grow(&mut strategy, first), 2);
+        let mut judged = context(t0 + GROW_INTERVAL, 3, 20.0 * MIB);
+        judged.max_concurrency = 5;
+        assert_eq!(grow(&mut strategy, judged), 2);
+    }
+
+    /// A probe due from four runners at a cap of six, with one slot held:
+    /// it could add only one of the two it needs to be judged, so it waits.
+    /// Once the slot is free, it probes to six and is judged.
+    #[test]
+    fn test_a_probe_waits_for_the_slots_it_needs() {
+        let t0 = Instant::now();
+        let mut strategy = DoublingStrategy::default();
+        strategy.set_hold(4, t0);
+        let mut held = context(t0, 4, 10.0 * MIB);
+        held.max_concurrency = 6;
+        held.held = 1;
+        assert_eq!(grow(&mut strategy, held), 0);
+        assert_eq!(strategy.want(8), 4);
+        let mut free = context(t0 + TICK, 4, 10.0 * MIB);
+        free.max_concurrency = 6;
+        assert_eq!(grow(&mut strategy, free), 2);
+        assert_eq!(strategy.want(8), 6, "a judged probe is pending");
+    }
+
+    /// No slot free for the held ones: nothing is asked, and the next tick
+    /// asks again.
+    #[test]
+    fn test_held_slots_that_leave_no_room_ask_nothing() {
+        let t0 = Instant::now();
+        let mut strategy = DoublingStrategy::default();
+        let mut full = context(t0, 2, 10.0 * MIB);
+        full.max_concurrency = 4;
+        full.held = 2;
+        assert_eq!(grow(&mut strategy, full), 0);
+        assert_eq!(grow(&mut strategy, context(t0 + TICK, 2, 10.0 * MIB)), 2);
     }
 
     /// A speed that drops after a growth holds too; the hold is probed
@@ -735,6 +827,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |n: u32, runners: usize, speed: f64| DoublingStrategyContext {
             max_concurrency: 8,
+            held: 0,
             ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
         };
         for (speed, refill) in [(40.0, 0), (80.0, 1)] {
@@ -760,6 +853,7 @@ mod tests {
         let deadline = t0 + growth_deadline(crate::runner::DEFAULT_CONNECT_TIMEOUT);
         let seven = |now: Instant| DoublingStrategyContext {
             max_concurrency: 8,
+            held: 0,
             ..context(now, 7, 35.0 * MIB)
         };
         assert_eq!(grow(&mut strategy, seven(deadline - NANO)), 0);
@@ -777,6 +871,7 @@ mod tests {
         let at =
             |n: u32, runners: usize, speed: f64, max_concurrency: usize| DoublingStrategyContext {
                 max_concurrency,
+                held: 0,
                 ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
             };
         let mut strategy = DoublingStrategy::default();
@@ -804,6 +899,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |n: u32, runners: usize, speed: f64| DoublingStrategyContext {
             max_concurrency: 16,
+            held: 0,
             ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
         };
         assert_eq!(grow(&mut strategy, at(0, 4, 40.0)), 4);
@@ -822,6 +918,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |n: u32, runners: usize, limit: usize| DoublingStrategyContext {
             max_concurrency: limit,
+            held: 0,
             ..context(t0 + GROW_INTERVAL * n, runners, runners as f64 * MIB)
         };
         // Below a limit of 16, which then drops to 8: no hold, a refill.
@@ -848,6 +945,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |n: u32, runners: usize, speed: f64, silent: bool| DoublingStrategyContext {
             max_concurrency: 8,
+            held: 0,
             silent_runners: silent,
             ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
         };
@@ -884,6 +982,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |n: u32, runners: usize, limit: usize| DoublingStrategyContext {
             max_concurrency: limit,
+            held: 0,
             ..context(t0 + GROW_INTERVAL * n, runners, runners as f64 * MIB)
         };
         assert_eq!(asked(&mut strategy, &mut at(0, 4, 6)), 2);
@@ -903,6 +1002,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |n: u32, runners: usize, speed: f64, limit: usize| DoublingStrategyContext {
             max_concurrency: limit,
+            held: 0,
             ..context(t0 + GROW_INTERVAL * n, runners, speed * MIB)
         };
         // No faster with eight: a hold of four, even once the limit rises.
@@ -916,6 +1016,7 @@ mod tests {
         let reprobe_at = t0 + GROW_INTERVAL + BASE_REPROBE_WAIT;
         let mut four = DoublingStrategyContext {
             max_concurrency: 16,
+            held: 0,
             ..context(reprobe_at, 4, 40.0 * MIB)
         };
         assert_eq!(asked(&mut strategy, &mut four), 4);
@@ -938,6 +1039,7 @@ mod tests {
     fn tick(now: Instant, runners: usize, speed: f64, limit: usize) -> DoublingStrategyContext {
         DoublingStrategyContext {
             max_concurrency: limit,
+            held: 0,
             ..context(now, runners, speed * MIB)
         }
     }
@@ -1433,6 +1535,7 @@ mod tests {
         let mut strategy = DoublingStrategy::default();
         let at = |n: u32, runners: usize, limit: usize| DoublingStrategyContext {
             max_concurrency: limit,
+            held: 0,
             ..context(t0 + GROW_INTERVAL * n, runners, runners as f64 * MIB)
         };
         assert_eq!(grow(&mut strategy, at(0, 11, 12)), 1);
@@ -1459,6 +1562,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |now: Instant, runners: usize| DoublingStrategyContext {
             max_concurrency: 6,
+            held: 0,
             ..context(now, runners, 40.0 * MIB)
         };
         // Four to six: cut short by the limit.

@@ -7,6 +7,7 @@ use super::{
 
 const TICK: Duration = DEFAULT_STRATEGY_TICK_INTERVAL;
 const SECOND: Duration = Duration::from_secs(1);
+const NANO: Duration = Duration::from_nanos(1);
 
 fn context(
     admission: &mut AdmissionEvidence,
@@ -17,6 +18,7 @@ fn context(
     ConcurrencyControlContext {
         want: usize::MAX,
         active_runners,
+        allocated_runners: active_runners,
         proven_runners: active_runners,
         admission,
         available_chunks,
@@ -81,9 +83,11 @@ fn test_create_tasks_waits_for_the_first_step_and_the_degradation() {
         [0..10, 20..30, 40..50]
     );
     context.active_runners = 4;
+    context.allocated_runners = 4;
     assert!(strategy.create_tasks(&context).is_empty());
 
     context.active_runners = 1;
+    context.allocated_runners = 1;
     congest(context.admission);
     context.now = Instant::now();
     assert!(strategy.create_tasks(&context).is_empty());
@@ -97,6 +101,7 @@ fn test_create_tasks_waits_for_the_first_step_and_the_degradation() {
         "unexpected actions: {actions:?}"
     );
     context.active_runners = 0;
+    context.allocated_runners = 0;
     assert_eq!(created(&strategy.create_tasks(&context)), [0..10]);
 }
 
@@ -183,6 +188,7 @@ impl Ctl {
         let mut context = ConcurrencyControlContext {
             want,
             active_runners: connected + self.connecting,
+            allocated_runners: connected + self.connecting,
             proven_runners: self.proven.unwrap_or(connected),
             admission: &mut self.admission,
             available_chunks: Vec::new(),
@@ -365,6 +371,86 @@ fn test_a_huge_connect_timeout_caps_the_step_deadline() {
     assert!(ctl.stepping());
     ctl.refuse(1);
     assert_eq!(ctl.tick(due + 601 * SECOND), Some(4));
+}
+
+/// A trial spent before it connected, with a connect timeout of
+/// `Duration::MAX`, whose step deadline is 30 years away: nothing reopens
+/// the trial slot, so the next tick ends the step inconclusive with the
+/// wait unchanged, instead of keeping it open for the rest of the
+/// transfer.
+#[test]
+fn test_a_spent_trial_ends_its_step_without_a_deadline() {
+    let config = ConcurrencyControlConfig::with_connect_timeout(Duration::MAX);
+    let t0 = Instant::now();
+    let mut ctl = Ctl::new(8, 4, t0 - TICK);
+    ctl.strategy = ConcurrencyControlStrategy::new(config, 8);
+    ctl.tick(t0 - TICK);
+    ctl.refuse(3);
+    ctl.admission.stamp(t0 - TICK);
+    assert_eq!(ctl.tick(t0), Some(4));
+    let due = start_step(&mut ctl, t0);
+    // The trial opens in the trial slot, and a 502 ends it before
+    // `Started`: no refusal, no mark that decides the step.
+    let trial = ctl.next_id;
+    ctl.next_id += 1;
+    ctl.admission.on_opened(trial, 5);
+    ctl.release(trial);
+    assert!(ctl.admission.trial_spent());
+    assert!(!ctl.admission.step_rejected() && !ctl.admission.step_unclear());
+    let ended = due + TICK;
+    assert_eq!(ctl.tick(ended), Some(4));
+    assert_eq!(
+        ctl.strategy.state(),
+        (4, None, Some(ended + base_wait()), base_wait())
+    );
+}
+
+/// A step opens one connection above the limit (G10). At a limit of four
+/// the trial A opens as the fifth connection and hangs. From then on the
+/// cap every opener takes is four: when one of the four finishes, its
+/// slot is refilled only below the limit, and nothing opens a second
+/// fifth connection. An attempt that opens anyway, as a race could, is
+/// no trial: its end spends nothing, so the step goes on, and A's refusal
+/// then rejects it, doubling the wait.
+#[test]
+#[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
+fn test_a_step_has_one_trial_through_turnover() {
+    let t0 = Instant::now();
+    let mut ctl = lowered_to_four(t0);
+    let due = start_step(&mut ctl, t0);
+    assert_eq!(ctl.strategy.refill_cap(usize::MAX, &ctl.admission), 5);
+    let trial = ctl.next_id;
+    ctl.next_id += 1;
+    ctl.admission.on_opened(trial, 5);
+    ctl.connecting = 1;
+    assert_eq!(ctl.strategy.refill_cap(usize::MAX, &ctl.admission), 4);
+    ctl.release(0);
+    // Three connected and the trial: the refill, the growth and the hedge
+    // see no free slot.
+    assert_eq!(ctl.strategy.refill_cap(usize::MAX, &ctl.admission), 4);
+    let mut opener = context(&mut ctl.admission, 4, vec![0..10], due + TICK / 2);
+    opener.proven_runners = 3;
+    assert!(ctl.strategy.create_tasks(&opener).is_empty());
+    let refill = ctl.next_id;
+    ctl.admission.on_opened(refill, 5);
+    let connected = ctl.connect();
+    assert_eq!(connected, refill);
+    ctl.release(refill);
+    assert!(!ctl.admission.trial_spent(), "the refill is no trial");
+    assert_eq!(ctl.tick(due + TICK), None);
+    assert!(ctl.stepping());
+    ctl.connecting = 0;
+    ctl.refuse(1);
+    assert_eq!(ctl.tick(due + 2 * TICK), Some(4));
+    assert_eq!(
+        ctl.strategy.state(),
+        (
+            4,
+            None,
+            Some(due + 2 * TICK + 2 * base_wait()),
+            2 * base_wait()
+        )
+    );
 }
 
 #[test]
@@ -781,7 +867,10 @@ fn test_rejected_steps_back_off() {
     let mut now = t0;
     let mut last = t0;
     let mut gaps = Vec::new();
+    // Bounded: a controller that never steps again fails, not hangs.
+    let horizon = t0 + 2000 * SECOND;
     while gaps.len() < 6 {
+        assert!(now < horizon, "no step since {last:?}: {gaps:?}");
         now += TICK;
         if ctl.tick(now) == Some(5) {
             gaps.push((now - last).as_secs_f64());
@@ -799,6 +888,7 @@ fn test_rejected_steps_back_off() {
 
     let wait = ctl.strategy.state().3;
     loop {
+        assert!(now < horizon + 400 * SECOND, "no step after {last:?}");
         now += TICK;
         if ctl.tick(now) == Some(5) {
             break;
@@ -808,6 +898,38 @@ fn test_rejected_steps_back_off() {
     now += TICK;
     assert_eq!(ctl.tick(now), Some(4));
     assert_eq!(ctl.strategy.state().3, wait);
+}
+
+/// A 503 with `Retry-After: 120` leaves one proven runner and three
+/// connects: the limit is lowered to the four, with the next step due 30 s
+/// after the hold. The three connects are then refused beside the runner,
+/// which goes on delivering, and the silent rule lowers the limit to one:
+/// the later due time stays, so no step begins when the hold ends, only
+/// 30 s after it.
+#[test]
+fn test_a_silent_lowering_keeps_a_congestion_s_due_time() {
+    let t0 = Instant::now();
+    let mut ctl = Ctl::new(8, 1, t0);
+    ctl.connecting = 3;
+    congest(&mut ctl.admission);
+    let hold_end = t0 + TICK + 120 * SECOND;
+    ctl.congestion_until = Some(hold_end);
+    assert_eq!(ctl.tick(t0 + TICK), Some(4));
+    let due = hold_end + base_wait();
+    assert_eq!(ctl.strategy.state(), (4, None, Some(due), base_wait()));
+
+    ctl.connecting = 0;
+    ctl.refuse(3);
+    ctl.admission.stamp(t0 + 2 * TICK);
+    assert_eq!(ctl.tick(t0 + 3 * TICK), Some(1));
+    assert_eq!(ctl.strategy.state(), (1, None, Some(due), base_wait()));
+    // Nothing when the hold ends; the step at the first tick from `due`.
+    let mut first_from = t0 + 4 * TICK;
+    while first_from < due {
+        first_from += TICK;
+    }
+    assert_eq!(ctl.ticks(t0 + 4 * TICK, first_from - NANO), []);
+    assert_eq!(ctl.tick(first_from), Some(2));
 }
 
 #[test]

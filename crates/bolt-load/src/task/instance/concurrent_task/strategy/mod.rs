@@ -94,6 +94,19 @@ impl StrategyControl {
         }
     }
 
+    /// [`Self::new`], with the limit controller configured by `config`.
+    #[cfg(test)]
+    pub fn with_concurrency_control(
+        max_connections: usize,
+        connect_timeout: Duration,
+        config: ConcurrencyControlConfig,
+    ) -> Self {
+        Self {
+            concurrency_control_strategy: ConcurrencyControlStrategy::new(config, max_connections),
+            ..Self::new(max_connections, connect_timeout)
+        }
+    }
+
     /// The connections the growth side wants open, see
     /// [`DoublingStrategy::want`].
     pub fn want(&self) -> usize {
@@ -141,8 +154,9 @@ impl StrategyControl {
     ///
     /// While `signals.congested`, no action opens a connection: no runner
     /// is created and none is split. No runner is created for a range still
-    /// backing off (design §8.1). Nothing is added while the active runners
-    /// reach `min(max_concurrency, cap)`, see
+    /// backing off (design §8.1). Nothing is added while the runners
+    /// holding a slot, active or not released yet, reach
+    /// `min(max_concurrency, cap)`, see
     /// [`ConcurrencyControlStrategy::refill_cap`], with what the growth
     /// wants: the growth asks the limit controller for connections through
     /// `want`, and adds them within its cap (design §8.3, §9.2).
@@ -164,6 +178,11 @@ impl StrategyControl {
         let want = self.want();
         let mut context = Self::context(want, runner_manager, now, signals);
         let active_runners = context.active_runners;
+        // The slots of runners that are no longer active but not released
+        // yet: no growth takes them before they stop.
+        let held = context
+            .allocated_runners
+            .saturating_sub(context.active_runners);
         let eligible_ranges = !context.available_chunks.is_empty();
         trace!("[STRATEGY] Concurrency control strategy context: {context:?}");
         let actions = self.concurrency_control_strategy.step(&mut context);
@@ -183,6 +202,7 @@ impl StrategyControl {
             now,
             active_runners,
             max_concurrency: limit_cap,
+            held,
             eligible_ranges,
             congested,
             all_delivering: tick.all_delivering,
@@ -234,6 +254,7 @@ impl StrategyControl {
         signals: LoopSignals,
     ) -> ConcurrencyControlContext<'_> {
         let active_runners = runner_manager.get_active_runners_count();
+        let allocated_runners = runner_manager.allocated_runner_count();
         let proven_runners = runner_manager.get_proven_runners_count();
         // No new connection while congested.
         let available_chunks = if signals.congested {
@@ -244,6 +265,7 @@ impl StrategyControl {
         ConcurrencyControlContext {
             want,
             active_runners,
+            allocated_runners,
             proven_runners,
             admission: runner_manager.admission_mut(),
             available_chunks,
