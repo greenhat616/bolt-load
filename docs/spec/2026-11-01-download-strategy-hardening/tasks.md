@@ -69,6 +69,7 @@
 | | C46 `refactor(task): drive loop deadlines and singleton sampling through the runtime` | T33 | |
 | | C47 `test(runtime): cover timer migration across engine paths` | T33 | |
 | PR-6d 审查修复 | C48 `fix(task): admit runners against held slots and spend a step's trial once` | T34 | PR-6c；放在 PR-6c 之上（`fix/hardening-50-review-fixes`） |
+| | C49 `fix(task): retry a short range from its end and finish after a last tolerated failure` | T34 | |
 
 **合并约束**：
 
@@ -716,7 +717,9 @@
 维护者 2026-11-19 的决定：#214、#181、#216、#217 的审查（design §14.35）提出的问题在 PR-6c 之上用新的 PR 修，不重排下面的栈。维护者 2026-11-20 又决定：审查到此为止，不再做 astra 第五轮，之后的改进开 issue（#219、#220）。一个 PR、每个源 PR 一个提交是 lead 的安排；修哪些、怎么修是 lead 和实现的选择。编号接在 T33 之后。
 
 - [x] C48（#214）：准入按占着槽位的 runner 数算，占着的槽位只限制扩张加多少、不改判断；step 的第一个越过上限的尝试是试探，之后到 step 结束都按上限准入；试探结束或被打败就用掉，用掉又没连着时 step 以不确定结束；静默降级保留更晚的 `due`；G10 的端到端测试要求 step、按降级前后计数服务器拒绝的连接；§8.3、§12 的恢复时间和 D21 的归属；两个可能挂住的测试加上界，模拟的进度只在有字节被接收时记录（design §14.35.1）。
+- [x] C49（#181）：`SmallerThanTotalSize` 先排空再报；最后一个 runner 的容忍失败之后，planner 完成、没有 runner 时循环结束；免记的拒绝仍算连续失败的测试；G10 的范围；`tests/retry.rs` 的等待加上界（design §14.35.2）。
 
 **验证**
 
 - C48：`a_finished_runner_holds_its_slot_until_it_stops`、`a_lost_trial_opens_no_second_trial_in_its_step`、`test_a_beaten_hedge_in_the_trial_slot_spends_the_trial`、`test_a_spent_trial_ends_its_step_without_a_deadline`、`test_held_slots_bound_a_doubling_but_not_its_verdict`、`test_a_step_has_one_trial_through_turnover`、`test_a_probe_waits_for_the_slots_it_needs`、`test_a_silent_lowering_keeps_a_congestion_s_due_time` 各自在去掉修复的变异下失败；G10 的两个端到端测试在 `may_step` 恒为假、或静默降级把 `due` 设成降级时刻时失败。
+- C49：`a_short_range_response_is_retried_from_its_end`、`a_tolerated_failure_after_the_last_frame_completes_the_download`、`an_exempt_refusal_still_counts_as_a_consecutive_failure` 各自在去掉修复（或对免记的失败直接返回）的变异下失败。

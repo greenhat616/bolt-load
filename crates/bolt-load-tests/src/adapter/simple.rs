@@ -101,6 +101,9 @@ struct Faults {
     /// From this long after the first body stream, the total limit is
     /// this many bytes per second instead of `max_speed`.
     raised_speed: Option<(Duration, u64)>,
+    /// The first range response ends after this many bytes, without an
+    /// error.
+    short_first_range: Option<u64>,
 }
 
 pub type GlobalRateLimiter = Arc<
@@ -283,6 +286,14 @@ impl SimpleTestAdapterBuilder {
     /// stream.
     pub fn raise_max_speed(mut self, after: Duration, bytes_per_sec: u64) -> Self {
         self.faults.raised_speed = Some((after, bytes_per_sec));
+        self
+    }
+
+    /// The first range response ends after `len` bytes without an error,
+    /// as a valid `206` whose `Content-Range` ends before the requested end
+    /// does; the responses after it are whole.
+    pub fn short_first_range(mut self, len: u64) -> Self {
+        self.faults.short_first_range = Some(len);
         self
     }
 
@@ -793,6 +804,10 @@ impl BoltLoadAdapter for SimpleTestAdapter {
             return Err(self.congestion());
         }
 
+        let end = match self.faults.short_first_range {
+            Some(len) if attempt == 0 => end.min(start.saturating_add(len)),
+            _ => end,
+        };
         Ok(self.body_stream(start as usize, end as usize, guard))
     }
 }
