@@ -71,6 +71,7 @@
 | PR-6d 审查修复 | C48 `fix(task): admit runners against held slots and spend a step's trial once` | T34 | PR-6c；放在 PR-6c 之上（`fix/hardening-50-review-fixes`） |
 | | C49 `fix(task): retry a short range from its end and finish after a last tolerated failure` | T34 | |
 | | C50 `fix(task): expire a probe before a wake-up admits for it` | T34 | |
+| | C51 `fix(task): corroborate a refusal only under the limit its connect opened at` | T34 | |
 
 **合并约束**：
 
@@ -720,9 +721,11 @@
 - [x] C48（#214）：准入按占着槽位的 runner 数算，占着的槽位只限制扩张加多少、不改判断；step 的第一个越过上限的尝试是试探，之后到 step 结束都按上限准入；试探结束或被打败就用掉，用掉又没连着时 step 以不确定结束；静默降级保留更晚的 `due`；G10 的端到端测试要求 step、按降级前后计数服务器拒绝的连接；§8.3、§12 的恢复时间和 D21 的归属；两个可能挂住的测试加上界，模拟的进度只在有字节被接收时记录（design §14.35.1）。
 - [x] C49（#181）：`SmallerThanTotalSize` 先排空再报；最后一个 runner 的容忍失败之后，planner 完成、没有 runner 时循环结束；免记的拒绝仍算连续失败的测试；G10 的范围；`tests/retry.rs` 的等待加上界（design §14.35.2）。
 - [x] C50（#216）：退避结束的唤醒先让过期的试探结束；增益正好 10% 算增益；性质测试接受合法的对冲；s6 的正例断言判断过了；s5 每一轮有独立的时限；三处公开文档和 §9.2 的公式、归属（design §14.35.3）。
+- [x] C51（#217）：记录只在尝试开始时的上限之下佐证；停止中的 runner 不作证；没有连接中的尝试不采样；两个 manager 测试不再可能挂住；超时场景断言 D27 的记预算；§12 的恢复时间（design §14.35.4）。
 
 **验证**
 
 - C48：`a_finished_runner_holds_its_slot_until_it_stops`、`a_lost_trial_opens_no_second_trial_in_its_step`、`test_a_beaten_hedge_in_the_trial_slot_spends_the_trial`、`test_a_spent_trial_ends_its_step_without_a_deadline`、`test_held_slots_bound_a_doubling_but_not_its_verdict`、`test_a_step_has_one_trial_through_turnover`、`test_a_probe_waits_for_the_slots_it_needs`、`test_a_silent_lowering_keeps_a_congestion_s_due_time` 各自在去掉修复的变异下失败；G10 的两个端到端测试在 `may_step` 恒为假、或静默降级把 `due` 设成降级时刻时失败。
 - C49：`a_short_range_response_is_retried_from_its_end`、`a_tolerated_failure_after_the_last_frame_completes_the_download`、`an_exempt_refusal_still_counts_as_a_consecutive_failure` 各自在去掉修复（或对免记的失败直接返回）的变异下失败。
 - C50：`a_retry_at_the_probe_deadline_admits_for_the_hold`、`test_an_exact_ten_percent_gain_ramps_on`、`test_a_gain_just_short_of_ten_percent_holds`、`test_a_gain_one_byte_short_of_ten_percent_holds`、`a_hedge_above_a_hold_is_legal` 各自在去掉修复的变异下失败。
+- C51：`test_connects_opened_before_a_lowering_corroborate_nothing_after_it`（变异下上限降到 1）、`test_a_stopping_runner_is_no_witness` 各自在去掉修复的变异下失败。

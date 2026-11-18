@@ -932,6 +932,73 @@ fn test_a_silent_lowering_keeps_a_congestion_s_due_time() {
     assert_eq!(ctl.tick(first_from), Some(2));
 }
 
+/// One period above the server's limit, in two cohorts (design §8.3,
+/// D32): four runners deliver at a limit of ten, and six connects hang
+/// beside them. The first three time out, and progress lowers the limit to
+/// the four. The other three are seen beside the four again, then the four
+/// finish, and the three time out with nothing proven: they opened under
+/// the limit of ten, so what they were seen beside corroborates nothing.
+/// A replacement connects below their level and delivers: the limit stays
+/// at four.
+#[test]
+fn test_connects_opened_before_a_lowering_corroborate_nothing_after_it() {
+    use super::super::admission_evidence::AdmissionClass::Refused;
+
+    let t0 = Instant::now();
+    let mut ctl = Ctl::new(10, 4, t0);
+    let hung: Vec<usize> = (4..10).collect();
+    for &id in &hung {
+        ctl.admission.on_opened(id, 0);
+    }
+    ctl.admission.observe_connecting(hung.iter().copied(), 4, 9);
+    ctl.next_id = 10;
+    ctl.connecting = 6;
+    for (n, &id) in hung[..3].iter().enumerate() {
+        ctl.admission.on_attempt_ended(id, Refused, 4, 8 - n);
+    }
+    ctl.connecting = 3;
+    ctl.admission.stamp(t0 + TICK);
+    assert_eq!(ctl.tick(t0 + 2 * TICK), Some(4));
+
+    // A later sample of the old connects, still beside the four.
+    ctl.admission
+        .observe_connecting(hung[3..].iter().copied(), 4, 6);
+    for id in 0..4 {
+        ctl.release(id);
+    }
+    for (n, &id) in hung[3..].iter().enumerate() {
+        ctl.admission.on_attempt_ended(id, Refused, 0, 2 - n);
+    }
+    ctl.connecting = 0;
+    ctl.connect();
+    ctl.admission.stamp(t0 + 3 * TICK);
+    assert_eq!(ctl.ticks(t0 + 4 * TICK, t0 + 20 * TICK), []);
+    assert_eq!(ctl.limit(), 4);
+    assert_eq!(ctl.admission.streak_count(), 0);
+}
+
+/// The same connects, opened after the lowering, still corroborate by
+/// what they were seen beside (D32).
+#[test]
+fn test_connects_opened_after_a_lowering_corroborate() {
+    use super::super::admission_evidence::AdmissionClass::Refused;
+
+    let t0 = Instant::now();
+    let mut ctl = lowered_to_four(t0);
+    let hung: Vec<usize> = (4..7).collect();
+    for &id in &hung {
+        ctl.admission.on_opened(id, 0);
+    }
+    ctl.admission.observe_connecting(hung.iter().copied(), 4, 6);
+    for id in 0..4 {
+        ctl.release(id);
+    }
+    for (n, &id) in hung.iter().enumerate() {
+        ctl.admission.on_attempt_ended(id, Refused, 0, 2 - n);
+    }
+    assert_eq!(ctl.admission.streak_count(), 3);
+}
+
 #[test]
 fn test_one_connection_never_steps() {
     let t0 = Instant::now();

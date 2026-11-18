@@ -970,6 +970,9 @@ async fn hung_connects_that_outlast_the_proven_runners_lower_the_limit() {
         sim.failures
     );
     assert_eq!(sim.failures.len(), 4);
+    // Corroborated only by what the connects were seen beside, so charged
+    // (D27): nothing is proven at the moment of their classification.
+    assert_eq!(sim.charges, [(1, false); 4]);
     assert_eq!(sim.download.manager.admission().streak_count(), 4);
     assert_eq!(sim.limits.len(), 1, "none connected yet");
 

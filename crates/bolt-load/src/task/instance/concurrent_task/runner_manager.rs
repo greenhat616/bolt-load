@@ -477,7 +477,24 @@ impl RunnerManager {
     /// are proven beside them (design §8.3): at each spawn, strategy tick
     /// and failure, and when an attempt becomes proven.
     pub(super) fn observe_connecting(&mut self) {
-        self.observe_connecting_with(self.chunk_planner.get_proven_runners_count());
+        if self.connecting_data.is_empty() {
+            return;
+        }
+        self.observe_connecting_with(self.proven_witnesses());
+    }
+
+    /// The proven attempts that witness the connects beside them: not
+    /// those the loop stopped, which may be gone long before a connect
+    /// beside them times out (design §8.3, §14.35).
+    fn proven_witnesses(&self) -> usize {
+        let stopping = self
+            .stopping
+            .keys()
+            .filter(|&&runner_id| self.chunk_planner.is_proven(runner_id))
+            .count();
+        self.chunk_planner
+            .get_proven_runners_count()
+            .saturating_sub(stopping)
     }
 
     /// [`Self::observe_connecting`] with `proven` attempts proven.
@@ -2214,12 +2231,32 @@ mod tests {
         let mut manager = RunnerManager::new(1000, 4);
         let (mut lifecycle_tx, mut data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
         lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
-        manager.tick().await;
+        // Queued already: bounded, a lost event fails rather than hangs.
+        manager.tick().now_or_never().expect("Started is queued");
         let (_connecting, _data) = spawn_test_runner(&mut manager, 500..1000).unwrap();
         assert!(!manager.admission().is_seen(1), "nothing proven yet");
         push_frame(&mut data_tx, 10).await;
-        assert!(manager.tick().await.downloaded.is_some());
+        let tick = manager.tick().now_or_never().expect("the frame is queued");
+        assert!(tick.downloaded.is_some());
         assert!(manager.admission().is_seen(1));
+    }
+
+    /// A proven runner the loop stopped witnesses no connect: it may be
+    /// gone long before a connect beside it times out (design §14.35).
+    #[tokio::test]
+    async fn test_a_stopping_runner_is_no_witness() {
+        let mut manager = RunnerManager::new(1000, 4);
+        let (mut lifecycle_tx, mut data_tx, _stop) = spawn_stoppable_runner(&mut manager, 0..500);
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        manager.tick().now_or_never().expect("Started is queued");
+        push_frame(&mut data_tx, 10).await;
+        let tick = manager.tick().now_or_never().expect("the frame is queued");
+        assert!(tick.downloaded.is_some());
+        assert!(manager.stop_runner(0));
+        let (_connecting, _data) = spawn_test_runner(&mut manager, 500..1000).unwrap();
+        assert!(!manager.admission().is_seen(1));
+        manager.observe_connecting();
+        assert!(!manager.admission().is_seen(1));
     }
 
     /// A connect seen beside a proven runner, then cancelled, is never
@@ -2232,7 +2269,11 @@ mod tests {
         lifecycle_tx
             .try_push(LifecycleEvent::failed(TaskError::Cancelled))
             .unwrap();
-        assert!(manager.tick_lifecycle_only().await.failure.is_none());
+        let tick = manager
+            .tick_lifecycle_only()
+            .now_or_never()
+            .expect("the cancellation is queued");
+        assert!(tick.failure.is_none());
         assert!(!manager.admission().is_seen(1));
     }
 
