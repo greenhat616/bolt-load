@@ -264,6 +264,11 @@ impl Sim {
         let rt = ScriptedRuntime::new(TimerKind::Scripted);
         let (mut download, file_writer) =
             admission_loop(&rt, server == Server::Hangs, max_connections, budget).await;
+        // No chunk is large enough for the growth to split, and no runner
+        // is hedged, so that only the runners a test arranges connect: the
+        // hedge's own tests cover the limit.
+        download.manager.set_min_chunk_size(TOTAL);
+        download.hedging = false;
         let t0 = Instant::now();
         let mut runners = Vec::new();
         for range in healthy {
@@ -322,8 +327,11 @@ impl Sim {
 
     /// Every running runner delivers, and its bytes are written; nothing
     /// while the writer is full, as the loop then polls no data.
+    ///
+    /// Without `delivering`, they still deliver, so that none is silent,
+    /// but the loop's failure policy sees no progress.
     fn deliver(&mut self) {
-        if !self.delivering || !self.download.writer.can_write() {
+        if !self.download.writer.can_write() {
             return;
         }
         for runner_id in self.runners(ChunkStatus::Running) {
@@ -331,9 +339,12 @@ impl Sim {
                 .manager
                 .update_progress(runner_id, DELIVERED)
                 .unwrap();
+            self.download.manager.note_delivery(runner_id, self.now);
         }
-        self.download.policy.on_progress(self.now);
-        self.download.policy.on_write_ok(1);
+        if self.delivering {
+            self.download.policy.on_progress(self.now);
+            self.download.policy.on_write_ok(1);
+        }
     }
 
     /// Answer the connects that are due, and handle what the runners
@@ -1208,7 +1219,6 @@ mod admission_properties {
 
         fn tick(&mut self, intervals: u32, speed: u64) {
             self.now += TICK * intervals;
-            self.download.throughput.speed = (speed << 20) as f64;
             let active = self.download.manager.get_active_runners_count().max(1);
             self.download.throughput.per_runner_speed = (speed << 20) as f64 / active as f64;
             self.download.on_strategy_tick(self.now);
@@ -1488,7 +1498,7 @@ mod fault_server {
     };
     use pretty_assertions::assert_eq;
 
-    use super::{super::super::super::strategy::StrategyAction, *};
+    use super::*;
     use crate::task::Progress;
 
     /// The limit controller's state, see `StrategyControl::limit_state`.
@@ -1551,6 +1561,16 @@ mod fault_server {
         tokio::time::timeout(Duration::from_secs(60), fut)
             .await
             .expect("the download never ended")
+    }
+
+    /// Split the chunk of `runner_id` at its half.
+    fn split(download: &mut DownloadLoop, runner_id: crate::task::RunnerId) {
+        let incomplete = download
+            .manager
+            .get_runner_state(runner_id)
+            .unwrap()
+            .incomplete_range();
+        assert!(download.split(runner_id, incomplete, Instant::now()));
     }
 
     fn running(download: &DownloadLoop, runner_id: crate::task::RunnerId) -> bool {
@@ -1631,7 +1651,7 @@ mod fault_server {
                 Some(&mut |d| running(d, 0)),
             )
             .await?;
-            download.apply(StrategyAction::SplitGivenTask(0), Instant::now());
+            split(&mut download, 0);
             drive(
                 &mut download,
                 &mut limits,
@@ -1641,7 +1661,8 @@ mod fault_server {
             )
             .await?;
             // Both split: a fourth connection, refused beside two proven.
-            download.apply(StrategyAction::SplitAllTask(1), Instant::now());
+            split(&mut download, 0);
+            split(&mut download, 1);
             drive(&mut download, &mut limits, &mut states, &mut charges, None).await
         })
         .await;

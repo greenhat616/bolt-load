@@ -21,7 +21,7 @@ use super::{
             chunk_planner::{ChunkState, ChunkStatus, DEFAULT_MIN_CHUNK_SIZE, Side, SideFailure},
             file_writer::WrittenRanges,
             runner_manager::RunnerChannels,
-            strategy::{SLOW_WINDOW, StrategyAction},
+            strategy::SLOW_WINDOW,
         },
         hedge::HEDGE_IDLE,
     },
@@ -33,7 +33,7 @@ use crate::{
         DATA_FRAME_CHANNEL_CAPACITY, DataFrame, DataFrameSender, LIFECYCLE_CHANNEL_CAPACITY,
         LifecycleEvent, LifecycleSender,
     },
-    task::{GrowthStrategy, RunnerId},
+    task::RunnerId,
 };
 
 const KIB: u64 = 1 << 10;
@@ -144,9 +144,7 @@ fn is_congestion(error: &TaskError) -> bool {
 }
 
 pub(super) fn options(max_connections: usize) -> TaskOptions {
-    TaskOptions::default()
-        .max_connections(NonZeroUsize::new(max_connections).unwrap())
-        .growth_strategy(GrowthStrategy::Doubling)
+    TaskOptions::default().max_connections(NonZeroUsize::new(max_connections).unwrap())
 }
 
 /// A loop over a file of `total` bytes whose writes are recorded.
@@ -367,22 +365,6 @@ async fn a_runner_silent_for_two_seconds_is_hedged() {
     assert_eq!(h.slots(), 3);
 }
 
-/// `Legacy` samples no rates, and never hedges.
-#[tokio::test]
-async fn legacy_never_hedges() {
-    let base = Instant::now();
-    let legacy = options(4).growth_strategy(GrowthStrategy::Legacy);
-    let (mut h, a, b, _ea, _eb) = endgame(&legacy, base);
-    assert!(h.download.rates.is_none());
-    for n in 1..20 {
-        let now = base + TICK * n;
-        h.download.manager.note_delivery(a, now);
-        h.download.hedge_stalled_runner(now);
-    }
-    assert!(!h.undecided(b));
-    assert_eq!(h.download.manager.get_active_runners_count(), 2);
-}
-
 /// A connecting runner is silent from its spawn.
 #[tokio::test]
 async fn a_connecting_runner_is_silent_from_its_spawn() {
@@ -516,16 +498,10 @@ async fn no_hedge_while_another_chunk_may_be_split() {
         let mut h = Harness::new(a_end + MIB, &options(4));
         let (a, _ea) = h.spawn_running(0..a_end, base);
         let (b, _eb) = h.spawn_running(a_end..a_end + MIB, base);
-        h.download
-            .rates
-            .as_mut()
-            .unwrap()
-            .sample(&h.download.manager, base + TICK);
+        h.download.rates.sample(&h.download.manager, base + TICK);
         h.deliver(a, OVER_A_TICK, base + TICK * 2);
         h.download
             .rates
-            .as_mut()
-            .unwrap()
             .sample(&h.download.manager, base + TICK * 2);
         assert_eq!(
             h.download.planned_split_size(a),
@@ -552,13 +528,9 @@ async fn a_connecting_chunk_is_judged_by_the_per_runner_speed() {
         h.deliver(a, MIB / 2, now);
         h.download.manager.note_delivery(c, now);
         for t in [base, base + TICK] {
-            h.download
-                .rates
-                .as_mut()
-                .unwrap()
-                .sample(&h.download.manager, t);
+            h.download.rates.sample(&h.download.manager, t);
         }
-        assert_eq!(h.download.rates.as_ref().unwrap().rate(c), Some(0.0));
+        assert_eq!(h.download.rates.rate(c), Some(0.0));
         h.download.throughput.per_runner_speed = per_runner_speed;
         h.download.hedge_stalled_runner(now);
         assert_eq!(h.undecided(b), hedged, "{per_runner_speed} B/s");
@@ -959,11 +931,13 @@ async fn a_hedge_after_two_splits_runs_to_the_end() {
     eo.start();
     h.go(t0);
     let now = t0 + Duration::from_secs(2);
-    h.download.apply(StrategyAction::SplitAllTask(0), now);
+    let incomplete = h.chunk(o).incomplete_range();
+    assert!(h.download.split(o, incomplete, now));
     for bytes in [5_701_224, 16_462_322, 7_196_583] {
         h.download.manager.update_progress(o, bytes).unwrap();
     }
-    h.download.apply(StrategyAction::SplitGivenTask(o), now);
+    let incomplete = h.chunk(o).incomplete_range();
+    assert!(h.download.split(o, incomplete, now));
     // The two tails, real runners parked at their spawn; kept alive.
     let tails = h.rt.take_parked();
     assert_eq!(tails.len(), 2);
@@ -971,7 +945,6 @@ async fn a_hedge_after_two_splits_runs_to_the_end() {
     assert_eq!(h.chunk(o).remaining(), 2 * MIN - 1);
 
     let active = h.download.manager.get_active_runners_count();
-    h.download.throughput.speed = 50_331_650.0;
     h.download.throughput.per_runner_speed = 50_331_650.0 / active as f64;
     h.download.on_strategy_tick(now);
     assert_eq!(h.slots(), 4, "the hedge holds a slot");
@@ -1528,11 +1501,7 @@ async fn the_survivor_of_an_undecided_pair_is_not_judged() {
                     .unwrap();
             }
         }
-        h.download
-            .rates
-            .as_mut()
-            .unwrap()
-            .sample(&h.download.manager, now);
+        h.download.rates.sample(&h.download.manager, now);
         h.download.restart_slow_runner(now);
     }
     assert!(SLOW_WINDOW <= TICK * 7);
