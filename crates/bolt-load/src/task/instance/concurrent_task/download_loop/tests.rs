@@ -1513,9 +1513,17 @@ mod split_properties {
         assert!(manager.allocated_runner_count() <= max_connections);
         assert!(manager.get_active_runners_count() <= max_connections);
         let held = runners(download, max_connections, &[Pending, Running, Finished]);
+        // A hedge in its pair, or a beaten side not confirmed yet, holds a
+        // slot without owning a chunk (design §9.6).
+        let partners = (0..max_connections)
+            .filter(|&runner_id| {
+                manager.get_runner_state(runner_id).is_none()
+                    && (manager.is_in_undecided_pair(runner_id) || manager.is_stopping(runner_id))
+            })
+            .count();
         assert_eq!(
             manager.allocated_runner_count(),
-            held.len(),
+            held.len() + partners,
             "a slot leaked"
         );
         let mut ranges = manager.chunk_ranges();
