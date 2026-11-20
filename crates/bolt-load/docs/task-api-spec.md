@@ -281,10 +281,14 @@ publishing `Initializing`:
    initialized data.
 
 Download strategy hardening, design §11.4-§11.5 (step 4 and Off's part of
-step 5 implemented in C31; a resumable fresh start, and the lock that
-`Resume::On` requires, in C33, behind a crate-internal `Resume`; the
-resume check and the switch of `prefer_mode(Singleton)` to the concurrent
-engine in C20 and C33c):
+step 5 implemented in C31; a resumable fresh start, the lock that
+`Resume::On` requires, and the switch of `prefer_mode(Singleton)` to the
+concurrent engine in C33, behind a crate-internal `Resume`; the resume
+check in C20). The switch happens where the mode is selected (step 2): a
+`Resume::On` task that prefers one connection, has a known, non-zero,
+uncoded size and a usable validator, and whose source takes ranges, runs
+on the concurrent engine with one connection; any other keeps the
+singleton mode and is not resumable:
 steps 3 and 4 become these, with everything before `info` is published:
 
 3. Resolve the destination and check the filesystem.
@@ -293,9 +297,8 @@ steps 3 and 4 become these, with everything before `info` is published:
    before any file is created or changed.
 5. With `Resume::On`: when a state file is there, inspect it (design
    §11.5.10) and either fail with `ResumeRejected` or write back the
-   accepted records; a `prefer_mode(Singleton)` task switches to the
-   concurrent engine with one connection (design §11.5.8); a resumable
-   fresh start creates the partial file and writes the state header
+   accepted records; a resumable fresh start creates the partial file
+   and writes the state header
    (design §11.5.5). With `Resume::Off`: invalidate a stale state file
    before the partial file is touched.
 6. Publish `info`, with `resumable` and `resumed`, then construct the
