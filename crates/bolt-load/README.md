@@ -97,6 +97,7 @@ decoded: a coded range makes the task fall back to one connection.
 Range requests carry `If-Range` with the validator of the metadata: the
 strong `ETag` of a GET, or else its `Last-Modified` when that is at least
 a second older than its `Date`. With only a weak `ETag`, none is sent.
+`BoltLoadAdapterMeta::validator` names the one sent, or `None`.
 When the resource changes during the download, the task removes what it
 wrote and fails with `DownloadError::ResourceChanged`. The task does not
 fall back to one connection then, since that connection could not notice

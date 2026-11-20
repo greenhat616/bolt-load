@@ -70,6 +70,14 @@ Every request, HEAD and full downloads included, sends
 body (RFC 9110 §12.5.3), and the file would hold the encoded bytes.
 `before_request` can still replace it.
 
+Range requests carry `If-Range` with the validator of the metadata,
+`BoltLoadAdapterMeta::validator`, and every range response is checked
+against that cached value, whatever was sent. A `before_request` hook
+(or a ureq `call` hook, or default headers of the reqwest client) must
+not replace that `If-Range`, nor add one when the metadata has none:
+a range of another version could then pass as this one, or a range of
+this one fail as `ResourceChanged`.
+
 A client that decodes bodies removes `Content-Encoding` before the check
 can see it. The body is therefore held to its `Content-Range` length: it
 fails with `RangeBodyTooLong` past it, and with `RangeBodyTooShort` if it
