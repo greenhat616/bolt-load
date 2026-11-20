@@ -59,11 +59,9 @@ impl DownloadLoop {
     }
 
     /// Whether `runner_id` may be judged, and so restarted: not once it is
-    /// stopping.
-    ///
-    /// The endgame hedge (T27, design §9.6) also leaves out either side of
-    /// a hedged pair here.
+    /// stopping, nor while it is a side of an undecided pair (design §9.6).
+    /// A runner left out is not in the median either.
     fn may_restart(&self, runner_id: RunnerId) -> bool {
-        !self.manager.is_stopping(runner_id)
+        !self.manager.is_stopping(runner_id) && !self.manager.is_in_undecided_pair(runner_id)
     }
 }

@@ -1,9 +1,11 @@
 use std::{
     collections::HashMap,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
+use async_ringbuf::traits::Consumer;
 use bolt_load_utils::telemetry::*;
 use bytes::Bytes;
 use futures::{Stream, task::AtomicWaker};
@@ -11,13 +13,28 @@ use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
 use super::{
-    DownloadedChunk, RunnerManager, RunnerTick,
+    DownloadedChunk, RunnerManager, RunnerTick, StopReason,
     stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem},
 };
 use crate::{
     runner::{DataFrame, DataFrameReceiver},
     task::RunnerId,
 };
+
+/// A runner's data receiver, shared by the aggregator, which polls it, and
+/// the arbitration of a hedged pair, which may take its queued frames first
+/// (design §9.6).
+#[derive(Clone)]
+struct SharedReceiver(Arc<Mutex<DataFrameReceiver>>);
+
+impl Stream for SharedReceiver {
+    type Item = DataFrame;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut receiver = self.0.lock().expect("a data receiver is never poisoned");
+        Pin::new(&mut *receiver).poll_next(cx)
+    }
+}
 
 pin_project! {
     /// Aggregates data from multiple runners into a single stream.
@@ -32,8 +49,8 @@ pin_project! {
     /// - Tracking runner ID for each data item
     pub struct DataAggregator {
         #[pin]
-        group: StreamGroup<RunnerTaggedStream<DataFrameReceiver>>,
-        map: HashMap<RunnerId, Key>,
+        group: StreamGroup<RunnerTaggedStream<SharedReceiver>>,
+        map: HashMap<RunnerId, (Key, SharedReceiver)>,
         waker: AtomicWaker,
     }
 }
@@ -60,18 +77,39 @@ impl DataAggregator {
     /// Register a data receiver for a runner.
     /// This is typically called when a `Started` lifecycle event is received.
     pub fn register(&mut self, runner_id: RunnerId, receiver: DataFrameReceiver) {
-        let tagged_stream = RunnerTaggedStream::new(runner_id, receiver);
+        let receiver = SharedReceiver(Arc::new(Mutex::new(receiver)));
+        let tagged_stream = RunnerTaggedStream::new(runner_id, receiver.clone());
         let key = self.group.insert(tagged_stream);
-        self.map.insert(runner_id, key);
+        self.map.insert(runner_id, (key, receiver));
         self.waker.wake();
     }
 
-    /// Unregister a data receiver for a runner.
+    /// Unregister a data receiver for a runner, dropping it with the frames
+    /// it holds.
     /// This is typically called when a `Stopped` lifecycle event is received.
     pub fn unregister(&mut self, runner_id: RunnerId) {
-        if let Some(key) = self.map.remove(&runner_id) {
+        if let Some((key, _)) = self.map.remove(&runner_id) {
             self.group.remove(key);
         }
+    }
+
+    /// Take the frames `runner_id` queued up to its first non-empty one,
+    /// which is returned; the empty ones before it are dropped. `None` when
+    /// it has no non-empty frame queued, or no receiver registered.
+    ///
+    /// The frames left stay for the aggregator, in order.
+    pub fn take_first_data(&mut self, runner_id: RunnerId) -> Option<Bytes> {
+        let (_, receiver) = self.map.get(&runner_id)?;
+        let mut receiver = receiver
+            .0
+            .lock()
+            .expect("a data receiver is never poisoned");
+        while let Some(frame) = receiver.try_pop() {
+            if !frame.data.is_empty() {
+                return Some(frame.data);
+            }
+        }
+        None
     }
 
     #[cfg(test)]
@@ -132,9 +170,9 @@ impl RunnerManager {
             .poll_next(cx)
             .map(
                 |event| match event.expect("the data aggregator never ends") {
-                    DataStreamEvent::Data(item) => RunnerTick::with_chunk(
-                        self.handle_data_frame(item.runner_id, item.item.data),
-                    ),
+                    DataStreamEvent::Data(item) => {
+                        self.on_data_frame(item.runner_id, item.item.data)
+                    }
                     DataStreamEvent::Closed(runner_id) => {
                         trace!("runner {runner_id} data stream closed");
                         self.data_aggregator.unregister(runner_id);
@@ -142,6 +180,66 @@ impl RunnerManager {
                     }
                 },
             )
+    }
+
+    /// Handle a data frame of `runner_id`, deciding its hedged pair first
+    /// when it is the first non-empty frame since the fork (design §9.6).
+    ///
+    /// The decision comes before the frame reaches the meters, the planner
+    /// or the writer. The original side wins a tie: when the hedge's first
+    /// frame is taken while the original, connected, still has a non-empty
+    /// frame queued, that frame is taken and handled instead. The beaten
+    /// side is stopped and its frames dropped; a frame of a beaten side is
+    /// never accepted. An empty frame decides nothing.
+    pub(in super::super) fn on_data_frame(
+        &mut self,
+        runner_id: RunnerId,
+        data_frame: Bytes,
+    ) -> RunnerTick {
+        if self.stop_reason(runner_id) == Some(StopReason::Loser) {
+            trace!("dropping a frame of beaten runner {runner_id}");
+            return RunnerTick::downloading();
+        }
+        if let Some(chunk) = self.chunk_planner.partner_chunk(runner_id) {
+            if data_frame.is_empty() {
+                return RunnerTick::downloading();
+            }
+            let original = chunk.runner_id.expect("an undecided pair has an owner");
+            // Only a connected original's frames are registered.
+            if let Some(queued) = self.data_aggregator.take_first_data(original) {
+                debug!("runner {original} wins its pair over hedge {runner_id}: a frame queued");
+                self.chunk_planner
+                    .drop_partner(runner_id)
+                    .expect("the hedge is a partner");
+                self.chunk_planner.decide(original);
+                self.stop_loser(runner_id);
+                return RunnerTick::with_chunk(self.handle_data_frame(original, queued));
+            }
+            debug!("hedge {runner_id} wins its pair over runner {original}");
+            self.chunk_planner
+                .hand_over(original)
+                .expect("the original owns the pair");
+            self.chunk_planner.decide(runner_id);
+            self.stop_loser(original);
+            return RunnerTick::with_chunk(self.handle_data_frame(runner_id, data_frame));
+        }
+        if !data_frame.is_empty()
+            && let Some(state) = self.chunk_planner.get_runner_state(runner_id)
+            && state.is_undecided()
+        {
+            if let Some(partner) = state.partner() {
+                debug!(
+                    "runner {runner_id} wins its pair over hedge {}",
+                    partner.runner_id
+                );
+                self.chunk_planner
+                    .drop_partner(partner.runner_id)
+                    .expect("the hedge is a partner");
+                self.stop_loser(partner.runner_id);
+            }
+            self.chunk_planner.decide(runner_id);
+        }
+        RunnerTick::with_chunk(self.handle_data_frame(runner_id, data_frame))
     }
 
     /// Handle data frames from runners, returning the chunk ready for writing.
@@ -157,6 +255,7 @@ impl RunnerManager {
         data_frame.truncate(picked_size as usize);
 
         DownloadedChunk {
+            runner_id,
             range: fixed_downloaded_range,
             bytes: data_frame,
         }
@@ -321,5 +420,94 @@ mod tests {
             DataStreamEvent::Closed(id) => assert_eq!(id, 1),
             other => panic!("expected Closed event, got {other:?}"),
         }
+    }
+
+    /// Counts its wake-ups.
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+
+    impl WakeCount {
+        fn get(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl futures::task::ArcWake for WakeCount {
+        fn wake_by_ref(this: &std::sync::Arc<Self>) {
+            this.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn frame(byte: u8) -> DataFrame {
+        DataFrame {
+            data: Bytes::from(vec![byte; 4]),
+        }
+    }
+
+    /// The data of the next event, polled with `waker`.
+    fn poll_data(aggregator: &mut DataAggregator, waker: &std::task::Waker) -> Poll<Option<Bytes>> {
+        let mut cx = Context::from_waker(waker);
+        Pin::new(aggregator)
+            .poll_next(&mut cx)
+            .map(|event| match event {
+                Some(DataStreamEvent::Data(item)) => Some(item.item.data),
+                other => panic!("expected data, got {other:?}"),
+            })
+    }
+
+    /// The receiver shared with the arbitration (design §9.6) keeps its
+    /// wake-ups and its order: frames taken from outside leave the rest in
+    /// order; once the aggregator found it empty, a new frame wakes it; and
+    /// a producer blocked on a full channel resumes once a frame is taken
+    /// from outside.
+    #[tokio::test]
+    async fn test_frames_taken_by_the_arbitration_keep_wake_ups_and_order() {
+        let (mut sender, receiver) = AsyncHeapRb::<DataFrame>::new(2).split();
+        let mut aggregator = DataAggregator::new();
+        aggregator.register(1, receiver);
+        let consumer_wakes = std::sync::Arc::new(WakeCount::default());
+        let consumer = futures::task::waker(consumer_wakes.clone());
+
+        // Taken from outside: empty frames are skipped, the rest stays.
+        sender.try_push(DataFrame { data: Bytes::new() }).unwrap();
+        sender.try_push(frame(1)).unwrap();
+        assert_eq!(aggregator.take_first_data(1), Some(Bytes::from(vec![1; 4])));
+        assert_eq!(aggregator.take_first_data(1), None);
+        assert!(poll_data(&mut aggregator, &consumer).is_pending());
+        let seen = consumer_wakes.get();
+        sender.try_push(frame(2)).unwrap();
+        assert!(
+            consumer_wakes.get() > seen,
+            "a new frame wakes the aggregator"
+        );
+        assert_eq!(
+            poll_data(&mut aggregator, &consumer),
+            Poll::Ready(Some(Bytes::from(vec![2; 4])))
+        );
+
+        // A producer waits for room, which a frame taken from outside
+        // makes.
+        sender.try_push(frame(3)).unwrap();
+        sender.try_push(frame(4)).unwrap();
+        let producer_wakes = std::sync::Arc::new(WakeCount::default());
+        let producer = futures::task::waker(producer_wakes.clone());
+        let mut push = std::pin::pin!(sender.push(frame(5)));
+        let mut cx = Context::from_waker(&producer);
+        assert!(
+            push.as_mut().poll(&mut cx).is_pending(),
+            "the channel is full"
+        );
+        assert_eq!(aggregator.take_first_data(1), Some(Bytes::from(vec![3; 4])));
+        assert!(producer_wakes.get() > 0, "the producer is woken");
+        assert!(matches!(push.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+
+        // The rest comes in order.
+        for byte in [4, 5] {
+            assert_eq!(
+                poll_data(&mut aggregator, &consumer),
+                Poll::Ready(Some(Bytes::from(vec![byte; 4])))
+            );
+        }
+        assert!(poll_data(&mut aggregator, &consumer).is_pending());
     }
 }

@@ -160,6 +160,8 @@ impl FileWriter {
             FileRangeWriterImpl::Compio(writer) => Some((&writer.tx, &writer.path)),
             #[cfg(test)]
             FileRangeWriterImpl::Slow(_) => None,
+            #[cfg(test)]
+            FileRangeWriterImpl::Recording(_) => None,
         }
     }
 

@@ -157,6 +157,12 @@ pub enum RangeFault {
     /// 200 and [`RangeFault::replacement`], as if the resource were replaced
     /// by a server that ignores ranges.
     ReplacedAfterShortRange,
+    /// Answer the first range request that starts past the start of the
+    /// resource with the first half of its body, then send nothing more,
+    /// without closing the connection. A task only gets past it within its
+    /// idle timeout by requesting the rest again, so it is not in
+    /// [`RangeFault::ALL`].
+    StalledOnce,
 }
 
 /// The `Retry-After` seconds of [`RangeFault::Congested`] and
@@ -193,6 +199,7 @@ impl RangeFault {
             Self::EncodedRepresentation => "/encoded-representation",
             Self::Truncated => "/truncated",
             Self::ReplacedAfterShortRange => "/replaced-after-short-range",
+            Self::StalledOnce => "/stalled-once",
         }
     }
 
@@ -209,6 +216,7 @@ impl RangeFault {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
+            .chain([Self::StalledOnce])
             .find(|fault| fault.path().strip_prefix('/') == Some(name))
     }
 }
