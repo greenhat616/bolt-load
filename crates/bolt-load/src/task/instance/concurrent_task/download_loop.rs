@@ -14,7 +14,7 @@ mod throughput;
 
 use std::{
     future::poll_fn,
-    ops::ControlFlow,
+    ops::{ControlFlow, Range},
     sync::Arc,
     task::{Context, Poll},
     time::Instant,
@@ -151,6 +151,17 @@ impl DownloadLoop {
         self
     }
 
+    /// Start from the ranges a resumed download kept (design §11.5.10
+    /// step 5): downloaded, written, and recorded by the state file. Call
+    /// it before the loop runs.
+    pub(super) fn resume_from(mut self, kept: &[Range<u64>]) -> Self {
+        self.manager.seed_kept(kept);
+        if let Some(checkpoints) = self.checkpoints.as_mut() {
+            checkpoints.seed_durable(kept);
+        }
+        self
+    }
+
     /// Start a checkpoint at `now` if one is due.
     fn maybe_checkpoint(&mut self, now: Instant) {
         if let Some(checkpoints) = self.checkpoints.as_mut() {
@@ -159,6 +170,10 @@ impl DownloadLoop {
     }
 
     pub(super) async fn run(&mut self) -> Result<()> {
+        // A resume that kept every byte has nothing to download.
+        if self.manager.is_complete() {
+            return Ok(());
+        }
         loop {
             let event = poll_fn(|cx| self.poll_event(cx)).await;
             if self.handle_event(event)?.is_break() {

@@ -945,3 +945,19 @@ async fn test_checkpoints_keep_their_minimum_spacing() {
         [Call::Record(vec![0]), Call::Record(vec![1])]
     );
 }
+
+/// What a resume kept is recorded already: its blocks are durable from the
+/// start, the last one shorter at the total included, and are not
+/// recorded again.
+#[tokio::test]
+async fn test_kept_blocks_are_durable() {
+    let mut s = Setup::new(2 * BLOCK, Duration::from_secs(3600));
+    s.checkpoints
+        .seed_durable(&[0..BLOCK, 3 * BLOCK..3 * BLOCK + 5]);
+    assert_eq!(s.durable(), [0..1, 3..4]);
+    s.write(BLOCK..3 * BLOCK).await;
+    assert!(s.maybe_start(Duration::ZERO));
+    s.settle().await;
+    assert_eq!(s.received.calls(), [Call::Record(vec![1, 2])]);
+    assert_eq!(s.durable(), [0..4]);
+}

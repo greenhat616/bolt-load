@@ -26,8 +26,7 @@ use super::{
 };
 use crate::task::Progress;
 
-/// How far an attempt got, as its cleanup sees it (design §11.5.9). The
-/// phase of a resume being checked (B2) arrives with C20.
+/// How far an attempt got, as its cleanup sees it (design §11.5.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// No lock and no file yet (A): nothing to clean up.
@@ -35,6 +34,9 @@ pub(crate) enum Phase {
     /// A resumable new start, its state header not yet durable (B1): a
     /// failure discards both files.
     Fresh,
+    /// A resume being checked, before it changed either file (B2): a
+    /// failure leaves both as they are.
+    Checking,
     /// A resumable transfer, its state header durable (C): a failure keeps
     /// the partial file and the state file for a later resume.
     Resumable,
@@ -165,6 +167,17 @@ impl Ownership {
         state.lock = Some(lock);
         state.tmp = Some(tmp);
         state.phase = Phase::Transfer;
+    }
+
+    /// The task holds `lock` and found a state file to resume from, next to
+    /// the temporary file `tmp`: it checks them before it changes either
+    /// (design §11.5.9, B2). The task writes the state file from then on.
+    pub(crate) fn own_to_resume(&self, lock: DestinationLock, tmp: PathBuf) {
+        let mut state = self.state();
+        state.lock = Some(lock);
+        state.tmp = Some(tmp);
+        state.phase = Phase::Checking;
+        state.durable = true;
     }
 
     /// Enter `phase`; [`Phase::Fresh`] marks the task as one that writes a
@@ -382,6 +395,12 @@ impl Ownership {
             // When the invalidation fails, both stay, and the partial file
             // is reported as left.
             (Phase::Fresh, Some(_)) => (self.discard_resumable().leftover, None),
+            // A resume being checked changed neither file: both stay as
+            // they are, and they are not reported (design §11.5.9, B2).
+            (Phase::Checking, _) => {
+                self.keep_files();
+                (None, None)
+            }
             // Both kept, as the last checkpoint left them; no teardown
             // checkpoint (design §11.5.9, C).
             // An invalidation cut the state before the panic: both stay, as

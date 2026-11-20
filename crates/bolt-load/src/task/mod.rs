@@ -20,6 +20,7 @@ pub use builder::*;
 pub use error::*;
 pub use handle::*;
 pub use options::*;
+pub use resume::{DropReason, DroppedRecord, RejectReason, ResumeReport};
 pub use status::{Speed, StatusReceiver, TaskInfo, TaskState, TaskStatus};
 
 pub type RunnerId = usize;
