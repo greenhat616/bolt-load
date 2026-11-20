@@ -648,10 +648,13 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
 
 需要同时满足：
 
-1. 没有可切的活：没有可领取的未分配区间；所有未完成的 chunk，不论 Pending 还是 Running，剩余量都 < `2 × min_chunk_size`。
+1. 没有可切的活，和 C11 的切分门槛对齐（理由见下文“排除”里的“和 C11 对齐”）：
+   - 没有可领取的未分配区间（`get_eligible_ranges(now)` 为空，冷却中的不算）；
+   - 候选 runner 自己的 chunk 剩余量 < `2 × min_chunk_size`，也就是 §9.5 低速重启管不到的那一段；
+   - 其它未完成的 chunk，不论 Pending 还是 Running，剩余量都 < `planned_split_size`，即 C11 的切分门槛 `max(donor_rate × 2 s, min_chunk_size)`（§14.14）。Pending 的 chunk 一律向 `planned_split_size` 传 `None` 作 donor 速率，也就是用 `per_runner_speed` 代替：`RunnerRates` 给连续两次采样都还在连接的 runner 记的是 `Some(0.0)`，不是 `None`，直接用它，门槛就退到 `min_chunk_size`。这是 T27 借用 C11 的门槛，C11 自己从不切 Pending 的 chunk。正在停止的 runner（§14.15）的 chunk 和这次尝试对冲过的 chunk（`hedge` 不为空，包括分出胜负之后的）不算：前者的区间马上要退回，后者不能切（见“排除”）。
 2. 能再开一条连接：活跃 runner（一对算两个）少于当前的并发上限（下载循环的 `max_concurrency`，并发控制降级后会变小）；`try_reserve_slot` 能占到槽位（§7.2）；不在 `congestion_until` 之前（§8.1）；没有启用限速。
 3. 某个 runner 已经静默 `hedge_idle`（默认 2 s），静默的算法见下。
-4. 它的 chunk 还有没收到的字节，并且这次尝试还没有对冲过（见“预算”）。
+4. 它的 chunk 还有没收到的字节，这次尝试还没有对冲过（见“预算”），它也不在停止中（§14.15）。
 
 有多个候选时，选静默最久的。每个 tick 最多发起一个对冲。发起对冲的函数自己再查一遍条件 1 和 2，和 `spawn_runner`、`split` 自己查拥塞一样（§14.12）。
 
@@ -675,6 +678,12 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
 - 分叉时原 runner 已经读到、但 manager 还没取走的数据（在它的通道或缓冲里）属于原 runner，从分叉点开始。如果先取到的是其中一帧，就是原 runner 先交来数据：原 runner 胜，这些帧照常写入。对冲先胜时，它们是败方的帧，丢弃。
 - 空帧不决定胜负。runner 不发空帧，但 planner 截断之后可能为空。
 - 两方都有帧可取时，原 runner 胜。`StreamGroup` 按内部 key 的顺序轮询，不保证先轮询原 runner，所以实现要自己保证：取到对冲的第一帧时，先看原 runner 的通道里有没有帧。
+  - “可取”指 manager 能取：原 runner 的 `Started` 已经处理过，它的数据通道里有帧。原 runner 在 manager 看来还在连接时，它的数据接收端在 `connecting_data` 里，帧不算可取，对冲的帧先到就是对冲胜。
+  - `StreamGroup`（futures-concurrency 7.7.1）只有 `insert`、`remove`、`contains_key`，不能按 key 取出组里的流。所以原 runner 的数据接收端要放在实现能直接查到的地方。
+  - 分叉时 O 往往已经是 Running，它的接收端早已在组里。不能先 `remove` 再放到别处：`remove` 会把接收端连同排着的帧一起丢掉（`DataAggregator::unregister` 就是这样用的）。所以要从普通 runner 起就换存储，两种做法都行：
+    - 数据接收端不放进 `StreamGroup`，放在按 runner ID 索引的表里，自己轮询，每个接收端注册自己的唤醒；
+    - 或者每个接收端旁边再留一个能查“通道里有没有帧”的句柄。
+  - 不管哪种，都要验证：查看或转移接收端时不丢帧，有新帧时循环照常被唤醒。
 - 败方的帧一律丢弃，不写入，也不计入吞吐。败方被取消：不算失败，不退避，`attempts` 和 `charged`（§14.13）都不变。
 
 #### 错误
@@ -684,7 +693,7 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
 | 出错的一方 | 错误 | 处理 |
 | --- | --- | --- |
 | 一方，另一方还在 | 可重试 | 只结束这一方。区间不退回，不退避，`attempts` 和 `charged` 都不变，也不检查区间预算。按 §14.13 的分类计入任务级连续失败，见表下 |
-| 一方，另一方还在 | 拥塞（429/503） | 只结束这一方。区间不退回，不退避，`attempts` 和 `charged` 都不变。另外立即按 §8.1 更新 `congestion_until`，并照常记入并发控制的反馈，和普通 runner 遇到拥塞一样（§14.12）。另一方算作在途，所以任务不终止，也不计入连续失败 |
+| 一方，另一方还在 | 拥塞（429/503） | 只结束这一方。区间不退回，不退避，`attempts` 和 `charged` 都不变。另外立即按 §8.1 更新 `congestion_until`，并照常记入并发控制的反馈，和普通 runner 遇到拥塞一样（§14.12）。没有 `Retry-After` 时，延迟取 `backoff(chunk.attempts + 1)`，即这个区间此刻失败会用的退避；之后像 `back_off` 一样按 `next_retry` 提前唤醒。另一方算作在途，所以任务不终止，也不计入连续失败 |
 | 任一方 | §4.3 的回退错误 | 照常回退：取消所有 runner，改用单连接 |
 | 任一方 | 其它不可重试的错误 | 照常终止任务 |
 | 最后一方 | 可重试或拥塞 | 区间按 §8.1 退回，只退避一次：`attempts + 1`；`charged` 最多加 1，规则见“预算”。先查这一对的预算，再按 §14.13 处理最后一方的错误，所以 429/503 也可能以 `RangeExhausted` 结束（见“预算”的判定顺序）。`RangeExhausted` 的 `source` 取这最后一个错误。前一方的 `Retry-After` 已经写进 `congestion_until`，它只推后、不提前（§14.12），所以较长的那个仍然有效 |
@@ -695,7 +704,7 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
 - 其它可重试的失败：计入，包括没收到过数据的失败、`ChannelClosed` 和可重试的状态码。胜负分出之前失败的对冲 runner 不会是重启。
 - 拥塞，并且还有别的尝试在途（另一方也算）：容忍，不计入，这是 `FailurePolicy::on_failure` 现在的做法。没有别的尝试在途时，拥塞照常终止任务，和普通 runner 一样。
 
-胜负分出之后，胜方就是这个 chunk 的普通 runner，按原来的规则处理。败方的事件按下面“待 T27 开工前补齐”的不变量处理。
+胜负分出之后，胜方的帧、切分以外的事件和超时都按普通 runner 处理，败方的事件按下面“状态转换”一节处理。例外是一方先失败、幸存方后来才交数据的情况（下文的状态 C′）：仲裁到此结束，但这次尝试的预算仍按一对算，见“预算”。
 
 #### 预算
 
@@ -721,21 +730,27 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
   | 原 runner 交过数据之后 `ChannelClosed` | 对冲 429/503 | +1：`ChannelClosed` 记预算，也不算重启 |
 
 - §14.13 的 `received` 取的是 chunk 已下载部分的长度，planner 不区分是哪个 runner 交的。对冲期间这些字节全是原 runner 交的，对冲 runner 自己是 0。所以 T27 要分别记两方被接受的字节数，不能直接用 `Released::received` 给对冲 runner 分类。
-- 这一对记的预算，不少于原 runner 单独失败时记的：原 runner 的失败记预算时，它不是重启，对冲 runner 在胜负分出之前也不会是重启，所以这一对加 1。
+  - 不用另加计数，只要记下分叉点：分叉之后被接受的字节都来自同一方。O 自己的字节是“分叉点 − chunk 起点”，O 幸存或胜出时再加上分叉之后的部分，也就是整个已下载部分；H 自己的字节是“已下载末尾 − 分叉点”，H 交第一个非空帧之前是 0。
+- 一方先失败、幸存的一方后来交了数据，也算分出胜负（没有败方要停）。仲裁到此结束，帧照常处理；但先失败一方的类别要留到这次尝试结束（区间完成或退回），幸存方之后的失败仍按一对算。不能当成普通 runner 处理：`ChannelClosed` 即使在交过数据之后也记预算（`failure_policy.rs` 的 `is_restart` 不含它）。比如 O 分叉前交过数据、后来超时（重启），H 交了数据之后丢失（`ChannelClosed`）：按一对算是 0，按普通 runner 算是 +1，在预算临界点上会误报 `RangeExhausted`。
+- 两方都在交数据之前失败时，这一对记的预算不少于原 runner 单独失败时记的：原 runner 的失败记预算时，它不是重启，对冲 runner 没交过数据，也不会是重启，所以这一对加 1。状态 C′ 里幸存方交过数据后才重启时，这一对是 0；这时这次尝试有字节被接受，区间已经变短，和单个 runner 的重启一样。
 - 不会没有进展地一直循环：
   - 每次尝试最多两个 runner（最多对冲一次），一方失败后不再补发。
-  - 有一方是重启时，这一对不记预算。重启的一定是原 runner，这次尝试有字节被接受，所以退回的区间严格变短，和 §14.13 的论证一样。
+  - 有一方是重启时，这一对不记预算。任一方被算成重启，都说明它自己有字节被接受，也就是这次尝试有字节被接受，所以退回的区间严格变短，和 §14.13 的论证一样。重启的可以是分叉前交过数据的 O，也可以是状态 C′ 里交过数据的幸存方（O 或 H）。
   - 没有重启、至少一方记预算时，`charged + 1`，受 `max_attempts_per_range` 约束。
   - 剩下的只有两方都是 429/503：和 §14.13 一样，只有别的连接还在途时才被容忍，`no_progress_timeout` 照常有效。
 
-#### 待 T27 开工前补齐
+#### 状态转换（T27 开工前补齐）
 
-一个逻辑 chunk 挂两个 runner 的具体状态机，要等 T11–T13 改完 planner 和策略再定：两方各自的状态转换、败方的清理、对冲 runner 的 spawn 被拒绝、败方的生命周期通道没发 `Stopped` 就关闭、败方还没停下任务就完成。T27 动代码之前，先按 T13 之后的代码在这里补一张状态转换表，评审通过再实现。不管表怎么写，都要守住：
+这一节按 C12（`ee092fc`）之后的代码，写一个逻辑 chunk 挂两个 runner 时的状态转换，评审通过再实现。O 是原 runner，H 是对冲 runner。没写目录的文件都在 `crates/bolt-load/src/task/instance/concurrent_task/` 下，runner 的文件在 `crates/bolt-load/src/runner/` 下。
+
+不管实现怎么写，都要守住：
 
 - 每一方都只释放自己的资源和槽位，败方也一样。槽位在确认这个 runner 已经终止、或者没能启动之后，恰好回收一次。确认的方式有三种：它报告了 `Stopped`；它的生命周期通道没发 `Stopped` 就关闭了；它的 spawn 被拒绝。
 - 败方不会完成、也不会释放这个逻辑区间。
-- 败方迟到的事件（数据、`Stopped`、失败）一律忽略，不去 planner 里查它的 chunk，更不当成失败处理。
+- 败方迟到的事件（`Started`、数据、`Stopped`、失败）一律忽略，不去 planner 里查它的 chunk，更不当成失败处理。
 - 活跃 runner 的计数两方都算。现在策略用的 `get_active_runners_count` 数的是活跃的 chunk，一对只算一个。
+
+##### 代码现状
 
 表里要处理的现状（C9）：
 
@@ -743,6 +758,236 @@ bolt-load 只做这个收尾版。§9.5 的低速重启在剩余量不足 `2 × 
   - C12 之后：每个 runner 有自己的停止开关（任务令牌的子令牌），`RunnerManager::stop_runner` 只停它一个；被停的 runner 报 `Cancelled` 时按低速重启处理，其余 runner 被取消时仍然跳过失败上报（§14.15）。已经决定怎么结束的 runner（拿着错误或已下完、在交最后一段缓冲或等帧被取走）不理这个开关。对冲的败方可以用同一个开关停下，但 T27 要记下停止的原因（低速重启还是对冲败方），manager 按原因处理，不能把被停之后的 `Cancelled` 一律当低速。
 - spawn 被拒绝现在按不可重试的连接失败处理，任务终止（§14.11），处理时同样会 `mark_failed`。
 - 生命周期通道没发 `Stopped` 就关闭时，`handle_runner_lost` 也是先 `mark_failed`，再释放槽位；任务还没完成时，上报一次 `ChannelClosed` 的可重试失败（`runner_manager/lifecycle.rs`）。
+
+下面这些也按 C12 的代码核对过，表里要用到：
+
+- planner 一个 chunk 只记一个 `runner_id`，`runner_to_chunk` 也是一个 runner 对一个 chunk。`update_progress`、`mark_running`、`mark_finished`、`mark_failed` 都按 runner ID 找 chunk（`chunk_planner.rs`）。manager 调用它们时都带 `expect`，找不到就 panic（`runner_manager/lifecycle.rs`、`runner_manager/data.rs`）。所以 H 的事件，以及不再是 owner 的一方的事件，都不能原样走这些路径。
+- 处理 `Stopped` 时，manager 先调用 `release_runner`：ID、limit sender、生命周期接收端、数据接收端、停止开关和 `stopping` 项一起释放（`runner_manager.rs`）。生命周期接收端没了，manager 就再也收不到这个 runner 的事件，也不会再有它的通道关闭事件。
+- 连接中的 runner，数据接收端放在 `connecting_data` 里，处理 `Started` 时才移进数据聚合器，这一步 `expect` 它还在（`runner_manager/lifecycle.rs`）。
+- `PublishingStarted` 阶段不看停止开关（`run_loop.rs` 的 `poll_step`）。所以连接中被停的 runner，可能先报 `Started`，再报 `Cancelled`。
+- runner 被取消（任务令牌或自己的停止开关）时不等 drain，直接报 `Stopped`（`run_loop/drain.rs` 的 `should_wait_data_drain`）。完成、流出错和超时要先等数据通道里的帧被取走。
+- manager 丢掉一个 runner 的数据接收端之后：runner 交帧时 `poll_ready` 返回 false，以 `ChannelClosed` 结束（`run_loop/emit.rs`）；runner 在 drain 时，`poll_drained` 立即返回，报它原来的结果（`run_loop/drain.rs`）。依据是 async-ringbuf 0.3.10 的 `is_closed`：消费端被丢掉后为真，它的 `drop_close_cons` 测试验证了这一点。所以丢掉败方的数据接收端、再拉下它的停止开关，败方在哪个阶段都会很快停下：连接和读流时靠停止开关，交帧和 drain 时靠通道关闭。
+- `update_progress` 收满 chunk 时把它改成 `Finished`，runner 这时还没停。`get_active_runners_count` 不再数它，它的 ID 要到 `Stopped` 才回收（§14.11）。
+- `resize_runner_state` 发给 runner 的上限是“新末尾 − chunk 起点”（`chunk_planner.rs`）。runner 从自己请求的起点开始数字节，而 H 的请求从分叉点开始，两者差“分叉点 − chunk 起点”。runner 收到不小于当前上限的新上限时报 `ExceededTotalSize`（`runner/control.rs` 的 `apply_control`），manager 把它当完成处理（`handle_lifecycle`）。
+- `on_failure` 的 `in_flight` 是 `allocated_runner_count()`，也就是占着 ID 的 runner 数。失败的 runner 在这之前已经释放（`download_loop/runner.rs`）。
+- 下载循环只在 `handle_event` 里取 `now`。manager 在轮询里处理数据帧，拿不到 `now`；`DownloadedChunk` 也不带 runner ID。
+- `RunnerRates::sample` 只采样 chunk 的 owner（`active_chunks` 的 `runner_id`）。`Doubling` 在“有 runner 在连接、或者这个 tick 没有数据”时不扩张（§14.14 的检查 5，即 `all_delivering`）。所以只要有一个 runner 静默了一个 tick，扩张就停着。
+
+##### 新增的记录
+
+- chunk 上，建议放进 `ChunkState`，这样 `PlannerGuard` 回滚时一起恢复：
+  - 仲裁和预算分开记，因为两者结束的时刻不同：
+    - `pair`，仲裁用：O 和 H 的 ID、H 的状态（Pending 或 Running）。一方出局时缩成只记幸存方的单方记录（不再记出局一方的 ID），T13 和扩张仍按它跳过幸存方；第一个非空帧到来时清掉，不论是两方都在时分出胜负，还是幸存方交来第一帧。
+    - `hedge`，预算用：`Option<{ fork, first, owner_side }>`。`fork` 是分叉点，`first` 是先失败一方的类别（是不是重启、记不记预算），没有一方失败过时为空。`owner_side` 是当前 owner 是哪一方（`Original` 或 `Hedge`），发起对冲时是 `Original`，“交给 H”时改成 `Hedge`。最后一方失败时按它选 owner 自己的字节：`Original` 用 `Released::received`，`Hedge` 用“已下载末尾 − `fork`”。这里只记哪一方，不记 runner ID，因为 ID 回收后会被重用。发起对冲时写入，一直留到这次尝试结束：chunk 收满，或者区间被退回。它在，就说明这次尝试已经对冲过。区间退回后被重新领取、或者切分出新 chunk 时，都是新的 `ChunkState`，从空开始。
+  - chunk 的 `runner_id` 仍是唯一的 owner，`runner_to_chunk` 也只映射 owner。
+  - 另有一张 H → chunk 起点的表 `hedge_of`。它只收录还活着、而且不是 owner 的 H。H 出局、H 变成 owner（H 胜，或者 O 先出局）、H 变成败方、H 的 spawn 被拒绝，这四种情况都先删掉 H 的项。`runner_to_chunk` 也一样：O 不再是 owner 时（“交给 H”）先删掉 O 的项。这两步都在“回收”或“停败方”之前做，所以一个 ID 被回收、再分配给别的 runner 时，两张表里都已经没有它的旧项，新 runner 的事件不会被导向旧的一对。
+- manager 上：
+  - `stopping` 从 `HashSet` 改成 `HashMap<RunnerId, StopReason>`，`StopReason` 是 `Slow` 或 `Loser`，见“停止的原因”。
+  - `last_delivery: HashMap<RunnerId, Instant>`，静默的起点：
+    - spawn 时写一次，时刻取 `spawn_runner`、`split` 和发起对冲时传进来的 `now`；
+    - 循环在 `on_runner` 里接受非空帧时，用 `handle_event` 的 `now` 更新，所以 `DownloadedChunk` 要带上 runner ID；
+    - writer 从满变成可写时，全部改成 `now`。不能在处理 `WriterCompleted` 前后比较 `can_write()`：`poll_writer` 调用的 `PendingWriter::poll_completions` 在 `settle` 里就释放了写槽、提交了排着的写入（`file_writer/pending_writer.rs`），处理事件时 writer 已经可写，前后都是 `true`。所以 `poll_writer` 在调用 `poll_completions` 之前记下 `!can_write()`，随 `WriterCompleted` 事件带出“之前满过”；`handle_event` 看到它，就用自己的 `now` 全部重置；
+    - `release_runner` 时删掉。
+- 每一方被接受的字节不用另加计数，由 `hedge.fork` 算出，见“预算”。
+
+##### 状态
+
+| 状态 | chunk 的 owner | 两个 runner | 计数与字节 | 活跃数 | 占用的槽位 |
+| --- | --- | --- | --- | --- | --- |
+| A 分叉前 | O | O 是 Pending 或 Running，没有 H | `attempts`、`charged` 是领取时带来的；O 的字节等于已下载部分 | 1 | 1 |
+| B 未决 | O | O、H 都在，各自是 Pending 或 Running | 和 A 一样；已下载部分停在分叉点，H 的字节是 0 | 2 | 2 |
+| C 一方已失败 | 幸存的一方 X | 先失败的一方已回收 | 和 A 一样；`pair` 是只记 X 的单方记录，`hedge.first` 记着先失败一方的类别 | 1 | 1 |
+| C′ 一方失败后幸存方交了数据 | X | X 照常下载 | 和 C 一样；`pair` 已清掉，`hedge.first` 还在 | 1 | 1 |
+| D 已决 | 胜方 W | W 照常下载；败方 L 在停止 | W 继承 `attempts`、`charged`；`hedge.first` 为空 | 1，不数 L | W 一个；L 另占一个，直到它确认终止 |
+| E 两方都失败 | 无，区间已退回 | 都已回收 | `attempts + 1`，`charged` 按“预算”加 0 或 1，区间冷却 | 0 | 0 |
+| F 完成 | W，chunk 是 `Finished` | W 在 drain 或已停 | 不变；`hedge` 随这次尝试结束 | 0 | W 确认终止后回收 |
+
+- 败方 L 不属于任何状态：它只是 `stopping` 里的一项 `Loser`，占着一个槽位，直到确认终止（见“停止的原因”）。chunk 之后怎么变（W 失败、区间退回、被新的尝试领取、收满），都不影响它；它的终止也不改 chunk 的状态。
+- D 和 C′ 里 W（或 X）之后的失败，都按“预算”里一对的规则算 `charged`；D 里 `hedge.first` 为空，结果和普通 runner 一样。
+- E 之后区间被重新领取，是新的尝试，可以再对冲。
+
+##### 转换
+
+记号：
+
+- “回收 X”：`release_runner(X)`，恰好一次。它释放 X 的 ID、limit sender、生命周期接收端、数据接收端和停止开关，并删掉 `meters`、`last_delivery`、`stopping` 里 X 的项。不碰 planner。调用之前，X 在 `runner_to_chunk` 和 `hedge_of` 里都已经没有项。
+- “停败方 L”：先从 `runner_to_chunk` 或 `hedge_of` 删掉 L；`stopping[L] = Loser`；拉下 L 的停止开关；拿掉 L 的数据接收端，排着的帧随之丢掉；删掉 `meters` 和 `last_delivery` 里 L 的项。L 的 ID、limit sender 和生命周期接收端留着，等它确认终止时再“回收 L”。
+- “交给 X”：先删掉旧 owner 在 `runner_to_chunk` 的项、X 在 `hedge_of` 的项，再把 chunk 的 owner 改成 X、`runner_to_chunk` 加上 X，chunk 的状态改成 X 的状态（Pending 或 Running）。`hedge.owner_side` 改成 X 那一方。已下载部分、`attempts`、`charged`、`generation`、`hedge.fork` 和 `hedge.first` 都不变。
+- “X 出局”：状态 B 里一方 X 失败、另一方 Y 还在。X 是 owner 时交给 Y，否则从 `hedge_of` 删掉 X；然后回收 X；`pair` 缩成只记 Y 的单方记录，不再记 X 的 ID（这时它只用来让 T13 和扩张跳过 Y，直到 Y 交来第一个非空帧时清掉）；`hedge.first` 记下 X 的类别：是不是重启（按 X 自己的字节），记不记预算（`charges_range`）。planner 不释放区间，不退避，`attempts` 和 `charged` 不变，不查区间预算。
+
+触发（A → B）：
+
+- 时机：每个策略 tick，在低速重启和策略动作（并发控制的 `CreateTask`、`Doubling` 的扩张）之后。它们先用槽位，发起对冲的函数再查一遍条件 1 和 2。
+- 先占一个槽位，占不到就什么都不改。
+- spawn H，请求 `[分叉点, allocated.end)`，带自己的停止开关。不在 planner 里分配区间（`spawn_in` 会分配，要另写一个），只记 `pair`、`hedge = { fork: 分叉点, first: 空, owner_side: Original }` 和 `hedge_of[H]`，并且 `last_delivery[H] = now`。
+- 计数、O 的字节、O 的空闲超时和无进展截止时间都不变。
+- spawn 被拒绝时，照现在的做法排进 `spawn_failures`，状态仍是 B，由 B 表里“H 的 spawn 被拒绝”一行处理。
+
+状态 B（未决，两方都在）：
+
+| 事件 | 下一状态 | 处理 |
+| --- | --- | --- |
+| O 交来非空帧 | D，W = O | 先停败方 H，清掉 `pair`。再照常处理这一帧：`meters`、`update_progress`、写入、`on_progress`，`last_delivery[O] = now`。计数不变 |
+| H 交来非空帧，O 不可取：O 还在连接，或 O 的数据通道是空的 | D，W = H | 交给 H（Running）；停败方 O；清掉 `pair`；再照常处理 H 的帧。O 在分叉前交的字节留在 chunk 里。计数不变，由 H 继承 |
+| H 交来非空帧，但 O 的通道里已经有帧；或者同一次轮询里两方都有帧 | D，W = O | H 的这一帧丢掉：不写入，不计 `meters`。停败方 H，清掉 `pair`。O 的帧照常取 |
+| 空帧 | B | 不会出现：分叉后 chunk 还有剩余，帧从已下载的末尾接上，截断后仍不为空。出现了也不决定胜负 |
+| O 的 `Started` | B | 照常：`mark_running(O)`，数据接收端移进聚合器 |
+| H 的 `Started` | B | `pair` 里的 H 改成 Running，数据接收端移进聚合器。不调用 planner 的 `mark_running` |
+| 任一方 X 报 `Finished`，或报当作完成的 `ExceededTotalSize` | C | 不会出现：runner 要等帧被取走才报完成，而取走第一帧就分出了胜负；B 里也不会 resize。出现了就按 X 以 `ChannelClosed` 失败处理，和 `handle_lifecycle` 里“连接中报完成”一样 |
+| X 报 `Cancelled`，`stopping` 里没有它 | C | 只有任务取消才会这样，那时循环先处理取消事件，整个结束。万一先处理到：X 出局，不算失败，`hedge.first` 记为既不是重启、也不记预算 |
+| X 可重试的失败，是重启。只能是分叉前交过数据的 O：超时、断流或提前结束 | C | X 出局，`hedge.first` 是重启。不计连续失败。结果采样照常记一次可重试的失败 |
+| X 可重试的失败，记预算：连接失败、没有数据的超时或断流、可重试的状态码、`ChannelClosed` | C | X 出局，`hedge.first` 是记预算。连续失败加 1，到上限时任务以 `RetryLimitExceeded` 结束；不查区间预算。结果采样照常 |
+| X 收到 429/503 | C | X 出局，`hedge.first` 既不是重启、也不记预算。按 §8.1 推后 `congestion_until`：有 `Retry-After` 时取它和退避中较长的，没有时取 `backoff(chunk.attempts + 1)`，上限 120 s，只推后不提前；然后像 `back_off` 一样按 `next_retry` 提前唤醒。结果采样记一次不可重试的失败，下一个 step 会降并发。不计连续失败 |
+| X 的 §4.3 回退错误 | 结束 | 照常回退到单连接（`range_unsupported`） |
+| X 的其它不可重试的错误 | 结束 | 照常终止任务 |
+| X 的生命周期通道没发 `Stopped` 就关闭 | C | 按 X 以 `ChannelClosed` 失败处理：X 出局，`hedge.first` 是记预算，连续失败加 1 |
+| H 的 spawn 被拒绝 | 结束 | 从 `hedge_of` 删掉 H，回收 H 一次，清掉 `pair`，O 的区间不释放。然后终止任务：被拒绝的 spawn 现在就按不可重试的连接失败（`TaskError::Other`）处理（§14.11），H 也一样（见“已决定”的 M4）。它总在分叉后的任何数据之前处理，因为 `poll_lifecycle` 最先报 spawn 失败 |
+| writer 满 | B | 不取任何数据，所以分不出胜负。生命周期照常，上面的失败照常处理 |
+| writer 恢复可写（`WriterCompleted` 带着“之前满过”） | B | `last_delivery` 全部改成 `now` |
+| 任务取消 | 结束 | 循环以 `Cancelled` 返回；`finish` 取消任务令牌，所有 runner 报 `Cancelled`，但 manager 已经丢掉，不再处理。不退避，计数不变 |
+| T13 的评判 | B | O 和 H 都不评判，也不算进中位数（`may_restart`） |
+| 扩张选 chunk | B | 跳过这个 chunk（`largest_running_chunk` 的 `skip`） |
+| 无进展截止时间到 | 结束 | 照常以 `NoProgress` 结束，对冲没有推迟它 |
+| 策略 tick 的对冲判定 | B | 这个 chunk 已对冲过（`hedge` 在），O 和 H 都不是候选 |
+
+状态 C（一方已失败，幸存的 X 是 owner）：
+
+| 事件 | 下一状态 | 处理 |
+| --- | --- | --- |
+| X 交来非空帧 | C′ | 清掉 `pair`，照常处理这一帧。`hedge.first` 留着，见“预算” |
+| X 的 `Started` | C | X 是 O 时，`mark_running(O)`。X 是 H 时，H 已经是 owner，`mark_running(H)`。数据接收端移进聚合器 |
+| X 报 `Finished` | E | 不会出现，理由同 B；出现了按 `ChannelClosed` 处理，见下一行 |
+| X 可重试的失败、429/503，或生命周期通道关闭（`ChannelClosed`） | E | 最后一方，按下面“最后一方失败”的顺序处理 |
+| X 报 `Cancelled`，`stopping` 里没有它 | E | 只在任务取消时出现。照现在的做法 `mark_failed`，不报失败 |
+| X 的 §4.3 回退错误、其它不可重试的错误 | 结束 | 照常回退或终止任务 |
+| writer 满或恢复可写、任务取消、无进展截止时间到 | 同 B | 同 B |
+| T13 的评判、扩张选 chunk、对冲判定 | C | 同 B：X 不评判，chunk 不切，不再对冲 |
+
+状态 C′（一方失败后，幸存的 X 交了数据）：
+
+| 事件 | 下一状态 | 处理 |
+| --- | --- | --- |
+| X 的数据帧 | C′ | 照常处理 |
+| X 下完，报 `Finished` | F | 照常 `mark_runner_completed`；`hedge` 随这次尝试结束 |
+| X 的任何失败，包括 T13 的低速停止 | E | 最后一方，按下面“最后一方失败”的顺序处理。X 自己的字节此时大于 0 |
+| X 的 §4.3 回退错误、其它不可重试的错误 | 结束 | 照常回退或终止任务 |
+| T13 的评判 | C′ | `pair` 已清掉，X 可以被评判；但剩余量 < `2 × min_chunk_size`，实际不会被停 |
+| 扩张选 chunk、对冲判定 | C′ | `hedge` 还在：不切，不再对冲 |
+| writer、任务取消、无进展截止时间到 | 照常 | 同 B |
+
+最后一方失败（C、C′ 里 X 失败，以及 D 里 W 失败）：
+
+1. 先存下分类要用的东西：`hedge.owner_side`、X 自己的字节、`hedge.first`。X 自己的字节：`owner_side` 是 `Original` 时用 `Released::received`；是 `Hedge` 时用“已下载末尾 − `hedge.fork`”，在 C 里是 0。
+2. `mark_failed(X)` 退回 `[downloaded.end, allocated.end)`，`attempts + 1`，清掉 `hedge` 和 `pair`（有已下载部分时，chunk 截成 `Finished` 留下，不再带它们）。然后回收 X，和现在 `handle_lifecycle` 先 `release_runner`、再生成失败一样。
+3. 这一对的 `charged` 增量：`hedge.first` 和 X 都不是重启、并且至少一方记预算时为 1，否则为 0。`hedge.first` 为空时（D 里的 W），就是 X 自己按 `charges_range` 的结果，和普通 runner 一样。`AttemptFailure::charged` 换成 `Released::charged` 加这个增量。
+4. X 回收之后，下载循环才算“别的在途尝试”：`allocated_runner_count()` 减去 `stopping` 里的项（`Loser` 和 `Slow` 都减，见“已决定”的 M3）。X 自己已经不在里面。
+5. 按“预算”的判定顺序处理：可重试或 429/503 时先查预算，再按 §14.13 调用 `on_failure`；连续失败按 X 自己的类别。比如 O、H 先后收到 503，预算没耗尽，也没有别的连接：第 4 步算出 0，503 不被容忍，任务以这个 503 结束。
+6. 任务继续时 `back_off`，用 `attempts` 和这一对的 `charged`。
+
+状态 D（已决，W 是 owner，L 在停止）：
+
+| 事件 | 下一状态 | 处理 |
+| --- | --- | --- |
+| W 的数据帧、`Finished`、T13 的评判 | 照常 | 照 §14.11–§14.15 处理，`stopping` 里没有 W |
+| W 的失败 | E | 按上面“最后一方失败”的顺序处理，`hedge.first` 为空，结果和普通 runner 一样 |
+| 扩张选 chunk、对冲判定 | D | `hedge` 还在：不切，不再对冲（见“排除”） |
+| writer 满或恢复可写、任务取消、无进展截止时间到 | 照常 | 和普通 runner 一样 |
+
+败方 L（不随 chunk 的状态变化，见“停止的原因”）：
+
+| 事件 | chunk | 处理 |
+| --- | --- | --- |
+| L 的 `Started` | 不变 | 只忽略，不回收：这不是终止的确认。L 的数据接收端已经丢掉；不碰 planner，也不 `expect` |
+| L 的数据帧 | 不变 | 收不到：数据接收端已经丢掉。实现里仍要先按 `stopping` 分流，不调用 `update_progress` |
+| L 报 `Stopped`，不论原因：`Finished`、`Cancelled`、可重试的错误、429/503、§4.3 回退错误、其它不可重试的错误 | 不变 | 回收 L 一次。不碰 planner，不报失败，不记结果采样，不退避，不改 `congestion_until`，计数不变。不管这时 W 还在下载、已经失败并退回了区间、区间已被新的尝试领取，还是 chunk 已收满，都一样 |
+| L 的生命周期通道没发 `Stopped` 就关闭 | 不变 | 同上 |
+| 任务完成，L 还没停 | — | 循环照常结束。`finish` 取消任务令牌并等 wait group，所以 L 停下之后任务才返回。L 的事件不再处理 |
+
+- E：区间按 §8.1 冷却。冷却结束后，由唤醒或 `CreateTask` 重新领取，是新的 `ChunkState`：`hedge` 为空，带着 `attempts` 和 `charged`。
+- F：W 报 `Finished` 时照常 `mark_runner_completed`，planner 完成时任务结束。
+
+##### 停止的原因
+
+- C12 的 manager 把“被停、报 `Cancelled`”一律当低速停止（`handle_lifecycle` 里的 `stopped_slow && kind.is_cancelled()`）。对冲的败方不能这样处理：
+  - 败方不是 chunk 的 owner。O 输了时，owner 已经交给 H；H 输了时，H 从来不在 `runner_to_chunk` 里。
+  - 走低速路径会对它调用 `mark_failed`，找不到 chunk 就 panic；即使找得到，也会释放胜方正在下载的区间。
+- 所以 `stopping` 要记下原因：
+  - `Slow`：由 `stop_runner`（T13）写入。处理和 C12 一样：报 `Cancelled` 时按低速停止，chunk 已收满时按完成，报自己的错误时按它的错误。
+  - `Loser`：分出胜负时由新的 `stop_loser` 写入。它不要求 Running，也不要求还有剩余：败方可能还在连接，也可能已经读完、正在 drain。
+- `handle_lifecycle`、`handle_runner_lost`、`take_spawn_failure` 和 `poll_data` 都先看 `stopping`。原因是 `Loser` 的，什么都不报：不查 `is_connecting`，不调用 planner，不记结果采样。只有终止的确认（`Stopped`、通道关闭、spawn 被拒绝）才回收它，而且只回收一次；`Started` 只忽略。
+- 败方的清理只看 `stopping`，不看 chunk：W 还在下载、W 已经失败并退回了区间、区间已被新的尝试领取、chunk 已收满，处理都一样。
+- `stopping` 的两种原因都从 `on_failure` 的在途数里减掉（M3）。
+- 不会释放区间：`Loser` 分支不调用 planner 的任何方法。
+- 只回收一次：三种确认互斥。
+  - 处理 `Stopped` 时调用 `release_runner`，它丢掉生命周期接收端，之后不会再有这个 runner 的通道关闭事件；
+  - 处理通道关闭时也调用它，之后也不会再有 `Stopped`；
+  - spawn 被拒绝的 runner 没有通道，也就没有前两种事件。
+  - `release_runner` 同时删掉 `stopping` 的项，ID 再分配给新 runner 时不带旧原因，C12 已经这样做。
+- 迟到的帧：分出胜负时就丢掉了败方的数据接收端，排着的帧随之丢掉。之后不会再有它的帧，也不会有它的数据通道关闭事件，因为它已经不在组里。
+- `may_restart` 和 `largest_running_chunk` 的 `skip` 看的“正在停止”，两种原因都算。
+
+##### 排除
+
+- T13 不评判一对中的任何一方：
+  - `may_restart`（`download_loop/restart.rs`）在“不在停止中”之外，再要求它不在任何 `pair` 里：B 的两方，以及 C 里单方记录的幸存方。`slow_runner` 只拿到过滤后的列表，所以它们也不算进中位数和“至少 3 个”的人数（`slow_restart.rs` 在看候选的剩余量之前就用整个列表算这两样）。
+  - H 本来也不会被评判：`RunnerRates` 只采样 owner，H 也没有完整的窗口。这里的排除是兜底。
+  - 分出胜负之后，W 是普通 runner，可以被评判。但候选的剩余量 < `2 × min_chunk_size`，正好不满足 T13 的剩余量条件，所以实际上不会被停。
+  - `stop_runner` 自己也拒绝有 `pair` 的 chunk 的 owner，再兜一层。
+- 扩张和切分不选对冲过的 chunk。`largest_running_chunk` 的 `skip` 在“正在停止”之外，再跳过 `hedge` 不为空的 chunk，也包括 C′、D 里的 chunk。理由：
+  - B、C 里切分会缩小 O 的上限，H 的请求却仍到原来的末尾，多下的部分会被截掉。
+  - W 是 H 时，`resize_runner_state` 按 chunk 起点算上限，比 H 能收的多出“分叉点 − chunk 起点”。新上限不小于 H 当前的上限时，H 报 `ExceededTotalSize`，manager 把它当完成，chunk 没收满就被标成 `Finished`，数据就丢了。
+  - 这样的 chunk 分叉时剩余量就不到 `2 × min_chunk_size`，只会越来越小，不切的损失不大。
+  - `Legacy` 的 `SplitAllTask`、`SplitGivenTask` 和 `find_chunk_to_split` 不用改：`Legacy` 从不对冲。planner 的 `resize_runner_state` 对 `hedge` 不为空的 chunk 直接拒绝，再兜一层。
+- 和 C11 对齐（触发条件 1）：
+  - §9.6 原来要求所有未完成的 chunk，包括候选自己的，剩余量都 < `2 × min_chunk_size`。C11 实际的切分门槛是 `planned = max(donor_rate × 2 s, min_chunk_size)`，剩余量 ≥ `planned` 才切（`strategy_tick.rs` 的 `grow` 和 `planned_split_size`）。两者有两处不一致：
+    - donor 快时，`planned` 大于 `2 × min_chunk_size`。比如 donor 10 MiB/s 时 `planned` 是 20 MiB：一个剩 5 MiB 的 chunk，C11 不会切（它 0.5 s 就下完），原写法却算“还有活”，挡住了对冲。
+    - donor 慢于 1 MiB/s 时（`min_chunk_size` 默认 1 MiB），`planned` 在 `min_chunk_size` 和 `2 × min_chunk_size` 之间。剩余量落在这一段的 chunk，C11 会切，原写法却算“没活”。
+  - 推荐：别的 chunk 用 C11 的门槛，候选自己的 chunk 用 `2 × min_chunk_size`。理由：
+    - T27 跟随 `Doubling`。“可切”就该是 `Doubling` 认为值得切的，用同一个函数 `planned_split_size`，不另立标准。
+    - 候选自己的 chunk 不能用 C11 的门槛：它静默，速率接近 0，门槛退到 `min_chunk_size`。剩 1–2 MiB 的静默 chunk 会因为自己“可切”而挡住自己的对冲。切它也没用，前一半还留给卡住的 runner。
+    - 候选用 `2 × min_chunk_size`，正好接上 T13 管不到的那一段（§9.5 条件 2），这就是 D5 说的“收尾版”的范围。
+    - Pending 的 chunk 向 `planned_split_size` 传 `None`，用 `per_runner_speed` 代替（见触发条件 1）。不能直接用 `RunnerRates` 的值：连续两次采样都在连接的 runner，速率是 `Some(0.0)`，门槛会退到 `min_chunk_size`。这样 T27 验证里的“剩余量够大的 Pending chunk”才按它连上之后的速度判断。C11 自己从不切 Pending 的 chunk，这里只是借用门槛。
+
+##### 缺口与建议
+
+已经在上文定下、不需要另外决定的：
+
+1. 对冲在什么时候判定，§9.6 没写。这里定为每个策略 tick 判定一次。所以实际在静默满 2 s 之后的第一个 tick 发起，也就是静默 2–3.5 s 之间。这和 `Doubling` 只在 tick 上扩张一样（§14.14）；测试显式传入 `now`，“差 1 ns 不发起”照样能测。
+2. 记静默时刻要知道是哪个 runner 交的帧：`DownloadedChunk` 加上 runner ID，在 `on_runner` 里用 `handle_event` 的 `now` 记。
+3. 先看原 runner 的通道：`StreamGroup` 不能按 key 取流，见“仲裁”。
+4. 先失败一方的 429/503 没有 `Retry-After` 时，`congestion_until` 用 `backoff(chunk.attempts + 1)`，见“错误”表。
+5. 每一方的字节不用另加计数，由 `hedge.fork` 算出；但先失败一方的类别 `hedge.first` 要留到这次尝试结束，见“预算”和“新增的记录”。
+6. 胜方是 H 时，切分会算错上限，见“排除”：用“扩张不选对冲过的 chunk”避开。另一种做法是在 chunk 上记 owner 请求的起点，按它算上限，改动更大，只有维护者想让对冲过的 chunk 还能切时才需要。
+7. writer 恢复可写要在 `poll_completions` 之前判断，见“新增的记录”的 `last_delivery`。
+8. Pending 的 chunk 用 `per_runner_speed` 算门槛，不用 `RunnerRates` 的 `Some(0.0)`，见触发条件 1。
+9. `hedge_of` 和 `runner_to_chunk` 的旧项在回收 ID 之前删掉，见“新增的记录”。
+10. 败方的清理不随 chunk 的状态变化，见“败方 L”表。
+
+已决定（2026-11-07，用户确认）：
+
+- **M1 收尾版的范围：保持 D5，不放宽。** 有两种情况，对冲和 T13 都不管，只能等 runner 的空闲超时（默认 30 s）。两种都写进 T14 的第 4 个场景去量：
+  - 静默的 runner 剩不到 `2 × min_chunk_size`，但别的 chunk 还“可切”。这时 `Doubling` 也不扩张，因为它要求每个 runner 在这个 tick 都有数据（检查 5），所以一个卡住的小 chunk 会让扩张也停到空闲超时。
+  - 静默的 runner 剩不少于 `2 × min_chunk_size`，但有完整窗口的 runner 不到 3 个，T13 不评判。收尾时常常只剩两三个 runner。
+  - 理由：先按 D5 做收尾版，量出代价再决定放不放宽。放宽的方向是去掉条件 1 里“其它 chunk”那一条，或者去掉候选的剩余量上限。
+- **M2 败方迟到的错误一律忽略。** 包括 §4.3 回退错误、其它不可重试的错误（比如 404、`RangeMismatch`）和 429/503：都不回退、不终止任务、不降并发、不推后 `congestion_until`。理由：这是不变量的要求；胜方正在同一个服务器上正常下载，败方的数据也没有写入。
+- **M3 传给 `on_failure` 的在途数减去所有正在停止的 runner，`Loser` 和 C12 的 `Slow` 都减。** 理由：正在停止的 runner 不会再交数据，不是在途的尝试；不减的话，一个快要停下的 runner 就能让别的 runner 的 429/503 被容忍，之后只剩 `no_progress_timeout` 兜底。
+  - 这也改变了 C12 的行为：以前慢 runner 在报 `Stopped` 之前一直算在途；T27 起不算。比如只剩一个被停的慢 runner 时，另一个 runner 收到 503，以前被容忍，现在任务以这个 503 结束（§14.15 已注明）。
+  - 失败的那个 runner 自己也不算：“最后一方失败”的第 4 步在回收它之后才数，普通 runner 也一样（现在 `handle_lifecycle` 就是先 `release_runner`）。
+  - 败方不算活跃但占槽位，降级之后实际连接数可能短暂超过新的上限。已经下完、还没报 `Stopped` 的 runner 现在也是这样（§14.11），接受。
+- **M4 对冲的 spawn 被拒绝时终止任务。** 理由：被拒绝的 spawn 现在就按不可重试的连接失败处理（§14.11），H 不例外。被拒绝不一定是 runtime 在关闭：`ThreadedRuntimeImpl::Other` 会转发自定义 runtime 的拒绝，测试用的 `FailOnSpawnRuntime` 只拒绝指定的那一次。所以理由是“和现有分类一致”，不是“反正 runtime 要关了”。
+- **M5 冷却中的区间不算“可切的活”，接受。** 条件 1 只看可领取的区间。最坏的情况：H 占了最后一个槽位，之后冷却结束，而 O 和 H 都一直静默。没有分出胜负，就没有败方腾出槽位；下一个 tick 也没有空闲槽位。这个区间要等到下面最早的一件事：
+  - 别的 runner 下完或失败；
+  - O 或 H 自己结束。每一方按自己所处的阶段计时（`run_loop/connect.rs`、`run_loop/stream.rs`）：还在连接时是连接超时（默认 30 s，从第一次被轮询算）；连上之后重新开始空闲超时（默认 30 s），上游每来一个非空的字节块就重置，不管它有没有攒够一帧交出来。所以一方可以先用掉将近 30 s 连上，再用 30 s 才空闲超时，两段串起来；上游一直有零星字节时，空闲超时根本不会到；
+  - 任一方交来第一个非空帧：分出胜负，败方很快停下、腾出槽位；
+  - 任务的无进展超时（默认 60 s，从最后一次有字节被接受算）。别的 runner 一直有进展时，它会一直往后推。
+  - 只有两方都已经在读流、而且上游一个字节都不再来时，才是“最多约 30 s”（O 的空闲超时从它最后一次收到上游字节算）。一般情况下没有固定的上限，最终由上面这些计时器之一、或者无进展超时结束任务来收尾。
+  - 理由：这种情况要求两方同时卡住，而且没有别的 runner 腾出槽位。O 自己的 chunk 不对冲也要等 O 的计时器；多出的代价是冷却中的区间跟着等，而不对冲时它能马上用上那个槽位。
+  - 便宜的改法（只作选项，不实现）：发起对冲时，要求空闲槽位数大于冷却中区间的个数，给每个冷却中的区间留一个槽位。代价是冷却期间（最长 30 s）不对冲。
+
+其它影响，不需要决定：
+
+- B 里 H 在连接，`RunnerRates` 看不到它，所以 `Doubling` 的检查 5 不会因为它跳过扩张；活跃数却算上了它，会让 `Doubling` 的 `allowed` 多 1。收尾阶段本来就没有可切的 chunk，影响很小。
+- 发起对冲让活跃数加 1，分出胜负又减 1。如果正有一次翻倍等着判断，减 1 会让这次判断作废（§14.14），和别的 runner 停下一样。
 
 ---
 
@@ -1418,7 +1663,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 剩余最多的 chunk 优先：它不到自己的门槛就停下，不再看别的 chunk。别的 chunk 剩得少一些、但 runner 更慢，门槛更低，本来可以切，也不会被选上。T14 要测连接速度不一的场景。
   - 速率只看一个 tick（1.5 s）。runner 攒满 32 KiB 才交一帧，所以慢于约 21 KiB/s（32 KiB ÷ 1.5 s）的 runner，有的 tick 里看起来没有数据，那个 tick 就不扩张。
   - writer 满的时候，下载循环不取 runner 的数据，这个 tick 看起来也没有数据，不扩张。这是有意的：瓶颈在写入时，加连接没有用。
-  - `planned` 的下限是 `min_chunk_size`，所以剩余量在 `min_chunk_size` 到 `2 × min_chunk_size` 之间、donor 又慢的 chunk 也会被切，两半都小于 `min_chunk_size`。`Legacy` 的 `SplitGivenTask` 也是这样（只要求剩余量 ≥ `min_chunk_size`）。T27 的“没有可切的活”按 `2 × min_chunk_size` 定义（§9.6），和这里的门槛不一样，T27 开工时要对齐。
+  - `planned` 的下限是 `min_chunk_size`，所以剩余量在 `min_chunk_size` 到 `2 × min_chunk_size` 之间、donor 又慢的 chunk 也会被切，两半都小于 `min_chunk_size`。`Legacy` 的 `SplitGivenTask` 也是这样（只要求剩余量 ≥ `min_chunk_size`）。T27 的“没有可切的活”原来按 `2 × min_chunk_size` 定义，和这里的门槛不一样；§9.6 的触发条件 1 已经改为对齐（见 §9.6 的“排除”）。
 - **验证。**
   - `DoublingStrategy` 的单元测试，速度序列和时间点都由测试构造，不 sleep：
     - `test_steady_growth_doubles_up_to_the_limit`：每个 runner 加 1 MiB/s，按 1.5 s 的 tick 走，连接数依次是 1、2、4、8，然后停在上限；
@@ -1544,6 +1789,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 已经决定怎么结束的 runner 不理停止开关：正在交最后一段缓冲时，它要等数据通道有空位；在 drain 时，最多等 5 s 的 drain 超时。这段时间它一直占着槽位，也不会被再次评判。
   - 被停的 runner 的生命周期通道没发 `Stopped` 就关闭时，仍按丢失处理（`ChannelClosed`，记预算）。正常的 runner 被取消时总会发 `Stopped`。
   - manager 把“被停、报 `Cancelled`”一律当低速停止。T27 的对冲败方也要用这个停止开关，那时要先记下停止的原因（低速重启还是对冲败方），再分别处理，见 §9.6 的说明。
+  - 被停的 runner 在报 `Stopped` 之前仍占着 ID，所以仍算在 `on_failure` 的在途数里：只剩它一个时，别的 runner 的 429/503 会被容忍。T27 起在途数减去所有正在停止的 runner，这时任务以那个 429/503 结束（§9.6 的 M3）。
 - **验证。**
   - `slow_restart.rs` 的单元测试，字节数都由测试构造：
     - `test_a_runner_below_a_quarter_of_the_median_is_restarted`：正好在边界上（`字节 + F = 0.25 × (中位数 − F)`）不重启，中位数多 4 B 就重启；候选是 0 或 1 MiB 都试；
