@@ -355,20 +355,21 @@ impl Checkpoints {
         self.since = now;
     }
 
-    /// The outcome of the running checkpoint, once it ended.
+    /// The outcome of the running checkpoint, once it ended; pass it to
+    /// [`Self::apply`].
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Outcome> {
         let Some(running) = self.running.as_mut() else {
             return Poll::Pending;
         };
         let (receiver, outcome) = std::task::ready!(running.poll_unpin(cx));
         self.running = None;
-        self.ended = Some(Instant::now());
         self.receiver = Some(receiver);
         Poll::Ready(outcome)
     }
 
-    /// Account for the `outcome` of a checkpoint.
-    pub(super) fn apply(&mut self, outcome: Outcome) {
+    /// Account for the `outcome` of a checkpoint that ended at `now`.
+    pub(super) fn apply(&mut self, outcome: Outcome, now: Instant) {
+        self.ended = Some(now);
         match outcome {
             Outcome::Recorded(blocks) => {
                 for block in blocks {
@@ -401,27 +402,26 @@ impl Checkpoints {
         self.crcs = BlockCrcs::new(self.schedule.block_size);
     }
 
-    /// Wait for the running checkpoint, if any, and account for it.
-    pub(super) async fn settle(&mut self) {
+    /// Wait for the running checkpoint, if any, and account for it at the
+    /// time `now` reads once it ended.
+    pub(super) async fn settle(&mut self, now: impl Fn() -> Instant) {
         if self.running.is_some() {
             let outcome = std::future::poll_fn(|cx| self.poll(cx)).await;
-            self.apply(outcome);
+            self.apply(outcome, now());
         }
     }
 
     /// The checkpoint at teardown: wait for the running one, then record
-    /// every complete block left (design §11.5.9).
-    pub(super) async fn finish(mut self, written: &WrittenSet) {
-        self.settle().await;
+    /// every complete block left (design §11.5.9). Each time is read from
+    /// `now` when its step comes.
+    pub(super) async fn finish(mut self, written: &WrittenSet, now: impl Fn() -> Instant) {
+        self.settle(&now).await;
         if self.stopped {
             return;
         }
         self.collect_complete(written);
-        self.start(Instant::now());
-        if self.running.is_some() {
-            let outcome = std::future::poll_fn(|cx| self.poll(cx)).await;
-            self.apply(outcome);
-        }
+        self.start(now());
+        self.settle(&now).await;
     }
 }
 

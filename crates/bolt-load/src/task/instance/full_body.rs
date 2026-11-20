@@ -128,6 +128,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "gzip"),
+        ignore = "decodes gzip, which needs the `gzip` feature"
+    )]
     async fn decodes_a_coded_body() {
         let encoded = gzip(CONTENT);
         let (head, tail) = encoded.split_at(encoded.len() / 2);
@@ -168,6 +172,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "gzip"),
+        ignore = "decodes gzip, which needs the `gzip` feature"
+    )]
     async fn fails_a_body_that_does_not_decode() {
         let mut trailing = gzip(CONTENT);
         trailing.push(0);
@@ -187,6 +195,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "gzip"),
+        ignore = "decodes gzip, which needs the `gzip` feature"
+    )]
     async fn passes_a_body_error_through() {
         let encoded = gzip(CONTENT);
         let items = vec![

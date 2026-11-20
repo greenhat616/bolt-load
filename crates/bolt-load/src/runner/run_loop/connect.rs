@@ -1,5 +1,4 @@
 use std::{
-    pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -10,24 +9,26 @@ use super::{Phase, RunnerLoop};
 use crate::{
     adapter::{AdapterError, AnyBytesStream},
     runner::RunnerInput,
+    runtime::{Deadline, TimerSource},
 };
 
 /// Waiting for the connection.
 pub(super) struct ConnectingState {
     /// Started on the runner's first poll; control signals do not extend it.
-    timeout: async_io::Timer,
+    timeout: Deadline,
     started_at: Instant,
 }
 
 impl ConnectingState {
-    pub(super) fn new(timeout: Duration, built_at: Instant) -> Self {
-        let started_at = Instant::now();
+    /// Started now, at the runner's first poll, on `source`'s clock.
+    pub(super) fn new(timeout: Duration, built_at: Instant, source: &TimerSource) -> Self {
+        let started_at = source.now();
         trace!(
             "runner: first polled {:?} after it was built",
-            started_at - built_at
+            started_at.saturating_duration_since(built_at)
         );
         Self {
-            timeout: async_io::Timer::after(timeout),
+            timeout: source.deadline_after(started_at, timeout),
             started_at,
         }
     }
@@ -39,7 +40,7 @@ impl RunnerLoop<'_> {
         let Phase::Connecting(state) = &mut self.phase else {
             unreachable!("not connecting");
         };
-        Pin::new(&mut state.timeout).poll(cx).map(drop)
+        state.timeout.poll(cx)
     }
 
     #[inline]
@@ -56,7 +57,13 @@ impl RunnerLoop<'_> {
     /// Stream from `stream` once `Started` is published.
     pub(super) fn on_connected(&mut self, stream: AnyBytesStream) {
         if let Phase::Connecting(state) = &self.phase {
-            trace!("runner: connected in {:?}", state.started_at.elapsed());
+            trace!(
+                "runner: connected in {:?}",
+                self.runner
+                    .timer_source
+                    .now()
+                    .saturating_duration_since(state.started_at)
+            );
         }
         self.runner.input = RunnerInput::Connected(stream);
     }

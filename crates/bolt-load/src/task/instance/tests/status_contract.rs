@@ -411,6 +411,10 @@ fn incompressible(len: usize) -> Vec<u8> {
 /// first byte on, whether the file is longer or shorter than that. A body
 /// that decodes to nothing is an empty file (#153).
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "gzip"),
+    ignore = "decodes gzip, which needs the `gzip` feature"
+)]
 async fn test_a_coded_full_response_is_decoded_with_an_unknown_total() {
     for (case, content) in [
         ("compressible", create_deterministic_content(SIZE)),

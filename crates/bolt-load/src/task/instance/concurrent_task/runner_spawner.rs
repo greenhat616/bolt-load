@@ -78,6 +78,7 @@ impl RunnerSpawner {
             .read_activity(reads.clone())
             .idle_timeout(self.idle_timeout)
             .connect_timeout(self.connect_timeout)
+            .timer_source(&self.rt)
             .build()
             .expect("every runner input is set");
         let worker = RunnerWorker {
@@ -138,13 +139,76 @@ mod tests {
     use crate::{
         adapter::{BoltLoadAdapter, DynBoltLoadAdapter},
         runner::{LifecycleEvent, StoppedReason},
-        runtime::ThreadedRuntimeImpl,
+        runtime::{ThreadedRuntimeImpl, test_support::current_tokio},
     };
+
+    /// A runner the spawner starts runs its timeouts on the task's runtime:
+    /// its connect times out when that runtime's clock says so.
+    #[tokio::test]
+    async fn test_spawned_runner_times_out_on_the_task_clock() {
+        use async_ringbuf::traits::Consumer;
+        use bolt_load_tests::adapter::{fault::FaultPlan, simple::SimpleTestAdapterBuilder};
+
+        use crate::{
+            runner::TaskError,
+            runtime::test_support::{ManualClock, ManualRuntime},
+        };
+
+        const CONNECT: Duration = Duration::from_secs(30);
+        let clock = ManualClock::new();
+        let rt = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        });
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(1000)
+            .support_range(true)
+            .range_connect_plan(FaultPlan::HangAt(0))
+            .build()
+            .unwrap();
+        let (_limit_tx, limits) = crate::runner::limit_mailbox();
+        let wg = WaitGroup::new();
+        let mut channels = RunnerSpawner::new(
+            rt,
+            DynBoltLoadAdapter::new_arc(adapter),
+            wg.clone(),
+            CancellationToken::new(),
+            crate::runner::DEFAULT_IDLE_TIMEOUT,
+        )
+        .connect_timeout(CONNECT)
+        .spawn(0..1000, 1, limits)
+        .expect("runner should spawn");
+
+        clock.until_waited_on().await;
+        clock.advance(CONNECT - Duration::from_nanos(1));
+        clock.until_waited_on().await;
+        assert!(
+            channels.lifecycle_rx.try_pop().is_none(),
+            "not before its timeout"
+        );
+        clock.advance(Duration::from_nanos(1));
+        let mut lifecycle_rx = pin!(channels.lifecycle_rx);
+        let event = tokio::time::timeout(Duration::from_secs(5), lifecycle_rx.next())
+            .await
+            .expect("the runner timed out on the task's clock");
+        assert!(
+            matches!(
+                event,
+                Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+                    TaskError::Timeout
+                )))
+            ),
+            "{event:?}"
+        );
+        drop(channels.data_rx);
+        tokio::time::timeout(Duration::from_secs(5), wg.wait())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_success() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let adapter =
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let range = 1000u64..3000u64;
@@ -224,7 +288,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_adapter_failure() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let adapter = DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1024).with_failure(true));
         let range = 0u64..500u64;
         let runner_id = 2;
@@ -323,7 +387,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_with_cancellation() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let adapter =
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let range = 0u64..5000u64;
@@ -367,7 +431,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_small_range_runner_with_control_messages() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let adapter =
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(10240).with_range_support(true));
         let old_total = 10240u64;
@@ -431,7 +495,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_edge_ranges() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let content_size = 1000;
         let adapter = DynBoltLoadAdapter::new_arc(
             SimpleTestAdapter::new(content_size).with_range_support(true),
@@ -506,7 +570,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_zero_length_range() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let adapter =
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1000).with_range_support(true));
 
@@ -547,7 +611,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_multiple_runners() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let adapter =
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(4000).with_range_support(true));
 
@@ -659,7 +723,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
     async fn test_create_background_range_runner_hash_verification() {
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = current_tokio();
         let adapter =
             DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(5000).with_range_support(true));
         let range = 1500u64..3500u64;

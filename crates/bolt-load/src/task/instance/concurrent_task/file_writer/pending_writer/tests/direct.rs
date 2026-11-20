@@ -332,6 +332,10 @@ async fn test_finish_joins_blocked_fallback_before_finalize() {
 #[tokio::test]
 async fn test_direct_backends_preserve_bytes() {
     use bolt_load_tests::adapter::simple::calculate_blake3;
+    #[cfg_attr(
+        not(any(feature = "mmap", feature = "compio")),
+        expect(unused_mut, reason = "only the optional backends are pushed")
+    )]
     let mut kinds = vec![
         FileRangeWriterKind::Pool,
         FileRangeWriterKind::Null,
@@ -350,7 +354,7 @@ async fn test_direct_backends_preserve_bytes() {
             .unwrap();
         let mut pending = PendingWriter::new_direct(
             Arc::new(writer.clone()),
-            ThreadedRuntimeImpl::new_tokio_rt(),
+            crate::runtime::test_support::current_tokio(),
             4,
         );
         let mut batch = Vec::new();

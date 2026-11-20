@@ -11,7 +11,8 @@ mod meta;
 mod options;
 mod resume;
 mod status;
-#[cfg(test)]
+// Only the task tests use it, which need a runtime.
+#[cfg(all(test, any(feature = "tokio", feature = "smol")))]
 mod test_support;
 #[cfg(test)]
 mod tests;

@@ -34,7 +34,7 @@ use std::{
 use bolt_load_utils::telemetry::*;
 
 use super::{Strategy, StrategyAction};
-use crate::task::RunnerId;
+use crate::{runtime::capped_wait, task::RunnerId};
 
 /// The least time from one growth to the next. Growth is only decided at
 /// strategy ticks, so it comes at the first tick at least this long after
@@ -56,9 +56,10 @@ pub const MAX_REPROBE_WAIT: Duration = Duration::from_secs(300);
 
 /// How long a growth may stay unjudged, from the tick that decided it,
 /// given runners that may take `connect_timeout` to connect: by then its
-/// runners have connected or failed. Saturates rather than overflow.
+/// runners have connected or failed. The connect timeout counts as the
+/// runners wait for it, capped at 30 years.
 pub fn growth_deadline(connect_timeout: Duration) -> Duration {
-    connect_timeout.saturating_add(GROW_INTERVAL.saturating_mul(5))
+    capped_wait(connect_timeout).saturating_add(GROW_INTERVAL.saturating_mul(5))
 }
 
 /// What the runners did over the last strategy tick (design §9.2, §9.3).
@@ -1480,6 +1481,22 @@ mod tests {
         let mut strategy = DoublingStrategy::default();
         assert_eq!(asked(&mut strategy, &mut limited(8.5 * MIB)), 0);
         assert_eq!(asked(&mut strategy, &mut limited(8.4 * MIB)), 2);
+    }
+
+    /// A connect timeout over 30 years counts as the runners wait for it,
+    /// 30 years, plus the window's margin.
+    #[test]
+    fn test_growth_deadline_counts_the_capped_connect_timeout() {
+        let thirty_years = Duration::from_secs(86400 * 365 * 30);
+        for connect_timeout in [
+            thirty_years + Duration::from_secs(86400 * 365),
+            Duration::MAX,
+        ] {
+            assert_eq!(
+                growth_deadline(connect_timeout),
+                thirty_years + 5 * GROW_INTERVAL
+            );
+        }
     }
 
     /// The planned size follows the split runner's own rate, not how many

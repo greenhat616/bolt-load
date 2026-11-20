@@ -106,6 +106,15 @@ impl TaskBuilder {
 
     /// The runtime the runners are spawned on and whose timer is used.
     /// Required: there is no ambient default.
+    ///
+    /// The task's timeouts, its no-progress deadline and its speed sampling,
+    /// in either mode, are that runtime's timers. A tokio runtime therefore
+    /// needs its timer, `enable_time` or `enable_all` on its builder, or the
+    /// task fails with
+    /// [`DownloadError::Runtime`](super::DownloadError::Runtime). It must
+    /// also be driven for as long as the task runs: a multi-thread runtime
+    /// drives itself, a current-thread one only inside its own `block_on`,
+    /// and its timers do not fire while nothing drives it.
     pub fn runtime(mut self, runtime: ThreadedRuntimeImpl) -> Self {
         self.runtime = Some(runtime);
         self
@@ -229,6 +238,10 @@ impl TaskBuilder {
 
     /// Take the destination's lock with `hooks`.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        expect(dead_code, reason = "only the task tests, which need tokio, use it")
+    )]
     pub(crate) fn lock_hooks(mut self, hooks: LockHooks) -> Self {
         self.lock_hooks = hooks;
         self
@@ -262,6 +275,10 @@ impl TaskBuilder {
 
     /// Call `hooks` before each file step of a resumable task.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        expect(dead_code, reason = "only the task tests, which need tokio, use it")
+    )]
     pub(crate) fn file_hooks(mut self, hooks: FileHooks) -> Self {
         self.file_hooks = hooks;
         self
@@ -270,6 +287,10 @@ impl TaskBuilder {
     /// Record in `starts` the progress of every `Downloading` start, as
     /// it is published, before the transfer runs.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "tokio"),
+        expect(dead_code, reason = "only the task tests, which need tokio, use it")
+    )]
     pub(crate) fn record_starts(mut self, starts: super::status::Starts) -> Self {
         self.starts = Some(starts);
         self

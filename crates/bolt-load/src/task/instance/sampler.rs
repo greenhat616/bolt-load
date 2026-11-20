@@ -17,27 +17,27 @@ pub struct SpeedSampler {
 }
 
 impl SpeedSampler {
-    /// Default α = 0.33, approximately 1 s smoothing window
-    pub fn new() -> Self {
-        Self::with_alpha(DEFAULT_EMA_ALPHA)
+    /// Default α = 0.33, approximately 1 s smoothing window; the first
+    /// sample measures from `now`.
+    pub fn new(now: Instant) -> Self {
+        Self::with_alpha(DEFAULT_EMA_ALPHA, now)
     }
 
     /// Custom α (0.0 < α ≤ 1.0)
-    pub fn with_alpha(alpha: f64) -> Self {
+    pub fn with_alpha(alpha: f64, now: Instant) -> Self {
         assert!((0.0..=1.0).contains(&alpha), "alpha must be within 0..=1");
         Self {
-            last_ts: Instant::now(),
+            last_ts: now,
             ema_speed: 0.0,
             alpha,
         }
     }
 
-    /// Sample: `bytes` is the number of bytes written since the last sample.
+    /// Sample at `now`: `bytes` is the number of bytes written since the last sample.
     /// After calling, `*bytes` will be set to 0, making it easier to accumulate in the next round.
     #[inline]
-    pub fn sample(&mut self, bytes: &mut usize) -> (f64, f64) {
+    pub fn sample(&mut self, bytes: &mut usize, now: Instant) -> (f64, f64) {
         let delta_bytes = std::mem::take(bytes) as f64;
-        let now = Instant::now();
         let elapsed = now.duration_since(self.last_ts).as_secs_f64();
         self.last_ts = now;
 
@@ -72,7 +72,7 @@ impl SpeedSampler {
 
 #[cfg(test)]
 mod test {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use bolt_load_tests::adapter::simple::SimpleTestAdapterBuilder;
     use bolt_load_utils::telemetry::*;
@@ -82,6 +82,26 @@ mod test {
         adapter::BoltLoadAdapter,
         task::instance::sampler::{DEFAULT_SAMPLE_INTERVAL, SpeedSampler},
     };
+
+    /// The speed is the bytes over the time between the samples' `now`.
+    #[test]
+    fn test_sample_measures_over_the_given_times() {
+        let t0 = Instant::now();
+        let mut sampler = SpeedSampler::with_alpha(0.5, t0);
+        let mut bytes = 1000;
+        assert_eq!(
+            sampler.sample(&mut bytes, t0 + Duration::from_secs(2)),
+            (500.0, 500.0)
+        );
+        assert_eq!(bytes, 0);
+        bytes = 3000;
+        let (inst, ema) = sampler.sample(&mut bytes, t0 + Duration::from_secs(3));
+        assert_eq!((inst, ema), (3000.0, 1750.0));
+        // No time passed: no speed, rather than a division by zero.
+        bytes = 10;
+        let (inst, _) = sampler.sample(&mut bytes, t0 + Duration::from_secs(3));
+        assert_eq!(inst, 0.0);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[n0_tracing_test::traced_test]
@@ -104,7 +124,7 @@ mod test {
             .expect("Failed to get full stream")
             .body;
 
-        let mut sampler = SpeedSampler::new();
+        let mut sampler = SpeedSampler::new(Instant::now());
         let mut bytes: usize = 0;
 
         let sample_every = DEFAULT_SAMPLE_INTERVAL;
@@ -119,7 +139,7 @@ mod test {
             bytes += chunk.len();
 
             if last_sample_check.elapsed() >= sample_every {
-                let (inst, ema) = sampler.sample(&mut bytes);
+                let (inst, ema) = sampler.sample(&mut bytes, Instant::now());
 
                 info!("speed: inst={:.2} B/s, ema={:.2} B/s", inst, ema);
 
@@ -158,7 +178,7 @@ mod test {
         }
 
         // Flush any remaining accumulated bytes in a final sample.
-        let (inst, ema) = sampler.sample(&mut bytes);
+        let (inst, ema) = sampler.sample(&mut bytes, Instant::now());
         info!("final speed: inst={:.2} B/s, ema={:.2} B/s", inst, ema);
         assert!(inst >= 0.0);
         assert!(ema >= 0.0);
@@ -207,7 +227,7 @@ mod test {
                 .expect("Failed to get full stream")
                 .body;
 
-            let mut sampler = SpeedSampler::new();
+            let mut sampler = SpeedSampler::new(Instant::now());
             let mut bytes_accumulated: usize = 0;
             let mut total_bytes: usize = 0;
 
@@ -223,7 +243,7 @@ mod test {
                 total_bytes += chunk.len();
 
                 if last_sample_check.elapsed() >= sample_every {
-                    let (inst, ema) = sampler.sample(&mut bytes_accumulated);
+                    let (inst, ema) = sampler.sample(&mut bytes_accumulated, Instant::now());
                     info!(
                         "Sample: inst={:.2} B/s ({:.2} KB/s), ema={:.2} B/s ({:.2} KB/s)",
                         inst,
@@ -241,7 +261,7 @@ mod test {
 
             // Final sample for any remaining bytes
             if bytes_accumulated > 0 {
-                let (inst, ema) = sampler.sample(&mut bytes_accumulated);
+                let (inst, ema) = sampler.sample(&mut bytes_accumulated, Instant::now());
                 info!("Final sample: inst={:.2} B/s, ema={:.2} B/s", inst, ema);
             }
 
@@ -340,7 +360,7 @@ mod test {
                 .expect("Failed to get full stream")
                 .body;
 
-            let mut sampler = SpeedSampler::with_alpha(alpha);
+            let mut sampler = SpeedSampler::with_alpha(alpha, Instant::now());
             let mut bytes_accumulated: usize = 0;
 
             let sample_every = DEFAULT_SAMPLE_INTERVAL;
@@ -355,7 +375,7 @@ mod test {
                 bytes_accumulated += chunk.len();
 
                 if last_sample_check.elapsed() >= sample_every {
-                    let (_inst, ema) = sampler.sample(&mut bytes_accumulated);
+                    let (_inst, ema) = sampler.sample(&mut bytes_accumulated, Instant::now());
 
                     // Calculate variance in EMA changes (after a few samples)
                     if let Some(prev) = prev_ema {

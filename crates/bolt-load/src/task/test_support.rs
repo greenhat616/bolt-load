@@ -6,10 +6,14 @@ use std::{
     time::Duration,
 };
 
-use smol_cancellation_token::CancellationToken;
-
-use super::{DownloadMode, StatusReceiver, Task, TaskBuilder, TaskState, TaskStatus};
-use crate::{DOWNLOADING_TMP_EXTENSION, adapter::BoltLoadAdapter, runtime::ThreadedRuntimeImpl};
+use super::{StatusReceiver, TaskState, TaskStatus};
+use crate::DOWNLOADING_TMP_EXTENSION;
+#[cfg(feature = "tokio")]
+use crate::{
+    adapter::BoltLoadAdapter,
+    runtime::ThreadedRuntimeImpl,
+    task::{DownloadMode, Task, TaskBuilder},
+};
 
 pub(crate) const WATCHDOG: Duration = Duration::from_secs(30);
 
@@ -28,11 +32,12 @@ pub(crate) fn tmp_path(dest: &Path) -> PathBuf {
 
 /// A builder on the current tokio runtime saving to `dest`, preferring
 /// `mode` and cancelled by `token`.
+#[cfg(feature = "tokio")]
 pub(crate) fn builder(
     mode: DownloadMode,
     adapter: impl BoltLoadAdapter + 'static,
     dest: &Path,
-    token: &CancellationToken,
+    token: &smol_cancellation_token::CancellationToken,
 ) -> TaskBuilder {
     Task::builder(adapter)
         .runtime(ThreadedRuntimeImpl::new_tokio_rt())
@@ -41,11 +46,12 @@ pub(crate) fn builder(
         .cancel_token(token.clone())
 }
 
+#[cfg(feature = "tokio")]
 pub(crate) fn spawn(
     mode: DownloadMode,
     adapter: impl BoltLoadAdapter + 'static,
     dest: &Path,
-    token: &CancellationToken,
+    token: &smol_cancellation_token::CancellationToken,
 ) -> Task {
     builder(mode, adapter, dest, token)
         .spawn()

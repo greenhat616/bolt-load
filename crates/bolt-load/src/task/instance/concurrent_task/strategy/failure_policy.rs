@@ -23,7 +23,11 @@ use std::{
 use bolt_load_core::adapter::{AdapterError, RetryableError, UnretryableError};
 
 use super::super::runner_manager::{AttemptFailure, SideFailed};
-use crate::{runner::TaskError, task::TaskOptions};
+use crate::{
+    runner::TaskError,
+    runtime::{capped_wait, instant_after},
+    task::TaskOptions,
+};
 
 /// A server rejecting the connection count (429/503), which the concurrency
 /// strategy answers by degrading instead of giving up.
@@ -204,13 +208,17 @@ impl FailurePolicy {
         self.consecutive
     }
 
+    /// When the task fails without progress; a timeout over 30 years is
+    /// capped there, as every deadline is.
     pub fn deadline(&self) -> Instant {
-        self.last_progress_at + self.no_progress
+        instant_after(self.last_progress_at, self.no_progress)
     }
 
+    /// The no-progress failure at `now`, if due; it reports the timeout the
+    /// task waited, capped at 30 years.
     pub fn check(&self, now: Instant) -> Option<TaskError> {
         (now >= self.deadline()).then_some(TaskError::NoProgress {
-            timeout: self.no_progress,
+            timeout: capped_wait(self.no_progress),
         })
     }
 }
@@ -387,6 +395,29 @@ mod tests {
             p.check(start + Duration::from_secs(15)),
             Some(TaskError::NoProgress { timeout: t }) if t == timeout
         ));
+    }
+
+    /// A timeout too long for an `Instant` is capped at 30 years instead of
+    /// panicking, does not fail the task before, and is reported as the 30
+    /// years the task waited; so is one over 30 years an `Instant` holds.
+    #[test]
+    fn test_no_progress_deadline_past_the_end_of_instants() {
+        let start = Instant::now();
+        let p = policy(8, Duration::MAX, start);
+        let year = Duration::from_secs(86400 * 365);
+        assert!(p.deadline() > start + 29 * year, "about 30 years ahead");
+        assert!(p.check(start + year).is_none());
+        for timeout in [Duration::MAX, 31 * year] {
+            let p = policy(8, timeout, start);
+            assert_eq!(p.deadline(), start + 30 * year);
+            assert!(
+                matches!(
+                    p.check(start + 30 * year),
+                    Some(TaskError::NoProgress { timeout: t }) if t == 30 * year
+                ),
+                "{timeout:?}"
+            );
+        }
     }
 
     // === Three tiers (design §8.2) ===

@@ -1,6 +1,6 @@
 //! The metadata request shared by the task builder and both task modes.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use backon::{ExponentialBuilder, Retryable};
 use bolt_load_utils::telemetry::*;
@@ -9,13 +9,16 @@ use futures::FutureExt;
 use super::MetaRetry;
 use crate::{
     adapter::{AdapterError, AnyAdapter, BoltLoadAdapter, BoltLoadAdapterMeta},
-    runtime::{Sleep, ThreadedRuntimeImpl, TimerBuilder},
+    runtime::{Sleep, ThreadedRuntimeImpl, TimerBuilder, capped_wait, instant_after},
 };
 
 /// Retrieve the metadata, retrying [`AdapterError::Retryable`] errors as
 /// `retry` allows and returning the last error once the retries run out.
 ///
-/// The backoff sleeps on `rt`'s timer, or on `async-io` when no runtime is set.
+/// The backoff sleeps on `rt`'s timer, or on `async-io` when no runtime is set,
+/// until an absolute deadline, as a runner's timeouts do. Each delay, the
+/// jitter included, is capped at 30 years, the longest the engine waits at
+/// once, before it is added to the clock.
 pub(crate) async fn retrieve_meta(
     adapter: &AnyAdapter,
     retry: &MetaRetry,
@@ -33,8 +36,13 @@ async fn retrieve_meta_with(
     let rt = rt.cloned();
     let sleep = move |delay: Duration| -> Sleep {
         match &rt {
-            Some(rt) => rt.sleep(delay),
-            None => async_io::Timer::after(delay).map(drop).boxed(),
+            Some(rt) => {
+                let mut deadline = rt.deadline(instant_after(rt.now(), delay));
+                Box::pin(std::future::poll_fn(move |cx| deadline.poll(cx)))
+            }
+            None => async_io::Timer::at(instant_after(Instant::now(), delay))
+                .map(drop)
+                .boxed(),
         }
     };
     let cap = retry.max_delay;
@@ -48,8 +56,10 @@ async fn retrieve_meta_with(
         )
         .sleep(sleep)
         .when(|e| matches!(e, AdapterError::Retryable { .. }))
-        // The jitter is added after `max_delay` caps the base delay.
-        .adjust(move |_, delay| delay.map(|d| d.min(cap)))
+        // The jitter is added after `max_delay` caps the base delay. The
+        // engine's 30-year cap on a wait applies too, so the delay notified
+        // and logged is the one waited for.
+        .adjust(move |_, delay| delay.map(|d| capped_wait(d.min(cap))))
         .notify(|e, delay| {
             // The error text may carry the request URL and its credentials.
             trace!("[TASK] retrieve_meta failed with a retryable error, retrying in {delay:?}");
@@ -172,6 +182,35 @@ mod tests {
         assert!(delays.iter().all(|d| *d <= retry.max_delay), "{delays:?}");
     }
 
+    /// A delay over 30 years, the jitter's included, is notified, and so
+    /// logged, as the 30 years it waits.
+    #[test]
+    fn a_delay_over_30_years_is_notified_as_30_years() {
+        use crate::runtime::test_support::{ManualClock, ManualRuntime};
+
+        const YEAR: Duration = Duration::from_secs(86400 * 365);
+        let rt = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: ManualClock::new(),
+        });
+        let retry = MetaRetry::default()
+            .max_retries(1)
+            .min_delay(100 * YEAR)
+            .max_delay(Duration::MAX);
+        let (adapter, _) = FlakyAdapter::new(1, true);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
+        let mut delays = Vec::new();
+        {
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            let mut meta =
+                std::pin::pin!(retrieve_meta_with(&adapter, &retry, Some(&rt), |_, d| {
+                    delays.push(d)
+                }));
+            assert!(meta.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(delays, [30 * YEAR]);
+    }
+
     /// Polled outside any tokio context, so the backoff must be registered
     /// with the runtime's own timer.
     #[cfg(feature = "tokio")]
@@ -199,7 +238,9 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
-        struct TimerOnlyRuntime(Arc<AtomicUsize>);
+        /// Its clock stands still, so the wall clock cannot pass a retry's
+        /// deadline before its sleep ticks.
+        struct TimerOnlyRuntime(Arc<AtomicUsize>, std::time::Instant);
         impl futures::task::Spawn for TimerOnlyRuntime {
             fn spawn_obj(
                 &self,
@@ -213,17 +254,134 @@ mod tests {
             fn create_delayed_timer(&self, _: Duration) -> TimerImpl {
                 TimerImpl::Custom(DynTimer::new_box(CountingTimer(self.0.clone())))
             }
+
+            fn now(&self) -> std::time::Instant {
+                self.1
+            }
         }
         impl ThreadedRuntime for TimerOnlyRuntime {}
 
         let ticks = Arc::new(AtomicUsize::new(0));
-        let rt = ThreadedRuntimeImpl::new_other_rt(TimerOnlyRuntime(ticks.clone()));
+        let rt = ThreadedRuntimeImpl::new_other_rt(TimerOnlyRuntime(
+            ticks.clone(),
+            std::time::Instant::now(),
+        ));
         let (adapter, calls) = FlakyAdapter::new(2, true);
         let adapter = DynBoltLoadAdapter::new_box(adapter);
         let meta = futures::executor::block_on(retrieve_meta(&adapter, &fast_retry(2), Some(&rt)));
         assert_eq!(meta.unwrap().content_size, 42);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(ticks.load(Ordering::SeqCst), 4, "two ticks per retry");
+    }
+
+    /// A retry delay too long for an `Instant`, `Duration::MAX`, waits 30
+    /// years on the runtime's clock, the engine's cap on any wait, instead
+    /// of handing the runtime a sleep it cannot add to its clock.
+    #[test]
+    fn a_retry_delay_past_what_an_instant_holds_waits_30_years() {
+        use crate::runtime::test_support::{ManualClock, ManualRuntime};
+
+        const THIRTY_YEARS: Duration = Duration::from_secs(86400 * 365 * 30);
+        let clock = ManualClock::new();
+        let rt = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        });
+        let retry = MetaRetry::default()
+            .max_retries(1)
+            .min_delay(Duration::MAX)
+            .max_delay(Duration::MAX);
+        let (adapter, calls) = FlakyAdapter::new(1, true);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut meta = std::pin::pin!(retrieve_meta(&adapter, &retry, Some(&rt)));
+        assert!(meta.as_mut().poll(&mut cx).is_pending());
+        clock.advance(THIRTY_YEARS - Duration::from_nanos(1));
+        assert!(
+            meta.as_mut().poll(&mut cx).is_pending(),
+            "a nanosecond early"
+        );
+        clock.advance(Duration::from_nanos(1));
+        let std::task::Poll::Ready(meta) = meta.as_mut().poll(&mut cx) else {
+            panic!("not retried 30 years on");
+        };
+        assert_eq!(meta.unwrap().content_size, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A retry delay longer than 30 years, one an `Instant` holds, waits 30
+    /// years on tokio: the engine's documented cap on any wait, applied
+    /// before tokio sees the deadline, not tokio's own cap on relative
+    /// sleeps.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_retry_delay_past_30_years_waits_30_years() {
+        use crate::runtime::TokioThreadedRuntime;
+
+        const DELAY: Duration = Duration::from_secs(86400 * 365 * 31);
+        const CAP: Duration = Duration::from_secs(86400 * 365 * 30);
+        let paused = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let rt = ThreadedRuntimeImpl::Tokio(TokioThreadedRuntime::Handle(paused.handle().clone()));
+        let retry = MetaRetry::default()
+            .max_retries(1)
+            .min_delay(DELAY)
+            .max_delay(DELAY);
+        let (adapter, calls) = FlakyAdapter::new(1, true);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
+        let start = rt.now();
+        let meta = paused.block_on(retrieve_meta(&adapter, &retry, Some(&rt)));
+        let waited = rt.now() - start;
+        assert_eq!(meta.unwrap().content_size, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            waited >= CAP && waited < CAP + Duration::from_millis(10),
+            "{waited:?}"
+        );
+    }
+
+    /// A generated delay over 30 years, the jitter's included, is capped
+    /// before a custom runtime's default `sleep_until` turns the rest into a
+    /// relative sleep: on a clock that moves 20 years as that sleep starts,
+    /// with 160 years left, a 150-year delay neither overflows the clock
+    /// nor outlives its 30-year cap.
+    #[test]
+    fn a_generated_delay_is_capped_before_the_default_sleep_until() {
+        use crate::runtime::test_support::{ManualClock, SlippingRuntime, last_instant};
+
+        const YEAR: Duration = Duration::from_secs(86400 * 365);
+        let clock = ManualClock::starting_at(last_instant(std::time::Instant::now()) - 160 * YEAR);
+        let t0 = clock.now();
+        let rt = ThreadedRuntimeImpl::new_other_rt(SlippingRuntime {
+            clock: clock.clone(),
+            slip: 20 * YEAR,
+            absolute: false,
+        });
+        let retry = MetaRetry::default()
+            .max_retries(1)
+            .min_delay(150 * YEAR)
+            .max_delay(150 * YEAR);
+        let (adapter, calls) = FlakyAdapter::new(1, true);
+        let adapter = DynBoltLoadAdapter::new_box(adapter);
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut meta = std::pin::pin!(retrieve_meta(&adapter, &retry, Some(&rt)));
+        assert!(meta.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(clock.now(), t0 + 20 * YEAR, "the sleep started late");
+        clock.advance(10 * YEAR - Duration::from_nanos(1));
+        assert!(
+            meta.as_mut().poll(&mut cx).is_pending(),
+            "a nanosecond before 30 years"
+        );
+        clock.advance(Duration::from_nanos(1));
+        let std::task::Poll::Ready(meta) = meta.as_mut().poll(&mut cx) else {
+            panic!("not retried 30 years on");
+        };
+        assert_eq!(meta.unwrap().content_size, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(feature = "smol")]
