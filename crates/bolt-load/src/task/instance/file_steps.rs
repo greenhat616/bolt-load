@@ -121,7 +121,15 @@ pub(crate) mod tests {
         After(Step),
     }
 
-    type GateState = (Step, When, mpsc::Sender<()>, mpsc::Receiver<()>);
+    /// A gate: the step, when, where its arrival is reported, its release,
+    /// and how long it waits for the release, if not until it comes.
+    type GateState = (
+        Step,
+        When,
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+        Option<std::time::Duration>,
+    );
 
     /// Logs every step in order, fails the steps named, and holds one at a
     /// gate.
@@ -163,9 +171,28 @@ pub(crate) mod tests {
             step: Step,
             when: When,
         ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            self.set_gate(step, when, Some(std::time::Duration::from_secs(30)))
+        }
+
+        /// [`Self::gate`] that never gives up: the step waits until the
+        /// sender sends or drops, for a process that is killed there.
+        pub(crate) fn hold(
+            &self,
+            step: Step,
+            when: When,
+        ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            self.set_gate(step, when, None)
+        }
+
+        fn set_gate(
+            &self,
+            step: Step,
+            when: When,
+            expiry: Option<std::time::Duration>,
+        ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
             let (entered_tx, entered) = mpsc::channel();
             let (release, release_rx) = mpsc::channel();
-            *self.gate.lock().unwrap() = Some((step, when, entered_tx, release_rx));
+            *self.gate.lock().unwrap() = Some((step, when, entered_tx, release_rx, expiry));
             (entered, release)
         }
 
@@ -194,9 +221,12 @@ pub(crate) mod tests {
                     _ => None,
                 }
             };
-            if let Some((.., entered, release)) = held {
+            if let Some((.., entered, release, expiry)) = held {
                 let _ = entered.send(());
-                let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+                let _ = match expiry {
+                    Some(expiry) => release.recv_timeout(expiry).ok(),
+                    None => release.recv().ok(),
+                };
             }
             let mut log = self.log.lock().unwrap();
             let fails = self
