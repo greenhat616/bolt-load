@@ -24,7 +24,7 @@ use smol_cancellation_token::CancellationToken;
 
 use self::{
     cancel::CancelSource,
-    completion::check_completions,
+    completion::settle_completions,
     deadline::DeadlineSource,
     strategy_tick::StrategyTick,
     throughput::{RunnerRates, ThroughputSampler},
@@ -217,11 +217,15 @@ impl DownloadLoop {
         } = self;
         spawner.cancel_token.cancel();
         progress.downloaded = manager.get_total_downloaded();
-        progress.downloaded_chunks = manager.get_downloaded_ranges();
+        let mut written = manager.written().clone();
         // Releasing the receivers unblocks runners pushing lifecycle or data frames.
         drop(manager);
         spawner.wg.wait().await;
-        let flush_result = check_completions(writer.finish().await).map(drop);
+        // The writes still in flight count once they complete, whatever
+        // ended the task (design §11.1).
+        let flush_result =
+            settle_completions(writer.finish().await, |range| written.insert(range)).map(drop);
+        progress.downloaded_chunks = written.into_ranges();
         transfer_result.and(flush_result)
     }
 }

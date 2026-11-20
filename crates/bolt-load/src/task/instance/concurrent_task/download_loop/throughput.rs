@@ -291,7 +291,7 @@ impl DownloadLoop {
             Progress::new(
                 Some(self.manager.total()),
                 self.manager.get_total_downloaded(),
-                self.manager.get_downloaded_ranges(),
+                self.manager.written().ranges().to_vec(),
             ),
             Speed::new(speed, write_speed),
         );

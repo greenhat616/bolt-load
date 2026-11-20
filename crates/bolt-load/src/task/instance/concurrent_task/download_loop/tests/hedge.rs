@@ -152,6 +152,8 @@ pub(super) struct Harness {
     pub(super) download: DownloadLoop,
     pub(super) rt: ScriptedRuntime,
     written: WrittenRanges,
+    /// The statuses the loop publishes; held, so that it publishes them.
+    pub(super) status: crate::task::StatusReceiver,
 }
 
 impl Harness {
@@ -160,7 +162,26 @@ impl Harness {
     }
 
     fn on(rt: ScriptedRuntime, total: u64, options: &TaskOptions) -> Self {
-        let (file_writer, written) = FileWriter::recording();
+        Self::writing(rt, total, options, Vec::new())
+    }
+
+    /// A harness whose writes of the ranges in `fail` fail.
+    pub(super) fn failing(total: u64, options: &TaskOptions, fail: Vec<Range<u64>>) -> Self {
+        Self::writing(
+            ScriptedRuntime::new(TimerKind::Scripted),
+            total,
+            options,
+            fail,
+        )
+    }
+
+    fn writing(
+        rt: ScriptedRuntime,
+        total: u64,
+        options: &TaskOptions,
+        fail: Vec<Range<u64>>,
+    ) -> Self {
+        let (file_writer, written) = FileWriter::recording_failing(fail);
         let spawner = RunnerSpawner::new(
             ThreadedRuntimeImpl::new_other_rt(rt.clone()),
             // Never connected: the hedge the trigger spawns stays parked.
@@ -169,7 +190,7 @@ impl Harness {
             CancellationToken::new(),
             crate::runner::DEFAULT_IDLE_TIMEOUT,
         );
-        let (reporter, _status) = ProgressReporter::for_test();
+        let (reporter, status) = ProgressReporter::for_test();
         let download = DownloadLoop::new(
             total,
             spawner,
@@ -182,6 +203,7 @@ impl Harness {
             download,
             rt,
             written,
+            status,
         }
     }
 
@@ -306,6 +328,15 @@ impl Harness {
         for pair in ranges.windows(2) {
             assert!(pair[0].end <= pair[1].start, "written twice: {ranges:?}");
         }
+        // The planner's written bytes are the writer's (design §11.1).
+        let mut merged: Vec<Range<u64>> = Vec::new();
+        for range in &ranges {
+            match merged.last_mut() {
+                Some(last) if last.end == range.start => last.end = range.end,
+                _ => merged.push(range.clone()),
+            }
+        }
+        assert_eq!(self.download.manager.written().ranges(), merged);
         ranges
     }
 

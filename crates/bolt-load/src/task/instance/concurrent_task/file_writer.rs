@@ -137,13 +137,37 @@ pub enum FileRangeWriterImpl {
     Slow(self::slow::SlowWriter),
     /// Records the range of every write, and discards the data.
     #[cfg(test)]
-    Recording(WrittenRanges),
+    Recording(Recorder),
 }
 
-/// The ranges a [`FileRangeWriterImpl::Recording`] writer was asked to
-/// write, in order.
+/// The ranges a [`FileRangeWriterImpl::Recording`] writer wrote, in order.
 #[cfg(test)]
 pub type WrittenRanges = Arc<std::sync::Mutex<Vec<Range<u64>>>>;
+
+/// Records the range of every write, and fails the writes of `fail` with an
+/// io error, writing nothing of them.
+#[cfg(test)]
+pub struct Recorder {
+    written: WrittenRanges,
+    fail: Vec<Range<u64>>,
+}
+
+#[cfg(test)]
+impl Recorder {
+    fn write(&self, range: Range<u64>) -> Result<(), FileWriterError> {
+        if self.fail.contains(&range) {
+            return Err(FileWriterError::WriteRange {
+                source: CommandError::Io {
+                    source: std::io::Error::other(format!("injected at {range:?}")),
+                },
+                chunk: None,
+                path: "recorded.bin".into(),
+            });
+        }
+        self.written.lock().unwrap().push(range);
+        Ok(())
+    }
+}
 
 impl FileRangeWriter for FileRangeWriterImpl {
     #[inline]
@@ -158,10 +182,7 @@ impl FileRangeWriter for FileRangeWriterImpl {
             #[cfg(test)]
             FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
             #[cfg(test)]
-            FileRangeWriterImpl::Recording(ranges) => {
-                ranges.lock().unwrap().push(range);
-                Ok(())
-            }
+            FileRangeWriterImpl::Recording(recorder) => recorder.write(range),
         }
     }
 
@@ -194,10 +215,7 @@ impl FileRangeWriter for Arc<FileRangeWriterImpl> {
             #[cfg(test)]
             FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
             #[cfg(test)]
-            FileRangeWriterImpl::Recording(ranges) => {
-                ranges.lock().unwrap().push(range);
-                Ok(())
-            }
+            FileRangeWriterImpl::Recording(recorder) => recorder.write(range),
         }
     }
 
@@ -373,12 +391,21 @@ impl FileWriter {
     /// spawned tasks, as it has no worker queue.
     #[cfg(test)]
     pub fn recording() -> (Self, WrittenRanges) {
-        let ranges = WrittenRanges::default();
+        Self::recording_failing(Vec::new())
+    }
+
+    /// A recording writer whose writes of the ranges in `fail` fail.
+    #[cfg(test)]
+    pub fn recording_failing(fail: Vec<Range<u64>>) -> (Self, WrittenRanges) {
+        let written = WrittenRanges::default();
         let writer = Self {
             kind: FileRangeWriterKind::Null,
-            inner: Arc::new(FileRangeWriterImpl::Recording(ranges.clone())),
+            inner: Arc::new(FileRangeWriterImpl::Recording(Recorder {
+                written: written.clone(),
+                fail,
+            })),
         };
-        (writer, ranges)
+        (writer, written)
     }
 }
 

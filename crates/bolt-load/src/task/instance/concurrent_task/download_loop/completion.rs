@@ -10,22 +10,35 @@ use crate::{
     task::{DownloadError, instance::Result},
 };
 
-/// The bytes written by `completions`, or the first failed write as
-/// [`TaskError::Write`], keeping its range and io error.
-pub(super) fn check_completions(completions: Vec<WriteCompletion>) -> Result<usize> {
+/// Hand every successful write of `completions` to `on_written`, and return
+/// the bytes they wrote, or the first failed write in the order the
+/// completions were received as [`TaskError::Write`], keeping its range and
+/// io error.
+///
+/// The writes after a failed one are handed over all the same: their bytes
+/// are in the file (design §11.1).
+pub(super) fn settle_completions(
+    completions: Vec<WriteCompletion>,
+    mut on_written: impl FnMut(std::ops::Range<u64>),
+) -> Result<usize> {
     let mut written = 0usize;
+    let mut failed = None;
     for WriteCompletion { range, result } in completions {
         match result {
-            Ok(()) => written += (range.end - range.start) as usize,
-            Err(error) => {
-                return Err(DownloadError::transfer(TaskError::Write {
+            Ok(()) => {
+                written += (range.end - range.start) as usize;
+                on_written(range);
+            }
+            Err(error) if failed.is_none() => {
+                failed = Some(DownloadError::transfer(TaskError::Write {
                     range,
                     source: Arc::new(error.into_io_error()),
                 }));
             }
+            Err(_) => {}
         }
     }
-    Ok(written)
+    failed.map_or(Ok(written), Err)
 }
 
 impl DownloadLoop {
@@ -53,7 +66,8 @@ impl DownloadLoop {
         was_full: bool,
         now: Instant,
     ) -> Result<()> {
-        let written = check_completions(completions)?;
+        let manager = &mut self.manager;
+        let written = settle_completions(completions, |range| manager.note_written(range))?;
         self.throughput.record_written(written);
         self.policy.on_write_ok(written);
         if was_full && self.writer.can_write() {
@@ -118,6 +132,8 @@ mod tests {
         completions
     }
 
+    /// A failed write is the task's error, and is not written; the writes
+    /// around it are, before and after it in the batch (design §11.1).
     #[tokio::test]
     async fn a_failed_write_keeps_its_range_and_io_error() {
         for kind in [
@@ -128,7 +144,9 @@ mod tests {
             let completions = completions(kind).await;
             assert_eq!(completions.len(), 3, "{kind:?}");
 
-            let error = check_completions(completions).unwrap_err();
+            let mut written = Vec::new();
+            let error = settle_completions(completions, |range| written.push(range)).unwrap_err();
+            assert_eq!(written, [0..4, 8..12], "{kind:?}");
             let Some(TaskError::Write { range, source }) = error.as_transfer() else {
                 panic!("{kind:?}: expected a write error, got {error:?}");
             };
@@ -153,7 +171,14 @@ mod tests {
             .write_range(4..6, Bytes::from_static(b"da"))
             .unwrap();
 
-        assert_eq!(check_completions(pending.finish().await).unwrap(), 6);
+        let mut written = Vec::new();
+        let mut completions = pending.finish().await;
+        completions.sort_by_key(|completion| completion.range.start);
+        assert_eq!(
+            settle_completions(completions, |range| written.push(range)).unwrap(),
+            6
+        );
+        assert_eq!(written, [0..4, 4..6]);
     }
 
     #[test]
@@ -167,7 +192,10 @@ mod tests {
             }),
         };
 
-        let error = check_completions(vec![completion]).unwrap_err();
+        let error = settle_completions(vec![completion], |range| {
+            panic!("{range:?} was not written");
+        })
+        .unwrap_err();
         let Some(TaskError::Write { range, source }) = error.as_transfer() else {
             panic!("expected a write error, got {error:?}");
         };

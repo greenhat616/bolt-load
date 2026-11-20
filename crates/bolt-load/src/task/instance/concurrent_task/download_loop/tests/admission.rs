@@ -1303,10 +1303,12 @@ mod admission_properties {
                 },
                 Op::FillWriter => {
                     self.runners.extend(self.rt.take_parked());
+                    // Empty writes: only bytes the planner accepted are ever
+                    // written, and the test accepts none for them.
                     while self.download.writer.can_write() {
                         self.download
                             .writer
-                            .write_range(0..1, bytes::Bytes::from_static(b"x"))
+                            .write_range(0..0, bytes::Bytes::new())
                             .unwrap();
                     }
                     self.writes.extend(self.rt.take_parked());
