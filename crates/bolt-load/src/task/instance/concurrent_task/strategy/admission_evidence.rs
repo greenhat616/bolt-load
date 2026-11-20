@@ -391,12 +391,19 @@ impl AdmissionEvidence {
     }
 
     /// The most attempts proven at once since the limit was last lowered.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "for the range budget's exemption (design §8.3)")
-    )]
     pub fn proven_window(&self) -> usize {
         self.proven_window
+    }
+
+    /// Whether an attempt that ended as `class`, with `proven` other
+    /// attempts proven and `others` other attempts in flight, is exempt
+    /// from its range's budget (design §14.13a): a refusal beside a proven
+    /// attempt, with at least `max(proven_window, 1)` others in flight, is
+    /// above what the server was seen to admit.
+    ///
+    /// Read after [`Self::on_attempt_ended`] recorded the same attempt.
+    pub fn exempts(&self, class: AdmissionClass, proven: usize, others: usize) -> bool {
+        class == AdmissionClass::Refused && proven > 0 && others >= self.proven_window().max(1)
     }
 }
 
@@ -662,6 +669,28 @@ mod tests {
         evidence.begin_step(5, t0);
         evidence.on_attempt_ended(AdmissionClass::Congestion, 0, 0);
         assert!(evidence.step_rejected());
+    }
+
+    /// Only a corroborated refusal with at least `max(window, 1)` others in
+    /// flight is exempt from its range's budget.
+    #[test]
+    fn test_only_a_refusal_above_the_window_is_exempt() {
+        use AdmissionClass::{Congestion, NoEvidence, Refused};
+
+        let mut evidence = AdmissionEvidence::default();
+        assert!(!evidence.exempts(Refused, 0, 4), "uncorroborated");
+        assert!(
+            evidence.exempts(Refused, 1, 1),
+            "a window of none counts as one"
+        );
+        assert!(!evidence.exempts(Refused, 1, 0));
+        evidence.observe_proven(4);
+        assert!(!evidence.exempts(Refused, 3, 3), "inside the window");
+        assert!(evidence.exempts(Refused, 3, 4));
+        assert!(!evidence.exempts(NoEvidence, 4, 4));
+        assert!(!evidence.exempts(Congestion, 4, 4));
+        evidence.on_lowered(3);
+        assert!(evidence.exempts(Refused, 3, 3), "clamped at the lowering");
     }
 
     #[test]

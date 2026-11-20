@@ -50,6 +50,27 @@ pub enum TaskError {
         limit: usize,
         source: Arc<TaskError>,
     },
+    /// `range` was charged `attempts` failures, as many as
+    /// [`TaskOptions::max_attempts_per_range`](crate::task::TaskOptions::max_attempts_per_range)
+    /// allows, however well the other connections went. `source` is its
+    /// last failure, and `range` is what was left of the range after it.
+    ///
+    /// `attempts` counts the charged failures only, so the range may have
+    /// failed more often: a restart, a timeout or a dropped stream after
+    /// the attempt delivered bytes, is not charged, and neither is a
+    /// `Congestion` rejection (429/503). A lost runner
+    /// ([`ChannelClosed`](Self::ChannelClosed)) is charged even after it
+    /// delivered bytes.
+    #[snafu(display(
+        "bytes {}..{} failed {attempts} times, last error: {source}",
+        range.start,
+        range.end
+    ))]
+    RangeExhausted {
+        range: Range<u64>,
+        attempts: u32,
+        source: Arc<TaskError>,
+    },
     /// Writing `range` of the file failed. No write failure is retried: the
     /// task ends with the first one. A full disk or an exceeded quota adds a
     /// hint to the message.
@@ -121,6 +142,22 @@ mod tests {
         }
         let message = write_error(io::ErrorKind::PermissionDenied).to_string();
         assert!(!message.contains("; "), "{message}");
+    }
+
+    #[test]
+    fn an_exhausted_range_names_its_attempts_and_chains_its_last_error() {
+        let error = TaskError::RangeExhausted {
+            range: 100..200,
+            attempts: 5,
+            source: Arc::new(TaskError::Timeout),
+        };
+        assert_eq!(
+            error.to_string(),
+            "bytes 100..200 failed 5 times, last error: task is timeout"
+        );
+        let source = std::error::Error::source(&error).expect("the last error");
+        assert_eq!(source.to_string(), "task is timeout");
+        assert!(!error.is_retryable());
     }
 
     #[test]

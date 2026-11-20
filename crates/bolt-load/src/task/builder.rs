@@ -1,4 +1,8 @@
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
+use std::{
+    num::{NonZeroU32, NonZeroUsize},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use bolt_load_core::adapter::AdapterError;
 use smol_cancellation_token::CancellationToken;
@@ -97,6 +101,13 @@ impl TaskBuilder {
     /// [`options`](Self::options) call replaces it.
     pub fn max_connections(mut self, limit: NonZeroUsize) -> Self {
         self.options.max_connections = limit;
+        self
+    }
+
+    /// Set [`TaskOptions::max_attempts_per_range`]. A later
+    /// [`options`](Self::options) call replaces it.
+    pub fn max_attempts_per_range(mut self, limit: NonZeroU32) -> Self {
+        self.options.max_attempts_per_range = limit;
         self
     }
 
@@ -205,7 +216,7 @@ mod tests {
     use bolt_load_tests::adapter::simple::SimpleTestAdapter;
 
     use super::*;
-    use crate::task::DEFAULT_MAX_CONNECTIONS;
+    use crate::task::{DEFAULT_MAX_ATTEMPTS_PER_RANGE, DEFAULT_MAX_CONNECTIONS};
 
     #[test]
     fn test_max_connections_sets_the_option() {
@@ -215,5 +226,24 @@ mod tests {
         // `options` replaces the whole set, the limit included.
         let builder = builder.options(TaskOptions::default());
         assert_eq!(builder.options.max_connections, DEFAULT_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn test_max_attempts_per_range_sets_the_option() {
+        let limit = NonZeroU32::new(2).unwrap();
+        let builder = Task::builder(SimpleTestAdapter::new(1024)).max_attempts_per_range(limit);
+        assert_eq!(builder.options.max_attempts_per_range, limit);
+        assert_eq!(
+            TaskOptions::default()
+                .max_attempts_per_range(limit)
+                .max_attempts_per_range,
+            limit
+        );
+        // `options` replaces the whole set, the limit included.
+        let builder = builder.options(TaskOptions::default());
+        assert_eq!(
+            builder.options.max_attempts_per_range,
+            DEFAULT_MAX_ATTEMPTS_PER_RANGE
+        );
     }
 }

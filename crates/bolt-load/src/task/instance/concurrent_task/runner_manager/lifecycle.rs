@@ -183,14 +183,11 @@ impl RunnerManager {
         if kind.is_cancelled() {
             return RunnerTick::downloading();
         }
-        self.record_attempt_end(AttemptPhase::Streaming, &kind);
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            retryable: is_attempt_retryable(&kind),
-            error: kind,
-            range: released.range,
-            attempts: released.attempts,
-        })
+        let admission = self.record_attempt_end(AttemptPhase::Streaming, &kind);
+        let retryable = is_attempt_retryable(&kind);
+        RunnerTick::with_failure(
+            AttemptFailure::new(runner_id, kind, retryable, released).with_admission(admission),
+        )
     }
 
     /// Handle a runner that stopped before it connected; its range is
@@ -205,15 +202,11 @@ impl RunnerManager {
             return RunnerTick::downloading();
         }
         error!("runner {runner_id} failed to connect: {error:?}");
-        self.record_attempt_end(AttemptPhase::Connecting, &error);
+        let admission = self.record_attempt_end(AttemptPhase::Connecting, &error);
         let retryable = is_attempt_retryable(&error);
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            error,
-            retryable,
-            range: released.range,
-            attempts: released.attempts,
-        })
+        RunnerTick::with_failure(
+            AttemptFailure::new(runner_id, error, retryable, released).with_admission(admission),
+        )
     }
 
     /// Handle a runner whose spawn was rejected.
@@ -244,7 +237,7 @@ impl RunnerManager {
         } else {
             AttemptPhase::Streaming
         };
-        self.record_attempt_end(phase, &TaskError::ChannelClosed);
+        let admission = self.record_attempt_end(phase, &TaskError::ChannelClosed);
         trace!(
             "runner {runner_id} lost, released range: {:?}",
             released.range
@@ -252,13 +245,10 @@ impl RunnerManager {
         if self.chunk_planner.is_complete() {
             return RunnerTick::finished();
         }
-        RunnerTick::with_failure(AttemptFailure {
-            runner_id,
-            error: TaskError::ChannelClosed,
-            retryable: true,
-            range: released.range,
-            attempts: released.attempts,
-        })
+        RunnerTick::with_failure(
+            AttemptFailure::new(runner_id, TaskError::ChannelClosed, true, released)
+                .with_admission(admission),
+        )
     }
 
     fn handle_lifecycle_stream_event(&mut self, event: LifecycleStreamEvent) -> RunnerTick {

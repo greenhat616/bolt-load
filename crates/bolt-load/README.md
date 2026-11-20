@@ -119,6 +119,21 @@ free slots, and after a 429 or 503 only once the concurrency has been
 lowered. A range it cannot retry then waits for the next strategy
 evaluation.
 
+Healthy connections cannot hide a range that keeps failing: once a range
+has failed `TaskOptions::max_attempts_per_range` times (5 by default),
+the task fails with `TaskError::RangeExhausted`, which names the range
+and carries its last error. A timeout or a dropped stream after the
+attempt delivered bytes only restarts the range: it backs off, but is
+counted neither for the range nor as a consecutive failure. A 429 or 503
+is not counted for the range either, nor is a connect refused above what
+the server was seen to admit: one that failed before it started, while
+another connection had delivered bytes and at least as many others were
+in flight as had delivered at once since the connection limit was last
+lowered. Every other retryable failure is counted, a lost runner even
+after it delivered bytes. While refusals stay exempt nothing bounds them
+per range; the task then ends once the other connections have the rest,
+or by its no-progress and consecutive-failure limits.
+
 ## Feature Flags
 
 | Feature | Default | Description |
