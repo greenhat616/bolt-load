@@ -2492,3 +2492,9 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
 - **做法。** 新函数 `bind_local()` 绑定 `127.0.0.1:0`，由系统在绑定时分配端口，再从 `local_addr()` 读出端口号。两个服务器都用它，公开函数的签名不变（仍返回端口号）。`portpicker` 没有别的用处，从 `bolt-load-tests` 的依赖里去掉，`Cargo.lock` 随之少了 `portpicker` 和它带来的 `rand 0.8`、`rand_chacha 0.3`、`rand_core 0.6`。
 - **其他地方。** 整个工作区里没有别的先挑后绑：`tests/empty_body.rs` 和 `bolt-load-adapter/tests/body_decoding.rs` 本来就绑定端口 0，没有写死的端口。
 - **验证。** `if_range` 和 `resource_changed` 各连续跑 40 次，没有失败，没有 10048；完整的工作区测试（全部 feature 782 个、默认 714 个）也没有。
+
+### 14.25 恶意文件名测试忽略外部扫描器的副本（测试设施）
+
+- **问题。** `test_save_into_rejects_hostile_filenames` 断言下载目录里只有 `evil.bin`。在一台测试机上，30 次里有 2 次目录里还多了一个 `EVIL.BIN.DOWNLOADING.tmp`，紧跟在 `evil.bin.downloading` 改名成 `evil.bin` 之后出现。bolt-load 里没有任何代码构造这个名字：临时文件只有 `<目标>.downloading`（小写，没有 `.tmp`），由 `async_fs::rename`（直接调 `std::fs::rename`，Windows 上是 `MoveFileExW`，不另造临时名）发布或 `remove_file` 删掉；这个测试用的是内存里的 `SimpleTestAdapter`，不起 HTTP 服务器；tempfile 的名字是 `.tmp<随机>`。所以怀疑是机器上的外部程序，比如杀毒软件（那台机器上运行着 Kaspersky）。这只是推测：观察到的现象不能说明是哪个进程建的文件，证实需要排除目录或 Process Monitor 跟踪。
+- **做法。** 测试先断言 `evil.bin` 存在、内容（hash 和长度）正确，`evil.bin.downloading` 不存在，`temp_dir` 里没有逃出去的 `evil.bin`；再列目录，只在 Windows 上去掉名字（不分大小写）恰好等于 `evil.bin.downloading.tmp` 的项，也就是观察到的那一个；剩下的必须恰好是 `["evil.bin"]`。不用 `*.tmp` 通配，也不放过没观察到的名字（评审建议，lead 采纳）。
+- **会不会掩盖真问题。** 只有产品自己在 Windows 上写出 `evil.bin.downloading.tmp`（文件或目录）时才会被掩盖；产品从不构造 `.tmp` 名字。其它平台上不放过任何多余的项。别的任何多余文件仍然让测试失败。`resource_changed.rs` 本来就只查产品自己的文件名（`out.bin`、`out.bin.downloading`），不用改。

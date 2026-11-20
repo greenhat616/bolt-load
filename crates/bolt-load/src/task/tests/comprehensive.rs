@@ -547,10 +547,13 @@ async fn test_save_into_rejects_hostile_filenames() {
     std::fs::create_dir(&dir).unwrap();
 
     let adapter = SimpleTestAdapter::new(1024).with_filename("../../evil.bin".to_string());
+    let expected_hash = adapter.expected_hash().to_owned();
     let output = watchdog(builder(adapter).save_into(&dir).spawn().unwrap())
         .await
         .unwrap();
     assert_eq!(output.path, dir.join("evil.bin"));
+    assert_hash(&dir.join("evil.bin"), &expected_hash, 1024);
+    assert!(!dir.join("evil.bin.downloading").exists());
     assert!(!temp_dir.path().join("evil.bin").exists());
 
     let adapter = SimpleTestAdapter::new(1024).with_filename("..".to_string());
@@ -571,8 +574,28 @@ async fn test_save_into_rejects_hostile_filenames() {
         "{result:?}"
     );
 
-    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-    assert_eq!(entries.len(), 1, "only evil.bin was written: {entries:?}");
+    // On one Windows test machine, 2 of 30 runs found a stray
+    // `EVIL.BIN.DOWNLOADING.tmp` next to the file just renamed from
+    // `.downloading`. Nothing in bolt-load builds such a name, so another
+    // process is suspected, such as an antivirus (Kaspersky runs on that
+    // machine); this is unconfirmed. Only that observed name is ignored, only
+    // on Windows and never as `*.tmp`, so any other file the task writes still
+    // fails the test.
+    let scanner_copies: &[&str] = if cfg!(windows) {
+        &["evil.bin.downloading.tmp"]
+    } else {
+        &[]
+    };
+    let entries: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            !scanner_copies
+                .iter()
+                .any(|copy| copy.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    assert_eq!(entries, ["evil.bin"], "only evil.bin was written");
 }
 
 // ============================================================================
