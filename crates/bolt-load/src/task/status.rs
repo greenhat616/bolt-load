@@ -3,7 +3,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use bolt_load_sync::watch;
@@ -146,8 +146,6 @@ struct Shared {
     terminal: Mutex<bool>,
     /// Set when downloading starts, replaced by a fallback.
     info: Mutex<Option<Arc<TaskInfo>>>,
-    /// The temporary file of the transfer, for cleanup after a panic.
-    temp_file: OnceLock<PathBuf>,
 }
 
 impl Shared {
@@ -185,7 +183,6 @@ impl StatusPublisher {
             tx,
             terminal: Mutex::new(false),
             info: Mutex::new(None),
-            temp_file: OnceLock::new(),
         };
         (Self(Arc::new(shared)), rx)
     }
@@ -205,10 +202,9 @@ impl StatusPublisher {
 
     /// Record `info` and publish a `Downloading` status with zero speed: the
     /// first one, or the first after a fallback.
-    pub(crate) fn downloading(&self, info: TaskInfo, temp_file: PathBuf, progress: Progress) {
+    pub(crate) fn downloading(&self, info: TaskInfo, progress: Progress) {
         let info = Arc::new(info);
         *self.0.info.lock().unwrap_or_else(PoisonError::into_inner) = Some(info.clone());
-        let _ = self.0.temp_file.set(temp_file);
         self.0.publish(TaskStatus::new(
             TaskState::Downloading,
             progress,
@@ -266,10 +262,6 @@ impl StatusPublisher {
     /// The last published progress.
     pub(crate) fn progress(&self) -> Progress {
         self.0.tx.borrow().progress.clone()
-    }
-
-    pub(crate) fn temp_file(&self) -> Option<&PathBuf> {
-        self.0.temp_file.get()
     }
 
     /// A receiver that has seen the current value, for tests.
@@ -332,7 +324,7 @@ mod tests {
         assert_eq!(rx.borrow().state, TaskState::Pending);
         publisher.initializing();
         assert_eq!(rx.borrow_and_update().state, TaskState::Initializing);
-        publisher.downloading(info(), "out.bin.downloading".into(), Progress::default());
+        publisher.downloading(info(), Progress::default());
         let status = rx.borrow_and_update();
         assert_eq!(status.state, TaskState::Downloading);
         assert!(status.info.is_some());
@@ -362,11 +354,7 @@ mod tests {
             mode: DownloadMode::Concurrent,
             ..info()
         };
-        publisher.downloading(
-            concurrent,
-            "out.bin.downloading".into(),
-            Progress::default(),
-        );
+        publisher.downloading(concurrent, Progress::default());
         publisher
             .reporter()
             .report(Progress::new(Some(10), 5, vec![0..5]), Speed::default());
@@ -374,7 +362,7 @@ mod tests {
             fallback: Some(FallbackReason::RangeIgnored),
             ..info()
         };
-        publisher.downloading(fallback, "out.bin.downloading".into(), Progress::default());
+        publisher.downloading(fallback, Progress::default());
         let status = rx.borrow();
         assert_eq!(status.state, TaskState::Downloading);
         assert_eq!(status.progress, Progress::default(), "starts over");

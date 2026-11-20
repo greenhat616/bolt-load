@@ -2841,3 +2841,41 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
 - **问题。** `test_save_into_rejects_hostile_filenames` 断言下载目录里只有 `evil.bin`。在一台测试机上，30 次里有 2 次目录里还多了一个 `EVIL.BIN.DOWNLOADING.tmp`，紧跟在 `evil.bin.downloading` 改名成 `evil.bin` 之后出现。bolt-load 里没有任何代码构造这个名字：临时文件只有 `<目标>.downloading`（小写，没有 `.tmp`），由 `async_fs::rename`（直接调 `std::fs::rename`，Windows 上是 `MoveFileExW`，不另造临时名）发布或 `remove_file` 删掉；这个测试用的是内存里的 `SimpleTestAdapter`，不起 HTTP 服务器；tempfile 的名字是 `.tmp<随机>`。所以怀疑是机器上的外部程序，比如杀毒软件（那台机器上运行着 Kaspersky）。这只是推测：观察到的现象不能说明是哪个进程建的文件，证实需要排除目录或 Process Monitor 跟踪。
 - **做法。** 测试先断言 `evil.bin` 存在、内容（hash 和长度）正确，`evil.bin.downloading` 不存在，`temp_dir` 里没有逃出去的 `evil.bin`；再列目录，只在 Windows 上去掉名字（不分大小写）恰好等于 `evil.bin.downloading.tmp` 的项，也就是观察到的那一个；剩下的必须恰好是 `["evil.bin"]`。不用 `*.tmp` 通配，也不放过没观察到的名字（评审建议，lead 采纳）。
 - **会不会掩盖真问题。** 只有产品自己在 Windows 上写出 `evil.bin.downloading.tmp`（文件或目录）时才会被掩盖；产品从不构造 `.tmp` 名字。其它平台上不放过任何多余的项。别的任何多余文件仍然让测试失败。`resource_changed.rs` 本来就只查产品自己的文件名（`out.bin`、`out.bin.downloading`），不用改。
+
+### 14.26 目标路径的锁（PR-9c，C31）
+
+- **范围。** §11.5.13 里 C31 的部分：每个任务（现在都是 `Resume::Off`）在整个任务期间对 `<dest>.boltload` 加独占锁，修 #152。续传的阶段（B1、B2、C）留给 C33。
+- **依赖。** `fs4` 1.1.0（`default-features = false, features = ["sync"]`，`sync` 就是它的默认 feature，所以只拿到同步的 API；MSRV 1.75；依赖 `rustix` 1、`windows-sys` 0.61，`Cargo.lock` 里都已经有，只新增 `fs4` 一项）。`same-file` 1（已在依赖树里）做文件身份的核对。Unix 上直接依赖 `libc`（已在依赖树里）取“不支持锁”的错误码；Windows 的几个错误码写成常量，不扩大 `windows-sys` 的 feature。`File::try_lock` 和 `File::unlock` 用 `FileExt::try_lock(&file)` 这种写法调用：标准库的同名方法要 1.89，本仓库 MSRV 是 1.88。
+- **加锁**（`task/instance/destination_lock.rs`）：
+  1. 先 `create_new` 打开（读写），已存在就打开已有的，记下 `created`；打开时被删掉了（`NotFound`），或者 Windows 上共享冲突（`ERROR_SHARING_VIOLATION`）、删除挂起（`ERROR_DELETE_PENDING`，或者 `ERROR_ACCESS_DENIED` 而路径已经查不到元数据），就等 20 ms 重来。`ERROR_ACCESS_DENIED` 而元数据还查得到的，是真的没有权限，报 `Io { op: Lock }`（第一轮审查 Minor 5）。元数据也可能因为没有权限而查不到，所以这个判断会错：重试用完时，最后一次打开如果还是这种被当作删除挂起的拒绝，报 `Io { op: Lock }` 和那个错误，不报 `InUse`（第二轮审查 Minor 2）。没有用 NT 状态码区分，那要多一个依赖。
+  2. `try_lock`：争用 → `DownloadError::InUse { path: dest }`；不支持锁（Unix `ENOLCK`、`EOPNOTSUPP`、`ENOTSUP`，Windows `ERROR_NOT_SUPPORTED`、`ERROR_INVALID_FUNCTION`，或 `ErrorKind::Unsupported`）→ 现在的任务打 `warn!`、不加锁继续（`Unsupported::Fail` 留给 C33 的 `On`）；其它错误 → `Io { op: IoOp::Lock, path: <dest>.boltload }`。两种情况都**不删**锁文件，即使是自己刚建的：没拿到锁，它这时可能已经是别的任务的了（第一轮审查 Major 1）；留下一个空文件，下一个任务当作没有状态。
+  3. 核对：`same_file::Handle` 比较锁住的句柄和路径现在指向的文件；路径指向别的文件或者没有文件就放锁、重来，最多 3 次，之后按 `InUse`；查询本身出错（句柄复制、元数据）报 `Io { op: Lock }`，不当作争用（第一轮审查 Minor 6）。
+  4. 锁住之后，已有内容的锁文件经锁住的句柄清空（`set_len(0)` + `sync_all`），在动临时文件之前。空的（崩溃留下的）直接用。
+  - 状态文件只经这个句柄读写；结束时先删路径、再放锁（`DestinationLock::release`），只在对临时文件的最后一次操作之后调用。
+- **所有权**（`task/instance/ownership.rs`）：`drive::spawn` 在 `catch_unwind` 之外建一个 `Ownership`，记着锁、临时文件和阶段（`Unowned`、`Transfer`、`Published`，即设计的 A、D、P），还有一个 drain 用的 `WaitGroup`。
+  - `run` 在解析出目标路径之后加锁：加锁和清空不和取消赛跑（`blocking::unblock` 之后才看取消），锁一拿到就交给 `Ownership`；之后若已取消，先删掉临时文件（这时它已归这个任务，可能是早先的任务留下的；删不掉报 `leftover_temp_file`），再放锁、以 `Cancelled` 结束（第一轮审查 Minor 4）。
+  - 正常结束（成功、失败、取消、回退之后）：teardown 完成后 `release`，再发布终态。`release` 在同一次加锁里先交出临时文件（阶段回到 `Unowned`、清掉临时路径），再删锁文件、放锁：之后再有 panic，清理什么都不动，不会删掉后来的任务的临时文件（第一轮审查 Major 2）。
+  - `OutputFile::commit` 改名成功后把阶段设为 `Published`，并记下完成时的进度（`commit` 收一个 `completed`，由传输在 commit 之前算好）；这个进度在 `release` 之后也保留（第一轮审查 Minor 7）。
+  - 并发模式的 writer 的每个 worker（pool、mmap、compio）都持有一个 drain 的克隆，关掉文件之后才放下（`FileWriter::new_drained`）。
+  - 先关文件、再放 drain 的顺序在每条路径上都成立（第二轮审查 Major 1）：闭包各自捕获的值，销毁顺序没有规定（Rust reference，Destructors），只有正常返回时的显式 `drop` 才排得了序，worker panic 或者排队的任务没运行就被丢掉时不行。所以用 `Drained<T> { value, _drain }`（`drained_file.rs`）把文件和 drain 的克隆放在一个结构体里，字段按声明顺序销毁；闭包整个拿走它，先写 `let held = held;`，不按字段分开捕获。pool 和 mmap 的 worker 套两层，`Drained::new(Drained::new(file, worker_guard), drain)`，依次放下文件、worker 自己的 guard、drain。compio 的 worker 在 `compio_file_writer_task` 里自己开关文件，那一帧先于闭包的捕获展开，不用改。
+  - 单连接模式（第一轮审查 Major 3）：原来的 `async_fs::File` 把写交给一个后台 worker，attempt 没了之后它还拿着文件，而且没有办法知道它什么时候关掉。改成 `task/instance/drained_file.rs` 的 `DrainedFile`：每次操作（建、`set_len`、写）各是一个 `blocking` 任务，持有文件和一个 drain 的克隆，先放文件、再放克隆；写要等到真正写进文件才返回，所以没有缓冲、也不再需要 `flush`（单连接的写错误都是 `Io { op: Write }`）。unwind 丢掉一个正在执行的写的 future 停不下它，但它持有 drain，panic 处理会等它写完、放下文件。
+  - panic：`report_panic` 先取消，再 `wait_blocking` 等 drain，然后按阶段：`Unowned` 什么都不动；`Transfer` 删临时文件（删不掉报 `leftover_temp_file`）；之后放锁。改过名的（有记下的完成进度）终态发布 `Finished` 和那个进度，否则 `Failed(Panicked)`。等待没有上限（Q2）。清理和 `release` 不能并发：清理先读阶段和临时路径、再删文件。现在不会并发，因为每个 `release` 都在 `run` 里、由同一个线程的 `block_on` 执行，`report_panic` 在 `catch_unwind` 返回之后才跑（第二轮审查建议 5，写在 `clean_up_after_panic` 的文档里）。
+  - 状态发布器不再记临时文件（`StatusPublisher::temp_file` 删掉），panic 时由 `Ownership` 负责。
+- **错误。** `DownloadError::InUse { path }`（目标路径）和 `IoOp::Lock` 都是新的（两个枚举本来就是 `#[non_exhaustive]`）。目录不可写时，原来以 `Io { op: Create }` 报临时文件，现在先以 `Io { op: Lock }` 报锁文件。
+- **测试。**
+  - `destination_lock.rs` 的单元测试：第二把锁 `InUse`、放锁后可再拿；旧内容被清空；崩溃留下的空文件被接管；打开和加锁之间文件被换掉，重新打开并锁住新的；每次都被换掉，最后 `InUse`；不支持锁时不加锁继续，`Unsupported::Fail` 时 `Io { op: Lock }`，都留下空的锁文件；权限错误两种都 `Io { op: Lock }`；目录不存在 `Io { op: Lock }`；A 建了文件、B 先锁住、A 加锁出错（权限、不支持锁各一次，用 `Barrier` 控制先后）：A 不删 B 的文件，C 仍然 `InUse`；身份核对：路径指向别的文件或没有文件是 `false`，核对出错时 `Io { op: Lock }`、锁照样放掉；Windows 上 `ERROR_ACCESS_DENIED` 按元数据分辨删除挂起和真的没有权限。
+  - `ownership.rs`：panic 之后，worker 退出之前锁一直被持有、临时文件还在，之后才删、才放；按阶段清理（`Unowned` 不动，`Published` 不删临时路径、带回完成进度）；`release` 之后再清理，后来的任务的临时文件和锁都不受影响。
+  - `drained_file.rs`：一个正在执行的写（钩子挡住），它的 future 和文件都被丢掉（模拟 unwind），drain 在写完之前不结束（直接 poll `drain.wait()`，不靠另一个线程有没有跑到），写完之后结束、数据在文件里；`Drained` 在闭包 panic 和闭包没运行就被丢掉两种情况下，值都先于 drain 的克隆放下（值在自己的 `Drop` 里记下 drain 是否还开着，只记不断言，免得 unwind 中二次 panic）。
+  - `drive.rs`：下载中 panic → `Failed(Panicked)`、临时文件和锁文件都没了；改名之后 panic → `Finished`、进度就是记下的完成进度、目标文件不动。
+  - `concurrent_task`：writer 的 worker 持有 drain，`finalize` 之前等待不会结束；`file_writer.rs` 对每种 writer（pool，以及启用时的 mmap、compio）各测一次，因为按 feature 选出来的只有一种。
+  - `task/tests/destination_lock.rs`（第一个任务停在适配器的门上，由测试放行，不靠时间，第一轮审查建议 8；它的流空闲超时设成 1 小时，超过所有 watchdog，不会自己超时放锁，第二轮审查 Minor 3）：#152 的场景（第二个任务以 `InUse` 失败、不碰它的临时文件，放行后第一个照常完成、内容正确）；成功、失败、取消、panic 之后锁文件和临时文件都没了，下一个任务能跑；旧的状态和临时文件被清空、从头下载（停在门上时锁文件已是空的）；崩溃留下的空锁文件被接管；加锁时取消，锁照样放掉、早先留下的临时文件被删掉、`leftover_temp_file` 为空；不支持锁时照常下载、留下空锁文件；权限错误 `Io { op: Lock }`、什么都没写。
+  - `tests/destination_lock.rs`（跨进程）：测试二进制以环境变量再起一个自己，子进程的 body 一直等它的标准输入（父进程掌握），进入 `Downloading` 时打印标记；父进程的任务 `InUse`；杀掉子进程后，父进程的任务接管目标路径（子进程留下的锁文件和临时文件），下载正确、不留锁文件。
+- **变异检查**，全部被抓到：
+  - 从不加锁：单元测试的第二把锁、文件被换掉，`ownership` 的等待，#152 的场景，跨进程；
+  - 去掉文件身份的核对：两个“文件被换掉”的单元测试；
+  - panic 时先放锁、再等 worker：`test_the_lock_waits_for_the_workers`；
+  - 不清空旧状态：`test_a_stale_state_is_invalidated`（下载中锁文件必须是空的）；
+  - 在对临时文件的最后一次操作之前删锁文件、放锁：#152 的场景、旧状态、跨进程。
+  - 第一轮审查之后加的：加锁失败时删掉自己建的锁文件（`test_a_failed_lock_leaves_the_holder_s_file`、`test_other_errors_fail`）；`release` 不交出临时文件（`test_a_cleanup_after_the_release_touches_nothing`）；单连接的写在执行完之前放下 drain（`test_a_dropped_write_holds_the_drain_until_it_ends`）；加锁之后取消不删临时文件（`test_cancelled_while_locking`）；改名之后 panic 用最后一次采样的进度（`test_a_panic_after_the_rename_finishes_the_task`）；身份核对出错当作“别的文件”（`test_an_identity_error_is_an_error`，测试用 `LockHooks::identity` 注入错误）。
+  - 第二轮审查之后加的：`Drained` 的两个字段换序（`test_a_drained_value_drops_before_its_drain`）；重试用完在“当作删除挂起的拒绝”上仍报 `InUse`（`test_running_out_on_an_access_denial_is_an_error`）；pool、mmap、compio 的 worker 各自不持有 drain（`test_every_writer_kind_holds_the_drain_group`）。
+- **没覆盖的。** Windows 上真实的 ACL 拒绝和删除挂起的文件，测试只用构造的错误码检查分类。
