@@ -909,6 +909,20 @@ async fn a_connecting_original_loses_to_the_first_frame() {
     assert_eq!(h.slots(), 2);
 }
 
+/// A connecting hedge, seen beside its proven original, is beaten by the
+/// original's frame: it is never classified, so what it was seen beside
+/// is forgotten at once (design §8.3).
+#[tokio::test]
+async fn a_beaten_connecting_hedge_forgets_what_it_was_seen_beside() {
+    let now = Instant::now();
+    let (mut h, _o, mut eo, hd, _eh) = pair(64 * KIB, false, now);
+    assert!(h.download.manager.admission().is_seen(hd));
+    eo.send(32 * KIB);
+    h.go(now);
+    assert!(h.download.manager.is_stopping(hd));
+    assert!(!h.download.manager.admission().is_seen(hd));
+}
+
 /// An empty frame decides nothing.
 #[tokio::test]
 async fn an_empty_frame_decides_nothing() {
@@ -2001,7 +2015,7 @@ async fn each_side_of_a_pair_is_classified_when_it_fails() {
 /// step, before its tick decides it.
 #[tokio::test]
 async fn a_hedge_opens_no_connection_above_the_limit() {
-    use super::super::super::strategy::AdmissionClass;
+    use super::super::super::strategy::{AdmissionClass, UNSEEN};
 
     let base = Instant::now();
     let (mut h, a, b, _ea, _eb) = endgame(&options(4), base);
@@ -2009,7 +2023,7 @@ async fn a_hedge_opens_no_connection_above_the_limit() {
     h.download
         .manager
         .admission_mut()
-        .on_attempt_ended(AdmissionClass::Congestion, 2, 2);
+        .on_attempt_ended(UNSEEN, AdmissionClass::Congestion, 2, 2);
     let mut now = base;
     let tick = |h: &mut Harness, now: Instant| {
         // Both deliver, so that neither is silent.
@@ -2036,7 +2050,7 @@ async fn a_hedge_opens_no_connection_above_the_limit() {
     h.download
         .manager
         .admission_mut()
-        .on_attempt_ended(AdmissionClass::Refused, 0, 2);
+        .on_attempt_ended(UNSEEN, AdmissionClass::Refused, 0, 2);
     h.download.manager.note_delivery(a, now + HEDGE_IDLE);
     h.download.hedge_stalled_runner(now + HEDGE_IDLE);
     assert!(!h.undecided(b));
