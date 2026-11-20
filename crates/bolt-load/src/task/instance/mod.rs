@@ -8,6 +8,7 @@ pub mod concurrent_task;
 pub(crate) mod destination_lock;
 pub(crate) mod drained_file;
 pub(crate) mod drive;
+pub(crate) mod file_steps;
 mod full_body;
 mod id;
 mod output_file;

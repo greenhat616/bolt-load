@@ -103,6 +103,14 @@ pub struct TaskStatus {
     /// The temporary file that could not be removed after a failure or a
     /// cancellation; the error that caused the removal is kept in `error`.
     pub leftover_temp_file: Option<PathBuf>,
+    /// The partial file a resumable task kept, with its state file, for a
+    /// later resume (design §11.5.9; task-api-spec STATUS-13). Crate
+    /// internal until resuming is public (C20).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "public with resuming, C20 (lead decision)")
+    )]
+    pub(crate) kept_for_resume: Option<PathBuf>,
 }
 
 impl TaskStatus {
@@ -114,6 +122,7 @@ impl TaskStatus {
             info,
             error: None,
             leftover_temp_file: None,
+            kept_for_resume: None,
         }
     }
 
@@ -225,6 +234,17 @@ impl StatusPublisher {
         progress: Progress,
         leftover_temp_file: Option<PathBuf>,
     ) {
+        self.finish_keeping(outcome, progress, leftover_temp_file, None);
+    }
+
+    /// [`Self::finish`], naming the partial file kept for a resume.
+    pub(crate) fn finish_keeping(
+        &self,
+        outcome: Result<(), DownloadError>,
+        progress: Progress,
+        leftover_temp_file: Option<PathBuf>,
+        kept_for_resume: Option<PathBuf>,
+    ) {
         let (state, error) = match outcome {
             Ok(()) => (TaskState::Finished, None),
             Err(DownloadError::Cancelled) => (TaskState::Cancelled, Some(DownloadError::Cancelled)),
@@ -233,6 +253,7 @@ impl StatusPublisher {
         let status = TaskStatus {
             error,
             leftover_temp_file,
+            kept_for_resume,
             ..TaskStatus::new(state, progress, self.0.info())
         };
         let mut terminal = self

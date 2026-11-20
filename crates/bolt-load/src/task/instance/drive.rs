@@ -13,15 +13,19 @@ use smol_cancellation_token::CancellationToken;
 
 use super::{
     ConcurrentTaskInner, SingletonTaskInner,
+    concurrent_task::checkpoint,
     destination_lock::{DestinationLock, LockHooks, Unsupported},
+    file_steps::{FileHooks, Step},
     output_file::{self, OutputFile, Teardown},
-    ownership::Ownership,
+    ownership::{Ownership, Phase},
+    state_file::{Header, StateFile, encode_header, sync_parent_dir},
 };
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter, BoltLoadAdapterMeta},
     runtime::{LocalRuntimeBuilderImpl, ThreadedRuntimeExt, ThreadedRuntimeImpl},
     task::{
         DownloadError, DownloadMode, FallbackReason, IoOp, Progress, TaskInfo, TaskOptions,
+        builder::Resume,
         destination::{self, Destination},
         meta,
         status::StatusPublisher,
@@ -54,6 +58,10 @@ pub(crate) struct Attempt {
     pub(crate) cancel_token: CancellationToken,
     /// How the destination's lock is taken; replaced in tests.
     pub(crate) lock_hooks: LockHooks,
+    /// Whether the task keeps a state file for a later resume.
+    pub(crate) resume: Resume,
+    /// What to call before each file step of a resumable task.
+    pub(crate) file_hooks: FileHooks,
 }
 
 /// Run `attempt` on a local runtime in a blocking thread.
@@ -73,7 +81,7 @@ pub(crate) fn spawn(
     blocking::unblock(move || {
         let on_panic = publisher.share();
         let cancel_token = attempt.cancel_token.clone();
-        let ownership = Ownership::new();
+        let ownership = Ownership::with_hooks(attempt.file_hooks.clone());
         let owned = ownership.clone();
         let ran = panic::catch_unwind(AssertUnwindSafe(move || {
             match rt.downcast_local(local_runtime_builder) {
@@ -121,10 +129,11 @@ fn report_panic(
     }
     match cleanup.published {
         Some(completed) => publisher.finish(Ok(()), completed, None),
-        None => publisher.finish(
+        None => publisher.finish_keeping(
             Err(DownloadError::Panicked { message }),
             publisher.progress(),
             cleanup.leftover_temp_file,
+            cleanup.kept_for_resume,
         ),
     }
 }
@@ -161,7 +170,14 @@ pub(super) async fn run(
         };
         trace!("[TASK] initialized, mode: {mode:?}, fallback: {fallback:?}, path: {path:?}");
         let output = OutputFile::new(path.clone(), ownership.clone());
-        if let Err(e) = lock_destination(&path, &output, &ownership, &attempt.lock_hooks).await {
+        // A task that may resume needs the lock (design §11.5.4).
+        let unsupported = match attempt.resume {
+            Resume::Off => Unsupported::Proceed,
+            Resume::On => Unsupported::Fail,
+        };
+        if let Err(e) =
+            lock_destination(&path, &output, &ownership, &attempt.lock_hooks, unsupported).await
+        {
             ownership.release();
             return publisher.finish(Err(e), Progress::default(), None);
         }
@@ -174,6 +190,26 @@ pub(super) async fn run(
             return publisher.finish(Err(DownloadError::Cancelled), Progress::default(), leftover);
         }
         let total = meta.content_size;
+        // A resumable new start creates the partial file and writes the
+        // state header before the transfer starts (design §11.5.5).
+        let state = match resumable_header(attempt.resume, mode, &meta) {
+            None => None,
+            Some(header) => {
+                match start_resumable(&output, &ownership, total, header, &cancel_token).await {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        let (leftover, kept) = end_failed_start(&output, &ownership).await;
+                        ownership.release();
+                        return publisher.finish_keeping(
+                            Err(e),
+                            Progress::default(),
+                            leftover,
+                            kept,
+                        );
+                    }
+                }
+            }
+        };
         // A zero size is unknown, and a coded size is not the file's: download
         // until the stream ends.
         let singleton_total = (total != 0 && meta.content_encoding.is_none()).then_some(total);
@@ -199,7 +235,7 @@ pub(super) async fn run(
                 drive(transfer, info, &publisher, &cancel_token).await
             }
             DownloadMode::Concurrent => {
-                let transfer = ConcurrentTaskInner::new(
+                let mut transfer = ConcurrentTaskInner::new(
                     adapter.clone(),
                     output.clone(),
                     total,
@@ -207,15 +243,19 @@ pub(super) async fn run(
                     options.clone(),
                     publisher.reporter(),
                 );
+                if let Some(state) = state {
+                    transfer = transfer.checkpoint_to(Box::new(state));
+                }
                 let (teardown, progress) =
                     drive(transfer, info.clone(), &publisher, &cancel_token).await;
                 let Err(DownloadError::RangeUnsupported { reason, source }) = &teardown.result
                 else {
                     ownership.release();
-                    return publisher.finish(
+                    return publisher.finish_keeping(
                         teardown.result,
                         progress,
                         teardown.leftover_temp_file,
+                        teardown.kept_for_resume,
                     );
                 };
                 // The concurrent teardown removed what it wrote; the
@@ -239,7 +279,12 @@ pub(super) async fn run(
         };
         // After the last operation on the temporary file.
         ownership.release();
-        publisher.finish(teardown.result, progress, teardown.leftover_temp_file);
+        publisher.finish_keeping(
+            teardown.result,
+            progress,
+            teardown.leftover_temp_file,
+            teardown.kept_for_resume,
+        );
     };
     #[cfg(feature = "tracing")]
     let run =
@@ -308,11 +353,12 @@ async fn lock_destination(
     output: &OutputFile,
     ownership: &Arc<Ownership>,
     hooks: &LockHooks,
+    unsupported: Unsupported,
 ) -> Result<(), DownloadError> {
     let lock = blocking::unblock({
         let dest = dest.to_path_buf();
         let hooks = hooks.clone();
-        move || DestinationLock::acquire(&dest, Unsupported::Proceed, &hooks)
+        move || DestinationLock::acquire(&dest, unsupported, &hooks)
     })
     .await?;
     ownership.own(lock, output.tmp.clone());
@@ -328,6 +374,126 @@ async fn lock_destination(
             source: Arc::new(source),
         }),
         _ => Ok(()),
+    }
+}
+
+/// The state header of a resumable download, or `None` when it is not
+/// resumable (design §11.5.3): `Resume::On`, the concurrent engine (which
+/// implies a known, non-zero size, no content coding and ranges), and a
+/// usable validator that fits the header.
+fn resumable_header(
+    resume: Resume,
+    mode: DownloadMode,
+    meta: &BoltLoadAdapterMeta,
+) -> Option<Vec<u8>> {
+    if resume != Resume::On || mode != DownloadMode::Concurrent {
+        return None;
+    }
+    let validator = meta.validator.as_ref()?;
+    encode_header(&Header {
+        block_size: checkpoint::BLOCK_SIZE.get() as u32,
+        total: meta.content_size,
+        validator,
+        source: None,
+    })
+    .inspect_err(|e| debug!("[TASK] not resumable: {e}"))
+    .ok()
+}
+
+/// The resumable new start, in the order of design §11.5.5, after the
+/// lock was taken and an old state invalidated: create or truncate the
+/// partial file, size it and sync it; write the state header through the
+/// locked handle and sync it; sync the directory.
+///
+/// The task is in phase B1 until the header is synced, and in phase C from
+/// then on (design §11.5.9). Cancellation is checked between the steps,
+/// never raced against one: a step that started ends.
+async fn start_resumable(
+    output: &OutputFile,
+    ownership: &Arc<Ownership>,
+    total: u64,
+    header: Vec<u8>,
+    cancel_token: &CancellationToken,
+) -> Result<StateFile, DownloadError> {
+    ownership.enter(Phase::Fresh);
+    let tmp = output.tmp.clone();
+    let state_path = super::destination_lock::state_path_for(&output.dest);
+    let owner = ownership.clone();
+    let token = cancel_token.clone();
+    blocking::unblock(move || {
+        let hooks = owner.hooks();
+        let io = |op, path: &std::path::Path, source| DownloadError::Io {
+            op,
+            path: path.to_path_buf(),
+            source: Arc::new(source),
+        };
+        let cancelled = || {
+            if token.is_cancelled() {
+                Err(DownloadError::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        let file = hooks
+            .before(Step::CreatePartial)
+            .and_then(|()| {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                file.set_len(total)?;
+                Ok(file)
+            })
+            .map_err(|e| io(IoOp::Create, &tmp, e))?;
+        cancelled()?;
+        hooks
+            .before(Step::SyncPartial)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| io(IoOp::Flush, &tmp, e))?;
+        drop(file);
+        cancelled()?;
+        let handle = owner.state_file().ok_or_else(|| {
+            io(
+                IoOp::Lock,
+                &state_path,
+                std::io::Error::other("the state file is not locked"),
+            )
+        })?;
+        let mut state = StateFile::new(Box::new(handle));
+        state
+            .write_header(&header)
+            .map_err(|e| io(IoOp::Write, &state_path, e))?;
+        // The header is durable: the pair can be resumed from now on.
+        owner.enter(Phase::Resumable);
+        cancelled()?;
+        hooks
+            .before(Step::SyncDirAfterStart)
+            .and_then(|()| sync_parent_dir(&tmp))
+            .map_err(|e| io(IoOp::Flush, &tmp, e))?;
+        cancelled()?;
+        Ok(state)
+    })
+    .await
+}
+
+/// After a resumable new start failed or was cancelled: discard both files
+/// before the header was durable (B1), keep both after (C). The partial
+/// file left and the one kept for a resume.
+async fn end_failed_start(
+    output: &OutputFile,
+    ownership: &Arc<Ownership>,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    match ownership.phase() {
+        Phase::Resumable => {
+            ownership.keep_files();
+            (None, Some(output.tmp.clone()))
+        }
+        _ => {
+            let owner = ownership.clone();
+            let discarded = blocking::unblock(move || owner.discard_resumable()).await;
+            (discarded.leftover, None)
+        }
     }
 }
 

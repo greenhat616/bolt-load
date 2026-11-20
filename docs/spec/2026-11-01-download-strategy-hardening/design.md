@@ -3034,3 +3034,66 @@ C33 拆成两个提交（实现者提议，lead 同意，各自审查、各自�
 - **变异检查**（`--all-features` 跑 `state_file`、`checkpoint`、`concurrent_task::tests`），全部被抓到：追加没同步就移动 `end`；回滚什么都不做（失败的追加之后没有回滚）；回滚不同步；头部不同步；记录不同步；作废不同步；头部 CRC 跳过 magic；记录 CRC 只覆盖 16 字节；长度上限差一；忽略最小间隔。
 - **第一轮审查之后的修改**（codex 第一轮 PASS，94 分，两个 Minor、一个建议）：最小间隔的测试改为从检查点自己记下的结束时刻（`ended`）算时间，差 1 ns 不开始、恰好到间隔开始（原来拿固定的 `t0 + 20 s` 和真实的 `Instant::now()` 比）；`checkpoint_interval` 的文档和 `docs/task.md` 改为：0.5 s 的间隔只约束定期的检查点，teardown 的那次不等它；`DestinationLock::handle` 和 `release` 的文档写明：经句柄对状态文件的每个操作都要在 `release` 之前结束，否则句柄比锁活得长；Windows 上写用的是 `seek_write`，它会移动所有克隆共用的文件游标，任何依赖游标的用法都要和它串行。C33b 接上写入方之后，加一个用真实句柄、带闸门的测试：一个状态文件操作停住时 teardown 不放锁，放行之后才放。
 - **兼容性。** 没有公开项变化：`StateFile`、格式、`DestinationLock::handle`、`MIN_SPACING`、`Schedule::min_spacing` 都是 crate 内部的；`TaskOptions` 只改了文档。行为上，检查点只有测试打开，所以生产路径不变。按 tasks.md §0 第 3 条不算破坏兼容，提交是 `feat(task)`。
+
+#### 14.29.2 C33b：可续任务写状态文件
+
+- **范围。** §11.5.13 的 C33 去掉 C33c 的两项（`On` 加 `prefer_mode(Singleton)` 改走并发引擎、`discard_partial`，实现者提议，见下）：crate 内部的 `Resume::{Off, On}`（`TaskBuilder::resume` 只在测试里）、§11.5.3 的可续判断、可续的新开始、阶段 B1/C/D、`OutputFile::commit` 按阶段分支、完成的 8 步、回退之前作废、丢弃的顺序、panic 按阶段清理、crate 内部的 `kept_for_resume`。只写不读：读回、校验、续传是 C20。
+- **C33c（实现者提议，lead 同意）。** `On` 的单连接改走并发引擎（§11.5.8）只改模式选择，`discard_partial` 只是复用这里的丢弃顺序的另一个入口，两者都还是 crate 内部的；拆出去让 C33b 好审。C33b 里 `On` 加 `prefer_mode(Singleton)` 按 §11.5.3 不可续（不走并发引擎），照 D 处理。
+- **可续的判断**（`drive::resumable_header`）：`Resume::On`、模式是并发（已经意味着总长已知非零、没有内容编码、能用 Range）、meta 有 `validator`，并且头部能编码（验证器不超过 1024 字节；`source` 现在总是 `None`，C20 加 `resume_source`）。不满足时照 `Off` 下载：阶段 D，不写状态。
+- **锁。** `Resume::On` 一律用 `Unsupported::Fail`（Q3：不支持锁时 `On` 失败），可续与否都一样；`Off` 仍是 `Proceed`。
+- **新开始，可续**（`drive::start_resumable`，在 `Initializing` 里、发布 `info` 之前，不和取消赛跑）：C31 已在加锁之后作废旧状态（第 1 步）；进入阶段 B1；`truncate(true)` 打开部分文件、`set_len(total)`、`sync_all`；经锁住的句柄写头部、`sync_all`（`StateFile::write_header`），这时进入阶段 C；同步父目录；`StateFile` 交给 `ConcurrentTaskInner::checkpoint_to`，成为检查点的接收者。每一步之后检查取消。任何一步失败：任务以 `Io` 失败（部分文件的打开和 `set_len` 是 `Create`，同步是 `Flush`；头部的写和同步是状态文件路径上的 `Write`；目录同步是 `Flush`，实现者的选择），按阶段清理：B1 丢弃，C 两者都留（第一轮审查之后的修改，见下）。
+- **阶段**（`Ownership`）：`Unowned`（A）、`Fresh`（B1）、`Resumable`（C）、`Transfer`（D）、`Published`（P）；B2 是 C20 的。另记 `durable`：任务写过状态文件，它的结束要同步目录。`release`：任务保留文件时（`keep`，第一轮审查之后从阶段 C 分出来）只放锁、不删状态文件（`DestinationLock::release_keeping`）；写过状态文件的其它情况删状态文件、同步目录、放锁（`release_synced`，每步失败 `warn!`）；其它照旧（`release`）。
+- **提交**（`OutputFile::commit`，阶段 C 时走 `commit_resumable`，其它阶段不变）：
+  - 成功：改名；进入 P；同步目录、截断状态、同步状态（`Ownership::complete_resumable`，每步失败 `warn!`，结果仍是 `Finished`）；放锁时删状态文件、同步目录、放锁。即 §11.5.5“完成”的第 2–8 步（第 1 步 `finalize` 在提交之前）。
+  - 改名失败：两者都留，`kept_for_resume` 是部分文件，任务以 `Io { op: Rename }` 失败。
+  - `ResourceChanged`：丢弃（作废 → 删部分文件 → 同步目录 → 放锁时删状态文件 → 同步目录）。teardown 不做检查点（C32）。
+  - 回退（`RangeUnsupported`）：同样先作废、再删部分文件，任务进入 D，之后照常回退到单连接，结束时删状态文件。作废失败时不回退（实现者的决定）：单连接会以 `truncate` 重写部分文件，而有效的状态还指着它；所以两者都留、`kept_for_resume` 是部分文件，任务以状态文件上的 `Io { op: Lock }` 失败。
+  - 其它失败、取消：两者都留，`kept_for_resume`；teardown 先做的检查点在 C32。
+- **丢弃**（`Ownership::discard_resumable`，ResourceChanged、B1 的失败、B1 的 panic 都用它）：作废（经锁住的句柄 `set_len(0)` + `sync_all`）→ 成功才删部分文件、同步目录 → 放锁时删状态文件、同步目录。作废失败：不删部分文件、两者都留，`warn!`，记下保留（放锁时不删状态文件）；任务按原来的错误结束，部分文件报在 `leftover_temp_file`，`kept_for_resume` 不设（实现者的决定：任务本来要丢弃它）。
+- **panic**（TASK-8）：A 不动；B1 按丢弃的顺序；C 两者都留、不做 teardown 检查点、`kept_for_resume`；D 删临时文件；P 补完完成的步骤（同步目录、截断、同步），终态 `Finished`。等 drain 的部分不变（C31、C32）。
+- **`kept_for_resume`**：`TaskStatus` 上 crate 内部的字段，`StatusPublisher::finish_keeping` 设置（lead 决定，§14.29 开头）；C20 公开。
+- **钩子**（`file_steps.rs`）：`FileHooks` 在每个文件步骤之前被调用（`Step` 列出 §11.5.5 的步骤），生产里是空的；状态文件的写、截断、同步经 `HookedFile`，同样先过钩子。测试用 `StepLog` 记下顺序、按次数或“某步之后”注入失败、在某一步停住。只有可续任务的步骤过钩子，`Off` 不经过它们。
+- **`Off` 不变的核对**（tasks.md §0 第 3 条，lead 要求）：
+  - 代码路径：`Off` 用 `Unsupported::Proceed`（照旧）；`Ownership` 的阶段一直是 `Transfer`，`durable` 为假，所以 `OutputFile::commit` 走原来的 `commit`，`release` 走原来的 `DestinationLock::release`；`ConcurrentTaskInner` 没有接收者，C32 保证不算 CRC、不同步、不调度。新的钩子只在可续任务的步骤里调用。
+  - 测试：`test_a_task_that_keeps_no_state_takes_none_of_the_steps`（`Off` 的并发、单连接，以及 `On` 但不可续的两种：没有验证器、偏好单连接，都一个文件步骤都没走，结束时只有目标文件；`Off` 失败时删掉临时文件、不设 `kept_for_resume`）；原有的全部测试不改就通过（C31 的锁、作废、panic 的测试都还在）；C32 的 `no_crc_and_no_sync_without_checkpoints`。
+  - 开销：`Off` 没有多出系统调用：多的只是一次阶段判断和一个空的钩子字段。错误：`Off` 的错误路径没有改动。所以不算破坏兼容，提交是 `feat(task)`。
+- **已知限制。** Windows 没有目录同步（`sync_parent_dir` 什么都不做），靠 NTFS 的元数据日志，§11.5.5 已写明。
+- **测试。**
+  - `task/tests/resume_state.rs`（真实的任务、真实的文件，源是按区间给内容、在第三块中间可以出错或停在闸门的适配器，1 条连接，每 1 MiB 一次检查点；`StepLog` 记下文件步骤）：
+    - 可续的下载：新开始的五步、之后只有成对的写和同步（检查点）、完成的六步，顺序都对；结束时只剩目标文件。
+    - 失败和取消（取消在块 0、1 都已写入之后）：两者都留，`kept_for_resume` 是部分文件，状态文件是有效的头部加两条记录、之后没有别的字节，每条记录的 CRC 等于部分文件里那一块的 CRC；锁已放。
+    - `ResourceChanged`：两者都删，最后五步是丢弃的顺序。
+    - 作废失败：部分文件留着并报在 `leftover_temp_file`，状态文件仍有有效的头部，锁已放。
+    - 新开始的步骤各自失败：头部落盘之前的四步，任务以对应的 `Io` 失败，两者都删，失败之后是丢弃的顺序；目录同步失败时已在 C，两者都留、`kept_for_resume`。
+    - 改名失败：两者都留，状态记了全部 4 块。
+    - 改名之后的步骤各自失败（目录同步、截断、同步、删除、删除后的目录同步，截断加删除、同步加删除）：都是 `Finished`，目标文件完整；留下的状态文件和 §11.5.5“紧接着的下一次 `On`”的表一致（删除成功则没有；截断成功、删除失败则是空的；截断和删除都失败则是有效的头部）。
+    - 回退：作废、删部分文件在前，之后单连接完成，结束时删状态文件；作废失败时不回退，以 `Io { op: Lock }` 失败、两者都留。
+    - 不写状态的任务（见上）一个文件步骤都不走。
+    - lead 要求的核对 `test_a_task_that_cannot_resume_ends_as_one_with_resume_off`：`On` 但不可续（偏好单连接、总长未知、没有验证器）的任务，成功和失败两种，结束状态、错误（去掉临时目录后的文本）、目标文件、部分文件、状态文件、`kept_for_resume`、`leftover_temp_file`、文件步骤都和同样的 `Off` 任务一模一样；唯一的差别是 `On` 要求锁（不支持锁时失败，见上）。
+    - `On` 在不支持锁的文件系统上以 `Io { op: Lock }` 失败，一个文件步骤都没走。
+    - §14.29 许诺的带闸门的真实句柄测试 `test_a_held_state_write_keeps_the_lock`：第一次检查点的追加停在闸门（经真实的锁住的句柄），这时取消任务；另一个任务拿同一个目标是 `InUse`，任务没有结束；放行之后它以 `Cancelled` 结束、两者都留、锁已放。
+  - `ownership.rs` 的 `test_a_panic_cleans_up_by_phase`：B1 按丢弃的顺序删两者；C 两者原样留下、`kept_for_resume`、锁已放；P 补完截断、同步、删除；B1 作废失败时两者都留、部分文件报为留下。
+- **变异检查**（`--all-features` 跑 `resume_state`、`ownership`、`destination_lock`、`drive`、`output_file`），全部被抓到：
+  - 头部在部分文件同步之前写（lead 列的）：顺序测试、新开始失败的测试、失败和取消的测试；
+  - 动部分文件之前不作废旧状态（lead 列的）：C31 的 `test_a_stale_state_is_invalidated`；
+  - 作废失败也删部分文件（lead 列的）：作废失败的测试、回退的测试、panic 的测试；
+  - 新开始之后不同步目录：顺序测试等三个；
+  - 可续任务失败时丢弃文件：失败和取消的测试、闸门测试；
+  - `ResourceChanged` 时保留文件：两个丢弃的测试；
+  - 回退之前不作废：回退的测试；
+  - 保留文件的放锁也删状态文件：六个测试；
+  - 改名之后不截断状态：顺序测试、改名之后失败的测试、panic 的测试；
+  - 新开始失败时保留文件：新开始失败的测试；
+  - 可能续传的任务在不支持锁时照样继续：`test_resuming_needs_the_lock`（第一版只断言错误种类，变异后在新开始里也以 `Io { op: Lock }` 失败，没被抓到；加了“一个文件步骤都没走”之后抓到）；
+  - 偏好单连接也算可续：不写状态的任务的测试；
+  - C 的 panic 丢弃文件：panic 的测试。
+  - “记录先于数据同步”和“追加失败之后不回滚”由 C32、C33a 的测试和变异覆盖。
+- **第一轮审查之后的修改**（codex 第一轮 82 分，三个 Major，各自修掉）：
+  - **新开始里的取消。** `start_resumable` 收任务的取消令牌，在每一步完成之后检查（不和正在执行的步骤赛跑，C31 的规则）。头部落盘之前看到取消（B1）：丢弃两者；之后（C）：两者都留、`kept_for_resume`。测试 `test_a_cancelled_new_start_follows_its_phase`：在 `SyncPartial`、`SyncDirAfterStart` 各停一次，取消、放行，停住的那一步照常结束，之后分别按 B1、C 处理。
+  - **B1 → C 的时刻。** 头部同步成功之后立刻进入 C（§11.5.9：新开始的第 3 步完成之后），不再等目录同步；初始化里出错的清理按阶段（`end_failed_start`）：B1 丢弃，C 两者都留并报 `kept_for_resume`。目录同步失败、或者在那一步 panic，都保留这一对（新开始失败的测试改了这一项，见下）。
+  - **作废分成截断和同步。** 新的 `Ownership::invalidate_state` 经锁住的句柄先截断（`Step::Invalidate`）、再同步（新的 `Step::SyncInvalidation`），结果是 `Invalidation::{Done, Intact, Unsynced}`：截断失败时状态原样、头部完好；截断成功而同步失败时状态现在是空的、掉电后可能回来，两种都不是可用的一对。“保留文件”不再靠阶段 C 表示，改成 `Ownership` 上单独的 `keep` 标志（`keep_files`），放锁时据此不删状态文件。回退：`Intact` 时以 `Io { op: Lock }` 失败、两者都留、`kept_for_resume`；`Unsynced` 时同样失败、两者都留，但部分文件报在 `leftover_temp_file`，不报 `kept_for_resume`。丢弃（`ResourceChanged`、B1）走同一个作废，两种失败都保留部分文件、报为 `leftover_temp_file`。加锁之后对旧状态的作废（C31，`DestinationLock::invalidate`）不受影响：它失败时任务在动部分文件之前就以 `Io { op: Lock }` 失败，不声称任何东西可续。测试 `test_an_invalidation_reports_what_it_left`（回退、`ResourceChanged` 各自截断失败、同步失败四种）。
+  - **建议：真实任务里的 panic。** `StepLog::panic` 在某一步之后 panic 一次。`test_a_panic_at_each_step_follows_its_phase`：在 `SyncPartial`（B1：两者都删）、`SyncDirAfterStart`（C：两者都留、`kept_for_resume`）、第一次检查点的写（C：同上，状态有效）、丢弃里删部分文件（作废之后已是 D：两者都删）、改名之后的截断（P：`Finished`，只剩目标文件）各 panic 一次；每次都核对终态、两个报告字段、留下的文件、锁能再拿到。
+  - 改动的测试：`test_a_failed_new_start_discards_both_files` 里目录同步失败现在是两者都留、`kept_for_resume`、状态只有头部；丢弃的顺序多了 `SyncInvalidation`。
+  - 新的变异，全部被抓到：新开始看不到取消（取消的测试）；C 在目录同步之后才开始（新开始失败、panic 的测试）；初始化出错一律丢弃（取消、新开始失败的测试）；没同步的作废报为可用的一对（`test_an_invalidation_reports_what_it_left`）；作废不同步（六个测试）。原有的 13 个按新代码改了文本，重跑，仍全部被抓到。
+- **第二轮审查之后的修改**（codex 第二轮 90 分，一个 Major）：回退或 `ResourceChanged` 的作废截断成功之后、同步结束之前 panic，原来的 panic 清理看到的仍是阶段 C，会把空的状态报成可续。现在 `Ownership` 记下作废的进度：截断成功之后、同步和它的钩子之前就记下 `cut`；panic 清理在 C 而 `cut` 时两者都留、报 `leftover_temp_file`、不报 `kept_for_resume`。进入 D 仍在作废落盘（`Invalidation::Done`）之后。其它两步之间的 panic 逐个核对过：B1 的清理里作废中途 panic，阶段仍是 B1，panic 清理再作废一次；作废落盘之后已是 D（删临时文件，状态文件随放锁删掉）；完成的步骤在改名之后已是 P；检查点的回滚截到 `end`，之前的状态仍有效；头部同步成功和进入 C 之间没有会 panic 的操作。测试：`test_a_panic_after_the_cut_reports_no_pair`（回退、`ResourceChanged` 各一次，在 `SyncInvalidation` panic：两者都留、状态为空、只报 `leftover_temp_file`、锁能再拿到）；按建议加了 `test_a_new_start_whose_discard_fails_to_sync_leaves_both`（B1 的失败、取消、panic 三种，丢弃的作废同步失败：两者都留、状态为空、只报 `leftover_temp_file`、锁能再拿到）。新的变异“截断之后不记下 `cut`”被 `test_a_panic_after_the_cut_reports_no_pair` 抓到；原有 18 个重跑，仍全部被抓到。
+- **第三轮审查**（codex 第三轮 PASS，98 分，没有 Critical、Major、Minor）：按它的建议加了 `test_a_new_start_retries_its_invalidation_after_a_panic`，直接覆盖 B1 的作废重试：新开始在头部落盘之前失败，丢弃的作废截断之后、同步时 panic，panic 处理再作废一次。第二次作废成功时两者都删、两个报告字段都不设；第二次截断失败时两者都留、状态为空、只报 `leftover_temp_file`；两种都核对步骤顺序、留下的文件、两个报告字段和锁能再拿到。
