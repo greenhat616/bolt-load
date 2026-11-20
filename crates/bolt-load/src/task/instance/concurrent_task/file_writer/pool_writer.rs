@@ -10,7 +10,7 @@ use snafu::prelude::*;
 use super::{
     Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
     FileWriterCapability, FileWriterError, FinalizeSnafu, OpenOrCreateFileSnafu, ValidationSnafu,
-    WriteRangeSnafu, WriteReply, finalize_and_join,
+    WriteRangeSnafu, WriteReply, finalize_and_join, sync_through,
 };
 use crate::task::instance::drained_file::Drained;
 
@@ -21,6 +21,15 @@ pub struct PoolWriter {
 }
 
 impl FileRangeWriter for PoolWriter {
+    /// A worker syncs its handle: the workers share the file, and a sync
+    /// covers the writes of every handle to it. The worker holds the
+    /// attempt's drain group, so an unwind waits for the sync to end and the
+    /// handle to close, even when nobody awaits the sync any more (design
+    /// §11.5.4).
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        sync_through(&self.tx, self.file.path()).await
+    }
+
     async fn finalize(self) -> Result<(), FileWriterError> {
         let Self {
             file,
@@ -75,7 +84,14 @@ pub struct PoolWriterBuilder {
     pub parallel: Option<usize>,
     /// Kept by every worker until it closed its handle.
     pub drain: Option<WaitGroup>,
+    /// Called by a worker before it syncs; tests hold a sync there.
+    #[cfg(test)]
+    pub(super) before_sync: Option<BeforeSync>,
 }
+
+/// What a worker calls before it syncs, in tests.
+#[cfg(test)]
+pub(super) type BeforeSync = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 impl FileWriterCapability for PoolWriterBuilder {}
 
@@ -122,12 +138,23 @@ fn execute_write(file: &File, chunk: Chunk) -> io::Result<()> {
     write_all_at(file, &chunk.data, chunk.range.start)
 }
 
-fn file_writer_task(file: &File, command_rx: &Receiver<Command>) {
+fn file_writer_task(
+    file: &File,
+    command_rx: &Receiver<Command>,
+    #[cfg(test)] before_sync: Option<&BeforeSync>,
+) {
     let _close_on_exit = CloseOnExit(command_rx);
     while let Ok(command) = command_rx.recv_blocking() {
         match command {
             Command::Write(chunk, reply) => {
                 reply.complete(execute_write(file, chunk), file.path());
+            }
+            Command::Sync(tx) => {
+                #[cfg(test)]
+                if let Some(before_sync) = before_sync {
+                    before_sync();
+                }
+                let _ = tx.send(file.sync_data());
             }
             Command::Finalize(tx) => {
                 // The owner syncs the file once all workers exited.
@@ -182,6 +209,8 @@ impl PoolWriterBuilder {
         let worker_wg = WaitGroup::new();
         for worker_file in worker_files {
             let rx = rx.clone();
+            #[cfg(test)]
+            let before_sync = self.before_sync.clone();
             // Dropped in order on every path, a panic included: the file,
             // then the worker's guard, then the drain's.
             let held = Drained::new(
@@ -190,7 +219,12 @@ impl PoolWriterBuilder {
             );
             blocking::unblock(move || {
                 let held = held;
-                file_writer_task(&held.value.value, &rx);
+                file_writer_task(
+                    &held.value.value,
+                    &rx,
+                    #[cfg(test)]
+                    before_sync.as_ref(),
+                );
             })
             .detach();
         }
@@ -209,6 +243,67 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    /// A sync held in a worker keeps the drain group open, after the sync's
+    /// future and the writer were dropped, until the worker synced and
+    /// closed its handle (design §11.5.4).
+    #[tokio::test]
+    async fn test_a_held_sync_holds_the_drain() {
+        use std::{
+            sync::{Arc, Mutex, mpsc},
+            time::Duration,
+        };
+
+        let temp = NamedTempFile::new().unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let before_sync: BeforeSync = Arc::new(move || {
+            entered_tx.lock().unwrap().send(()).unwrap();
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+        });
+        let drain = WaitGroup::new();
+        let writer = PoolWriterBuilder {
+            file: Some(file),
+            parallel: Some(2),
+            drain: Some(drain.clone()),
+            before_sync: Some(before_sync),
+        }
+        .build()
+        .unwrap();
+        {
+            let mut sync = std::pin::pin!(writer.sync());
+            assert!(futures::poll!(sync.as_mut()).is_pending());
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a worker takes the sync");
+        }
+        drop(writer);
+        // The idle worker exits as soon as the queue closes, the other only
+        // after the sync. Nothing signals that the drain did not end, so the
+        // test gives it half a second: a correct writer always passes; one
+        // that synced outside the workers would let it end within that.
+        let mut wait = std::pin::pin!(drain.wait());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), wait.as_mut())
+                .await
+                .is_err(),
+            "the sync still holds a handle"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("the workers exit once the sync ended");
+    }
 
     /// One `write_at` call of [`ScriptedFile`].
     enum Step {

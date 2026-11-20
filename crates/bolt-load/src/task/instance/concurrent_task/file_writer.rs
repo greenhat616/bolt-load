@@ -6,6 +6,7 @@
 mod command;
 #[cfg(feature = "compio")]
 mod compio_writer;
+mod crc;
 #[cfg(feature = "mmap")]
 mod mmap_writer;
 mod null_writer;
@@ -31,13 +32,14 @@ use snafu::prelude::*;
 pub use self::compio_writer::CompioWriterBuilder;
 #[cfg(feature = "mmap")]
 pub use self::mmap_writer::MmapWriterBuilder;
-use self::{null_writer::NullWriter, pool_writer::PoolWriter};
 // Re-export builders for benchmarking and advanced usage
 pub use self::{
+    crc::CrcSegment,
     null_writer::NullWriterBuilder,
     pending_writer::{PendingWrite, PendingWriter, WriteCompletion, WriteStatus, WriterFullError},
     pool_writer::PoolWriterBuilder,
 };
+use self::{null_writer::NullWriter, pool_writer::PoolWriter};
 use crate::{runtime::yield_now, task::IoOp};
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
@@ -67,6 +69,8 @@ pub enum FileWriterError {
     },
     #[snafu(display("failed to finalize, sync all data to disk etc, in path: {path:?}"))]
     Finalize { source: CommandError, path: PathBuf },
+    #[snafu(display("failed to sync the data written to {path:?}"))]
+    Sync { source: CommandError, path: PathBuf },
 }
 
 impl FileWriterError {
@@ -78,7 +82,7 @@ impl FileWriterError {
             Self::OpenOrCreateFile { .. } => IoOp::Create,
             Self::AllocateFile { .. } => IoOp::Allocate,
             Self::WriteRange { .. } => IoOp::Write,
-            Self::Finalize { .. } => IoOp::Flush,
+            Self::Finalize { .. } | Self::Sync { .. } => IoOp::Flush,
         }
     }
 
@@ -89,7 +93,8 @@ impl FileWriterError {
         let (Self::OpenOrCreateFile { source, .. }
         | Self::AllocateFile { source, .. }
         | Self::WriteRange { source, .. }
-        | Self::Finalize { source, .. }) = self;
+        | Self::Finalize { source, .. }
+        | Self::Sync { source, .. }) = self;
         match source {
             CommandError::Io { source } => source,
             queue => io::Error::new(io::ErrorKind::BrokenPipe, queue),
@@ -111,6 +116,23 @@ where
         range: Range<u64>,
         data: Bytes,
     ) -> impl Future<Output = Result<(), FileWriterError>> + Send;
+    /// Sync the data of every write that completed so far to the disk, and
+    /// keep writing (design §11.5.5).
+    ///
+    /// # Errors
+    ///
+    /// The sync failed. A writer that cannot sync fails, which is the
+    /// default: a checkpoint never records data that was not synced.
+    fn sync(&self) -> impl Future<Output = Result<(), FileWriterError>> + Send {
+        async {
+            Err(FileWriterError::Sync {
+                source: CommandError::Io {
+                    source: io::Error::new(io::ErrorKind::Unsupported, "the writer cannot sync"),
+                },
+                path: PathBuf::new(),
+            })
+        }
+    }
     /// Sync all data to disk
     ///
     /// # Errors
@@ -145,16 +167,82 @@ pub enum FileRangeWriterImpl {
 pub type WrittenRanges = Arc<std::sync::Mutex<Vec<Range<u64>>>>;
 
 /// Records the range of every write, and fails the writes of `fail` with an
-/// io error, writing nothing of them.
+/// io error, writing nothing of them. With a memory, it keeps the bytes it
+/// writes there, as a file would.
 #[cfg(test)]
 pub struct Recorder {
     written: WrittenRanges,
     fail: Vec<Range<u64>>,
+    memory: Option<Memory>,
+    syncs: SyncProbe,
+}
+
+/// The bytes a [`Recorder`] wrote, at their offsets.
+#[cfg(test)]
+pub type Memory = Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// What the syncs of a [`Recorder`] did: how many there were, the ranges
+/// written before the last one that succeeded, and how many of the next
+/// ones fail.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct SyncProbe(Arc<std::sync::Mutex<SyncState>>);
+
+#[cfg(test)]
+#[derive(Default)]
+struct SyncState {
+    count: usize,
+    synced: Vec<Range<u64>>,
+    fail: usize,
+}
+
+#[cfg(test)]
+impl SyncProbe {
+    /// How many syncs were asked for, failed ones included.
+    pub fn count(&self) -> usize {
+        self.0.lock().unwrap().count
+    }
+
+    /// Fail the next `n` syncs.
+    pub fn fail_next(&self, n: usize) {
+        self.0.lock().unwrap().fail = n;
+    }
+
+    /// Whether every byte of `range` was written before a sync that
+    /// succeeded.
+    pub fn is_synced(&self, range: &Range<u64>) -> bool {
+        let state = self.0.lock().unwrap();
+        let mut ranges = state.synced.clone();
+        ranges.sort_by_key(|range| range.start);
+        let mut covered = range.start;
+        for written in ranges {
+            if written.start <= covered && written.end > covered {
+                covered = written.end;
+            }
+        }
+        covered >= range.end
+    }
+
+    fn sync(&self, written: &WrittenRanges) -> Result<(), FileWriterError> {
+        let mut state = self.0.lock().unwrap();
+        state.count += 1;
+        if state.fail > 0 {
+            state.fail -= 1;
+            return Err(FileWriterError::Sync {
+                source: CommandError::Io {
+                    source: std::io::Error::other("injected sync failure"),
+                },
+                path: "recorded.bin".into(),
+            });
+        }
+        state.synced = written.lock().unwrap().clone();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 impl Recorder {
-    fn write(&self, range: Range<u64>) -> Result<(), FileWriterError> {
+    fn write(&self, range: Range<u64>, data: &[u8]) -> Result<(), FileWriterError> {
         if self.fail.contains(&range) {
             return Err(FileWriterError::WriteRange {
                 source: CommandError::Io {
@@ -163,6 +251,9 @@ impl Recorder {
                 chunk: None,
                 path: "recorded.bin".into(),
             });
+        }
+        if let Some(memory) = &self.memory {
+            memory.lock().unwrap()[range.start as usize..range.end as usize].copy_from_slice(data);
         }
         self.written.lock().unwrap().push(range);
         Ok(())
@@ -182,7 +273,23 @@ impl FileRangeWriter for FileRangeWriterImpl {
             #[cfg(test)]
             FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
             #[cfg(test)]
-            FileRangeWriterImpl::Recording(recorder) => recorder.write(range),
+            FileRangeWriterImpl::Recording(recorder) => recorder.write(range, &data),
+        }
+    }
+
+    #[inline]
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        match self {
+            #[cfg(feature = "mmap")]
+            FileRangeWriterImpl::Mmap(writer) => writer.sync().await,
+            FileRangeWriterImpl::Pool(writer) => writer.sync().await,
+            FileRangeWriterImpl::Null(writer) => writer.sync().await,
+            #[cfg(feature = "compio")]
+            FileRangeWriterImpl::Compio(writer) => writer.sync().await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Slow(writer) => writer.sync().await,
+            #[cfg(test)]
+            FileRangeWriterImpl::Recording(recorder) => recorder.syncs.sync(&recorder.written),
         }
     }
 
@@ -205,18 +312,11 @@ impl FileRangeWriter for FileRangeWriterImpl {
 
 impl FileRangeWriter for Arc<FileRangeWriterImpl> {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
-        match &**self {
-            #[cfg(feature = "mmap")]
-            FileRangeWriterImpl::Mmap(writer) => writer.write_range(range, data).await,
-            FileRangeWriterImpl::Pool(writer) => writer.write_range(range, data).await,
-            FileRangeWriterImpl::Null(writer) => writer.write_range(range, data).await,
-            #[cfg(feature = "compio")]
-            FileRangeWriterImpl::Compio(writer) => writer.write_range(range, data).await,
-            #[cfg(test)]
-            FileRangeWriterImpl::Slow(writer) => writer.write_range(range, data).await,
-            #[cfg(test)]
-            FileRangeWriterImpl::Recording(recorder) => recorder.write(range),
-        }
+        (**self).write_range(range, data).await
+    }
+
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        (**self).sync().await
     }
 
     async fn finalize(mut self) -> Result<(), FileWriterError> {
@@ -292,6 +392,23 @@ async fn open_file(path: PathBuf, size: u64) -> Result<File, FileWriterError> {
     })
     .await?;
     Ok(file)
+}
+
+/// Ask a channel-driven backend's worker to sync the data written so far.
+///
+/// The command queues behind the writes already queued; the writes that
+/// completed before it was sent are done either way.
+async fn sync_through(tx: &Sender<Command>, path: &Path) -> Result<(), FileWriterError> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    async {
+        tx.send(Command::Sync(ack_tx))
+            .await
+            .map_err(|_| CommandError::Send)?;
+        ack_rx.await.map_err(|_| CommandError::Recv)??;
+        Ok::<_, CommandError>(())
+    }
+    .await
+    .context(SyncSnafu { path })
 }
 
 /// Ask a channel-driven backend to finalize, then wait until all of its
@@ -423,21 +540,38 @@ impl FileWriter {
     /// A recording writer whose writes of the ranges in `fail` fail.
     #[cfg(test)]
     pub fn recording_failing(fail: Vec<Range<u64>>) -> (Self, WrittenRanges) {
+        let (writer, written, ..) = Self::in_memory(0, fail);
+        (writer, written)
+    }
+
+    /// A recording writer that keeps the bytes it writes in a memory of
+    /// `size` bytes, when `size` is not 0, and fails the writes of `fail`;
+    /// with the probe of its syncs.
+    #[cfg(test)]
+    pub fn in_memory(size: u64, fail: Vec<Range<u64>>) -> (Self, WrittenRanges, Memory, SyncProbe) {
         let written = WrittenRanges::default();
+        let memory = Memory::new(std::sync::Mutex::new(vec![0; size as usize]));
+        let syncs = SyncProbe::default();
         let writer = Self {
             kind: FileRangeWriterKind::Null,
             inner: Arc::new(FileRangeWriterImpl::Recording(Recorder {
                 written: written.clone(),
                 fail,
+                memory: (size > 0).then(|| memory.clone()),
+                syncs: syncs.clone(),
             })),
         };
-        (writer, written)
+        (writer, written, memory, syncs)
     }
 }
 
 impl FileRangeWriter for FileWriter {
     async fn write_range(&self, range: Range<u64>, data: Bytes) -> Result<(), FileWriterError> {
         self.inner.write_range(range, data).await
+    }
+
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        self.inner.sync().await
     }
 
     async fn finalize(self) -> Result<(), FileWriterError> {

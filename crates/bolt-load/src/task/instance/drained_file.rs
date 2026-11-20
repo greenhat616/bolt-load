@@ -39,6 +39,11 @@ impl<T> Drained<T> {
             _drain: drain,
         }
     }
+
+    /// The value and the drain, for the caller to drop in its own order.
+    pub(crate) fn into_parts(self) -> (T, Option<WaitGroup>) {
+        (self.value, self._drain)
+    }
 }
 
 /// What to call in each write before it touches the file; tests hold a

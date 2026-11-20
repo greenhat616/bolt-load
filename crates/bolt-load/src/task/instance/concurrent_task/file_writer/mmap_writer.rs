@@ -12,7 +12,7 @@ use snafu::prelude::*;
 use super::{
     Chunk, CloseOnExit, Command, CommandError, FileRangeWriter, FileWriterBuilderError,
     FileWriterCapability, FileWriterError, OpenOrCreateFileSnafu, ValidationSnafu, WriteRangeSnafu,
-    WriteReply, finalize_and_join,
+    WriteReply, finalize_and_join, sync_through,
 };
 use crate::task::instance::drained_file::Drained;
 
@@ -23,6 +23,12 @@ pub struct MmapWriter {
 }
 
 impl FileRangeWriter for MmapWriter {
+    /// The worker flushes the mapping: `msync` on Unix, `FlushViewOfFile`
+    /// and `FlushFileBuffers` on Windows.
+    async fn sync(&self) -> Result<(), FileWriterError> {
+        sync_through(&self.tx, self.file.path()).await
+    }
+
     async fn finalize(self) -> Result<(), FileWriterError> {
         let Self {
             file,
@@ -125,6 +131,9 @@ fn mmap_writer_task(
         match command {
             Command::Write(chunk, reply) => {
                 reply.complete(execute_write(&mut mmap, chunk), file.path());
+            }
+            Command::Sync(tx) => {
+                let _ = tx.send(mmap.flush());
             }
             Command::Finalize(tx) => {
                 let _ = match mmap.flush() {
