@@ -149,8 +149,11 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 
 `checkpoint_bytes` and `checkpoint_interval` schedule the checkpoints of a
 task that keeps a state file for a later resume: its complete blocks,
-with their CRCs, recorded once their data is synced. No task keeps one
-yet, so they have no effect for now.
+with their CRCs, recorded once their data is synced. A periodic
+checkpoint never starts sooner than 0.5 s after the last one ended, so a
+fast source does not sync the file every few milliseconds; the checkpoint
+at teardown does not wait for that. No task keeps a state file yet,
+so they have no effect for now.
 
 Keep `no_progress_timeout` larger than `stream_idle_timeout`; otherwise a
 stalled stream ends the task with `NoProgress` before its runner can time

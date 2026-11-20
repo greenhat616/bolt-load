@@ -261,6 +261,7 @@ impl Setup {
             block_size: NonZeroU64::new(block).unwrap(),
             bytes: NonZeroU64::new(bytes).unwrap(),
             interval,
+            min_spacing: Duration::ZERO,
         };
         let checkpoints = Checkpoints::new(
             total,
@@ -912,4 +913,35 @@ async fn test_an_unread_result_drops_its_work_before_its_drain() {
     assert_eq!(seen(&probes), [ALIVE, ALIVE], "held by the unread result");
     drop(running);
     assert_eq!(seen(&probes), [DRAIN_OPEN, DRAIN_OPEN]);
+}
+
+/// A due checkpoint waits until the last one ended at least the minimum
+/// spacing ago, however many bytes were written meanwhile.
+#[tokio::test]
+async fn test_checkpoints_keep_their_minimum_spacing() {
+    let mut s = Setup::new(1, Duration::from_secs(3600));
+    s.checkpoints.schedule.min_spacing = Duration::from_secs(10);
+    s.write(0..BLOCK).await;
+    assert!(
+        s.maybe_start(Duration::ZERO),
+        "the first one is not held back"
+    );
+    s.settle().await;
+    s.write(BLOCK..2 * BLOCK).await;
+    // Times from when the first one ended, as the checkpoints saw it.
+    let ended = s.checkpoints.ended.unwrap();
+    let spacing = s.checkpoints.schedule.min_spacing;
+    s.checkpoints
+        .maybe_start(&s.written, ended + spacing - Duration::from_nanos(1));
+    assert!(
+        s.checkpoints.running.is_none(),
+        "just too soon after the last"
+    );
+    s.checkpoints.maybe_start(&s.written, ended + spacing);
+    assert!(s.checkpoints.running.is_some(), "exactly the spacing after");
+    s.settle().await;
+    assert_eq!(
+        s.received.calls(),
+        [Call::Record(vec![0]), Call::Record(vec![1])]
+    );
 }

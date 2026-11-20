@@ -240,6 +240,7 @@ impl Harness {
             block_size: std::num::NonZeroU64::new(block).unwrap(),
             bytes: options.checkpoint_bytes,
             interval: options.checkpoint_interval,
+            min_spacing: Duration::ZERO,
         };
         let checkpoints = Checkpoints::new(
             total,

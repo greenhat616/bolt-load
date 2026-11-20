@@ -97,22 +97,30 @@ impl BlockReader for FileBlocks {
     }
 }
 
+/// The least time between the end of a checkpoint and the start of the
+/// next, whatever was written meanwhile (design §14.29).
+pub(crate) const MIN_SPACING: Duration = Duration::from_millis(500);
+
 /// When checkpoints are taken: after this many bytes were written since the
-/// last one started, or this long after it.
+/// last one started, or this long after it; never sooner than
+/// `min_spacing` after the last one ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Schedule {
     pub(crate) block_size: NonZeroU64,
     pub(crate) bytes: NonZeroU64,
     pub(crate) interval: Duration,
+    pub(crate) min_spacing: Duration,
 }
 
 impl Schedule {
-    /// The schedule of `options`, with blocks of [`BLOCK_SIZE`].
+    /// The schedule of `options`, with blocks of [`BLOCK_SIZE`] and
+    /// [`MIN_SPACING`].
     pub(crate) fn of(options: &TaskOptions) -> Self {
         Self {
             block_size: BLOCK_SIZE,
             bytes: options.checkpoint_bytes,
             interval: options.checkpoint_interval,
+            min_spacing: MIN_SPACING,
         }
     }
 }
@@ -175,6 +183,8 @@ pub(super) struct Checkpoints {
     unrecorded: u64,
     /// When the last checkpoint started, or the attempt.
     since: Instant,
+    /// When the last checkpoint ended.
+    ended: Option<Instant>,
     stopped: bool,
     /// Held by the blocking work of a running checkpoint until it ends, so
     /// that teardown and the panic handler wait for it (design §11.5.4).
@@ -209,6 +219,7 @@ impl Checkpoints {
             running: None,
             unrecorded: 0,
             since: now,
+            ended: None,
             stopped: false,
             drain,
             #[cfg(test)]
@@ -290,7 +301,10 @@ impl Checkpoints {
         }
         let due = self.unrecorded >= self.schedule.bytes.get()
             || now.saturating_duration_since(self.since) >= self.schedule.interval;
-        if !due {
+        let spaced = self
+            .ended
+            .is_none_or(|ended| now.saturating_duration_since(ended) >= self.schedule.min_spacing);
+        if !due || !spaced {
             return;
         }
         self.collect_complete(written);
@@ -335,6 +349,7 @@ impl Checkpoints {
         };
         let (receiver, outcome) = std::task::ready!(running.poll_unpin(cx));
         self.running = None;
+        self.ended = Some(Instant::now());
         self.receiver = Some(receiver);
         Poll::Ready(outcome)
     }
