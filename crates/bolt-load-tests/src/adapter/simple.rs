@@ -1,10 +1,11 @@
 use std::{
     num::NonZeroU32,
+    ops::Range,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bolt_load_core::adapter::{
@@ -72,6 +73,8 @@ pub struct SimpleTestAdapterBuilder {
     connecting_delay: Option<Duration>,
     /// Maximum number of concurrent streams
     max_concurrent_streams: Option<usize>,
+    /// How long the speed limits may burst for; one second by default
+    speed_burst: Option<Duration>,
     /// Fault injection settings
     faults: Faults,
 }
@@ -89,6 +92,12 @@ struct Faults {
     stall_with_empty_frames: bool,
     /// Absolute offset at which every body stream yields an error.
     fail_body_after_bytes: Option<(u64, FaultKind)>,
+    /// Absolute offset at which the first body stream to reach it stops
+    /// yielding data, without ending.
+    stall_once_at: Option<u64>,
+    /// Bytes in this range are sent at this many bytes per second, per
+    /// stream.
+    paced_region: Option<(Range<u64>, u64)>,
 }
 
 pub type GlobalRateLimiter = Arc<
@@ -111,6 +120,7 @@ impl Default for SimpleTestAdapterBuilder {
             max_per_stream_speed: None,
             connecting_delay: None,
             max_concurrent_streams: None,
+            speed_burst: None,
             faults: Faults::default(),
         }
     }
@@ -191,6 +201,19 @@ impl SimpleTestAdapterBuilder {
         self
     }
 
+    /// Let [`max_speed`](Self::max_speed),
+    /// [`max_per_stream_speed`](Self::max_per_stream_speed) and
+    /// [`paced_region`](Self::paced_region) burst `window` of their limit
+    /// instead of one second, but at least the chunk size.
+    ///
+    /// A limit waits on a timer, which may be coarse (about 15.6 ms on
+    /// Windows): a burst shorter than the timer's period caps the limit at
+    /// one burst per period.
+    pub fn speed_burst(mut self, window: Duration) -> Self {
+        self.speed_burst = Some(window);
+        self
+    }
+
     /// `retrieve_meta` waits at this gate.
     pub fn meta_gate(mut self, gate: Gate) -> Self {
         self.faults.meta_gate = Some(gate);
@@ -234,6 +257,21 @@ impl SimpleTestAdapterBuilder {
         self
     }
 
+    /// The first body stream to reach this absolute offset stops yielding
+    /// data there, without ending; the streams after it pass. See
+    /// [`SimpleTestAdapter::stalled_at`].
+    pub fn stall_once_at(mut self, offset: u64) -> Self {
+        self.faults.stall_once_at = Some(offset);
+        self
+    }
+
+    /// Every body stream sends the bytes in `range` at `bytes_per_sec`, on
+    /// top of the other limits.
+    pub fn paced_region(mut self, range: Range<u64>, bytes_per_sec: u64) -> Self {
+        self.faults.paced_region = Some((range, bytes_per_sec));
+        self
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument)]
     pub fn build(self) -> Result<SimpleTestAdapter, SimpleTestAdapterBuildError> {
         let Some(content_size) = self.content_size else {
@@ -242,12 +280,9 @@ impl SimpleTestAdapterBuilder {
         let content = create_deterministic_content(content_size);
         let expected_hash = calculate_blake3(&content);
         let chunk_size = self.chunk_size.unwrap_or(8192);
-        let rate_limiter = self.max_speed.map(|speed| {
-            Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32"))
-                    .expect("speed must be non-zero"),
-            )))
-        });
+        let rate_limiter = self
+            .max_speed
+            .map(|speed| rate_limiter(speed, self.speed_burst, chunk_size));
 
         Ok(SimpleTestAdapter {
             content: Bytes::from(content),
@@ -261,11 +296,36 @@ impl SimpleTestAdapterBuilder {
             max_per_stream_speed: self.max_per_stream_speed,
             connecting_delay: self.connecting_delay,
             max_concurrent_streams: self.max_concurrent_streams,
+            speed_burst: self.speed_burst,
             current_concurrency: Arc::new(AtomicUsize::new(0)),
             faults: self.faults,
             counters: Counters::default(),
         })
     }
+}
+
+/// A limiter of `speed` bytes per second, bursting `burst` of it but at
+/// least `min_burst` bytes, or one second of `speed` without `burst`.
+fn rate_limiter(speed: u64, burst: Option<Duration>, min_burst: usize) -> GlobalRateLimiter {
+    let cells = |bytes: u64| {
+        NonZeroU32::new(bytes.try_into().expect("speed must be lossless to u32"))
+            .expect("speed must be non-zero")
+    };
+    let mut quota = Quota::per_second(cells(speed));
+    if let Some(burst) = burst {
+        let bytes = (speed as f64 * burst.as_secs_f64()) as u64;
+        quota = quota.allow_burst(cells(bytes.max(min_burst as u64)));
+    }
+    Arc::new(RateLimiter::direct(quota))
+}
+
+/// A body stream the adapter accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamRecord {
+    /// When the stream was created.
+    pub at: Instant,
+    /// The requested absolute range, end exclusive.
+    pub range: (u64, u64),
 }
 
 /// Live resource counters, shared between clones of an adapter.
@@ -275,6 +335,17 @@ struct Counters {
     active_streams: Arc<AtomicUsize>,
     range_attempts: Arc<AtomicUsize>,
     full_attempts: Arc<AtomicUsize>,
+    /// The most body streams open at once.
+    peak_streams: Arc<AtomicUsize>,
+    /// Connections refused for `max_concurrent_streams`.
+    congested: Arc<AtomicUsize>,
+    /// Bytes every body stream yielded.
+    served_bytes: Arc<AtomicU64>,
+    /// The body streams created, in order.
+    streams: Arc<Mutex<Vec<StreamRecord>>>,
+    /// Whether a stream stopped at `Faults::stall_once_at`, and when.
+    stalled: Arc<AtomicBool>,
+    stalled_at: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Simple test adapter for testing Task and TaskBuilder
@@ -296,6 +367,7 @@ pub struct SimpleTestAdapter {
     connecting_delay: Option<Duration>,
     /// Maximum number of concurrent streams
     max_concurrent_streams: Option<usize>,
+    speed_burst: Option<Duration>,
     /// Current number of concurrent streams
     current_concurrency: Arc<AtomicUsize>,
     faults: Faults,
@@ -330,6 +402,7 @@ impl SimpleTestAdapter {
             max_per_stream_speed: self.max_per_stream_speed,
             connecting_delay: self.connecting_delay,
             max_concurrent_streams: self.max_concurrent_streams,
+            speed_burst: self.speed_burst,
             current_concurrency: Arc::new(AtomicUsize::new(0)),
             faults: self.faults.clone(),
             counters: Counters::default(),
@@ -396,17 +469,70 @@ impl SimpleTestAdapter {
         self.counters.range_attempts.load(Ordering::SeqCst)
     }
 
+    /// The most body streams that were open at once.
+    pub fn peak_streams(&self) -> usize {
+        self.counters.peak_streams.load(Ordering::SeqCst)
+    }
+
+    /// Number of connections refused with 429 for
+    /// [`SimpleTestAdapterBuilder::max_concurrent_streams`].
+    pub fn congested(&self) -> usize {
+        self.counters.congested.load(Ordering::SeqCst)
+    }
+
+    /// Bytes all body streams yielded so far.
+    pub fn served_bytes(&self) -> u64 {
+        self.counters.served_bytes.load(Ordering::SeqCst)
+    }
+
+    /// The body streams created so far, in order.
+    pub fn streams(&self) -> Vec<StreamRecord> {
+        self.counters.streams.lock().unwrap().clone()
+    }
+
+    /// When a stream stopped at [`SimpleTestAdapterBuilder::stall_once_at`].
+    pub fn stalled_at(&self) -> Option<Instant> {
+        *self.counters.stalled_at.lock().unwrap()
+    }
+
+    /// A refused connection: 429 without `Retry-After`.
+    fn congestion(&self) -> AdapterError {
+        self.counters.congested.fetch_add(1, Ordering::SeqCst);
+        CongestionSnafu {
+            status: 429u16,
+            retry_after: None,
+        }
+        .build()
+        .into()
+    }
+
     /// Build the body stream for the absolute range `start..end`.
     fn body_stream(&self, start: usize, end: usize, guard: impl Send + 'static) -> AnyBytesStream {
         let content = self.content.clone();
         let end = end.min(content.len());
         let chunk_size = self.chunk_size;
         let rate_limiter = self.rate_limiter.clone();
-        let stream_rate_limiter = self.max_per_stream_speed.map(|speed| {
-            let quota = Quota::per_second(
-                NonZeroU32::new(speed.try_into().expect("speed must be lossless to u32")).unwrap(),
-            );
-            Arc::new(RateLimiter::direct(quota))
+        let burst = self.speed_burst;
+        let stream_rate_limiter = self
+            .max_per_stream_speed
+            .map(|speed| self::rate_limiter(speed, burst, chunk_size));
+        let region = self.faults.paced_region.clone().map(|(range, speed)| {
+            (
+                range.start as usize..range.end as usize,
+                self::rate_limiter(speed, burst, chunk_size),
+            )
+        });
+        let stall_once = self.faults.stall_once_at.map(|offset| {
+            (
+                offset as usize,
+                self.counters.stalled.clone(),
+                self.counters.stalled_at.clone(),
+            )
+        });
+        let served = self.counters.served_bytes.clone();
+        self.counters.streams.lock().unwrap().push(StreamRecord {
+            at: Instant::now(),
+            range: (start as u64, end as u64),
         });
         let stall_at = self.faults.stall_after_bytes.map(|o| o as usize);
         let stall_with_empty_frames = self.faults.stall_with_empty_frames;
@@ -414,7 +540,10 @@ impl SimpleTestAdapter {
             .faults
             .fail_body_after_bytes
             .map(|(o, kind)| (o as usize, kind));
-        let stream_guard = CounterGuard::new(&self.counters.active_streams);
+        // The count this stream's own increment made: a stream closing
+        // before a separate read would hide it from the peak.
+        let (stream_guard, open) = CounterGuard::counted(&self.counters.active_streams);
+        self.counters.peak_streams.fetch_max(open, Ordering::SeqCst);
 
         let stream = async_stream::stream! {
             let _guard = guard;
@@ -424,6 +553,13 @@ impl SimpleTestAdapter {
                 if let Some((at, kind)) = fail_at && pos >= at {
                     yield Err(kind.error("body"));
                     return;
+                }
+                if let Some((at, stalled, stalled_at)) = &stall_once
+                    && pos == *at
+                    && !stalled.swap(true, Ordering::SeqCst)
+                {
+                    *stalled_at.lock().unwrap() = Some(Instant::now());
+                    futures::future::pending::<()>().await;
                 }
                 if stall_at.is_some_and(|at| pos >= at) {
                     loop {
@@ -436,7 +572,13 @@ impl SimpleTestAdapter {
                     }
                 }
                 let mut next = (pos + chunk_size).min(end);
-                for limit in [stall_at, fail_at.map(|(at, _)| at)].into_iter().flatten() {
+                let region_bounds = region.iter().flat_map(|(range, _)| [range.start, range.end]);
+                let stall_once_at = stall_once.as_ref().map(|(at, _, _)| *at);
+                for limit in [stall_at, fail_at.map(|(at, _)| at), stall_once_at]
+                    .into_iter()
+                    .flatten()
+                    .chain(region_bounds)
+                {
                     if limit > pos {
                         next = next.min(limit);
                     }
@@ -448,6 +590,12 @@ impl SimpleTestAdapter {
                 if let Some(stream_rate_limiter) = stream_rate_limiter.clone() {
                     stream_rate_limiter.until_n_ready(chunk_len).await.unwrap();
                 }
+                if let Some((range, limiter)) = &region
+                    && range.contains(&pos)
+                {
+                    limiter.until_n_ready(chunk_len).await.unwrap();
+                }
+                served.fetch_add((next - pos) as u64, Ordering::SeqCst);
                 yield Ok(content.slice(pos..next));
                 pos = next;
             }
@@ -543,12 +691,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         if let Some(max_concurrent_streams) = self.max_concurrent_streams
             && current_concurrency >= max_concurrent_streams
         {
-            return Err(CongestionSnafu {
-                status: 429u16,
-                retry_after: None,
-            }
-            .build()
-            .into());
+            return Err(self.congestion());
         }
 
         info!(
@@ -606,12 +749,7 @@ impl BoltLoadAdapter for SimpleTestAdapter {
         if let Some(max_concurrent_streams) = self.max_concurrent_streams
             && current_concurrency >= max_concurrent_streams
         {
-            return Err(CongestionSnafu {
-                status: 429u16,
-                retry_after: None,
-            }
-            .build()
-            .into());
+            return Err(self.congestion());
         }
 
         Ok(self.body_stream(start as usize, end as usize, guard))
@@ -1353,5 +1491,150 @@ mod tests {
             delay,
             elapsed
         );
+    }
+
+    /// A range adapter of 100 bytes, sent 10 bytes at a time.
+    fn small_adapter() -> SimpleTestAdapterBuilder {
+        SimpleTestAdapterBuilder::new()
+            .content_size(100)
+            .support_range(true)
+            .chunk_size(10)
+    }
+
+    /// The bytes `stream` yields until it ends, or until it yields nothing
+    /// for 200 ms; and whether it ended.
+    async fn drain(stream: AnyBytesStream) -> (Vec<u8>, bool) {
+        let mut stream = std::pin::pin!(stream);
+        let mut bytes = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
+                Ok(Some(item)) => bytes.extend_from_slice(&item.unwrap()),
+                Ok(None) => return (bytes, true),
+                Err(_) => return (bytes, false),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stall_once_stops_only_the_first_stream_to_reach_it() {
+        let adapter = small_adapter().stall_once_at(55).build().unwrap();
+        let content = adapter.content().clone();
+
+        // Ends before the offset, or starts past it: no stall, and the
+        // first stream to reach it is still to come.
+        let (bytes, ended) = drain(adapter.range_stream(0, 55).await.unwrap()).await;
+        assert_eq!((&bytes[..], ended), (&content[..55], true));
+        let (bytes, ended) = drain(adapter.range_stream(56, 100).await.unwrap()).await;
+        assert_eq!((&bytes[..], ended), (&content[56..], true));
+        assert_eq!(adapter.stalled_at(), None);
+
+        // The first stream to reach it stops exactly there, without ending.
+        let before = Instant::now();
+        let (bytes, ended) = drain(adapter.range_stream(30, 100).await.unwrap()).await;
+        assert_eq!((&bytes[..], ended), (&content[30..55], false));
+        let stalled_at = adapter.stalled_at().expect("a stream stalled");
+        assert!(stalled_at >= before);
+
+        // The next one, also from a clone sharing the state, passes; a
+        // stream starting at the offset passes too.
+        let clone = adapter.clone();
+        let (bytes, ended) = drain(clone.range_stream(50, 100).await.unwrap()).await;
+        assert_eq!((&bytes[..], ended), (&content[50..], true));
+        let (bytes, ended) = drain(adapter.range_stream(55, 100).await.unwrap()).await;
+        assert_eq!((&bytes[..], ended), (&content[55..], true));
+        assert_eq!(clone.stalled_at(), Some(stalled_at));
+
+        // A reset clone starts afresh: its first stream to reach it stalls.
+        let fresh = adapter.clone_reset_count();
+        assert_eq!(fresh.stalled_at(), None);
+        let (bytes, ended) = drain(fresh.range_stream(55, 100).await.unwrap()).await;
+        assert_eq!((bytes.len(), ended), (0, false));
+        assert!(fresh.stalled_at().is_some());
+        assert_eq!(adapter.stalled_at(), Some(stalled_at));
+    }
+
+    #[tokio::test]
+    async fn test_counters_of_streams_bytes_and_refusals() {
+        let adapter = small_adapter().max_concurrent_streams(2).build().unwrap();
+        let a = adapter.range_stream(0, 40).await.unwrap();
+        let b = adapter.range_stream(40, 100).await.unwrap();
+        // A third concurrent connection is refused with 429.
+        let refused = adapter.range_stream(0, 10).await;
+        assert!(matches!(
+            refused,
+            Err(AdapterError::Unretryable {
+                source: UnretryableError::Congestion { status: 429, .. }
+            })
+        ));
+        assert_eq!(adapter.congested(), 1);
+        assert_eq!(adapter.peak_streams(), 2);
+        assert_eq!(adapter.served_bytes(), 0);
+
+        // Bytes are counted as the streams yield them.
+        let (bytes, _) = drain(a).await;
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(adapter.served_bytes(), 40);
+        // One closed: a new one fits, and the peak stays 2.
+        let c = adapter.range_stream(0, 100).await.unwrap();
+        assert_eq!(adapter.peak_streams(), 2);
+        let (_, _) = drain(b).await;
+        let (_, _) = drain(c).await;
+        assert_eq!(adapter.served_bytes(), 40 + 60 + 100);
+        let ranges: Vec<_> = adapter.streams().iter().map(|s| s.range).collect();
+        assert_eq!(ranges, [(0, 40), (40, 100), (0, 100)]);
+        assert!(adapter.streams().windows(2).all(|w| w[0].at <= w[1].at));
+
+        // A reset clone counts from zero.
+        let fresh = adapter.clone_reset_count();
+        assert_eq!(
+            (
+                fresh.peak_streams(),
+                fresh.congested(),
+                fresh.served_bytes()
+            ),
+            (0, 0, 0)
+        );
+        assert!(fresh.streams().is_empty());
+    }
+
+    /// Bytes in the region come at its rate; the rest, unlimited, does not
+    /// wait on it.
+    #[tokio::test]
+    async fn test_paced_region() {
+        tokio::time::timeout(Duration::from_secs(30), paced_region())
+            .await
+            .unwrap();
+    }
+
+    async fn paced_region() {
+        const SIZE: usize = 256 * 1024;
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(SIZE)
+            .support_range(true)
+            .chunk_size(8 * 1024)
+            .speed_burst(Duration::from_millis(20))
+            .paced_region(128 * 1024..192 * 1024, 128 * 1024)
+            .build()
+            .unwrap();
+        // The first limiter of the process calibrates its clock, which
+        // takes about 200 ms; every stream builds the region's limiter.
+        drain(adapter.range_stream(0, 1).await.unwrap()).await;
+
+        let started = Instant::now();
+        let (bytes, ended) = drain(adapter.range_stream(0, 128 * 1024).await.unwrap()).await;
+        assert_eq!((bytes.len(), ended), (128 * 1024, true));
+        let outside = started.elapsed();
+
+        let started = Instant::now();
+        let (bytes, ended) = drain(adapter.range_stream(0, SIZE as u64).await.unwrap()).await;
+        assert_eq!((&bytes[..], ended), (&adapter.content()[..], true));
+        let through = started.elapsed();
+        // 64 KiB at 128 KiB/s is 500 ms; a burst, the timer and the
+        // limiter's rounding take some of it.
+        assert!(through >= Duration::from_millis(350), "{through:?}");
+        // Twice the bytes outside the region take a small part of the time
+        // the region does: they never wait on its limiter (which would
+        // make them at least as slow, 2 × 64 KiB at 128 KiB/s).
+        assert!(outside * 4 < through, "{outside:?} against {through:?}");
     }
 }
