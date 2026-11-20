@@ -111,6 +111,14 @@ impl TaskBuilder {
         self
     }
 
+    /// Set [`TaskOptions::growth_strategy`]. A later
+    /// [`options`](Self::options) call replaces it. Unstable.
+    #[cfg(any(test, feature = "unstable-strategy"))]
+    pub fn growth_strategy(mut self, strategy: super::GrowthStrategy) -> Self {
+        self.options.growth_strategy = strategy;
+        self
+    }
+
     /// Cancel the task with `parent`. The task only cancels child tokens of
     /// it, so it never cancels `parent` itself.
     pub fn cancel_token(mut self, parent: CancellationToken) -> Self {
@@ -245,5 +253,17 @@ mod tests {
             builder.options.max_attempts_per_range,
             DEFAULT_MAX_ATTEMPTS_PER_RANGE
         );
+    }
+
+    #[test]
+    fn test_growth_strategy_sets_the_option() {
+        use crate::task::GrowthStrategy;
+
+        let builder =
+            Task::builder(SimpleTestAdapter::new(1024)).growth_strategy(GrowthStrategy::Doubling);
+        assert_eq!(builder.options.growth_strategy, GrowthStrategy::Doubling);
+        // `options` replaces the whole set, the strategy included.
+        let builder = builder.options(TaskOptions::default());
+        assert_eq!(builder.options.growth_strategy, GrowthStrategy::Legacy);
     }
 }
