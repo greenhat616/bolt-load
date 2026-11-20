@@ -1264,21 +1264,27 @@ mod written;
 /// Random sequences of the loop's steps, including failures that back their
 /// range off, congestion, growth and time passing.
 mod split_properties {
+    use std::{ops::ControlFlow, sync::LazyLock};
+
+    use bytes::Bytes;
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
     use super::{
         super::super::{
             chunk_planner::{ChunkStatus, Cooldown},
-            runner_manager::AttemptFailure,
+            runner_manager::StopReason,
             strategy::{MIN_RANGE_BACKOFF, StrategyAction},
         },
         *,
     };
-    use crate::adapter::UnretryableError;
+    use crate::{adapter::UnretryableError, runner::StoppedReason};
 
     const TOTAL: u64 = 64 << 20;
     const MAX_CONNECTIONS: usize = 8;
+
+    /// The bytes of every frame; slices of it are cheap.
+    static ZEROS: LazyLock<Bytes> = LazyLock::new(|| Bytes::from(vec![0; TOTAL as usize]));
 
     /// How a runner fails.
     #[derive(Clone, Copy, Debug)]
@@ -1291,6 +1297,20 @@ mod split_properties {
     }
 
     impl Failure {
+        /// Whether a runner that delivered `own` bytes itself and fails so
+        /// is a restart, and whether it is charged to its range's budget
+        /// (design §8.2), as the design states it: a lost runner is
+        /// charged, a timeout is a restart after its own bytes and charged
+        /// before them, unless it is a refusal above the proven window
+        /// (`exempt`, design §14.13a); a congestion is neither.
+        fn class(self, own: u64, exempt: bool) -> (bool, bool) {
+            match self {
+                Failure::Retryable => (false, true),
+                Failure::Timeout => (own > 0, own == 0 && !exempt),
+                Failure::Congestion(_) => (false, false),
+            }
+        }
+
         fn error(self) -> TaskError {
             match self {
                 Failure::Retryable => TaskError::ChannelClosed,
@@ -1314,15 +1334,20 @@ mod split_properties {
         /// last, for the whole file, which is taken unless it is all
         /// unassigned.
         Create(usize),
-        /// The `n`th connecting runner reports `Started`.
+        /// The `n`th connecting runner, a connecting hedge included, reports
+        /// `Started`.
         Start(usize),
-        /// The `n`th running runner receives `bytes`.
+        /// A frame of `bytes` of the `n`th running runner, a running hedge
+        /// included, as the loop takes it from its channel: it decides an
+        /// undecided pair, and a non-empty one is progress. Not written.
         Progress(usize, u64),
         /// The `n`th running runner, or one whose chunk is complete,
-        /// receives the rest of its chunk and stops.
+        /// delivers the rest of its chunk and reports that it finished.
         Finish(usize),
-        /// The `n`th connecting or running runner fails, and the loop
-        /// backs its range off.
+        /// The `n`th connecting or running runner, a hedge of an undecided
+        /// pair or a beaten side reports that it failed, and the loop handles
+        /// it as it would: a failed attempt is backed off, a failed side of
+        /// a pair leaves the chunk to the other side (design §9.6).
         Fail(usize, Failure),
         /// Grow by up to `n` runners.
         Grow(usize),
@@ -1386,7 +1411,63 @@ mod split_properties {
         a.start < b.end && b.start < a.end
     }
 
-    fn step(download: &mut DownloadLoop, max_connections: usize, now: &mut Instant, op: Op) {
+    /// The hedges of undecided pairs, by ID, that reported `Started`, or
+    /// that did not.
+    fn hedges(
+        download: &DownloadLoop,
+        max_connections: usize,
+        running: bool,
+    ) -> Vec<crate::task::RunnerId> {
+        (0..max_connections)
+            .filter_map(|owner| download.manager.get_runner_state(owner)?.partner())
+            .filter(|partner| partner.running == running)
+            .map(|partner| partner.runner_id)
+            .collect()
+    }
+
+    /// The chunk owners with `status` and the hedges that `running` or not.
+    fn sides(
+        download: &DownloadLoop,
+        max_connections: usize,
+        status: ChunkStatus,
+        running: bool,
+    ) -> Vec<crate::task::RunnerId> {
+        let mut ids = runners(download, max_connections, &[status]);
+        ids.extend(hedges(download, max_connections, running));
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The beaten sides whose end the loop has not seen yet.
+    fn losers(download: &DownloadLoop, max_connections: usize) -> Vec<crate::task::RunnerId> {
+        (0..max_connections)
+            .filter(|&runner_id| download.manager.stop_reason(runner_id) == Some(StopReason::Loser))
+            .collect()
+    }
+
+    /// The runners that may report a failure: the connecting and running
+    /// chunk owners, the hedges of undecided pairs and the beaten sides.
+    fn failing(download: &DownloadLoop, max_connections: usize) -> Vec<crate::task::RunnerId> {
+        use ChunkStatus::{Pending, Running};
+
+        let manager = &download.manager;
+        let mut ids = runners(download, max_connections, &[Pending, Running]);
+        ids.extend((0..max_connections).filter(|&runner_id| {
+            manager.get_runner_state(runner_id).is_none()
+                && (manager.is_in_undecided_pair(runner_id)
+                    || manager.stop_reason(runner_id) == Some(StopReason::Loser))
+        }));
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Take a step; [`ControlFlow::Break`] when the loop ended.
+    fn step(
+        download: &mut DownloadLoop,
+        max_connections: usize,
+        now: &mut Instant,
+        op: Op,
+    ) -> ControlFlow<()> {
         use ChunkStatus::{Finished, Pending, Running};
 
         match op {
@@ -1399,65 +1480,43 @@ mod split_properties {
                 );
             }
             Op::Start(n) => {
-                if let Some(runner_id) = nth(&runners(download, max_connections, &[Pending]), n) {
-                    download.manager.mark_started(runner_id);
+                if let Some(runner_id) = nth(&sides(download, max_connections, Pending, false), n) {
+                    let tick = download.manager.report_started(runner_id);
+                    assert!(tick.failure.is_none(), "{tick:?}");
                 }
             }
             Op::Progress(n, bytes) => {
-                if let Some(runner_id) = nth(&runners(download, max_connections, &[Running]), n) {
-                    download.manager.update_progress(runner_id, bytes).unwrap();
+                let mut senders = sides(download, max_connections, Running, true);
+                senders.extend(losers(download, max_connections));
+                senders.sort_unstable();
+                if let Some(runner_id) = nth(&senders, n) {
+                    take_frame(download, runner_id, bytes, *now);
                 }
             }
             Op::Finish(n) => {
                 let held = runners(download, max_connections, &[Running, Finished]);
                 if let Some(runner_id) = nth(&held, n) {
-                    download
+                    let left = download
                         .manager
-                        .update_progress(runner_id, u64::MAX)
-                        .unwrap();
-                    download
+                        .get_runner_state(runner_id)
+                        .unwrap()
+                        .remaining();
+                    if left > 0 {
+                        take_frame(download, runner_id, left, *now);
+                    }
+                    let tick = download
                         .manager
-                        .release_runner_full(runner_id, true)
-                        .unwrap();
+                        .report_stopped(runner_id, StoppedReason::Finished);
+                    assert!(tick.failure.is_none(), "{tick:?}");
+                    // It ends the download once every chunk is complete.
+                    return download.on_runner(tick, *now).expect("a finished runner");
                 }
             }
             Op::Fail(n, failure) => {
-                let active = runners(download, max_connections, &[Pending, Running]);
-                let Some(runner_id) = nth(&active, n) else {
-                    return;
+                let Some(runner_id) = nth(&failing(download, max_connections), n) else {
+                    return ControlFlow::Continue(());
                 };
-                let state = download.manager.get_runner_state(runner_id).unwrap();
-                let (attempts, charged) = (state.attempts, state.charged);
-                let released = download.manager.mark_failed(runner_id).unwrap();
-                download.manager.release_runner(runner_id);
-                assert_eq!(released.attempts, attempts + 1, "the failure is counted");
-                assert_eq!(released.charged, charged);
-                let failure = AttemptFailure::new(
-                    runner_id,
-                    failure.error(),
-                    !matches!(failure, Failure::Congestion(_)),
-                    released.clone(),
-                );
-                let charge = match failure.error {
-                    TaskError::ChannelClosed => 1,
-                    TaskError::Timeout => u32::from(released.received == 0),
-                    _ => 0,
-                };
-                assert_eq!(failure.charged, charged + charge, "{failure:?}");
-                download.back_off(&failure, *now);
-                if released.range.is_empty() {
-                    return;
-                }
-                let cooldowns = download.manager.cooldowns();
-                let (_, cooldown) = cooldowns
-                    .iter()
-                    .find(|(range, _)| {
-                        range.start <= released.range.start && released.range.end <= range.end
-                    })
-                    .expect("the released range backs off");
-                assert!(cooldown.attempts >= released.attempts);
-                assert!(cooldown.charged >= failure.charged);
-                assert!(cooldown.not_before >= *now + MIN_RANGE_BACKOFF);
+                return fail(download, runner_id, failure, *now).0;
             }
             Op::Grow(n) => download.apply(StrategyAction::Grow(n), *now),
             Op::SplitGiven(runner_id) => {
@@ -1477,12 +1536,179 @@ mod split_properties {
             Op::Advance(ms) => *now += Duration::from_millis(ms),
             Op::Retry => download.retry_backed_off(*now),
         }
+        ControlFlow::Continue(())
+    }
+
+    /// A frame of `bytes` of `runner_id`, as the loop takes it from the
+    /// runner's channel at `now`: the manager decides an undecided pair on
+    /// it and accepts what fits; a non-empty accepted range is progress and
+    /// ends the runner's silence, as `DownloadLoop::on_runner` has it. The
+    /// bytes are not written: the loop's writer is parked.
+    fn take_frame(
+        download: &mut DownloadLoop,
+        runner_id: crate::task::RunnerId,
+        bytes: u64,
+        now: Instant,
+    ) {
+        let beaten = download.manager.stop_reason(runner_id) == Some(StopReason::Loser);
+        let tick = download
+            .manager
+            .on_data_frame(runner_id, ZEROS.slice(..bytes as usize));
+        // A late frame of a beaten side is dropped (design §9.6).
+        assert!(!beaten || tick.downloaded.is_none(), "{tick:?}");
+        if let Some(chunk) = tick.downloaded
+            && !chunk.range.is_empty()
+        {
+            download.policy.on_progress(now);
+            download.manager.note_delivery(chunk.runner_id, now);
+        }
+    }
+
+    /// `runner_id` reports that it failed with `failure`, and the loop
+    /// handles it at `now`. Returns whether the loop goes on, and the
+    /// attempts and the charged failures of the range it released, if any.
+    ///
+    /// The last side of a pair is charged for the pair (design §9.6): once,
+    /// when neither side is a restart and either is charged.
+    fn fail(
+        download: &mut DownloadLoop,
+        runner_id: crate::task::RunnerId,
+        failure: Failure,
+        now: Instant,
+    ) -> (ControlFlow<()>, Option<(u32, u32)>) {
+        let manager = &download.manager;
+        let owned = manager.get_runner_state(runner_id).cloned();
+        let beaten = manager.stop_reason(runner_id) == Some(StopReason::Loser);
+        let partner = owned
+            .as_ref()
+            .and_then(|state| state.partner().map(|partner| partner.runner_id));
+        // The other side of the pair: the hedge of an original, or the
+        // original of a hedge.
+        let survivor = partner.or_else(|| {
+            (0..2 * MAX_CONNECTIONS).find(|&id| {
+                manager
+                    .get_runner_state(id)
+                    .and_then(|state| state.partner())
+                    .is_some_and(|partner| partner.runner_id == runner_id)
+            })
+        });
+        // A timeout before `Started` is a refused connect (design §8.3).
+        let connecting = match &owned {
+            Some(state) => state.status == ChunkStatus::Pending,
+            None => (0..2 * MAX_CONNECTIONS).any(|id| {
+                manager
+                    .get_runner_state(id)
+                    .and_then(|state| state.partner())
+                    .is_some_and(|partner| partner.runner_id == runner_id && !partner.running)
+            }),
+        };
+        let slots = manager.allocated_runner_count();
+        let cooldowns = manager.cooldowns();
+        let tick = download.manager.fail_runner(runner_id, failure.error());
+        let manager = &download.manager;
+        // The exemption, from the state the manager classified it in: the
+        // state now, before the loop handles the tick (design §14.13a).
+        let admission = manager.admission();
+        let proven = manager.get_proven_runners_count();
+        let exempt = matches!(failure, Failure::Timeout)
+            && connecting
+            && proven > 0
+            && manager.in_flight() >= admission.proven_window().max(1);
+        assert_eq!(
+            manager.allocated_runner_count(),
+            slots - 1,
+            "the slot is reclaimed"
+        );
+        assert!(manager.get_runner_state(runner_id).is_none());
+        let side = beaten || partner.is_some() || owned.is_none();
+        if side {
+            // A beaten side, or a side of an undecided pair: nothing is
+            // released or backed off; the other side keeps the chunk, and
+            // keeps how this side failed for the pair's budget.
+            assert!(tick.failure.is_none(), "{tick:?}");
+            assert_eq!(tick.side_failure.is_some(), !beaten, "{tick:?}");
+            assert_eq!(manager.cooldowns(), cooldowns, "runner {runner_id}");
+            if let Some(side) = &tick.side_failure {
+                let (restart, charged) = failure.class(side.received, exempt);
+                let survivor = survivor.expect("a failed side has another side");
+                let kept = manager.get_runner_state(survivor).unwrap();
+                assert!(kept.partner().is_none());
+                let first = kept.hedge.as_ref().and_then(|hedge| hedge.first).unwrap();
+                assert_eq!(
+                    (first.restart, first.charged),
+                    (restart, charged),
+                    "{side:?}"
+                );
+                if let Some(owned) = &owned {
+                    assert_eq!(kept.allocated, owned.allocated);
+                }
+            }
+        } else {
+            let state = owned.expect("a plain attempt owns its chunk");
+            let failed = tick.failure.as_ref().expect("the attempt failed");
+            assert_eq!(
+                failed.attempts,
+                state.attempts + 1,
+                "the failure is counted"
+            );
+            assert_eq!(failed.exempt, exempt, "{failed:?}");
+            let (restart, charged) = failure.class(failed.received, exempt);
+            // The last side of a pair is charged for the pair.
+            let charge = match state.hedge.as_ref().and_then(|hedge| hedge.first) {
+                None => charged,
+                Some(first) => !first.restart && !restart && (first.charged || charged),
+            };
+            assert_eq!(
+                failed.charged,
+                state.charged + u32::from(charge),
+                "{failed:?}"
+            );
+        }
+        let released = tick
+            .failure
+            .as_ref()
+            .map(|failed| (failed.range.clone(), failed.attempts, failed.charged));
+        let counts = released
+            .as_ref()
+            .map(|&(_, attempts, charged)| (attempts, charged));
+        match download.on_runner(tick, now) {
+            Ok(ControlFlow::Continue(())) => {}
+            Ok(ControlFlow::Break(())) => unreachable!("a failure finished the download"),
+            // A congestion with no other attempt in flight ends the task;
+            // the limits are too high for any other failure to.
+            Err(error) => {
+                assert!(
+                    matches!(failure, Failure::Congestion(_)) && !side,
+                    "the loop gave up on {failure:?}: {error:?}"
+                );
+                return (ControlFlow::Break(()), counts);
+            }
+        }
+        if let Some((range, attempts, charged)) = released
+            && !range.is_empty()
+        {
+            let cooldowns = download.manager.cooldowns();
+            let (_, cooldown) = cooldowns
+                .iter()
+                .find(|(backing_off, _)| {
+                    backing_off.start <= range.start && range.end <= backing_off.end
+                })
+                .expect("the released range backs off");
+            assert!(cooldown.attempts >= attempts);
+            assert!(cooldown.charged >= charged);
+            assert!(cooldown.not_before >= now + MIN_RANGE_BACKOFF);
+        }
+        (ControlFlow::Continue(()), counts)
     }
 
     /// What a step must respect, taken before it.
     struct Before {
         now: Instant,
         held: Vec<crate::task::RunnerId>,
+        /// The hedge of each undecided pair, with its chunk's start, attempts
+        /// and charged failures: a hedge that takes the chunk over inherits
+        /// them (design §9.6).
+        hedges: Vec<(crate::task::RunnerId, u64, u32, u32)>,
         congested: bool,
         cooldowns: Vec<(std::ops::Range<u64>, Cooldown)>,
         chunks: Vec<std::ops::Range<u64>>,
@@ -1492,9 +1718,24 @@ mod split_properties {
         fn of(download: &DownloadLoop, max_connections: usize, now: Instant) -> Self {
             use ChunkStatus::{Finished, Pending, Running};
 
+            let held = runners(download, max_connections, &[Pending, Running, Finished]);
+            let hedges = held
+                .iter()
+                .filter_map(|&owner| {
+                    let state = download.manager.get_runner_state(owner)?;
+                    let partner = state.partner()?;
+                    Some((
+                        partner.runner_id,
+                        state.allocated.start,
+                        state.attempts,
+                        state.charged,
+                    ))
+                })
+                .collect();
             Self {
                 now,
-                held: runners(download, max_connections, &[Pending, Running, Finished]),
+                held,
+                hedges,
                 congested: download.backoff.is_congested(now),
                 cooldowns: download.manager.cooldowns(),
                 chunks: download.manager.chunk_ranges(),
@@ -1577,12 +1818,43 @@ mod split_properties {
                 "runner {runner_id}: {state:?}"
             );
         }
+        // A new hedge opens a connection too (design §9.6).
+        for owner in &held {
+            let Some(partner) = manager.get_runner_state(*owner).unwrap().partner() else {
+                continue;
+            };
+            if !before
+                .hedges
+                .iter()
+                .any(|&(hedge, ..)| hedge == partner.runner_id)
+            {
+                assert!(
+                    !before.congested,
+                    "hedge {} connects while congested",
+                    partner.runner_id
+                );
+            }
+        }
         for runner_id in held.into_iter().filter(|id| !before.held.contains(id)) {
+            let state = manager.get_runner_state(runner_id).unwrap();
+            // A hedge that took its pair's chunk over opened no connection
+            // now, and inherits the chunk's counters (design §9.6).
+            if let Some(&(_, _, attempts, charged)) = before
+                .hedges
+                .iter()
+                .find(|&&(hedge, start, ..)| hedge == runner_id && start == state.allocated.start)
+            {
+                assert_eq!(
+                    (state.attempts, state.charged),
+                    (attempts, charged),
+                    "hedge {runner_id} took over"
+                );
+                continue;
+            }
             assert!(
                 !before.congested,
                 "runner {runner_id} connects while congested"
             );
-            let state = manager.get_runner_state(runner_id).unwrap();
             // A runner on a range a chunk held before is a split tail.
             if before
                 .chunks
@@ -1621,6 +1893,336 @@ mod split_properties {
         }
     }
 
+    /// A loop with `max_connections`, whose failure limits the steps hardly
+    /// reach: the property is about the loop's state, not when it gives up.
+    fn property_loop(max_connections: usize) -> DownloadLoop {
+        let options = TaskOptions::default()
+            .max_connections(NonZeroUsize::new(max_connections).unwrap())
+            .max_consecutive_failures(1 << 20)
+            .max_attempts_per_range(std::num::NonZeroU32::MAX);
+        let (download, _file_writer) = futures::executor::block_on(loop_with_options(
+            ThreadedRuntimeImpl::new_other_rt(ScriptedRuntime::new(TimerKind::Scripted)),
+            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
+            TOTAL,
+            &options,
+        ));
+        download
+    }
+
+    /// The sequence a property run shrank to (design §14.22): runner 7,
+    /// still connecting, is hedged by runner 2, and the pair is undecided.
+    /// Returns the loop, its time and runner 7's range.
+    fn hedged_connecting_runner() -> (DownloadLoop, Instant, std::ops::Range<u64>) {
+        let mut download = property_loop(MAX_CONNECTIONS);
+        let mut now = Instant::now();
+        let ops = [
+            Op::Create(0),
+            Op::Start(0),
+            Op::Grow(7),
+            Op::Fail(4718873269110173105, Failure::Retryable),
+            Op::Tick(0),
+            Op::Fail(76377055454692882, Failure::Retryable),
+            Op::Progress(0, 524288),
+            Op::Fail(2070358860948955903, Failure::Retryable),
+            Op::Advance(2000),
+            Op::Fail(6634265196278952056, Failure::Retryable),
+            Op::Retry,
+            Op::Start(8393998727265456),
+            Op::Tick(8388610),
+            Op::Progress(0, 1048576),
+        ];
+        for op in ops {
+            let before = Before::of(&download, MAX_CONNECTIONS, now);
+            assert!(step(&mut download, MAX_CONNECTIONS, &mut now, op).is_continue());
+            check(&download, MAX_CONNECTIONS, &before);
+        }
+        let state = download.manager.get_runner_state(7).unwrap();
+        assert_eq!(state.status, ChunkStatus::Pending);
+        assert_eq!(state.partner().map(|partner| partner.runner_id), Some(2));
+        let range = state.allocated.clone();
+        assert!(failing(&download, MAX_CONNECTIONS).contains(&7));
+        assert!(failing(&download, MAX_CONNECTIONS).contains(&2));
+        (download, now, range)
+    }
+
+    /// The first side of an undecided pair to fail is a side failure, the
+    /// original's as the hedge's (design §9.6, §14.22): the other side keeps
+    /// the chunk, and nothing is released. The test driver once released a
+    /// failed original's chunk directly, which the loop never does. The
+    /// last side then fails for the pair: a lost side and a congestion are
+    /// charged once.
+    #[test]
+    fn the_first_side_of_a_pair_fails_as_a_side() {
+        for (failed, survivor) in [(7, 2), (2, 7)] {
+            let (mut download, now, range) = hedged_connecting_runner();
+            let attempts = download.manager.get_runner_state(7).unwrap().attempts;
+            let charged = download.manager.get_runner_state(7).unwrap().charged;
+            let before = Before::of(&download, MAX_CONNECTIONS, now);
+            let (flow, released) = fail(&mut download, failed, Failure::Retryable, now);
+            assert!(flow.is_continue() && released.is_none());
+            check(&download, MAX_CONNECTIONS, &before);
+            let state = download.manager.get_runner_state(survivor).unwrap();
+            assert_eq!(state.allocated, range, "runner {failed} failed");
+            assert!(state.partner().is_none());
+            assert_eq!(download.manager.cooldowns(), before.cooldowns);
+
+            let before = Before::of(&download, MAX_CONNECTIONS, now);
+            let (_, released) = fail(&mut download, survivor, Failure::Congestion(None), now);
+            check(&download, MAX_CONNECTIONS, &before);
+            assert_eq!(
+                released,
+                Some((attempts + 1, charged + 1)),
+                "runner {failed} first"
+            );
+        }
+    }
+
+    /// A running runner that delivered all but `MIN - 1` bytes of the file,
+    /// then nothing for 2 s, hedged (design §9.6): runner 0, with runner 1
+    /// its hedge, still connecting. Two connections.
+    fn hedged_running_runner() -> (DownloadLoop, Instant) {
+        const MIN: u64 = super::super::super::chunk_planner::DEFAULT_MIN_CHUNK_SIZE;
+        let mut download = property_loop(2);
+        let mut now = Instant::now();
+        for op in [
+            Op::Create(0),
+            Op::Start(0),
+            Op::Progress(0, TOTAL - MIN + 1),
+            Op::Advance(2000),
+            Op::Tick(0),
+        ] {
+            let before = Before::of(&download, 2, now);
+            assert!(step(&mut download, 2, &mut now, op).is_continue());
+            check(&download, 2, &before);
+        }
+        let state = download.manager.get_runner_state(0).unwrap();
+        assert_eq!(state.partner().map(|partner| partner.runner_id), Some(1));
+        (download, now)
+    }
+
+    /// A hedge that wins a retried range's pair inherits the range's
+    /// counters (design §9.6): taking ownership opens no new connection.
+    /// The range failed once, charged; its retry delivered all but `MIN - 1`
+    /// bytes and was hedged; the hedge connects and delivers a byte first.
+    #[test]
+    fn a_hedge_that_wins_keeps_the_counters_of_its_chunk() {
+        const MIN: u64 = super::super::super::chunk_planner::DEFAULT_MIN_CHUNK_SIZE;
+        let mut download = property_loop(2);
+        let mut now = Instant::now();
+        let run = |download: &mut DownloadLoop, now: &mut Instant, op: Op| {
+            let before = Before::of(download, 2, *now);
+            assert!(step(download, 2, now, op).is_continue());
+            check(download, 2, &before);
+        };
+        run(&mut download, &mut now, Op::Create(0));
+        run(&mut download, &mut now, Op::Start(0));
+        run(&mut download, &mut now, Op::Progress(0, MIN));
+        run(&mut download, &mut now, Op::Fail(0, Failure::Retryable));
+        run(&mut download, &mut now, Op::Advance(5000));
+        // The concurrency control claims the range once its backoff ended.
+        run(&mut download, &mut now, Op::Tick(0));
+        let retried = runners(&download, 2, &[ChunkStatus::Pending]);
+        let [retried] = retried[..] else {
+            panic!("one runner retries the range: {retried:?}");
+        };
+        let state = download.manager.get_runner_state(retried).unwrap();
+        assert_eq!((state.attempts, state.charged), (1, 1));
+        run(&mut download, &mut now, Op::Start(0));
+        let left = download
+            .manager
+            .get_runner_state(retried)
+            .unwrap()
+            .remaining();
+        run(&mut download, &mut now, Op::Progress(0, left - (MIN - 1)));
+        run(&mut download, &mut now, Op::Advance(2000));
+        run(&mut download, &mut now, Op::Tick(0));
+        let hedge = download
+            .manager
+            .get_runner_state(retried)
+            .and_then(|state| state.partner())
+            .expect("the retried range is hedged")
+            .runner_id;
+
+        let before = Before::of(&download, 2, now);
+        assert!(download.manager.report_started(hedge).failure.is_none());
+        take_frame(&mut download, hedge, 1, now);
+        check(&download, 2, &before);
+        let state = download.manager.get_runner_state(hedge).unwrap();
+        assert_eq!((state.attempts, state.charged), (1, 1));
+        assert_eq!(
+            download.manager.stop_reason(retried),
+            Some(StopReason::Loser)
+        );
+        // Its late frame is dropped.
+        take_frame(&mut download, retried, 1, now);
+    }
+
+    /// The oracle itself: a hedge spawned while the task is congested opens
+    /// a connection it may not (design §8.1, §9.6), and `check()` says so.
+    /// The loop never does this; the test spawns the hedge through the
+    /// manager.
+    #[test]
+    #[should_panic(expected = "hedge 1 connects while congested")]
+    fn the_oracle_rejects_a_hedge_while_congested() {
+        let mut download = property_loop(2);
+        let mut now = Instant::now();
+        for op in [Op::Create(0), Op::Start(0)] {
+            let before = Before::of(&download, 2, now);
+            assert!(step(&mut download, 2, &mut now, op).is_continue());
+            check(&download, 2, &before);
+        }
+        download
+            .backoff
+            .on_failure(&Failure::Congestion(Some(9)).error(), 1, now);
+        // The loop wakes at the end of the hold, as it does on a congestion.
+        let until = download.next_retry(now).unwrap();
+        download.deadline.wake_by(until);
+        let before = Before::of(&download, 2, now);
+        assert!(before.congested);
+        let slot = download.manager.try_reserve_slot().unwrap();
+        assert_eq!(slot.runner_id, 1);
+        let (_ends, channels) = super::hedge::Ends::new();
+        assert!(
+            download
+                .manager
+                .spawn_hedge(slot, 0, now, |_, _, _| Ok(channels))
+        );
+        check(&download, 2, &before);
+    }
+
+    /// Two pairs at once: each failed hedge's classification goes to its own
+    /// original (design §9.6), not to the other pair's.
+    #[test]
+    fn each_pair_keeps_its_own_first_failure() {
+        const MAX: usize = 4;
+        const MIN: u64 = super::super::super::chunk_planner::DEFAULT_MIN_CHUNK_SIZE;
+        let mut download = property_loop(MAX);
+        let mut now = Instant::now();
+        for op in [Op::Create(0), Op::Start(0), Op::Grow(1)] {
+            let before = Before::of(&download, MAX, now);
+            assert!(step(&mut download, MAX, &mut now, op).is_continue());
+            check(&download, MAX, &before);
+        }
+        assert!(download.manager.report_started(1).failure.is_none());
+        for owner in [0, 1] {
+            let left = download
+                .manager
+                .get_runner_state(owner)
+                .unwrap()
+                .remaining();
+            take_frame(&mut download, owner, left - (MIN - 1), now);
+        }
+        now += Duration::from_secs(2);
+        let mut pairs = Vec::new();
+        for _ in 0..2 {
+            let before = Before::of(&download, MAX, now);
+            assert!(step(&mut download, MAX, &mut now, Op::Tick(0)).is_continue());
+            check(&download, MAX, &before);
+        }
+        for owner in [0, 1] {
+            let hedge = download
+                .manager
+                .get_runner_state(owner)
+                .and_then(|state| state.partner())
+                .unwrap_or_else(|| panic!("runner {owner} is hedged"))
+                .runner_id;
+            pairs.push((owner, hedge));
+        }
+        let [(first_owner, first_hedge), (second_owner, second_hedge)] = pairs[..] else {
+            unreachable!()
+        };
+        // The first pair's hedge connects, then times out without bytes:
+        // no evidence, and charged; the second's is rejected with a 503:
+        // neither.
+        assert!(
+            download
+                .manager
+                .report_started(first_hedge)
+                .failure
+                .is_none()
+        );
+        let (flow, _) = fail(&mut download, first_hedge, Failure::Timeout, now);
+        assert!(flow.is_continue());
+        let (flow, _) = fail(&mut download, second_hedge, Failure::Congestion(None), now);
+        assert!(flow.is_continue());
+        let first = |owner| {
+            let state = download.manager.get_runner_state(owner).unwrap();
+            let first = state.hedge.as_ref().and_then(|hedge| hedge.first).unwrap();
+            (first.restart, first.charged)
+        };
+        assert_eq!(first(first_owner), (false, true));
+        assert_eq!(first(second_owner), (false, false));
+    }
+
+    /// A timeout without own bytes beside a proven runner (design §14.13a):
+    /// a connecting runner's is a refusal above the proven window and not
+    /// charged; a streaming runner's is no evidence and stays charged.
+    #[test]
+    fn only_a_connecting_timeout_beside_a_proven_runner_is_exempt() {
+        const MAX: usize = 4;
+        for started in [false, true] {
+            let mut download = property_loop(MAX);
+            let mut now = Instant::now();
+            for op in [Op::Create(0), Op::Start(0), Op::Grow(1)] {
+                let before = Before::of(&download, MAX, now);
+                assert!(step(&mut download, MAX, &mut now, op).is_continue());
+                check(&download, MAX, &before);
+            }
+            take_frame(&mut download, 0, 1, now);
+            assert_eq!(download.manager.get_proven_runners_count(), 1);
+            if started {
+                assert!(download.manager.report_started(1).failure.is_none());
+            }
+            let (flow, released) = fail(&mut download, 1, Failure::Timeout, now);
+            assert!(flow.is_continue());
+            assert_eq!(
+                released,
+                Some((1, u32::from(started))),
+                "started: {started}"
+            );
+        }
+    }
+
+    /// Both sides of a pair fail, either first, with each class of failure
+    /// (design §9.6): the pair counts one attempt, charged once when neither
+    /// side is a restart and either is charged. The original delivered
+    /// bytes of its own, so its timeout is a restart. The hedge delivered
+    /// none and never connected: its timeout is a refused connect, above
+    /// the proven window while the original runs beside it, so not charged
+    /// (design §14.13a); after the original failed nothing is proven, and
+    /// it is charged. Each side keeps the decision of its own moment.
+    #[test]
+    fn a_pair_is_charged_once_for_both_sides() {
+        const CLASSES: [Failure; 3] = [
+            Failure::Retryable,
+            Failure::Timeout,
+            Failure::Congestion(None),
+        ];
+        for (first_side, last_side) in [(0, 1), (1, 0)] {
+            for first in CLASSES {
+                for last in CLASSES {
+                    let (mut download, now) = hedged_running_runner();
+                    let own = |id| if id == 0 { 1 } else { 0 };
+                    // Only the hedge failing first is beside a proven runner.
+                    let (first_restart, first_charged) =
+                        first.class(own(first_side), first_side == 1);
+                    let (last_restart, last_charged) = last.class(own(last_side), false);
+                    let charge = !first_restart && !last_restart && (first_charged || last_charged);
+                    let (flow, released) = fail(&mut download, first_side, first, now);
+                    assert!(flow.is_continue() && released.is_none());
+                    let before = Before::of(&download, 2, now);
+                    let (_, released) = fail(&mut download, last_side, last, now);
+                    check(&download, 2, &before);
+                    assert_eq!(
+                        released,
+                        Some((1, u32::from(charge))),
+                        "runner {first_side} {first:?}, then runner {last_side} {last:?}"
+                    );
+                }
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -1629,23 +2231,19 @@ mod split_properties {
             max_connections in 1..=MAX_CONNECTIONS,
             ops in prop::collection::vec(op(), 1..64),
         ) {
-            let options = TaskOptions::default()
-                .max_connections(NonZeroUsize::new(max_connections).unwrap());
-            let (mut download, _file_writer) = futures::executor::block_on(loop_with_options(
-                ThreadedRuntimeImpl::new_other_rt(ScriptedRuntime::new(TimerKind::Scripted)),
-                DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
-                TOTAL,
-                &options,
-            ));
+            let mut download = property_loop(max_connections);
             let mut now = Instant::now();
             let mut downloaded = 0;
             for op in ops {
                 let before = Before::of(&download, max_connections, now);
-                step(&mut download, max_connections, &mut now, op);
+                let flow = step(&mut download, max_connections, &mut now, op);
                 check(&download, max_connections, &before);
                 let total = download.manager.get_total_downloaded();
                 prop_assert!(total >= downloaded, "downloaded bytes were dropped");
                 downloaded = total;
+                if flow.is_break() {
+                    break;
+                }
             }
         }
     }
