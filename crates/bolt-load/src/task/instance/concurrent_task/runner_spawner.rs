@@ -51,7 +51,8 @@ impl RunnerSpawner {
 
     /// Spawn a runner that connects `range` and downloads it.
     ///
-    /// Returns the runner's receivers; nothing is left running when the
+    /// Returns the runner's receivers and its own stop, a child of the
+    /// task's cancellation (design §9.5); nothing is left running when the
     /// spawn is rejected.
     #[cfg_attr(
         feature = "tracing",
@@ -65,12 +66,14 @@ impl RunnerSpawner {
     ) -> Result<RunnerChannels, SpawnFailed> {
         let (start, end) = (range.start, range.end);
         let adapter = self.adapter.clone();
+        let stop = self.cancel_token.child_token();
         let (runner, lifecycle_rx, data_rx) = TaskRunner::builder()
             .total(end - start)
             .connector(async move { adapter.range_stream(start, end).await })
             .runner_id(runner_id)
             .limit_receiver(limits)
             .cancel_token(self.cancel_token.clone())
+            .stop_token(stop.clone())
             .idle_timeout(self.idle_timeout)
             .connect_timeout(self.connect_timeout)
             .build()
@@ -99,6 +102,7 @@ impl RunnerSpawner {
         Ok(RunnerChannels {
             lifecycle_rx,
             data_rx,
+            stop,
         })
     }
 }

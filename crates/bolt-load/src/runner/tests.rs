@@ -2380,3 +2380,127 @@ async fn test_run_after_started_takes_the_total_from_ready() {
         assert_eq!(got, received, "{ready:?}");
     }
 }
+
+/// Run a runner on `stream` of `total` bytes until it waits, send it
+/// `control` if any, then stop it alone, or with `cancel` cancel the task;
+/// take its frames, as the manager would, until it ends, and return why
+/// it stopped.
+async fn end_after_a_stop(
+    stream: AnyBytesStream,
+    total: u64,
+    control: Option<ControlEvent>,
+    cancel: bool,
+) -> StoppedReason {
+    let (control_tx, control_rx) = async_channel::bounded(1);
+    let (task, stop) = (CancellationToken::new(), CancellationToken::new());
+    let (mut runner, lifecycle_rx, data_rx) = TaskRunner::builder()
+        .total(total)
+        .stream(stream)
+        .runner_id(1)
+        .control_signal(control_rx)
+        .cancel_token(task.clone())
+        .stop_token(stop.clone())
+        .build()
+        .unwrap();
+    let mut lifecycle_rx = pin!(lifecycle_rx);
+    let mut data_rx = pin!(data_rx);
+    let mut run = pin!(runner.run());
+    assert!(futures::poll!(run.as_mut()).is_pending());
+    if let Some(control) = control {
+        control_tx.try_send(control).unwrap();
+        assert!(futures::poll!(run.as_mut()).is_pending());
+    }
+    if cancel {
+        task.cancel();
+    } else {
+        stop.cancel();
+    }
+    while futures::poll!(run.as_mut()).is_pending() {
+        timeout(Duration::from_secs(2), data_rx.next())
+            .await
+            .expect("a waiting runner has a frame to take")
+            .expect("the data channel is open");
+    }
+    assert!(matches!(
+        lifecycle_rx.next().await,
+        Some(LifecycleEvent::Started)
+    ));
+    match lifecycle_rx.next().await {
+        Some(LifecycleEvent::Stopped(reason)) => reason,
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+}
+
+/// A stop ends a runner that has not decided how it ends: one reading its
+/// stream, whatever it buffered. One that has, ends as it would have: its
+/// error, held while its frames drain or while it waits to deliver its
+/// last buffer, or finished. The task's cancellation still ends every one
+/// of them as cancelled (design §14.15).
+#[tokio::test]
+async fn test_a_stop_keeps_the_end_a_runner_decided() {
+    const FRAMES: usize = DATA_FRAME_CHANNEL_CAPACITY + 1;
+    fn reading() -> AnyBytesStream {
+        Box::pin(stream! {
+            yield Ok(Bytes::from_static(b"abc"));
+            futures::future::pending::<()>().await;
+        })
+    }
+    fn failed_while_draining() -> AnyBytesStream {
+        Box::pin(stream! {
+            yield Ok(Bytes::from_static(b"abc"));
+            yield Err(stream_io_error("reset"));
+        })
+    }
+    fn complete_while_draining() -> AnyBytesStream {
+        Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"abc"))]))
+    }
+    // Its frames fill the channel, so its last buffer waits to be
+    // delivered before the error.
+    fn failed_while_delivering() -> AnyBytesStream {
+        Box::pin(stream! {
+            yield Ok(patterned_frame(FRAMES * BUFFER_SIZE));
+            yield Err(stream_io_error("reset"));
+        })
+    }
+    // Its frames fill the channel, with more of its item to follow.
+    fn delivering() -> AnyBytesStream {
+        Box::pin(stream! {
+            yield Ok(patterned_frame((FRAMES + 1) * BUFFER_SIZE));
+            futures::future::pending::<()>().await;
+        })
+    }
+    let is_cancelled =
+        |reason: &StoppedReason| matches!(reason, StoppedReason::Failed(TaskError::Cancelled));
+    let is_stream_error =
+        |reason: &StoppedReason| matches!(reason, StoppedReason::Failed(e) if e.is_stream_error());
+    let total = 2 * (FRAMES * BUFFER_SIZE) as u64;
+    // A limit no lower than the total fails the runner once it delivered.
+    let failing_limit = || Some(ControlEvent::LimitTotal(total));
+
+    let stopped = |stream, total, control| end_after_a_stop(stream, total, control, false);
+    assert!(is_cancelled(&stopped(reading(), 10, None).await));
+    assert!(is_cancelled(&stopped(delivering(), total, None).await));
+    let reason = stopped(failed_while_draining(), 10, None).await;
+    assert!(is_stream_error(&reason), "{reason:?}");
+    let reason = stopped(complete_while_draining(), 3, None).await;
+    assert!(matches!(reason, StoppedReason::Finished), "{reason:?}");
+    let reason = stopped(failed_while_delivering(), total, None).await;
+    assert!(is_stream_error(&reason), "{reason:?}");
+    let reason = stopped(delivering(), total, failing_limit()).await;
+    assert!(
+        matches!(reason, StoppedReason::Failed(TaskError::ExceededTotalSize)),
+        "{reason:?}"
+    );
+
+    for (stream, total, control) in [
+        (reading(), 10, None),
+        (delivering(), total, None),
+        (failed_while_draining(), 10, None),
+        (complete_while_draining(), 3, None),
+        (failed_while_delivering(), total, None),
+        (delivering(), total, failing_limit()),
+    ] {
+        let reason = end_after_a_stop(stream, total, control, true).await;
+        assert!(is_cancelled(&reason), "{reason:?}");
+    }
+}

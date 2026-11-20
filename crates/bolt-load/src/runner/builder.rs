@@ -38,6 +38,8 @@ pub struct TaskRunnerBuilder {
     control: Option<ControlSource>,
     /// the cancel token of the task
     cancel_token: Option<CancellationToken>,
+    /// stops this runner alone
+    stop_token: Option<CancellationToken>,
     /// optional override for tests that need to exercise drain timeout paths quickly
     data_drain_timeout: Option<std::time::Duration>,
     /// how long the stream may yield no non-empty data before the runner fails with `Timeout`
@@ -102,6 +104,20 @@ impl TaskRunnerBuilder {
         self
     }
 
+    /// Stop this runner alone when `stop_token` is cancelled; it reports
+    /// [`Cancelled`](super::TaskError::Cancelled), as for the
+    /// [`Self::cancel_token`].
+    ///
+    /// Unlike the task's cancellation, a stop does not interrupt a runner
+    /// that already decided how it ends: one that is delivering its last
+    /// buffer after its stream ended or failed, or after a control signal
+    /// failed, or that waits for its frames to be taken. That runner ends
+    /// as it would have, with its own error or as finished (design §14.15).
+    pub(crate) fn stop_token(mut self, stop_token: CancellationToken) -> Self {
+        self.stop_token = Some(stop_token);
+        self
+    }
+
     /// set the idle timeout of the stream, defaults to [`DEFAULT_IDLE_TIMEOUT`]
     pub fn idle_timeout(mut self, idle_timeout: std::time::Duration) -> Self {
         self.idle_timeout = Some(idle_timeout);
@@ -157,6 +173,7 @@ impl TaskRunnerBuilder {
             cancel_token: self
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
+            stop_token: self.stop_token,
         };
         Ok((runner, lifecycle_cons, data_cons))
     }

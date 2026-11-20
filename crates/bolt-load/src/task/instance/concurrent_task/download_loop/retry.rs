@@ -15,9 +15,14 @@ impl DownloadLoop {
             .backoff
             .on_failure(&failure.error, failure.attempts, now);
         trace!(
-            "[TASK] backing off {:?} after {} failed attempts until {:?} from now",
+            "[TASK] backing off {:?} after {} failed attempts{} until {:?} from now",
             failure.range,
             failure.attempts,
+            if failure.slow {
+                ", the last too slow"
+            } else {
+                ""
+            },
             not_before - now
         );
         self.manager.cool_down(

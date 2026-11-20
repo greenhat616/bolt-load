@@ -49,9 +49,15 @@ impl StreamingState {
         self.staged.is_some()
     }
 
+    /// The buffer being emitted, and whether the runner's own stop may
+    /// interrupt it: only while more of the current item follows, so the
+    /// runner has not decided how it ends.
     #[inline]
-    pub(super) fn staged_mut(&mut self) -> Option<&mut Emission> {
-        self.staged.as_mut().map(|(emission, _)| emission)
+    pub(super) fn staged_mut(&mut self) -> Option<(&mut Emission, bool)> {
+        self.staged.as_mut().map(|(emission, then)| {
+            let stoppable = matches!(then, Continuation::ResumeItem);
+            (emission, stoppable)
+        })
     }
 }
 

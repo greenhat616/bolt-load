@@ -116,8 +116,13 @@ At most every 2 s, while every runner delivers data and the task is not
 held back by a 429 or 503, it doubles the runners up to the current
 limit, by splitting the running ranges with the most left. A split needs
 at least 2 s of work at the split runner's own rate. Once a doubling
-gains less than 10% in speed, it stops adding runners. It may change or
-go away.
+gains less than 10% in speed, it stops adding runners. It also stops a
+runner that delivered under a quarter of the median of at least three
+runners over the last 10 s, allowing one 32 KiB buffer either way, when
+it has at least twice the minimum chunk size left; its range is retried
+from the bytes already received after a backoff, which counts against
+the range's budget only when the runner had received nothing. It may
+change or go away.
 
 A failed range is retried after a backoff: 0.5 s after its first
 failure, doubling up to 30 s, with jitter. A 429 or 503 holds back every
