@@ -635,6 +635,47 @@ fn test_the_next_step_counts_a_trial_that_stayed() {
     assert_eq!(ctl.limit(), 7);
 }
 
+/// A hold of eight whose limit was lowered to four under six connected
+/// runners (design §8.3, §14.33): with eight wanted, nothing
+/// is created while six run; when due, a step opens nothing, counts the
+/// six, and is accepted after the observation period, then the next: five,
+/// then six. The step to seven needs a trial the growth opens.
+#[test]
+#[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
+fn test_a_lowered_limit_under_running_runners_adds_nothing() {
+    const WANT: usize = 8;
+    let t0 = Instant::now();
+    let mut ctl = lowered_to_four(t0);
+    ctl.connect();
+    ctl.connect();
+    assert_eq!(ctl.strategy.cap(WANT), 4);
+    let due = t0 + base_wait();
+    let mut now = t0 + TICK;
+    while now < due {
+        let mut context = context(&mut ctl.admission, 6, vec![0..10], now);
+        context.want = WANT;
+        assert!(ctl.strategy.create_tasks(&context).is_empty());
+        assert_eq!(ctl.tick_wanting(now, WANT), None);
+        now += TICK;
+    }
+    assert_eq!(now, due);
+    let mut context = context(&mut ctl.admission, 6, vec![0..10], due);
+    context.want = WANT;
+    let actions = ctl.strategy.step(&mut context);
+    assert!(
+        matches!(actions[..], [StrategyAction::ChangeMaxConcurrency(5)]),
+        "the step opens nothing: {actions:?}"
+    );
+    let mut changes = Vec::new();
+    let mut now = due + TICK;
+    while now <= due + 2 * observation() + 3 * TICK {
+        changes.extend(ctl.tick_wanting(now, WANT));
+        now += TICK;
+    }
+    assert_eq!(changes, [6, 7]);
+    assert_eq!(ctl.limit(), 6);
+}
+
 #[test]
 fn test_a_refusal_before_the_step_at_the_same_instant_does_not_reject_it() {
     let t0 = Instant::now();

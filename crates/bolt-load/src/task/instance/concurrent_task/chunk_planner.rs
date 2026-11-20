@@ -297,6 +297,9 @@ pub struct ChunkPlanner {
     cooldowns: BTreeMap<u64, Cooldown>,
     /// The [`ChunkState::generation`] of the next chunk.
     next_generation: u64,
+    /// Advanced whenever a runner may have joined, left, connected or
+    /// changed the chunk it owns, see [`Self::population`].
+    population: u64,
 }
 
 impl ChunkPlanner {
@@ -312,7 +315,22 @@ impl ChunkPlanner {
             written: WrittenSet::default(),
             cooldowns: BTreeMap::new(),
             next_generation: 0,
+            population: 0,
         }
+    }
+
+    /// A count advanced at every change of who runs what: a chunk handed
+    /// out or split off, a runner connected, finished or failed, a chunk
+    /// completed, a hedge forked, connected, dropped, handed over or
+    /// decided. Two samples with the same count saw the same runners on
+    /// the same attempts throughout, even one that came and went in
+    /// between (design §14.33). It may advance without a change.
+    pub fn population(&self) -> u64 {
+        self.population
+    }
+
+    fn population_changed(&mut self) {
+        self.population = self.population.wrapping_add(1);
     }
 
     /// A generation no chunk has had.
@@ -385,6 +403,7 @@ impl ChunkPlanner {
         runner_id: Option<RunnerId>,
         status: ChunkStatus,
     ) -> bool {
+        self.population_changed();
         if range.start >= range.end || range.end > self.total {
             return false;
         }
@@ -445,9 +464,10 @@ impl ChunkPlanner {
         self.accepted_bytes += new_end - previous_end;
 
         // Check if complete; the attempt ends, and its hedge with it.
-        if chunk.is_complete() {
+        if chunk.is_complete() && chunk.status != ChunkStatus::Finished {
             chunk.status = ChunkStatus::Finished;
             chunk.hedge = None;
+            self.population_changed();
         }
 
         Ok(previous_end..new_end)
@@ -455,6 +475,7 @@ impl ChunkPlanner {
 
     /// Mark a runner as running
     pub fn mark_running(&mut self, runner_id: RunnerId) -> Result<(), Error> {
+        self.population_changed();
         let range = self
             .runner_to_chunk
             .get(&runner_id)
@@ -474,6 +495,7 @@ impl ChunkPlanner {
 
     /// Mark a runner as finished
     pub fn mark_finished(&mut self, runner_id: RunnerId) -> Result<(), Error> {
+        self.population_changed();
         let range = self
             .runner_to_chunk
             .remove(&runner_id)
@@ -492,6 +514,7 @@ impl ChunkPlanner {
     ///
     /// The released range is fresh until [`Self::cool_down`] backs it off.
     pub fn mark_failed(&mut self, runner_id: RunnerId) -> Result<Released, Error> {
+        self.population_changed();
         let range = self
             .runner_to_chunk
             .remove(&runner_id)
@@ -662,6 +685,7 @@ impl ChunkPlanner {
         split_pos: u64,
         new_runner_id: RunnerId,
     ) -> Result<Range<u64>, Error> {
+        self.population_changed();
         let range = self
             .runner_to_chunk
             .remove(&runner_id)
@@ -833,6 +857,7 @@ impl ChunkPlanner {
     /// Only a connecting or running chunk that is incomplete and was not
     /// hedged in this attempt may be hedged, by a runner without a chunk.
     pub fn fork_hedge(&mut self, owner: RunnerId, hedge: RunnerId) -> Result<Range<u64>, Error> {
+        self.population_changed();
         let invalid = Error::InvalidHedge { runner_id: owner };
         let start = *self
             .runner_to_chunk
@@ -872,6 +897,7 @@ impl ChunkPlanner {
 
     /// The hedge runner `runner_id` reported `Started`.
     pub fn mark_partner_running(&mut self, runner_id: RunnerId) -> Result<(), Error> {
+        self.population_changed();
         let partner = self
             .hedge_of
             .get(&runner_id)
@@ -886,6 +912,7 @@ impl ChunkPlanner {
     /// beaten: the original runner keeps the chunk. Returns the original
     /// runner.
     pub fn drop_partner(&mut self, runner_id: RunnerId) -> Result<RunnerId, Error> {
+        self.population_changed();
         let start = self
             .hedge_of
             .remove(&runner_id)
@@ -906,6 +933,7 @@ impl ChunkPlanner {
     /// beaten: the hedge runner takes the chunk over, with its downloaded
     /// part and its counts. Returns the hedge runner.
     pub fn hand_over(&mut self, owner: RunnerId) -> Result<RunnerId, Error> {
+        self.population_changed();
         let start = *self
             .runner_to_chunk
             .get(&owner)
@@ -952,6 +980,7 @@ impl ChunkPlanner {
     /// A non-empty frame of `owner` is taken: its pair, if undecided, is
     /// decided. The hedge stays, for the budget of the attempt.
     pub fn decide(&mut self, owner: RunnerId) {
+        self.population_changed();
         if let Some(hedge) = self
             .runner_to_chunk
             .get(&owner)

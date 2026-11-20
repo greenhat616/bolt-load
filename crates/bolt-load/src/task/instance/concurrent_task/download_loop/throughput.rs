@@ -55,6 +55,8 @@ struct RatesSample {
     at: Instant,
     /// The bytes accepted from every runner so far.
     total: u64,
+    /// See [`RunnerManager::population`].
+    population: u64,
     /// Each active runner's attempt.
     runners: HashMap<RunnerId, RunnerSample>,
 }
@@ -99,6 +101,7 @@ impl RunnerRates {
         let mut sample = RatesSample {
             at: now,
             total: manager.get_total_downloaded(),
+            population: manager.population(),
             runners: HashMap::new(),
         };
         let last = self.history.back();
@@ -146,6 +149,22 @@ impl RunnerRates {
         let speed = last
             .zip(elapsed)
             .map(|(last, elapsed)| (sample.total - last.total) as f64 / elapsed);
+        // The same attempts running at both ends of the tick and none
+        // other active, and no change of who runs what in between: no
+        // runner finished, failed, started or connected in it, not even
+        // one that came and went, so its speed is theirs (design §9.2,
+        // §14.33).
+        let stable = !sample.runners.is_empty()
+            && last.is_some_and(|last| {
+                last.population == sample.population
+                    && last.runners.len() == sample.runners.len()
+                    && sample.runners.iter().all(|(runner_id, now)| {
+                        now.running
+                            && last.runners.get(runner_id).is_some_and(|then| {
+                                then.running && then.generation == now.generation
+                            })
+                    })
+            });
         self.history.push_back(sample);
         // The next window starts at the latest sample a window back.
         while self
@@ -159,6 +178,7 @@ impl RunnerRates {
             speed,
             all_delivering,
             silent,
+            stable,
             rates,
         };
         &self.tick
@@ -418,6 +438,77 @@ mod tests {
         let tick = sampler.sample(&manager, t0 + TICK * 4).clone();
         assert!(tick.all_delivering);
         assert_eq!(rates(&tick), [(0, MIB as f64 / 1.5), (2, MIB as f64 / 1.5)]);
+    }
+
+    /// A tick is stable when the same attempts ran at both of its samples
+    /// and no other runner was active at either: not when a runner
+    /// finished, connected, was added or retried in it (design §14.33).
+    #[test]
+    fn test_a_tick_is_stable_while_its_runners_stay() {
+        let mut manager = RunnerManager::new(100 * MIB, 4);
+        let _a = manager.allocate_runner_with_chunk(0..10 * MIB).unwrap();
+        let _b = manager
+            .allocate_runner_with_chunk(10 * MIB..50 * MIB)
+            .unwrap();
+        let mut sampler = RunnerRates::default();
+        let t0 = Instant::now();
+        let mut stable = Vec::new();
+        let mut sample = |sampler: &mut RunnerRates, manager: &RunnerManager, n: u32| {
+            stable.push(sampler.sample(manager, t0 + TICK * n).stable);
+        };
+        sample(&mut sampler, &manager, 0);
+        manager.update_progress(1, MIB).unwrap();
+        sample(&mut sampler, &manager, 1);
+        // Runner 0 finishes.
+        manager.update_progress(0, 10 * MIB).unwrap();
+        manager.release_runner_full(0, true).unwrap();
+        sample(&mut sampler, &manager, 2);
+        sample(&mut sampler, &manager, 3);
+        // Runner 2 is added, then connects.
+        assert!(manager.allocate_chunk(50 * MIB..60 * MIB, 2));
+        sample(&mut sampler, &manager, 4);
+        manager.mark_started(2);
+        sample(&mut sampler, &manager, 5);
+        sample(&mut sampler, &manager, 6);
+        // Runner 2 fails and its ID claims the range again.
+        manager.release_runner_full(2, false).unwrap();
+        let _retry = manager
+            .allocate_runner_with_chunk(50 * MIB..60 * MIB)
+            .unwrap();
+        sample(&mut sampler, &manager, 7);
+        sample(&mut sampler, &manager, 8);
+        assert_eq!(
+            stable,
+            [false, true, false, true, false, false, true, false, true]
+        );
+    }
+
+    /// A runner that comes and goes between two samples leaves both of
+    /// them with the same runners, yet its bytes are in the tick's speed:
+    /// the tick is not stable (design §14.33).
+    #[test]
+    fn test_a_runner_that_came_and_went_unsettles_the_tick() {
+        let mut manager = RunnerManager::new(100 * MIB, 4);
+        let _a = manager.allocate_runner_with_chunk(0..40 * MIB).unwrap();
+        let mut sampler = RunnerRates::default();
+        let t0 = Instant::now();
+        sampler.sample(&manager, t0);
+        manager.update_progress(0, MIB).unwrap();
+        assert!(sampler.sample(&manager, t0 + TICK).stable);
+
+        let _b = manager
+            .allocate_runner_with_chunk(40 * MIB..48 * MIB)
+            .unwrap();
+        manager.update_progress(1, 8 * MIB).unwrap();
+        manager.release_runner_full(1, true).unwrap();
+        manager.update_progress(0, MIB).unwrap();
+        let tick = sampler.sample(&manager, t0 + TICK * 2).clone();
+        assert_eq!(tick.speed, Some(9.0 * MIB as f64 / 1.5));
+        assert!(tick.all_delivering);
+        assert!(!tick.stable);
+
+        manager.update_progress(0, MIB).unwrap();
+        assert!(sampler.sample(&manager, t0 + TICK * 3).stable);
     }
 
     /// A rate belongs to the attempt: a split keeps it, an ID reused for
