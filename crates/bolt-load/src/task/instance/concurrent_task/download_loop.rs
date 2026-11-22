@@ -3,6 +3,7 @@
 mod cancel;
 mod completion;
 mod deadline;
+mod retry;
 mod runner;
 mod strategy_tick;
 #[cfg(test)]
@@ -27,7 +28,7 @@ use super::{
     RunnerManager, RunnerSpawner,
     file_writer::{FileWriter, PendingWriter, WriteCompletion},
     runner_manager::RunnerTick,
-    strategy::{DEFAULT_STRATEGY_TICK_INTERVAL, FailurePolicy, StrategyControl},
+    strategy::{Backoff, DEFAULT_STRATEGY_TICK_INTERVAL, FailurePolicy, StrategyControl},
 };
 use crate::{
     runtime::TimerBuilder,
@@ -56,6 +57,9 @@ pub(super) struct DownloadLoop {
     manager: RunnerManager,
     strategy: StrategyControl,
     policy: FailurePolicy,
+    /// When failed ranges, and the task after a congestion, may connect
+    /// again.
+    backoff: Backoff,
     max_concurrency: usize,
     writer: PendingWriter<FileWriter>,
     reporter: ProgressReporter,
@@ -93,6 +97,7 @@ impl DownloadLoop {
             manager,
             strategy,
             policy,
+            backoff: Backoff::new(),
             max_concurrency,
             writer,
             reporter,
@@ -113,6 +118,11 @@ impl DownloadLoop {
     }
 
     /// Priority: cancel > deadline > writer > strategy > throughput > runner.
+    ///
+    /// The deadline source is the loop's one timer: it fires at the
+    /// no-progress deadline, or earlier when a range's backoff or the
+    /// task's congestion ends, to create runners without waiting for the
+    /// strategy tick (design §8.1).
     ///
     /// Every source is polled before `Pending` is returned, so each has
     /// registered for its wake-up.
@@ -135,10 +145,13 @@ impl DownloadLoop {
         self.poll_runner(cx)
     }
 
+    /// Handle `event`; the handlers take the time from here, so tests can
+    /// pass their own.
     fn handle_event(&mut self, event: LoopEvent) -> Result<ControlFlow<()>> {
+        let now = Instant::now();
         match event {
             LoopEvent::Cancelled => Err(DownloadError::Cancelled),
-            LoopEvent::Deadline => self.on_deadline().map(ControlFlow::Continue),
+            LoopEvent::Deadline => self.on_deadline(now).map(ControlFlow::Continue),
             LoopEvent::WriterCompleted(Some(completions)) => self
                 .record_completions(completions)
                 .map(ControlFlow::Continue),
@@ -146,14 +159,14 @@ impl DownloadLoop {
                 "writer completion channel closed unexpectedly",
             )),
             LoopEvent::StrategyTimer => {
-                self.on_strategy_tick();
+                self.on_strategy_tick(now);
                 Ok(ControlFlow::Continue(()))
             }
             LoopEvent::ThroughputTimer => {
                 self.on_throughput_tick();
                 Ok(ControlFlow::Continue(()))
             }
-            LoopEvent::Runner(tick) => self.on_runner(tick),
+            LoopEvent::Runner(tick) => self.on_runner(tick, now),
         }
     }
 

@@ -59,8 +59,11 @@ pub struct ConcurrencyControlContext<'a> {
     /// The sampler
     #[debug(skip)]
     pub sampler: &'a mut RunnerOutcomeSampler,
-    /// The available chunks
+    /// The ranges a runner may be created for now: none while a congestion
+    /// holds back new connections, and no range still backing off.
     pub available_chunks: Vec<Range<u64>>,
+    /// The time of this step
+    pub now: Instant,
 }
 
 /// The state of the concurrency control strategy
@@ -256,6 +259,39 @@ impl ConcurrencyControlStrategy {
         }
     }
 
+    /// The runners a step would create once the concurrency needs no
+    /// change: one per available range, up to the free slots. Changes no
+    /// state.
+    ///
+    /// None before the first step, which creates the first runners, nor
+    /// while an unretryable failure waits for the next step to degrade the
+    /// concurrency: runners created before it would be counted as the new
+    /// limit.
+    pub fn create_tasks(&self, context: &ConcurrencyControlContext) -> Vec<StrategyAction> {
+        if self.first_execute
+            || context
+                .sampler
+                .unretryable_pending(self.config.unretryable_detection_window, context.now)
+        {
+            return Vec::new();
+        }
+        Self::fill_free_slots(context)
+    }
+
+    /// One runner per available range, up to the free slots.
+    fn fill_free_slots(context: &ConcurrencyControlContext) -> Vec<StrategyAction> {
+        context
+            .available_chunks
+            .iter()
+            .take(
+                context
+                    .max_concurrency
+                    .saturating_sub(context.active_runners),
+            )
+            .map(|chunk| StrategyAction::CreateTask(chunk.clone()))
+            .collect()
+    }
+
     /// Get the current state
     #[expect(dead_code, reason = "debugging aid for the strategy state")]
     pub fn current_state(&self) -> &str {
@@ -279,7 +315,7 @@ impl Strategy for ConcurrencyControlStrategy {
 
     #[inline]
     fn step(&mut self, context: &mut Self::Context<'_>) -> Vec<StrategyAction> {
-        let now = Instant::now();
+        let now = context.now;
 
         // When first launch the task,
         // Create background runners for all available chunks according to the current concurrency
@@ -295,7 +331,7 @@ impl Strategy for ConcurrencyControlStrategy {
 
         if context
             .sampler
-            .has_recent_unretryable(self.config.unretryable_detection_window)
+            .has_recent_unretryable(self.config.unretryable_detection_window, now)
         {
             bolt_load_utils::telemetry::trace!(
                 "[CONTROL STRATEGY] Has recent unretryable, degraded"
@@ -343,17 +379,7 @@ impl Strategy for ConcurrencyControlStrategy {
         }
 
         // When the active runners are less than the max concurrency, create background runners for all available chunks
-        if context.active_runners < context.max_concurrency {
-            return context
-                .available_chunks
-                .iter()
-                .take(context.max_concurrency - context.active_runners)
-                .map(|chunk| StrategyAction::CreateTask(chunk.clone()))
-                .collect();
-        }
-
-        // No Action
-        actions
+        Self::fill_free_slots(context)
     }
 }
 
@@ -371,6 +397,7 @@ mod tests {
             active_runners: 0,
             sampler: &mut sampler,
             available_chunks: vec![0..100],
+            now: Instant::now(),
         };
         // The first step only schedules the initial runners.
         strategy.step(&mut context);
@@ -378,10 +405,66 @@ mod tests {
         context
             .sampler
             .record_connect_failed(FailureKind::Unretryable);
+        context.now = Instant::now();
         let actions = strategy.step(&mut context);
         assert!(
             matches!(actions.as_slice(), [StrategyAction::ChangeMaxConcurrency(n)] if *n >= 1),
             "unexpected actions: {actions:?}"
         );
+    }
+
+    fn created(actions: &[StrategyAction]) -> Vec<Range<u64>> {
+        actions
+            .iter()
+            .map(|action| match action {
+                StrategyAction::CreateTask(range) => range.clone(),
+                other => panic!("unexpected action: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Between steps, runners are created only as a step would create them,
+    /// and only once the step degraded for an unretryable failure.
+    #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
+    fn test_create_tasks_waits_for_the_first_step_and_the_degradation() {
+        let mut strategy = ConcurrencyControlStrategy::with_default_config(4);
+        let mut sampler = RunnerOutcomeSampler::with_defaults();
+        let mut context = ConcurrencyControlContext {
+            max_concurrency: 4,
+            active_runners: 1,
+            sampler: &mut sampler,
+            available_chunks: vec![0..10, 20..30, 40..50, 60..70],
+            now: Instant::now(),
+        };
+        assert!(strategy.create_tasks(&context).is_empty());
+        strategy.step(&mut context);
+
+        // Three free slots.
+        assert_eq!(
+            created(&strategy.create_tasks(&context)),
+            [0..10, 20..30, 40..50]
+        );
+        context.active_runners = 4;
+        assert!(strategy.create_tasks(&context).is_empty());
+
+        context.active_runners = 1;
+        context
+            .sampler
+            .record_connect_failed(FailureKind::Unretryable);
+        context.now = Instant::now();
+        assert!(strategy.create_tasks(&context).is_empty());
+        // Still pending: `create_tasks` left it to the step.
+        let actions = strategy.step(&mut context);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [StrategyAction::ChangeMaxConcurrency(1)]
+            ),
+            "unexpected actions: {actions:?}"
+        );
+        context.max_concurrency = 1;
+        context.active_runners = 0;
+        assert_eq!(created(&strategy.create_tasks(&context)), [0..10]);
     }
 }

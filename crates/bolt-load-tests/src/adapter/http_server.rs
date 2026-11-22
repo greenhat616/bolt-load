@@ -2,13 +2,14 @@ use std::{
     io::{BufWriter, Seek, Write},
     ops::Bound,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use axum::{
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -16,7 +17,7 @@ use rand::RngExt;
 use tempfile::tempfile;
 use tokio::net::TcpListener;
 
-use super::fault::{CONGESTED_RETRY_AFTER_SECS, RangeFault};
+use super::fault::{CONGESTED_RETRY_AFTER_SECS, Gate, RangeFault, THROTTLED_BYTES_PER_SEC};
 
 /// Create a random file with given size, useful for testing
 pub fn create_random_file(size: usize) -> std::io::Result<std::fs::File> {
@@ -146,13 +147,48 @@ pub async fn create_http_server_with_file_size(
 #[derive(Clone)]
 struct FaultState {
     content: Bytes,
-    /// `content` as gzip, for [`RangeFault::EncodedRepresentation`].
-    encoded: Bytes,
+    /// `content` as gzip, for [`RangeFault::EncodedRepresentation`]; encoded
+    /// on first use, which large contents rarely need.
+    encoded: Arc<OnceLock<Bytes>>,
     /// Whether [`RangeFault::Truncated`] already cut a response.
     truncated: Arc<AtomicBool>,
     /// Whether [`RangeFault::ReplacedAfterShortRange`] serves the
     /// replacement.
     replaced: Arc<AtomicBool>,
+    /// The range requests other than the probe that
+    /// [`RangeFault::CongestedOnce`] answered.
+    congested_once: Arc<AtomicUsize>,
+    /// Where the first range response of [`RangeFault::CongestedOnce`]
+    /// holds its body.
+    hold: Option<Gate>,
+    log: RequestLog,
+}
+
+/// A request the range fault server answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedRequest {
+    /// When the request arrived.
+    pub at: Instant,
+    pub method: Method,
+    pub fault: Option<RangeFault>,
+    /// The requested range as `(first, last)`; `None` without `Range`.
+    pub range: Option<(u64, u64)>,
+    pub status: StatusCode,
+}
+
+/// The requests a range fault server answered, in the order it answered
+/// them.
+#[derive(Clone, Debug, Default)]
+pub struct RequestLog(Arc<Mutex<Vec<RecordedRequest>>>);
+
+impl RequestLog {
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn record(&self, request: RecordedRequest) {
+        self.0.lock().unwrap().push(request);
+    }
 }
 
 /// Serve `content` at every [`RangeFault::path`], misbehaving on range
@@ -161,14 +197,32 @@ struct FaultState {
 pub async fn create_range_fault_server(
     content: Bytes,
 ) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+    let (port, handle, _log) = create_range_fault_server_with_log(content, None).await?;
+    Ok((port, handle))
+}
+
+/// [`create_range_fault_server`], also returning the log of the requests
+/// it answers.
+///
+/// With `hold`, the first range response of [`RangeFault::CongestedOnce`]
+/// other than the probe sends its headers, then holds its body at the gate
+/// until the gate is released.
+pub async fn create_range_fault_server_with_log(
+    content: Bytes,
+    hold: Option<Gate>,
+) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>, RequestLog)> {
     let port =
         portpicker::pick_unused_port().ok_or(anyhow::anyhow!("Failed to pick an unused port"))?;
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let log = RequestLog::default();
     let state = FaultState {
-        encoded: gzip(&content)?,
+        encoded: Arc::default(),
         content,
         truncated: Arc::new(AtomicBool::new(false)),
         replaced: Arc::new(AtomicBool::new(false)),
+        congested_once: Arc::new(AtomicUsize::new(0)),
+        hold,
+        log: log.clone(),
     };
     let app = axum::Router::new()
         .route("/{fault}", axum::routing::get(fault_handler))
@@ -178,7 +232,7 @@ pub async fn create_range_fault_server(
             .await
             .unwrap()
     });
-    Ok((port, handle))
+    Ok((port, handle, log))
 }
 
 /// `content` as a gzip stream.
@@ -248,39 +302,106 @@ fn truncated(content: &Bytes, first: u64, last: u64, total: u64) -> Response {
         .into_response()
 }
 
+/// A 206 for `first..=last`, sent at [`THROTTLED_BYTES_PER_SEC`]. With
+/// `hold`, the body waits at the gate; the headers are sent before.
+fn throttled(content: &Bytes, first: u64, last: u64, total: u64, hold: Option<Gate>) -> Response {
+    const FRAME: usize = 64 * 1024;
+    let body = content.slice(first as usize..=last as usize);
+    let stream = async_stream::stream! {
+        if let Some(gate) = hold {
+            gate.pass().await;
+        }
+        let start = tokio::time::Instant::now();
+        let mut sent = 0;
+        while sent < body.len() {
+            // Paced from the start, so coarse timers keep the average rate.
+            let due = Duration::from_secs_f64(sent as f64 / THROTTLED_BYTES_PER_SEC as f64);
+            tokio::time::sleep_until(start + due).await;
+            let end = (sent + FRAME).min(body.len());
+            yield Ok::<_, std::io::Error>(body.slice(sent..end));
+            sent = end;
+        }
+    };
+    (
+        StatusCode::PARTIAL_CONTENT,
+        partial_headers(first, last, total),
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+fn congested() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, CONGESTED_RETRY_AFTER_SECS.to_string())],
+    )
+        .into_response()
+}
+
 async fn fault_handler(
     axum::extract::Path(fault): axum::extract::Path<String>,
     axum::extract::State(state): axum::extract::State<FaultState>,
-    method: axum::http::Method,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let Some(fault) = RangeFault::from_name(&fault) else {
+    let at = Instant::now();
+    let fault = RangeFault::from_name(&fault);
+    let response = fault_response(fault, &state, &method, &headers);
+    let len = fault.map_or(0, |fault| state.content(fault).len() as u64);
+    state.log.record(RecordedRequest {
+        at,
+        method,
+        fault,
+        range: requested_range(&headers, len),
+        status: response.status(),
+    });
+    response
+}
+
+impl FaultState {
+    /// What `fault` serves before any fault applies.
+    fn content(&self, fault: RangeFault) -> &Bytes {
+        if fault == RangeFault::EncodedRepresentation {
+            self.encoded
+                .get_or_init(|| gzip(&self.content).expect("gzip into memory never fails"))
+        } else {
+            &self.content
+        }
+    }
+}
+
+fn fault_response(
+    fault: Option<RangeFault>,
+    state: &FaultState,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(fault) = fault else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let encoded = fault == RangeFault::EncodedRepresentation;
-    let content = if encoded {
-        &state.encoded
-    } else {
-        &state.content
-    };
+    let content = state.content(fault);
     let len = content.len() as u64;
     let replaced =
         fault == RangeFault::ReplacedAfterShortRange && state.replaced.load(Ordering::SeqCst);
     // The GET route also serves HEAD, which never gets a fault.
     let mut response = if replaced {
         RangeFault::replacement(content).into_response()
-    } else if method == axum::http::Method::HEAD || !headers.contains_key(header::RANGE) {
+    } else if method == Method::HEAD || !headers.contains_key(header::RANGE) {
         content.clone().into_response()
     } else {
-        let range = requested_range(&headers, len);
+        let range = requested_range(headers, len);
         let is_probe = range == Some((0, 0));
         match (fault, range) {
             (RangeFault::IgnoreRange, _) => content.clone().into_response(),
-            (RangeFault::Congested, _) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, CONGESTED_RETRY_AFTER_SECS.to_string())],
-            )
-                .into_response(),
+            (RangeFault::Congested, _) => congested(),
+            (RangeFault::CongestedOnce, Some((first, last))) if !is_probe => {
+                match state.congested_once.fetch_add(1, Ordering::SeqCst) {
+                    0 => throttled(content, first, last, len, state.hold.clone()),
+                    1 => congested(),
+                    _ => throttled(content, first, last, len, None),
+                }
+            }
             (RangeFault::Unsatisfiable, _) | (_, None) => (
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 [(header::CONTENT_RANGE, format!("bytes */{len}"))],
@@ -571,6 +692,97 @@ mod tests {
         );
         assert_eq!(resp.bytes().await?, encoded.slice(2..5));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn range_fault_server_rejects_the_second_range_once_and_logs() -> Result<()> {
+        let content = Bytes::from(vec![3u8; DEFAULT_FILE_SIZE]);
+        let (port, handle, log) = create_range_fault_server_with_log(content.clone(), None).await?;
+        let _guard = ServerGuard(handle);
+        let client = local_client()?;
+        let url = format!(
+            "http://127.0.0.1:{port}{}",
+            RangeFault::CongestedOnce.path()
+        );
+        let get = |range: &'static str| client.get(&url).header(RANGE, range).send();
+
+        // The probe is never rejected nor throttled.
+        assert_eq!(
+            get("bytes=0-0").await?.status(),
+            StatusCode::PARTIAL_CONTENT
+        );
+        let started = Instant::now();
+        let resp = get("bytes=0-").await?;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.bytes().await?, content);
+        // The last frame leaves one frame short of the whole body.
+        let paced = (DEFAULT_FILE_SIZE - 64 * 1024) as f64 / THROTTLED_BYTES_PER_SEC as f64;
+        assert!(started.elapsed() >= Duration::from_secs_f64(paced));
+        let resp = get("bytes=5-9").await?;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(RETRY_AFTER).unwrap(),
+            &CONGESTED_RETRY_AFTER_SECS.to_string()
+        );
+        assert_eq!(get("bytes=5-9").await?.bytes().await?, content.slice(5..10));
+
+        let requests = log.requests();
+        let seen: Vec<_> = requests
+            .iter()
+            .map(|request| (request.range, request.status))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (Some((0, 0)), StatusCode::PARTIAL_CONTENT),
+                (
+                    Some((0, DEFAULT_FILE_SIZE as u64 - 1)),
+                    StatusCode::PARTIAL_CONTENT
+                ),
+                (Some((5, 9)), StatusCode::SERVICE_UNAVAILABLE),
+                (Some((5, 9)), StatusCode::PARTIAL_CONTENT),
+            ]
+        );
+        assert!(requests.iter().all(|request| request.method == Method::GET
+            && request.fault == Some(RangeFault::CongestedOnce)));
+        assert!(requests.windows(2).all(|pair| pair[0].at <= pair[1].at));
+        Ok(())
+    }
+
+    /// The first range response sends its headers and holds its body at the
+    /// gate; the probe and the later requests are answered meanwhile.
+    #[tokio::test]
+    async fn range_fault_server_holds_the_first_body_at_the_gate() -> Result<()> {
+        let content = Bytes::from(vec![5u8; 256 * 1024]);
+        let gate = Gate::new();
+        let (port, handle, log) =
+            create_range_fault_server_with_log(content.clone(), Some(gate.clone())).await?;
+        let _guard = ServerGuard(handle);
+        let client = local_client()?;
+        let url = format!(
+            "http://127.0.0.1:{port}{}",
+            RangeFault::CongestedOnce.path()
+        );
+        let get = |range: &'static str| client.get(&url).header(RANGE, range).send();
+
+        // Bounded as a whole: a gate that held the probe or the headers
+        // would otherwise hang the test.
+        let exchange = async {
+            assert_eq!(get("bytes=0-0").await?.bytes().await?, content.slice(..1));
+            let held = get("bytes=0-").await?;
+            assert_eq!(held.status(), StatusCode::PARTIAL_CONTENT);
+            gate.entered().await;
+            let resp = get("bytes=5-9").await?;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(get("bytes=5-9").await?.bytes().await?, content.slice(5..10));
+
+            gate.release();
+            assert_eq!(held.bytes().await?, content);
+            anyhow::Ok(())
+        };
+        tokio::time::timeout(Duration::from_secs(10), exchange).await??;
+        assert_eq!(log.requests().len(), 4);
         Ok(())
     }
 

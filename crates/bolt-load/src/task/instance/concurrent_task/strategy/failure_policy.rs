@@ -16,14 +16,21 @@ use crate::{runner::TaskError, task::TaskOptions};
 /// A server rejecting the connection count (429/503), which the concurrency
 /// strategy answers by degrading instead of giving up.
 fn is_congestion(error: &TaskError) -> bool {
-    matches!(
-        error,
+    congestion_retry_after(error).is_some()
+}
+
+/// The `Retry-After` of a congestion rejection (429/503), `Some(None)` when
+/// it sent none; `None` for any other error.
+pub(super) fn congestion_retry_after(error: &TaskError) -> Option<Option<Duration>> {
+    match error {
         TaskError::StreamError {
-            source: AdapterError::Unretryable {
-                source: UnretryableError::Congestion { .. }
-            }
-        }
-    )
+            source:
+                AdapterError::Unretryable {
+                    source: UnretryableError::Congestion { retry_after, .. },
+                },
+        } => Some(*retry_after),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -101,34 +108,41 @@ mod tests {
         )
     }
 
-    fn retryable() -> AttemptFailure {
+    fn failure(error: TaskError, retryable: bool) -> AttemptFailure {
         AttemptFailure {
             runner_id: 0,
-            error: TaskError::StreamError {
+            error,
+            retryable,
+            range: 0..1,
+            attempts: 1,
+        }
+    }
+
+    fn retryable() -> AttemptFailure {
+        failure(
+            TaskError::StreamError {
                 source: AdapterError::Retryable {
                     source: RetryableError::Io {
                         source: Arc::new(std::io::Error::other("reset")),
                     },
                 },
             },
-            retryable: true,
-        }
+            true,
+        )
     }
 
     fn unretryable() -> AttemptFailure {
-        AttemptFailure {
-            runner_id: 0,
-            error: TaskError::Other {
+        failure(
+            TaskError::Other {
                 message: "forbidden".into(),
             },
-            retryable: false,
-        }
+            false,
+        )
     }
 
     fn congestion() -> AttemptFailure {
-        AttemptFailure {
-            runner_id: 0,
-            error: TaskError::StreamError {
+        failure(
+            TaskError::StreamError {
                 source: AdapterError::Unretryable {
                     source: UnretryableError::Congestion {
                         status: 429,
@@ -136,8 +150,8 @@ mod tests {
                     },
                 },
             },
-            retryable: false,
-        }
+            false,
+        )
     }
 
     #[test]
@@ -207,6 +221,23 @@ mod tests {
             p.on_failure(&congestion(), 0),
             Some(TaskError::StreamError { .. })
         ));
+    }
+
+    #[test]
+    fn test_congestion_keeps_its_retry_after() {
+        let delay = Some(Duration::from_secs(2));
+        let error = |retry_after| TaskError::StreamError {
+            source: AdapterError::Unretryable {
+                source: UnretryableError::Congestion {
+                    status: 503,
+                    retry_after,
+                },
+            },
+        };
+        assert_eq!(congestion_retry_after(&error(delay)), Some(delay));
+        assert_eq!(congestion_retry_after(&error(None)), Some(None));
+        assert_eq!(congestion_retry_after(&retryable().error), None);
+        assert_eq!(congestion_retry_after(&unretryable().error), None);
     }
 
     #[test]

@@ -1,12 +1,19 @@
-use std::{ops::Range, time::Duration};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use bolt_load_utils::telemetry::*;
 
+mod backoff;
 mod concurrency_control_strategy;
 mod dynamic_strategy;
 mod failure_policy;
 mod runner_outcome_sampler;
 
+pub use backoff::Backoff;
+#[cfg(test)]
+pub use backoff::MIN_RANGE_BACKOFF;
 use concurrency_control_strategy::{ConcurrencyControlContext, ConcurrencyControlStrategy};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
@@ -55,27 +62,33 @@ impl StrategyControl {
         }
     }
 
+    /// Step the strategies at `now`.
+    ///
+    /// While `congested`, no action opens a connection: no runner is
+    /// created and none is split. No runner is created for a range still
+    /// backing off (design §8.1).
     pub fn execute(
         &mut self,
         max_concurrency: usize,
         current_speed: f64,
         per_runner_avg_speed: f64,
         runner_manager: &mut super::RunnerManager,
+        now: Instant,
+        congested: bool,
     ) -> Option<(&'static str, Vec<StrategyAction>)> {
-        let active_runners = runner_manager.get_active_runners_count();
-        let available_chunks = runner_manager.get_available_ranges();
-        let mut context = ConcurrencyControlContext {
-            max_concurrency,
-            active_runners,
-            sampler: runner_manager.runner_outcome_sampler_mut(),
-            available_chunks,
-        };
+        let mut context = Self::context(max_concurrency, runner_manager, now, congested);
+        let active_runners = context.active_runners;
         trace!("[STRATEGY] Concurrency control strategy context: {context:?}");
         let actions = self.concurrency_control_strategy.step(&mut context);
 
         if !actions.is_empty() {
             trace!("[STRATEGY] Concurrency control strategy not none, proceeding");
             return Some((ConcurrencyControlStrategy::name(), actions));
+        }
+
+        if congested {
+            trace!("[STRATEGY] Congested, not splitting");
+            return None;
         }
 
         // TODO: move this to dynamic strategy inner?
@@ -87,7 +100,7 @@ impl StrategyControl {
             && let Some(SplitCandidate::Running {
                 runner: runner_id,
                 range: suggested_range,
-            }) = runner_manager.find_chunk_to_split(planned_chunk_size)
+            }) = runner_manager.find_chunk_to_split(planned_chunk_size, now)
             && suggested_range.end - suggested_range.start >= planned_chunk_size
         {
             // split the chunk
@@ -107,5 +120,47 @@ impl StrategyControl {
         }
 
         None
+    }
+
+    /// The runners to create between ticks, for ranges whose backoff, or
+    /// the task's congestion, ended at `now` (design §8.1).
+    ///
+    /// No strategy steps: the runners are only those the concurrency
+    /// control would create next, see
+    /// [`ConcurrencyControlStrategy::create_tasks`].
+    pub fn create_tasks(
+        &self,
+        max_concurrency: usize,
+        runner_manager: &mut super::RunnerManager,
+        now: Instant,
+        congested: bool,
+    ) -> Vec<StrategyAction> {
+        if congested {
+            return Vec::new();
+        }
+        let context = Self::context(max_concurrency, runner_manager, now, congested);
+        self.concurrency_control_strategy.create_tasks(&context)
+    }
+
+    fn context(
+        max_concurrency: usize,
+        runner_manager: &mut super::RunnerManager,
+        now: Instant,
+        congested: bool,
+    ) -> ConcurrencyControlContext<'_> {
+        let active_runners = runner_manager.get_active_runners_count();
+        // No new connection while congested.
+        let available_chunks = if congested {
+            Vec::new()
+        } else {
+            runner_manager.get_eligible_ranges(now)
+        };
+        ConcurrencyControlContext {
+            max_concurrency,
+            active_runners,
+            sampler: runner_manager.runner_outcome_sampler_mut(),
+            available_chunks,
+            now,
+        }
     }
 }

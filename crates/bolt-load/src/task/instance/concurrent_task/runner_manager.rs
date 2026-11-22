@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use bolt_load_utils::telemetry::*;
@@ -31,6 +32,11 @@ pub(super) struct AttemptFailure {
     pub runner_id: RunnerId,
     pub error: TaskError,
     pub retryable: bool,
+    /// The unfinished range the runner gave back, fresh until the loop
+    /// backs it off.
+    pub range: Range<u64>,
+    /// Failed attempts on `range`, this one included.
+    pub attempts: u32,
 }
 
 /// Bytes received from runners since the previous snapshot.
@@ -366,7 +372,7 @@ impl RunnerManager {
     pub fn mark_failed(
         &mut self,
         runner_id: RunnerId,
-    ) -> Result<Range<u64>, super::chunk_planner::Error> {
+    ) -> Result<super::chunk_planner::Released, super::chunk_planner::Error> {
         self.chunk_planner.mark_failed(runner_id)
     }
 
@@ -383,9 +389,40 @@ impl RunnerManager {
     }
 
     /// Gets the available ranges
+    #[cfg(test)]
     #[inline]
     pub fn get_available_ranges(&self) -> Vec<Range<u64>> {
         self.chunk_planner.get_available_ranges()
+    }
+
+    /// Gets the available ranges a runner may claim at `now`
+    #[inline]
+    pub fn get_eligible_ranges(&self, now: Instant) -> Vec<Range<u64>> {
+        self.chunk_planner.get_eligible_ranges(now)
+    }
+
+    /// Back an available range off, see [`ChunkPlanner::cool_down`]
+    #[inline]
+    pub fn cool_down(&mut self, range: Range<u64>, attempts: u32, not_before: Instant) {
+        self.chunk_planner.cool_down(range, attempts, not_before);
+    }
+
+    /// Until when a backoff still holds `range` back at `now`
+    #[inline]
+    pub fn cooling_until(&self, range: &Range<u64>, now: Instant) -> Option<Instant> {
+        self.chunk_planner.cooling_until(range, now)
+    }
+
+    /// The earliest backoff that ends after `now`
+    #[inline]
+    pub fn next_cooldown_end(&self, now: Instant) -> Option<Instant> {
+        self.chunk_planner.next_cooldown_end(now)
+    }
+
+    /// The backoffs of available ranges, in order
+    #[cfg(test)]
+    pub(super) fn cooldowns(&self) -> Vec<(Range<u64>, super::chunk_planner::Cooldown)> {
+        self.chunk_planner.cooldowns()
     }
 
     /// Gets the number of active runners
@@ -400,10 +437,10 @@ impl RunnerManager {
         self.chunk_planner.get_runner_state(runner_id)
     }
 
-    /// Finds a chunk that can be split
+    /// Finds a chunk that can be split at `now`
     #[inline]
-    pub fn find_chunk_to_split(&self, required_size: u64) -> Option<SplitCandidate> {
-        self.chunk_planner.find_chunk_to_split(required_size)
+    pub fn find_chunk_to_split(&self, required_size: u64, now: Instant) -> Option<SplitCandidate> {
+        self.chunk_planner.find_chunk_to_split(required_size, now)
     }
 
     /// Gets incomplete states
@@ -494,7 +531,7 @@ impl RunnerManager {
             self.mark_finished(runner_id)?;
             None
         } else {
-            Some(self.mark_failed(runner_id)?)
+            Some(self.mark_failed(runner_id)?.range)
         };
 
         self.release_runner(runner_id);

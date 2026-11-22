@@ -172,11 +172,14 @@ impl RunnerManager {
             StoppedReason::Failed(kind) => kind,
         };
         error!("runner {runner_id} failed: {kind:?}");
-        let unfinished_range = self
+        let released = self
             .chunk_planner
             .mark_failed(runner_id)
             .expect("chunk planner should not fail");
-        trace!("runner {runner_id} failed, released range: {unfinished_range:?}");
+        trace!(
+            "runner {runner_id} failed, released range: {:?}",
+            released.range
+        );
         if kind.is_cancelled() {
             return RunnerTick::downloading();
         }
@@ -190,13 +193,16 @@ impl RunnerManager {
             runner_id,
             retryable: is_attempt_retryable(&kind),
             error: kind,
+            range: released.range,
+            attempts: released.attempts,
         })
     }
 
     /// Handle a runner that stopped before it connected; its range is
     /// released and it never counts as finished.
     fn handle_connect_failed(&mut self, runner_id: RunnerId, error: TaskError) -> RunnerTick {
-        self.chunk_planner
+        let released = self
+            .chunk_planner
             .mark_failed(runner_id)
             .expect("chunk planner should not fail");
         if error.is_cancelled() {
@@ -215,6 +221,8 @@ impl RunnerManager {
             runner_id,
             error,
             retryable,
+            range: released.range,
+            attempts: released.attempts,
         })
     }
 
@@ -236,7 +244,7 @@ impl RunnerManager {
         warn!("runner {runner_id} lifecycle stream closed unexpectedly");
         let connecting = self.is_connecting(runner_id);
         self.meters.remove(&runner_id);
-        let unfinished_range = self
+        let released = self
             .chunk_planner
             .mark_failed(runner_id)
             .expect("chunk planner should not fail");
@@ -248,7 +256,10 @@ impl RunnerManager {
                 .record_stream_closed(RunnerFailureKind::Retryable);
         }
         self.release_runner(runner_id);
-        trace!("runner {runner_id} lost, released range: {unfinished_range:?}");
+        trace!(
+            "runner {runner_id} lost, released range: {:?}",
+            released.range
+        );
         if self.chunk_planner.is_complete() {
             return RunnerTick::finished();
         }
@@ -256,6 +267,8 @@ impl RunnerManager {
             runner_id,
             error: TaskError::ChannelClosed,
             retryable: true,
+            range: released.range,
+            attempts: released.attempts,
         })
     }
 

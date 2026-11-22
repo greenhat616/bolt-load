@@ -28,9 +28,11 @@ impl DownloadLoop {
             .map(LoopEvent::Runner)
     }
 
-    pub(super) fn on_runner(&mut self, tick: RunnerTick) -> Result<ControlFlow<()>> {
+    /// Handle a runner event at `now`; a failure the task survives backs
+    /// its range off.
+    pub(super) fn on_runner(&mut self, tick: RunnerTick, now: Instant) -> Result<ControlFlow<()>> {
         if let Some(chunk) = tick.downloaded {
-            self.accept_chunk(chunk)?;
+            self.accept_chunk(chunk, now)?;
         }
         if let Some(failure) = tick.failure {
             if let Some(e) = range_unsupported(&failure.error) {
@@ -42,6 +44,7 @@ impl DownloadLoop {
             {
                 return Err(DownloadError::transfer(e));
             }
+            self.back_off(&failure, now);
         }
         Ok(if tick.state == TaskState::Finished {
             ControlFlow::Break(())
@@ -51,13 +54,13 @@ impl DownloadLoop {
     }
 
     /// Write a chunk the planner accepted; a non-empty one is progress.
-    fn accept_chunk(&mut self, chunk: DownloadedChunk) -> Result<()> {
+    fn accept_chunk(&mut self, chunk: DownloadedChunk, now: Instant) -> Result<()> {
         let progressed = !chunk.range.is_empty();
         self.writer
             .write_range(chunk.range, chunk.bytes)
             .map_err(writer_full)?;
         if progressed {
-            self.policy.on_progress(Instant::now());
+            self.policy.on_progress(now);
         }
         Ok(())
     }

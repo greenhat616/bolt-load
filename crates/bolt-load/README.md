@@ -110,6 +110,15 @@ reassigned to new runners via the `DynamicStrategy`. A split first
 reserves a slot for the new runner, so it never exceeds
 `max_connections`; without a free slot the ranges stay as they are.
 
+A failed range is retried after a backoff: 0.5 s after its first
+failure, doubling up to 30 s, with jitter. A 429 or 503 holds back every
+new connection of the task, splits included, for its `Retry-After` when
+that is longer, at most 120 s. The end of a backoff wakes the engine,
+which then creates runners as the concurrency control would: only into
+free slots, and after a 429 or 503 only once the concurrency has been
+lowered. A range it cannot retry then waits for the next strategy
+evaluation.
+
 ## Feature Flags
 
 | Feature | Default | Description |
