@@ -10,9 +10,9 @@ use bolt_load_core::adapter::{
     UnretryableError, error::unretryable::IoSnafu as UnretryableIoSnafu,
 };
 use bolt_load_http::{
-    RangeHeaders, classify_status,
+    RangeHeaders, Validator, classify_status,
     header::{ContentDisposition, parse_retry_after},
-    limit_range_body, validate_range_response,
+    if_range_validator, is_strong_etag, limit_range_body, validate_range_response,
 };
 use bolt_load_utils::reader::CrossRuntimeStream;
 use futures::Stream;
@@ -31,7 +31,7 @@ type CallFn = Box<dyn Fn(Request) -> Result<ureq2::Response, ureq2::Error> + Sen
 pub struct UreqAdapter {
     agent: Agent,
     target: (String, url::Url),
-    head_response: Arc<async_lock::Mutex<Option<ureq2::Response>>>,
+    probed: Arc<async_lock::Mutex<Option<Arc<Probed>>>>,
     before_request: Option<BeforeRequestFn>,
     call: Arc<Option<CallFn>>,
 }
@@ -47,7 +47,7 @@ impl IntoUreqAdapter for ureq2::Agent {
         UreqAdapter {
             agent: self,
             target: (method, target.1),
-            head_response: Arc::new(async_lock::Mutex::new(None)),
+            probed: Arc::new(async_lock::Mutex::new(None)),
             before_request: None,
             call: Arc::new(None),
         }
@@ -89,11 +89,63 @@ fn combined(response: &ureq2::Response, name: &http::HeaderName) -> Option<Strin
     (!values.is_empty()).then(|| values.join(", "))
 }
 
-/// Check that a range response carries `requested`, and return its range.
+/// The value of a field that occurs once, such as `ETag`: `None` when it is
+/// missing or repeated.
+fn single<'a>(response: &'a ureq2::Response, name: &http::HeaderName) -> Option<&'a str> {
+    match response.all(name.as_str())[..] {
+        [value] => Some(value),
+        _ => None,
+    }
+}
+
+/// `meta` with the validators of `response`, a response to a GET: its
+/// strong `ETag` and its `Last-Modified`; and the validator for
+/// `If-Range`. A repeated field counts as missing.
+fn with_validators(
+    meta: BoltLoadAdapterMeta,
+    response: &ureq2::Response,
+) -> (BoltLoadAdapterMeta, Option<Validator>) {
+    let etag = single(response, &http::header::ETAG);
+    let last_modified = single(response, &http::header::LAST_MODIFIED);
+    let date = single(response, &http::header::DATE);
+    let validator = if_range_validator(etag, last_modified, date);
+    let meta = meta
+        .with_etag(
+            etag.filter(|etag| is_strong_etag(etag))
+                .map(|etag| etag.trim().to_owned()),
+        )
+        .with_last_modified(last_modified.map(|value| value.trim().to_owned()));
+    (meta, validator)
+}
+
+/// What the adapter learned about the resource, from a HEAD and an
+/// unconditional `bytes=0-0` GET.
+///
+/// The validators come from the GET, if it succeeded, as the range
+/// requests that are checked against them: some servers send other
+/// validators with a HEAD. The total comes from the `Content-Range` of the
+/// GET's 206, when it proves its offsets; otherwise from the HEAD's
+/// `Content-Length`. The HEAD also gives the filename and the coding.
+///
+/// It is probed once, for the adapter's life. When the GET fails or is
+/// rejected, there is no validator, so range requests carry no `If-Range`
+/// and a changed resource goes unnoticed.
+struct Probed {
+    meta: BoltLoadAdapterMeta,
+    /// What every range request sends in `If-Range`.
+    if_range: Option<Validator>,
+    /// The HEAD says `Accept-Ranges: bytes`, or the GET was a 206 that
+    /// proves its offsets.
+    is_range_stream_available: bool,
+}
+
+/// Check that a range response carries `requested`, and return its range;
+/// `if_range` is what the request sent in `If-Range`.
 fn check_range(
     response: &ureq2::Response,
     requested: Range<u64>,
     expected_total: Option<u64>,
+    if_range: Option<&Validator>,
 ) -> Result<ContentRange, AdapterError> {
     let content_range = combined(response, &http::header::CONTENT_RANGE);
     let content_type = combined(response, &http::header::CONTENT_TYPE);
@@ -102,7 +154,10 @@ fn check_range(
         .with_content_range(content_range.as_deref())
         .with_content_type(content_type.as_deref())
         .with_content_encoding(content_encoding.as_deref())
-        .with_retry_after(retry_after(response));
+        .with_retry_after(retry_after(response))
+        .with_if_range(if_range)
+        .with_etag(single(response, &http::header::ETAG))
+        .with_last_modified(single(response, &http::header::LAST_MODIFIED));
     validate_range_response(response.status(), &headers, requested, expected_total)
 }
 
@@ -158,17 +213,89 @@ impl UreqAdapter {
         }
     }
 
-    /// Run `f` on the HEAD response, sent once and shared by the meta, the
-    /// range check and range detection.
-    async fn with_head<T>(&self, f: impl FnOnce(&ureq2::Response) -> T) -> Result<T, AdapterError> {
-        let mut head = self.head_response.lock().await;
-        let response = match head.take() {
-            Some(response) => response,
-            None => self.perform_head().await?,
+    /// What was probed, probed once and shared by the meta, range
+    /// detection and range requests.
+    async fn probed(&self) -> Result<Arc<Probed>, AdapterError> {
+        let mut probed = self.probed.lock().await;
+        if let Some(probed) = probed.as_ref() {
+            return Ok(probed.clone());
+        }
+        let fresh = Arc::new(self.probe().await?);
+        *probed = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    /// Send the HEAD, which must succeed, and the `bytes=0-0` GET, which
+    /// may fail: then the adapter has no validator (see [`Probed`]).
+    async fn probe(&self) -> Result<Probed, AdapterError> {
+        let head = self.perform_head().await?;
+        let request = self.apply_before_request(
+            self.agent
+                .request_url(&self.target.0, &self.target.1)
+                .set(http::header::RANGE.as_str(), "bytes=0-0")
+                .set(http::header::ACCEPT_ENCODING.as_str(), "identity"),
+        );
+        let call = self.call.clone();
+        let get = unblock(move || Self::apply_call(call, request))
+            .await
+            .ok()
+            .filter(|get| (200..300).contains(&get.status()));
+        // Only a 206 that proves its offsets shows range support.
+        let probed = get
+            .as_ref()
+            .and_then(|get| check_range(get, 0..1, None, None).ok());
+        let accepts_ranges = head
+            .header(http::header::ACCEPT_RANGES.as_str())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("bytes"));
+        let size = probed
+            .and_then(|range| range.complete)
+            .unwrap_or_else(|| self.get_content_size(&head));
+        let meta = BoltLoadAdapterMeta::new(size)
+            .with_filename(self.suggest_filename(&head))
+            .with_content_encoding(combined(&head, &http::header::CONTENT_ENCODING));
+        let (meta, if_range) = match &get {
+            Some(get) => with_validators(meta, get),
+            None => (meta, None),
         };
-        let result = f(&response);
-        *head = Some(response);
-        Ok(result)
+        Ok(Probed {
+            meta,
+            if_range,
+            // A weak signal: every range response is still checked.
+            is_range_stream_available: accepts_ranges || probed.is_some(),
+        })
+    }
+
+    /// Request `start..end`, sending `if_range` in `If-Range`, and check the
+    /// response against it and against `expected_total`.
+    async fn request_range(
+        &self,
+        start: u64,
+        end: u64,
+        expected_total: Option<u64>,
+        if_range: Option<&Validator>,
+    ) -> Result<AnyBytesStream, AdapterError> {
+        let mut request = self
+            .agent
+            .request_url(&self.target.0, &self.target.1)
+            .set(
+                http::header::RANGE.as_str(),
+                &format!("bytes={}-{}", start, end - 1),
+            )
+            .set(http::header::ACCEPT_ENCODING.as_str(), "identity");
+        if let Some(validator) = if_range {
+            request = request.set(http::header::IF_RANGE.as_str(), validator.as_str());
+        }
+        let request = self.apply_before_request(request);
+        let call = self.call.clone();
+        let res =
+            unblock(move || any_status(Self::apply_call(call, request)).map_err(UreqError::from))
+                .await
+                .map_err(AdapterError::from)?;
+        let got = check_range(&res, start..end, expected_total, if_range)?;
+        let reader = res.into_reader();
+        let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
+        let ureq_stream = UreqStream(Box::pin(stream));
+        Ok(limit_range_body(Box::pin(ureq_stream), got))
     }
 
     async fn perform_head(&self) -> Result<ureq2::Response, AdapterError> {
@@ -237,12 +364,7 @@ impl Stream for UreqStream {
 
 impl BoltLoadAdapter for UreqAdapter {
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
-        self.with_head(|response| {
-            BoltLoadAdapterMeta::new(self.get_content_size(response))
-                .with_filename(self.suggest_filename(response))
-                .with_content_encoding(combined(response, &http::header::CONTENT_ENCODING))
-        })
-        .await
+        Ok(self.probed().await?.meta.clone())
     }
 
     async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
@@ -265,61 +387,23 @@ impl BoltLoadAdapter for UreqAdapter {
             .with_content_type(content_type))
     }
 
+    /// A range, made conditional on the validator probed with the
+    /// metadata, and checked against it and the size, once probed.
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
-        let request = self.apply_before_request(
-            self.agent
-                .request_url(&self.target.0, &self.target.1)
-                .set(
-                    http::header::RANGE.as_str(),
-                    &format!("bytes={}-{}", start, end - 1),
-                )
-                .set(http::header::ACCEPT_ENCODING.as_str(), "identity"),
-        );
-        let call = self.call.clone();
-        let res =
-            unblock(move || any_status(Self::apply_call(call, request)).map_err(UreqError::from))
-                .await
-                .map_err(AdapterError::from)?;
-        let expected_total = self
-            .head_response
-            .lock()
-            .await
+        let probed = self.probed.lock().await.clone();
+        let expected_total = probed
             .as_ref()
-            .map(|head| self.get_content_size(head))
+            .map(|probed| probed.meta.content_size)
             .filter(|&size| size > 0);
-        let got = check_range(&res, start..end, expected_total)?;
-        let reader = res.into_reader();
-        let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
-        let ureq_stream = UreqStream(Box::pin(stream));
-        Ok(limit_range_body(Box::pin(ureq_stream), got))
+        let if_range = probed.as_ref().and_then(|probed| probed.if_range.as_ref());
+        self.request_range(start, end, expected_total, if_range)
+            .await
     }
 
     async fn is_range_stream_available(&self) -> bool {
-        // A weak signal: every range response is still checked.
-        let accepts_ranges = self
-            .with_head(|response| {
-                response
-                    .header(http::header::ACCEPT_RANGES.as_str())
-                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("bytes"))
-            })
-            .await;
-        let Ok(mut is_range_supported) = accepts_ranges else {
-            return false;
-        };
-        // Otherwise only a 206 that proves its offsets shows range support.
-        if !is_range_supported {
-            let request = self.apply_before_request(
-                self.agent
-                    .request_url(&self.target.0, &self.target.1)
-                    .set(http::header::RANGE.as_str(), "bytes=0-0")
-                    .set(http::header::ACCEPT_ENCODING.as_str(), "identity"),
-            );
-            let call = self.call.clone();
-            is_range_supported = unblock(move || Self::apply_call(call, request))
-                .await
-                .is_ok_and(|res| check_range(&res, 0..1, None).is_ok());
-        }
-        is_range_supported
+        self.probed()
+            .await
+            .is_ok_and(|probed| probed.is_range_stream_available)
     }
 }
 
@@ -362,6 +446,63 @@ mod test {
     use url::Url;
 
     use super::*;
+
+    /// The metadata of a response with `headers`.
+    fn validators_of(headers: &[(&str, &str)]) -> (BoltLoadAdapterMeta, Option<Validator>) {
+        let mut response = String::from("HTTP/1.1 200 OK\r\n");
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        with_validators(BoltLoadAdapterMeta::new(1), &response.parse().unwrap())
+    }
+
+    const OLD: &str = "Sun, 08 Nov 2026 12:00:09 GMT";
+    const DATE: &str = "Sun, 08 Nov 2026 12:00:10 GMT";
+
+    /// The validators of a response, `None` for a field that is missing or
+    /// repeated: a `Last-Modified` without `Date`, or with a repeated one,
+    /// is no validator.
+    #[test]
+    fn validators_come_from_single_fields() {
+        let date = |value: &str| Some(Validator::LastModified(value.into()));
+        let (meta, validator) = validators_of(&[("last-modified", OLD)]);
+        assert_eq!(meta.last_modified.as_deref(), Some(OLD));
+        assert_eq!(validator, None);
+        assert_eq!(
+            validators_of(&[("last-modified", OLD), ("date", DATE)]).1,
+            date(OLD)
+        );
+        assert_eq!(
+            validators_of(&[("last-modified", OLD), ("date", DATE), ("date", DATE)]).1,
+            None
+        );
+        let (meta, validator) = validators_of(&[
+            ("last-modified", OLD),
+            ("last-modified", OLD),
+            ("date", DATE),
+        ]);
+        assert_eq!((meta.last_modified, validator), (None, None));
+        let (meta, validator) = validators_of(&[
+            ("etag", "\"a\""),
+            ("etag", "\"a\""),
+            ("last-modified", OLD),
+            ("date", DATE),
+        ]);
+        assert_eq!((meta.etag, validator), (None, date(OLD)));
+        let (meta, validator) = validators_of(&[
+            ("etag", "\"a\", \"b\""),
+            ("last-modified", OLD),
+            ("date", DATE),
+        ]);
+        assert_eq!((meta.etag, validator), (None, date(OLD)));
+        let (meta, validator) =
+            validators_of(&[("etag", "W/\"a\""), ("last-modified", OLD), ("date", DATE)]);
+        assert_eq!((meta.etag, validator), (None, None));
+        let (meta, validator) = validators_of(&[("etag", "\"a\""), ("last-modified", OLD)]);
+        assert_eq!(meta.etag.as_deref(), Some("\"a\""));
+        assert_eq!(validator, Some(Validator::StrongEtag("\"a\"".into())));
+    }
 
     #[tokio::test]
     async fn test_get_content_size() {

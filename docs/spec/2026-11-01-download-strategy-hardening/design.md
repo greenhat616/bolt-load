@@ -110,6 +110,9 @@
 | D9 | 解码 crate 的后端 | `compression-codecs`，只在 crate 内部使用；gzip、deflate 默认开启，br、zstd 放在 feature 后面（§4.4） | 已确认（2026-11-03） |
 | D10 | 在哪一层解码 | `full_stream` 把 `Content-Encoding` 和 `Content-Type` 交给引擎，由引擎决定是否解码；adapter 自己不解码（§4.4） | 已确认（2026-11-03） |
 | D11 | HTTP 校验与解析放在哪 | 新 crate `bolt-load-http`，依赖 core：搬入 core 里只有 adapter 调用的函数，以及 utils 的 `http` 模块；新增 `ContentCoding`。core 只留 trait、meta、错误类型和 `ContentRange`（§4.5） | 已确认（2026-11-03） |
+| D12 | 下载途中资源变了（`ResourceChanged`） | **已修订（2026-11-09，维护者）：引擎只检测，以 `DownloadError::ResourceChanged` 失败（临时文件照常删掉，不回退）；从头重来移到引擎之上（客户端或 job 层），见 #195。** 原决定：任务内从头重来一次，和 §4.3 的回退一样：丢掉已写的数据、截断、刷新 adapter、重新探测，用新的 meta 再下一次；同一个任务里再变一次，就以 `DownloadError::ResourceChanged` 失败。T20 的“文件被替换 → 从头下载、hash 与新文件一致”在 C19 里以“下载途中被替换”端到端验证，“续传之前被替换”留给 C20（§11.2） | 已修订（2026-11-09，维护者），见 #195 |
+| D13 | adapter 的缓存怎么刷新 | **已修订（2026-11-09，维护者）：C19 不加 `refresh`；重来要的新 meta 怎么取，和重来一起在 #195 里定。** 原决定：`BoltLoadAdapter` 新增 `fn refresh(&self) {}`，默认什么也不做；reqwest 和 ureq2 覆盖它，丢掉缓存的探测结果。引擎在 D12 的从头重来之前调用，C20 在续传之前调用（§11.2） | 已修订（2026-11-09，维护者），见 #195 |
+| D14 | 验证器绑在哪 | **已移到 #195（2026-11-09，lead 按维护者对 D12、D13 的修订一并移走）：C19 不加 `range_stream_if`；没有 `refresh`，adapter 缓存的验证器不会变，共享 adapter 的任务看到的是同一个。** 原决定：绑在每个任务上，随每个请求传：`BoltLoadAdapter` 新增可选的 `range_stream_if(start, end, expected)`，默认调用 `range_stream`，所以自定义 adapter 照常工作，只是看不出资源变了。引擎从自己的 meta 取验证器和总长，传给每个 range 请求；reqwest 和 ureq2 实现它，`If-Range` 和响应检查都用传进来的验证器，不用 adapter 的缓存。`refresh()` 只影响调用者下一次 `retrieve_meta`，从不改变别的任务的 range（§14.23） | 已移到 #195（2026-11-09，维护者） |
 | D20 | 带着数据断开的流是否还降并发 | 不降：只有 `Started` 之前失败的尝试和 429/503 是证据（§8.3） | 已确认（2026-11-13） |
 | D21 | 连续拒绝之后降到多少 | 降到已连接的 runner 数（§8.3） | 已确认（2026-11-13） |
 | D22 | 服务器明确限连（429/503）之后是否继续试探 | 继续，按退避拉开间隔（§8.3） | 已确认（2026-11-13） |
@@ -1063,11 +1066,12 @@ IDM 的按站点上限是每个下载各算各的，bolt-load 有意做成跨任
 
 ### 11.2 资源身份
 
-- `BoltLoadAdapterMeta` 增加 `etag: Option<String>`（只保存强 ETag）和 `last_modified: Option<String>`。
-- adapter 的 context 缓存要能在多次尝试之间刷新。现在的 `OnceCell` 只初始化一次。
-- 续传请求带上 `If-Range`：有强 ETag 就用 ETag，否则用 Last-Modified。
-  - 返回 `206`：继续下载。
-  - 返回 `200`：说明资源已经变了，返回 `ResourceChanged`，丢弃已写区间，从头下载。这种情况**不**走 §4.3 的单连接回退。
+- `BoltLoadAdapterMeta` 增加 `etag: Option<String>`（只保存强 ETag）和 `last_modified: Option<String>`，都取自 GET（探测的 `bytes=0-0`），不取自 HEAD。
+- 每个 range 请求都带上 `If-Range`（不只续传）：有强 ETag 就用 ETag；没有 ETag 时，用至少早于 `Date` 1 s 的 Last-Modified；只有弱 ETag 时什么都不发。
+  - 返回 `206`：继续下载；`206` 带的验证器和发出去的冲突时，返回 `ResourceChanged`。
+  - 返回 `200`：验证器和发出去的相同，是忽略 Range（§4.3 的回退）；不同或没有，说明资源已经变了，返回 `ResourceChanged`。这种情况**不**走 §4.3 的单连接回退。
+- 维护者的决定（2026-11-09，§3 的 D12、D13、D14 已修订）：引擎只检测，任务丢掉已写的数据（删掉临时文件），以 `DownloadError::ResourceChanged` 失败。从头重来、刷新 adapter 缓存、共享 adapter 时每个任务的验证器，都移到引擎之上，见 #195。实现见 §14.23。
+- C20 续传之前也要比对验证器，要和 #195 一起设计（新的 meta、同一套验证器规则）。
 
 ### 11.3 状态文件
 
@@ -2355,13 +2359,13 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 对冲（§9.6）：败方的帧，包括晚到的，在 `on_data_frame` 里就丢掉了，到不了 planner 和 writer，不会有完成；两方只按 planner 接收的区间写同一个 chunk，没有字节写两次。`hedge.rs` 测试的 `Harness::written` 现在每次都核对 planner 的 `written` 和 writer 实际写过的区间一致。
   - 重启、停止：区间从 `downloaded.end` 退回；之前的字节要么写完了，要么还在路上，它们的完成在区间退回之后照样记进集合；重试从 `downloaded.end` 开始，不重叠。
   - 合并、领取冷却中的区间：集合和 chunk 怎么排没关系。
-  - 回退到单连接、从头再来：`downloaded` 从不在一个 `ChunkPlanner` 里清零或丢掉；唯一丢掉它的是回退，这时整个并发那一次（`DownloadLoop`、它的 `ChunkPlanner` 和 `written`）随之丢掉，单连接从自己的计数从零开始报。没有别的“从头再来”的路径（`ResourceChanged` 是 C19 的事）。所以重置是结构上的：没有一行重置代码，也就没有可以漏掉的一行。`test_a_fallback_starts_with_nothing_written`（`status_contract.rs`）：range 先正常下 3 MiB（越过 adapter 1 s 的突发），然后报 `RangeIgnored`；并发那一次报过已写入的区间，回退之后单连接的每个状态都是 `[0..downloaded]`，而且 `downloaded` 从零单调增长，最后是 `[0..SIZE]`。
+  - 回退到单连接、从头再来：`downloaded` 从不在一个 `ChunkPlanner` 里清零或丢掉；唯一丢掉它的是回退，这时整个并发那一次（`DownloadLoop`、它的 `ChunkPlanner` 和 `written`）随之丢掉，单连接从自己的计数从零开始报。没有别的“从头再来”的路径（资源变了之后从头重来见 #195；C19 只让任务以 `ResourceChanged` 失败）。所以重置是结构上的：没有一行重置代码，也就没有可以漏掉的一行。`test_a_fallback_starts_with_nothing_written`（`status_contract.rs`）：range 先正常下 3 MiB（越过 adapter 1 s 的突发），然后报 `RangeIgnored`；并发那一次报过已写入的区间，回退之后单连接的每个状态都是 `[0..downloaded]`，而且 `downloaded` 从零单调增长，最后是 `[0..SIZE]`。
 - **`downloaded_chunks` 保证什么、不保证什么。** 它是 teardown 之前 writer 确认写入成功的区间，偏保守：
   - 一个失败的写可能已经把一部分字节写进了文件（`pool_writer.rs` 的 `test_write_all_at_fails_when_nothing_is_written`：1 个字节落盘之后才报 `WriteZero`），这部分不报；
   - 不保证持久：没有 `fsync`（那是 C20 的 `durable`）；
   - 不保证文件还在：失败或取消的任务会删掉临时文件。
 - **迁移。** 原来并发任务的 `downloaded_chunks` 是已接收的区间。要已接收的字节总数，用 `Progress.downloaded`；`downloaded_chunks` 当作“确认写入成功的区间”来读。`Progress` 的文档里写了同样的说明。
-- **不在 C18。** §11.1 的第三个位点 `durable`（`fsync` 之后才推进）和状态文件一起在 C20 做。C18 的回退没有重置代码（见上），真正的“重置之后不留旧区间”的测试，跟着 C20 的状态文件一起写：那时重置是实际的代码（丢弃或重写状态文件）。
+- **不在 C18。** §11.1 的第三个位点 `durable`（`fsync` 之后才推进）和状态文件一起在 C20 做。C18 的回退没有重置代码（见上），真正的“重置之后不留旧区间”的测试，跟着 C20 的状态文件一起写：那时重置是实际的代码（丢弃或重写状态文件）。C19 原来要在任务内从头重来时写这个测试；重来移到引擎之上以后（§14.23），这个测试也跟着移到 #195。
 - **测试。**
   - `chunk_planner.rs`：`test_written_ranges_merge_in_any_order`（乱序、重复、空区间的合并）；`test_written_lags_downloaded`（写完之前 `written` 落后于 `downloaded`；后完成的写先记；切分、失败、退避之后再完成的写照样记，`downloaded` 不变）。
   - `completion.rs`：`a_failed_write_keeps_its_range_and_io_error` 加上“失败的写不记、它前后的写都记”（`[0..4, 8..12]`）；`successful_writes_count_their_bytes` 核对交出的区间；`a_closed_writer_queue_is_a_broken_pipe` 核对什么也没交出。
@@ -2400,3 +2404,84 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 再查一遍同类的问题，又找到一处：新开的对冲也是一个新连接，原来的“拥塞期间不开新连接”只查新的主人，不查新的对冲。现在 `check()` 也查：上一步没有的对冲，上一步不能处于拥塞中。另外 `Progress` 也可以挑被打败的一方，核对它晚到的帧被丢掉（原来生成器覆盖不到）。其它按主人记的状态没有问题：槽位的计数已经把未分胜负的对冲和正在停止的 runner 算进去了；`Finish` 只挑主人，没分胜负的一方不可能下完。
   - 变异检查：接管当新连接查（原来的预言），让 `a_hedge_that_wins_keeps_the_counters_of_its_chunk` 失败；按原来的方式找留下的一方，让 `each_pair_keeps_its_own_first_failure` 失败；产品接受被打败一方晚到的帧，让 `a_hedge_that_wins_keeps_the_counters_of_its_chunk` 和已有的 `the_hedge_never_moves_the_no_progress_deadline` 失败；产品在拥塞期间也对冲，让已有的 `no_hedge_without_a_free_connection_or_with_a_range_left` 失败（随机序列很少走到，新加的预言检查在 4096 个用例里没有碰上）。
   - 4096 个用例再跑一次：没有失败，5.7 s。计数：3700 次失败里，对冲一方 1 次，一对的原始一方 1 次，一对的最后一方 1 次，被打败的一方 0 次；接管 1 次；对冲连上、对冲交帧、被打败一方的晚帧都是 0 次。
+
+### 14.23 验证器与 `If-Range`（PR-9b，C19）
+
+- **范围。** C19 只做检测：带上 `If-Range`，认出资源变了，任务失败。从头重来移到引擎之上，见 #195。
+- **决定。**
+  - 维护者（2026-11-09，§3 的 D12、D13 已修订，D14 移到 #195）：
+    - 引擎只检测，以 `DownloadError::ResourceChanged` 失败；
+    - 不在任务内从头重来，不加 `BoltLoadAdapter::refresh`，也不加按请求传验证器的 `range_stream_if`；
+    - 原因写在 #195：共享 adapter 的缓存、重来时的取消、重来的策略。
+  - lead（实现时、codex 第一轮之后）：
+    - 一个带 `If-Range` 的请求收到 `200`：比较 `200` 自己的验证器和发出去的那个，相同是 `RangeIgnored`（服务器忽略 Range，照旧回退），不同或没有是 `ResourceChanged`。不带 `If-Range` 的 `200` 仍是 `RangeIgnored`。
+    - 一个带 `If-Range` 的请求收到 `206`，而 `206` 带的验证器和发出去的冲突（ETag 强比较不相等，或者发的是日期、`Last-Modified` 解析后不相等），是 `ResourceChanged`；`206` 没带验证器，照常接受。
+    - 只用强 ETag；有合法的弱 ETag 时什么都不发，不退到日期（RFC 9110 §13.1.5：只有没有实体标签时才能用日期）。`Last-Modified` 离 `Date` 不到 1 s、晚于 `Date`，或者响应没有 `Date`，不能用于 `If-Range`（§8.8.2.2）。验证器按服务器发来的原样保存、原样发回。
+    - ETag 按 §8.8.3 的完整文法检查；`ETag`、`Last-Modified`（还有判断要用的 `Date`）重复出现时当作没有。
+    - 验证器只取自 GET：ureq2 也发一个无条件的 `bytes=0-0` GET，即使 HEAD 说支持 Range；reqwest 探测失败、回到 HEAD 时，用探测响应（2xx 时）的验证器，不用 HEAD 的。
+    - `ResourceChanged` 从不走回退；teardown 照常删掉临时文件。
+    - 提交是 `feat(core)!`：新的错误变体是加的，但行为变了：range 请求带 `If-Range`，资源变了任务失败，不再回退。
+    - `ReplacedAfterShortRange` 不带验证器，继续测回退；带验证器的场景用新的 fault。
+- **做法。**
+  - core：`BoltLoadAdapterMeta` 增加 `etag`、`last_modified` 和 `with_etag`、`with_last_modified`。`with_etag` 丢掉弱 ETag，所以弱 ETag 时 `meta.etag` 是 `None`；`last_modified` 照样保存，即使它不能用于 `If-Range`（C20 比对状态文件时还用得上）。`UnretryableError::ResourceChanged` 是新变体（枚举本来就是 `#[non_exhaustive]`）。trait 不变。
+  - `bolt-load-http` 的 `validator` 模块：
+    - `Validator`（`StrongEtag`、`LastModified`，不是 `non_exhaustive`：`If-Range` 只有这两种）。
+    - `is_strong_etag`、`strong_etag`：按 §8.8.3 的文法（`opaque-tag` 里没有转义，逗号和反斜杠是字面字符，引号结束标签，所以 `"a", "b"` 不是实体标签）。
+    - `if_range_validator(etag, last_modified, date) -> Option<Validator>`：强 ETag；有弱 ETag 时 `None`；否则至少早于 `Date` 1 s 的 `Last-Modified`。解析不了的值当作没有。
+    - `has_validator(sent, etag, last_modified)`：`200` 是否带着发出去的验证器（ETag 强比较，日期解析后比较，所以格式可以不同）。
+    - `conflicts_with(expected, etag, last_modified)`：`206` 的验证器是否冲突：同一种、存在、能解析、不相等。
+    - `RangeHeaders` 增加 `if_range: Option<&Validator>`（发出去的）、`etag`、`last_modified`（响应的；重复时传 `None`，合并成一个值也解析不了，结果一样）。`validate_range_response` 先查 `206` 的冲突（冲突时即使 `Content-Range` 不对也报 `ResourceChanged`），再按原来的规则检查，`200` 按上面的规则分类。
+  - reqwest：缓存不变（`OnceCell<Context>`），`Context` 多存一个 `if_range: Option<Validator>`。`range_stream` 用取到的 context：带上 `If-Range`，把发出去的值和响应的验证器交给 `check_range`。`ETag`、`Last-Modified`、`Date` 只取单个字段行，重复或不是 UTF-8 时当作没有。
+  - ureq2：缓存从 HEAD 响应改成 `Probed { meta, if_range, is_range_stream_available }`：HEAD（必须成功）加一个无条件的 `bytes=0-0` GET（可以失败），只探测一次。验证器来自 GET（2xx 时）；总长来自证明了偏移的 206 的 `Content-Range`，否则用 HEAD 的 `Content-Length`；文件名、编码来自 HEAD。能否用 Range：HEAD 有 `Accept-Ranges: bytes`，或者 GET 是证明了偏移的 206。`range_stream` 和 reqwest 一样。
+  - 引擎：`download_loop/runner.rs` 的 `mode_ending`：`ResourceChanged` 变成 `DownloadError::ResourceChanged`，和回退的错误一样结束并发模式（一方失败、对冲一方失败都算），但不走回退；任务照常 teardown（删掉临时文件）后失败。那里有 `TODO(#195)`。`drive.rs` 不变。
+- **共享 adapter。** 克隆的 builder 共享一个 adapter。没有 `refresh`，adapter 缓存的验证器取到之后就不变，所以共享它的任务发的是同一个验证器；资源变了，每个任务各自失败。一个新的任务用同一个 adapter 实例，拿到的还是旧版本的 meta 和验证器，会马上又失败：重来要换一个 adapter，或者等 #195 定下的办法。
+- **已知限制。**
+  - 单连接（包括回退）用 `full_stream`，没有 `If-Range`，看不出资源变了。
+  - 服务器不发验证器时，大小不变的替换看不出来；`206` 不带验证器时照常接受，只能靠服务器正确执行 `If-Range`。
+  - 检测要靠一次成功、带验证器的 `bytes=0-0` 探测。探测失败或被拒（reqwest 回到 HEAD 的路径也一样）时，adapter 缓存的 meta 没有验证器，之后它的 range 都不带 `If-Range`，在这个 adapter 的整个生命期里都看不出资源变了。测试：`a_rejected_probe_leaves_no_validator`、`a_rejected_probe_leaves_ranges_unconditional`。
+  - adapter 只探测一次。`ResourceChanged` 之后用同一个 adapter（或者克隆的 adapter、builder）再下，拿到的还是旧的验证器，马上又失败；要换一个新的 adapter。README 和 `docs/adapter.md` 这样写，`a_later_task_on_the_same_adapter_keeps_the_old_validator` 记下现在的行为，#195 要改它。
+  - 自定义 adapter 不发 `If-Range` 时，资源变了照旧不会被发现。
+  - ureq2 取 meta 时多发一个 GET。
+- **移到 #195。**
+  - 从头重来，以及它和回退怎么组合（C19 草拟的规则记在 #195）。
+  - T20 原来的验证“文件被替换 → 从头下载、hash 与新文件一致”；C19 改为验证任务以 `ResourceChanged` 失败、不留文件。
+  - C18 留下的“重置之后不留旧区间”的测试（§14.21）。
+  - 重来时的取消、共享 adapter 时每个任务的验证器（codex 第一轮的 Major 2、Major 4，Minor 6、Suggestion 9 也随之不再适用）。
+- **测试。**
+  - `bolt-load-http`：
+    - `validator.rs` 的五个单元测试：文法（合法的逗号、反斜杠、obs-text；非法的列表、内部引号、空白）；选哪个验证器（含弱 ETag 不退到日期、合并的值）；相等、恰好 1 s、晚于 `Date`、没有 `Date`、三种日期格式；`has_validator`；`conflicts_with`。
+    - `range.rs` 的 `a_200_with_another_validator_is_a_changed_resource` 和 `a_206_with_a_conflicting_validator_is_a_changed_resource`（冲突的 ETag、冲突的日期、没有验证器分开测）。
+  - 两个 adapter 的单元测试 `validators_come_from_single_fields`（构造的响应）：没有 `Date`、重复的 `Date`、`Last-Modified`、`ETag`，一行里的列表，弱 ETag。
+  - 测试服务器（`bolt-load-tests`）：`RangeFault::VALIDATED` 有 18 个 fault。每个响应的 `Date`、`ETag`、`Last-Modified` 来自同一个快照，`Date` 固定为 `VALIDATED_DATE`（不用 HTTP 栈加的当前时间）；判 `If-Range` 时日期解析后比较。
+    - 原有：`ChangedMidDownload`、`ChangedThenIgnoresRange`、`IgnoreRangeWithValidators`、`WeakEtag`、`RecentLastModified`（改成 `Last-Modified` 等于 `Date`）。
+    - 新增：`LastModifiedOneSecondOld`、`FutureLastModified`、`ObsoleteDateFormats`（`Date` 用 asctime，`Last-Modified` 用 RFC 850，探测以外的 206 用 IMF-fixdate）、`ChangedIgnoringIfRange`、`ChangedByDateIgnoringIfRange`（忽略 `If-Range`，用新版本的 206 回答，大小不变）、`PartsWithoutValidators`、`HeadValidatorsDiffer`、`HeadValidatorsDifferThenChanged`、`IgnoreRangeWithHeadValidators`、`RepeatedEtag`、`ListEtag`、`RejectedProbe`（`bytes=0-0` 探测得到 403）、`HeadSizeDiffers`（HEAD 的 `Content-Length` 多 16 字节）。
+    - 单元测试 `validated_dates_in_every_format`。
+  - `bolt-load-adapter/tests/if_range.rs`，两个 adapter 都跑：
+    - 强 ETag 进 `If-Range`，变了之后是 `ResourceChanged`。
+    - 弱 ETag 什么都不发；`Last-Modified` 等于、晚于 `Date` 不发，恰好早 1 s 发，旧格式原样发回、和 IMF 格式的 206 不冲突；重复的、列表的 ETag 退到日期。
+    - 忽略 Range、验证器相同（HEAD 的验证器不同也一样）是 `RangeIgnored`；HEAD 和 GET 的验证器不同时发 GET 的。
+    - 冲突的 206（ETag、日期）是 `ResourceChanged`，没有验证器的 206 通过。
+    - 总长来自证明了偏移的 206，不用 HEAD 说的（`the_total_comes_from_the_validated_206`）。
+    - 探测被拒：没有验证器，range 不带 `If-Range`（`a_rejected_probe_leaves_no_validator`）。
+  - `bolt-load/tests/resource_changed.rs`，三种客户端都跑，每次都查临时文件已经删掉。`sent` 列出每个数据 range（探测以外）的 `If-Range`，没带的是 `None`，所以漏发也看得出来：
+    - 下载途中被替换（HEAD 的验证器不同也一样）：以 `ResourceChanged` 失败，不留文件，发过的 `If-Range` 只有 `"v1"`。
+    - 变了之后忽略 Range：同样失败，不回退。
+    - 忽略 `If-Range`、发新版本的 206（按 ETag、按日期）：同样失败，不拼两个版本；没有验证器的 206，一次下完。
+    - 忽略 Range、验证器相同（HEAD 的不同也一样）：照常回退，hash 一致。
+    - HEAD 和 GET 的验证器不同的稳定服务器：一次下完、只发 `"v1"`。
+    - 探测被拒：一次下完，每个 range 都不带 `If-Range`。
+    - 两个克隆的 builder 共享一个 adapter：只探测一次，两个任务都下完，每个 range 都带 `"v1"`。
+    - 同一个 adapter 上，变了之后再开一个任务：仍然带旧的 `"v1"`，马上以 `ResourceChanged` 失败，只探测一次（记下 #195 要改的行为）。
+  - `runner.rs` 的 `a_changed_resource_ends_the_mode_without_a_fallback`。
+- **变异检查**，全部被抓到：
+  - 弱 ETag 也发：`validator.rs` 的测试、两个 adapter 的 `validators_come_from_single_fields`、`a_weak_etag_sends_no_validator`；
+  - 弱 ETag 退到日期：`validator.rs` 的测试、两个 adapter 的 `validators_come_from_single_fields`；
+  - 验证器相同的 `200` 也当成变了：`range.rs` 的测试、`a_200_with_the_validator_sent_ignores_the_range`、`the_validator_of_a_get_is_sent_not_that_of_a_head`、`ignored_ranges_with_the_same_validator_fall_back`；
+  - 忽略 `206` 的冲突：两个 `a_206_with_a_conflicting_validator_is_a_changed_resource`；
+  - 没有验证器的 `206` 也当成冲突：`range.rs`、`validator.rs` 的测试、`parts_of_another_version_are_not_mixed_in`；
+  - 日期按字符串比较：`range.rs`、`validator.rs` 的测试、`a_last_modified_a_second_before_date_is_sent`；
+  - 文法接受任意内容：`validator.rs` 的测试、两个 adapter 的单元测试；
+  - reqwest 取重复字段的第一个：`validators_come_from_single_fields`；
+  - ureq2 用 HEAD 的验证器：`the_validator_of_a_get_is_sent_not_that_of_a_head`、`head_validators_that_differ_from_a_get_are_not_sent`、`a_resource_changed_mid_download_fails_the_task` 等六个；
+  - reqwest 回到 HEAD 时用 HEAD 的验证器：`a_200_with_the_validator_sent_ignores_the_range`、`ignored_ranges_with_the_same_validator_fall_back`；
+  - `ResourceChanged` 走回退：`a_changed_resource_ends_the_mode_without_a_fallback`、`a_resource_changed_mid_download_fails_the_task`、`a_changed_resource_that_ignores_ranges_does_not_fall_back`、`parts_of_another_version_are_not_mixed_in`。

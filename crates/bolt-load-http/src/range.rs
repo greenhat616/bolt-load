@@ -15,7 +15,7 @@ use std::{
 use bolt_load_core::adapter::{AdapterError, AnyBytesStream, ContentRange, UnretryableError};
 use futures::{Stream, StreamExt};
 
-use crate::{ContentCoding, classify_status};
+use crate::{ContentCoding, Validator, classify_status, conflicts_with, has_validator};
 
 /// The response headers [`validate_range_response`] reads.
 ///
@@ -23,6 +23,11 @@ use crate::{ContentCoding, classify_status};
 /// `", "` in order (RFC 9110 §5.3). A repeated `Content-Range` then fails to
 /// parse, and every `Content-Encoding` line is checked. Keep a value that is
 /// not valid UTF-8 (lossily), so it cannot pass as absent.
+///
+/// `ETag` and `Last-Modified` are the exception: pass `None` for one that
+/// is missing, repeated or not UTF-8, so the response has no such validator
+/// (a repeated one combined does not parse either, which comes to the
+/// same).
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct RangeHeaders<'a> {
@@ -31,6 +36,13 @@ pub struct RangeHeaders<'a> {
     pub content_encoding: Option<&'a str>,
     /// The parsed `Retry-After` delay, passed on to [`classify_status`].
     pub retry_after: Option<Duration>,
+    /// The validator the request sent in `If-Range`, if it sent one, see
+    /// [`if_range_validator`](crate::if_range_validator).
+    pub if_range: Option<&'a Validator>,
+    /// The response's `ETag`, unless it is repeated.
+    pub etag: Option<&'a str>,
+    /// The response's `Last-Modified`, unless it is repeated.
+    pub last_modified: Option<&'a str>,
 }
 
 impl<'a> RangeHeaders<'a> {
@@ -53,6 +65,21 @@ impl<'a> RangeHeaders<'a> {
         self.retry_after = value;
         self
     }
+
+    pub fn with_if_range(mut self, value: Option<&'a Validator>) -> Self {
+        self.if_range = value;
+        self
+    }
+
+    pub fn with_etag(mut self, value: Option<&'a str>) -> Self {
+        self.etag = value;
+        self
+    }
+
+    pub fn with_last_modified(mut self, value: Option<&'a str>) -> Self {
+        self.last_modified = value;
+        self
+    }
 }
 
 /// Check a response to a single-part range request for `requested`
@@ -65,12 +92,19 @@ impl<'a> RangeHeaders<'a> {
 ///
 /// | Response | Error |
 /// | --- | --- |
+/// | 206 to a request with `If-Range`, with a validator that conflicts with the one sent | [`UnretryableError::ResourceChanged`] |
 /// | 206 that would pass but is content-coded | [`UnretryableError::RangeContentCoded`] |
 /// | 206 that fails the checks otherwise | [`UnretryableError::RangeMismatch`] |
-/// | 200 | [`UnretryableError::RangeIgnored`] |
+/// | 200 to a request with `If-Range`, with another validator than it sent, or none | [`UnretryableError::ResourceChanged`] |
+/// | other 200 | [`UnretryableError::RangeIgnored`] |
 /// | 416 | [`UnretryableError::RangeNotSatisfiable`], with the total from `bytes */total` |
 /// | other 4xx, 5xx | [`classify_status`] |
 /// | anything else | [`UnretryableError::Status`] |
+///
+/// A 206 without a validator, or with one that does not parse, passes: a
+/// server need not repeat it. One of the other kind, such as an `ETag` when
+/// the request sent a date, is not compared. See
+/// [`conflicts_with`](crate::conflicts_with).
 ///
 /// Headers cannot show a body the HTTP client has already decoded: the
 /// client drops `Content-Encoding`. Wrap the body in [`limit_range_body`]
@@ -82,8 +116,24 @@ pub fn validate_range_response(
     expected_total: Option<u64>,
 ) -> Result<ContentRange, AdapterError> {
     match status {
+        // A server that ignored `If-Range`, or a cache, may send a part of
+        // another representation; its own validator shows it.
+        206 if headers
+            .if_range
+            .is_some_and(|sent| conflicts_with(sent, headers.etag, headers.last_modified)) =>
+        {
+            Err(UnretryableError::ResourceChanged.into())
+        }
         206 => check_partial(headers, requested, expected_total),
-        200 => Err(UnretryableError::RangeIgnored.into()),
+        // A server that ignores ranges sends the representation it holds
+        // with its validator: the one sent, unless the resource changed.
+        200 => Err(match headers.if_range {
+            Some(sent) if !has_validator(sent, headers.etag, headers.last_modified) => {
+                UnretryableError::ResourceChanged
+            }
+            _ => UnretryableError::RangeIgnored,
+        }
+        .into()),
         416 => Err(UnretryableError::RangeNotSatisfiable {
             total: headers
                 .content_range
@@ -366,6 +416,112 @@ mod tests {
                 source: UnretryableError::RangeBodyTooLong { got: g }
             }) if g == got
         ));
+    }
+
+    /// A 200 to a request made conditional with `If-Range` shows a changed
+    /// resource, unless it carries the validator sent: then the server
+    /// ignores ranges, as without one.
+    #[test]
+    fn a_200_with_another_validator_is_a_changed_resource() {
+        const SENT: &str = "\"v1\"";
+        const DATE: &str = "Sun, 08 Nov 2026 12:00:09 GMT";
+        let classify = |headers: RangeHeaders<'_>| match validate(200, headers) {
+            Err(AdapterError::Unretryable { source }) => source,
+            other => panic!("unexpected {other:?}"),
+        };
+        let strong = Validator::StrongEtag(SENT.into());
+        let date = Validator::LastModified(DATE.into());
+        let sent = RangeHeaders::default().with_if_range(Some(&strong));
+        assert!(matches!(
+            classify(sent.with_etag(Some(SENT))),
+            UnretryableError::RangeIgnored
+        ));
+        for changed in [
+            sent.with_etag(Some("\"v2\"")),
+            sent.with_etag(Some("W/\"v1\"")),
+            sent.with_last_modified(Some(DATE)),
+            sent,
+        ] {
+            assert!(
+                matches!(classify(changed), UnretryableError::ResourceChanged),
+                "{changed:?}"
+            );
+        }
+        let by_date = RangeHeaders::default().with_if_range(Some(&date));
+        assert!(matches!(
+            classify(by_date.with_last_modified(Some(DATE))),
+            UnretryableError::RangeIgnored
+        ));
+        assert!(matches!(
+            classify(by_date.with_etag(Some(SENT))),
+            UnretryableError::ResourceChanged
+        ));
+        // Without `If-Range`, a 200 is an ignored range, whatever it carries.
+        assert!(matches!(
+            classify(RangeHeaders::default().with_etag(Some("\"v2\""))),
+            UnretryableError::RangeIgnored
+        ));
+    }
+
+    /// A 206 to a request made conditional with `If-Range` is part of
+    /// another representation when it carries a validator that conflicts
+    /// with the one sent; one it omits does not count.
+    #[test]
+    fn a_206_with_a_conflicting_validator_is_a_changed_resource() {
+        const DATE: &str = "Sun, 08 Nov 2026 12:00:09 GMT";
+        let changed = |result: Result<ContentRange, AdapterError>| {
+            matches!(
+                result,
+                Err(AdapterError::Unretryable {
+                    source: UnretryableError::ResourceChanged
+                })
+            )
+        };
+        let strong = Validator::StrongEtag("\"v1\"".into());
+        let date = Validator::LastModified(DATE.into());
+        let by_etag = headers("bytes 10-19/100").with_if_range(Some(&strong));
+        let by_date = headers("bytes 10-19/100").with_if_range(Some(&date));
+
+        // A conflicting entity tag.
+        assert!(changed(validate(206, by_etag.with_etag(Some("\"v2\"")))));
+        assert!(changed(validate(206, by_etag.with_etag(Some("W/\"v1\"")))));
+        // Even when the part would not pass otherwise.
+        assert!(changed(validate(
+            206,
+            by_etag
+                .with_etag(Some("\"v2\""))
+                .with_content_range(Some("bytes 10-19/200"))
+        )));
+        // A conflicting date.
+        assert!(changed(validate(
+            206,
+            by_date.with_last_modified(Some("Sun, 08 Nov 2026 12:00:10 GMT"))
+        )));
+        // An absent validator, one that does not parse, and one of the other
+        // kind pass.
+        for passes in [
+            by_etag,
+            by_etag.with_etag(Some("\"v1\"")),
+            by_etag.with_etag(Some("\"v1\", \"v2\"")),
+            by_etag.with_last_modified(Some(DATE)),
+            by_date,
+            by_date.with_last_modified(Some(DATE)),
+            by_date.with_last_modified(Some("Sun Nov  8 12:00:09 2026")),
+            by_date.with_last_modified(Some("yesterday")),
+            by_date.with_etag(Some("\"v2\"")),
+        ] {
+            assert_eq!(
+                validate(206, passes).unwrap(),
+                ContentRange {
+                    first: 10,
+                    last: 19,
+                    complete: Some(TOTAL)
+                },
+                "{passes:?}"
+            );
+        }
+        // Without `If-Range`, a validator is not compared.
+        assert!(validate(206, headers("bytes 10-19/100").with_etag(Some("\"v2\""))).is_ok());
     }
 
     #[test]
