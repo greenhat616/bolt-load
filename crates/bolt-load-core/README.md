@@ -37,6 +37,10 @@ pub trait BoltLoadAdapter: Send + Sync {
 pub struct BoltLoadAdapterMeta {
     pub content_size: u64,
     pub filename: Option<String>,
+    pub content_encoding: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub validator: Option<Validator>,
 }
 
 let meta = BoltLoadAdapterMeta::new(1024).with_filename(Some("file.bin".into()));
@@ -44,6 +48,17 @@ let meta = BoltLoadAdapterMeta::new(1024).with_filename(Some("file.bin".into()))
 
 The struct is `#[non_exhaustive]`: build it with `new` and the `with_*`
 setters instead of a struct literal.
+
+`validator` is the validator the adapter sends in `If-Range` with every
+range request: a strong entity tag (`Validator::StrongEtag`) or a
+`Last-Modified` date (`Validator::LastModified`), as the server sent it.
+`None` means the adapter has none it can use, and its ranges are not
+conditional. Set it from the same value the range requests send, so the
+metadata names what they are checked against. `Validator::matches`
+compares two validators by what they name: the same kind, a strong
+entity tag byte for byte, a date as a date, whatever its format. The
+HTTP adapters pick the validator with `bolt-load-http`, which also
+re-exports the type.
 
 ### Full responses
 
@@ -140,6 +155,7 @@ thread-safe.
 | `futures` | `BoxStream` and stream utilities |
 | `dynosaur` | Dynamic dispatch for the async adapter trait |
 | `bytes` | Zero-copy byte buffers |
+| `httpdate` | Comparing `Last-Modified` validators as dates |
 
 ## License
 

@@ -2879,3 +2879,34 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 第一轮审查之后加的：加锁失败时删掉自己建的锁文件（`test_a_failed_lock_leaves_the_holder_s_file`、`test_other_errors_fail`）；`release` 不交出临时文件（`test_a_cleanup_after_the_release_touches_nothing`）；单连接的写在执行完之前放下 drain（`test_a_dropped_write_holds_the_drain_until_it_ends`）；加锁之后取消不删临时文件（`test_cancelled_while_locking`）；改名之后 panic 用最后一次采样的进度（`test_a_panic_after_the_rename_finishes_the_task`）；身份核对出错当作“别的文件”（`test_an_identity_error_is_an_error`，测试用 `LockHooks::identity` 注入错误）。
   - 第二轮审查之后加的：`Drained` 的两个字段换序（`test_a_drained_value_drops_before_its_drain`）；重试用完在“当作删除挂起的拒绝”上仍报 `InUse`（`test_running_out_on_an_access_denial_is_an_error`）；pool、mmap、compio 的 worker 各自不持有 drain（`test_every_writer_kind_holds_the_drain_group`）。
 - **没覆盖的。** Windows 上真实的 ACL 拒绝和删除挂起的文件，测试只用构造的错误码检查分类。
+
+### 14.27 meta 带上 `If-Range` 的验证器（PR-9d，C34）
+
+- **范围。** §11.5.13 里 C34 的部分（§11.5.7 的第一条）：`Validator` 移回 core，`BoltLoadAdapterMeta` 增加 `validator`，两个 adapter 探测时设置它，range 请求的 `If-Range` 和 `check_range` 也从它取。任务引擎还没有用这个字段做持久化或续传，C33 写状态文件、C20 续传比对时才用。
+- **移动了什么。**
+  - `Validator`（`StrongEtag`、`LastModified`，`as_str`，derive 不变）从 `bolt-load-http/src/validator.rs` 移到 `bolt-load-core/src/adapter/validator.rs`，路径是 `bolt_load_core::adapter::Validator`，`bolt_load::adapter` 的 glob re-export 也带上它。`bolt-load-http` 的 `validator` 模块 `pub use` 它，`bolt_load_http::Validator` 照旧可用。
+  - core 只多了比较：`Validator::matches(&other)`，给 C20 比对头部存的验证器和新 meta 的（§11.5.7）：种类相同；强 ETag 逐字节相同；`Last-Modified` 解析成日期后相同，所以格式可以不同；解析不了的日期只和同一个字符串相同（自反）。`==`（derive 的）仍按字符串比较，文档写明两者的区别。
+  - 解析和挑选（`is_strong_etag`、`strong_etag`、`if_range_validator`、`has_validator`、`conflicts_with`、`RangeHeaders`）留在 `bolt-load-http`：core 用不到它们，D11 把 HTTP 头的处理放在 http。
+  - 依赖：core 新增 `httpdate = "1"`（日期比较要用；没有依赖，`Cargo.lock` 里已有，只多了 core 指向它的一行）。
+- **meta 字段。** `BoltLoadAdapterMeta::validator: Option<Validator>`：adapter 在 `If-Range` 里实际发的那个，种类和值；`None` 表示没有可用的、range 不带 `If-Range`。`with_validator` 照原样保存，不再过滤。`new` 设成 `None`。
+- **一个来源。** 两个 adapter 删掉了缓存里单独的 `if_range`（reqwest 的 `Context::if_range`、ureq2 的 `Probed::if_range`）。`with_validators` 只返回 meta，用 `if_range_validator` 算出的值调用 `with_validator`；`range_stream` 从缓存的 `meta.validator` 取 `If-Range` 和交给 `check_range` 的值。所以 meta 报的和 range 发的是同一个值，不会各算一次。探测被拒（reqwest 回到 HEAD 而探测不是 2xx、ureq2 的 GET 失败）时不调用 `with_validators`，`validator` 是 `None`，range 也不带 `If-Range`。
+- **兼容性。** 不破坏：结构体本来就是 `#[non_exhaustive]`，加字段不影响下游；`Validator` 的旧路径靠 re-export 保留，定义和 derive 不变；新增的 `with_validator`、`Validator::matches` 都是加的。没有公开项改名或改签名（adapter 里改掉的 `with_validators`、`Context`、`Probed` 都是私有的）。提交是 `feat(core)`，不带 `!`。
+- **测试。**
+  - core `validator.rs` 的四个单元测试：`as_str`；强 ETag 逐字节（大小写、尾随空白都不同）；日期按日期比较（三种格式互相相同，另一个日期、解析不了的不同，解析不了的只等于自己）；种类不同不相同（同样的值也不相同）。
+  - http `validator.rs` 原有的五个测试不变，照常通过。
+  - 两个 adapter 的 `validators_come_from_single_fields` 改成检查 `meta.validator`。
+  - `bolt-load-adapter/tests/if_range.rs`，两个 adapter 都跑：
+    - 新增 `the_meta_names_the_validator_sent`：强 ETag（`HeadValidatorsDiffer`，HEAD 的不同，meta 是 GET 的 `"v1"`）；只有 `Last-Modified`（`LastModifiedOneSecondOld`，以及 `ObsoleteDateFormats`，RFC 850 格式原样保存）；弱 ETag、`Last-Modified` 等于或晚于 `Date`、探测被拒都是 `None`。每种情况发两个 range，每次的 `If-Range` 都等于 `meta.validator` 的值（`None` 时不带）。
+    - `a_200_with_the_validator_sent_ignores_the_range` 加查 `meta.validator` 是 `"v1"`（reqwest 回到 HEAD 的路径）；`a_rejected_probe_leaves_no_validator` 加查 `None`。
+    - codex 第一轮之后加的：`a_cloned_adapter_shares_the_validator`：探测之前克隆的 reqwest adapter 和原来的共享探测，报同一个 `meta.validator`、发同一个 `If-Range`，只探测一次。`UreqAdapter` 不是 `Clone`，只能经 `Arc` 共享同一个实例，没有可测的克隆。`a_failed_range_request_keeps_the_validator`（两个 adapter）：测试的钩子（reqwest 的 `before_request` 改端口，ureq2 的 `call` 改发到别处）把一个 range 发到一个接受连接后立刻关掉的端口，得到 `Retryable`；之后 `meta.validator` 不变，重发的 range 带同一个 `If-Range`，钩子看到两次都是 `"v1"`，只探测一次。不靠时间：失败由测试切换，关连接的端口一直在监听。
+- **变异检查**（`--all-features` 跑 core、http、adapter 三个 crate 的全部测试），全部被抓到：
+  - core 的 `with_validator` 丢掉值：`the_meta_names_the_validator_sent`、两个 `validators_come_from_single_fields` 和 `if_range.rs` 的另外七个（`If-Range` 也跟着没了）；
+  - reqwest、ureq2 各自把 meta 的验证器设成 `None`：同上，各自的单元测试；
+  - meta 的验证器取自 HEAD 而不是 GET：reqwest 回到 HEAD 的路径被 `a_200_with_the_validator_sent_ignores_the_range` 抓到；ureq2 被它、`the_meta_names_the_validator_sent`、`the_validator_of_a_get_is_sent_not_that_of_a_head` 抓到。meta 和 `If-Range` 同源，所以“只有 meta 取自 HEAD”这种变异已经写不出来；
+  - 弱 ETag 当成验证器：`the_meta_names_the_validator_sent`、`a_weak_etag_sends_no_validator`、两个 `validators_come_from_single_fields`、http 的 `test_the_validator_for_if_range`；
+  - `matches` 把日期当字符串比较：`test_dates_match_as_dates`；
+  - `matches` 的 ETag 不分大小写：`test_entity_tags_match_byte_for_byte`；
+  - `matches` 不看种类：`test_another_kind_does_not_match`。
+  - codex 第一轮之后加的：reqwest 的克隆不共享探测（`clone` 时换一个新的 `OnceCell`）：`a_cloned_adapter_shares_the_validator`；range 请求失败时清掉缓存的探测（ureq2 的 `range_stream` 出错时把 `probed` 置空）：`a_failed_range_request_keeps_the_validator`。另外重跑了“meta 的验证器取自 HEAD（reqwest 回到 HEAD 的路径）”，加了断言之后照样被 `a_200_with_the_validator_sent_ignores_the_range` 抓到。
+- **自定义请求。** adapter 的 `before_request`（ureq2 还有 `call`）在 adapter 设好 `If-Range` 之后执行，可以改掉它；reqwest 客户端的默认头也可以在 `meta.validator` 是 `None` 时带上一个。响应的检查总是用缓存的 `meta.validator`，不看实际发了什么，所以这样的自定义会让另一个版本的 range 被当成这一个，或者让这一个被当成 `ResourceChanged`。行为不变（C19 起就是这样），只在两个 `before_request` 的文档和 adapter 的 README 里写明：自定义不能替换 adapter 设的 `If-Range`，也不能在没有验证器时加一个（codex 第一轮的建议）。
+- **没做的。** 任务引擎还没有用 `meta.validator` 做持久化或续传：状态文件的头部（C33）和续传的比对（C20）以后用它。`TaskBuilder::meta` 交进来的 meta 里的 `validator` 只是调用方说的，adapter 发的 `If-Range` 仍来自它自己探测的 meta；C20 比对时要用 adapter 取的新 meta，见 §11.5.7。
