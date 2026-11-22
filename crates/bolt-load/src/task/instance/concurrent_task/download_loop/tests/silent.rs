@@ -25,7 +25,7 @@ use super::{
 use crate::{
     adapter::UnretryableError,
     runner::{DATA_FRAME_CHANNEL_CAPACITY, LifecycleEvent, LimitReceiver},
-    task::{GrowthStrategy, RunnerId},
+    task::RunnerId,
 };
 
 const KIB: u64 = 1 << 10;
@@ -406,7 +406,7 @@ async fn queued_frames_are_no_silence() {
         eb.send(FRAME);
     }
     let sample = |h: &Harness| {
-        let tick = h.download.rates.as_ref().unwrap().tick();
+        let tick = h.download.rates.tick();
         (tick.all_delivering, tick.silent)
     };
     tick(&mut h, &[a], base + HEDGE_IDLE);
@@ -616,21 +616,6 @@ async fn a_slow_restart_releases_the_doubling_at_the_limit() {
     drop(h.rt.take_parked());
 }
 
-/// `Legacy` samples no rates, so it never restarts a silent runner.
-#[tokio::test]
-async fn legacy_never_restarts_a_silent_runner() {
-    let base = Instant::now();
-    let options = TaskOptions::default()
-        .max_connections(NonZeroUsize::new(2).unwrap())
-        .growth_strategy(GrowthStrategy::Legacy);
-    let (mut h, a, b, _ea, _eb) = two_runners(&options, 0, base);
-    for n in 1..=20 {
-        tick(&mut h, &[a], base + TICK * n);
-    }
-    assert!(h.download.rates.is_none());
-    assert!(!stopping(&h, b));
-}
-
 /// A running runner silent for the hedge's idle time no longer holds the
 /// growth back (design §9.2, §14.19): the tick lets it off, and says so.
 /// One that delivers nothing for less, one still connecting and one that
@@ -639,7 +624,7 @@ async fn legacy_never_restarts_a_silent_runner() {
 #[tokio::test]
 async fn a_silent_runner_does_not_hold_the_growth_back() {
     let sample = |h: &Harness| {
-        let tick = h.download.rates.as_ref().unwrap().tick();
+        let tick = h.download.rates.tick();
         (tick.all_delivering, tick.silent)
     };
     let base = Instant::now();

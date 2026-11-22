@@ -215,11 +215,15 @@ async fn retry_after_holds_back_every_new_connection() {
 
     for now in [t0, t0 + SECOND, until - NANO] {
         download.apply(StrategyAction::CreateTask(HALF..TOTAL), now);
-        download.apply(StrategyAction::SplitGivenTask(0), now);
-        download.apply(StrategyAction::SplitAllTask(1), now);
-        // At 2 MiB/s the dynamic strategy would split.
-        download.throughput.speed = 2.0 * 1024.0 * 1024.0;
-        download.throughput.per_runner_speed = download.throughput.speed;
+        let incomplete = download
+            .manager
+            .get_runner_state(0)
+            .unwrap()
+            .incomplete_range();
+        assert!(!download.split(0, incomplete, now));
+        // At 2 MiB/s growth would split.
+        download.throughput.per_runner_speed = 2.0 * 1024.0 * 1024.0;
+        download.apply(StrategyAction::Grow(2), now);
         download.on_strategy_tick(now);
         download.on_deadline(now).unwrap();
         assert_eq!(download.manager.allocated_runner_count(), 1, "at {now:?}");
@@ -231,7 +235,12 @@ async fn retry_after_holds_back_every_new_connection() {
         assert_eq!(download.deadline.at(), until);
     }
 
-    download.apply(StrategyAction::SplitGivenTask(0), until);
+    let incomplete = download
+        .manager
+        .get_runner_state(0)
+        .unwrap()
+        .incomplete_range();
+    assert!(download.split(0, incomplete, until));
     assert!(download.manager.get_runner_state(0).unwrap().allocated.end < HALF);
     download.apply(StrategyAction::CreateTask(HALF..TOTAL), until);
     assert_eq!(download.manager.allocated_runner_count(), 3);
@@ -705,8 +714,8 @@ async fn drive_until(
 ///   congestion, with the first runner still in flight, and only then
 ///   releases the gate.
 ///
-/// A task only splits on its own when the dynamic strategy's speed samples
-/// call for it, which a test cannot force.
+/// A task only splits on its own when its growth's speed samples call for
+/// it, which a test cannot force.
 #[cfg(all(feature = "reqwest", feature = "tokio"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_after_holds_back_the_requests_to_the_server() {
@@ -768,7 +777,12 @@ async fn retry_after_holds_back_the_requests_to_the_server() {
                 .is_some_and(|state| state.status == ChunkStatus::Running)
         })
         .await?;
-        download.apply(StrategyAction::SplitGivenTask(0), Instant::now());
+        let incomplete = download
+            .manager
+            .get_runner_state(0)
+            .unwrap()
+            .incomplete_range();
+        download.split(0, incomplete, Instant::now());
         drive_until(&mut download, |download| {
             download.backoff.congestion_until().is_some()
         })

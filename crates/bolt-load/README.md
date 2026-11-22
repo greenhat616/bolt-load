@@ -105,28 +105,39 @@ The concurrent download engine continuously monitors runner outcomes:
 3. **Recovering** — after a `recovery_delay` (30 s), the engine probes with
    one additional runner and observes for 15 s before committing.
 
-Slow or stalled runners have their remaining byte ranges split and
-reassigned to new runners via the `DynamicStrategy`. A split first
+Runners are added by doubling. At most every 2 s, while no runner is
+connecting, every running runner delivers data and the task is not held
+back by a 429 or 503, the engine doubles the runners up to the current
+limit, by splitting the running ranges with the most left. A running
+runner that has been silent for 2 s, and running at least that long,
+does not hold the growth back: silent means it read nothing of its body
+and is not pushing a frame. That is not so while the writer is full, nor
+for a runner with frames the engine has not taken yet. A split first
 reserves a slot for the new runner, so it never exceeds
-`max_connections`; without a free slot the ranges stay as they are.
+`max_connections`, and needs at least 2 s of work at the split runner's
+own rate. Once a doubling gains less than 10% in speed, no more runners
+are added.
 
-The unstable `unstable-strategy` feature adds
-`TaskOptions::growth_strategy`, to try the `Doubling` strategy instead.
-At most every 2 s, while every runner delivers data and the task is not
-held back by a 429 or 503, it doubles the runners up to the current
-limit, by splitting the running ranges with the most left. A split needs
-at least 2 s of work at the split runner's own rate. Once a doubling
-gains less than 10% in speed, it stops adding runners. It also stops a
-runner that delivered under a quarter of the median of at least three
-runners over the last 10 s, allowing one 32 KiB buffer either way, when
-it has at least twice the minimum chunk size left; its range is retried
-from the bytes already received after a backoff, which counts against
-the range's budget only when the runner had received nothing. In the
-endgame, when nothing is left to split, a runner with less than twice the
-minimum chunk size left that has delivered nothing for 2 s is hedged: a
-second runner requests the rest of its range again, the first to deliver
-goes on and the other is stopped, so no byte is written twice. It may
-change or go away.
+A runner that delivered under a quarter of the median of at least three
+runners over the last 10 s, allowing one 32 KiB buffer either way, is
+stopped when it has at least twice the minimum chunk size left. So is a
+runner silent for 4.5 s, and running at least that long, without three
+runners or a full 10 s: it needs at least twice the minimum chunk size
+left, no hedge, no frames the engine has not taken yet, a writer that is
+not full and no 429 or 503 holding the task back. At most one runner a
+strategy tick is stopped. Its range is retried from the bytes already
+received after a backoff, which counts against the range's budget only
+when the runner had received nothing. In the endgame, when nothing is
+left to split, a runner with less than twice the minimum chunk size left
+that has delivered nothing for 2 s is hedged: a second runner requests
+the rest of its range again, the first to deliver goes on and the other
+is stopped, so no byte is written twice.
+
+**Breaking change.** Doubling is the only growth strategy. The unstable
+feature flag that chose it, `TaskOptions::growth_strategy`,
+`TaskBuilder::growth_strategy` and `GrowthStrategy` are gone; a crate
+that enables that feature no longer builds. The speed-threshold splitting
+that was the default before is removed.
 
 A failed range is retried after a backoff: 0.5 s after its first
 failure, doubling up to 30 s, with jitter. A 429 or 503 holds back every
@@ -170,7 +181,6 @@ or by its no-progress and consecutive-failure limits.
 | `gzip`, `deflate` | Yes | Decode content-coded full downloads |
 | `br` | No | Decode `br` |
 | `zstd` | No | Decode `zstd`; builds the libzstd C library |
-| `unstable-strategy` | No | Unstable: `TaskOptions::growth_strategy` chooses the `Doubling` growth strategy |
 
 ## File Writer Backends
 

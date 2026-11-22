@@ -57,9 +57,7 @@ impl DownloadLoop {
             .can_write()
             .then(|| now.checked_sub(super::hedge::HEDGE_IDLE))
             .flatten();
-        if let Some(rates) = self.rates.as_mut() {
-            rates.sample_at(&self.manager, now, silent_since);
-        }
+        self.rates.sample_at(&self.manager, now, silent_since);
         self.restart_runner(now);
         self.step_strategies(now);
         self.hedge_stalled_runner(now);
@@ -67,15 +65,12 @@ impl DownloadLoop {
 
     fn step_strategies(&mut self, now: Instant) {
         let signals = self.signals(now);
-        let tick = self.rates.as_ref().map(|rates| rates.tick());
         let Some((strategy_name, actions)) = self.strategy.execute(
             self.max_concurrency,
-            self.throughput.speed,
-            self.throughput.per_runner_speed,
             &mut self.manager,
             now,
             signals,
-            tick,
+            self.rates.tick(),
         ) else {
             return;
         };
@@ -90,24 +85,6 @@ impl DownloadLoop {
         #[cfg(test)]
         self.applied.push(format!("{action:?}"));
         match action {
-            // Split current all task into two separate tasks
-            StrategyAction::SplitAllTask(planned_chunk_size) => {
-                trace!("[TASK] Strategy: split all task");
-                let states = self.manager.get_incomplete_states(Some(planned_chunk_size));
-                for (runner_id, incomplete_range) in states {
-                    trace!("split task: {runner_id}, {incomplete_range:?}");
-                    self.split(runner_id, incomplete_range, now);
-                }
-            }
-            // Split the given task into two separate tasks
-            StrategyAction::SplitGivenTask(task_id) => {
-                trace!("[TASK] Strategy: split given task: {task_id}");
-                let Some(state) = self.manager.get_runner_state(task_id) else {
-                    trace!("[TASK] skip splitting runner {task_id}: it has no chunk");
-                    return;
-                };
-                self.split(task_id, state.incomplete_range(), now);
-            }
             // Change the max concurrency
             StrategyAction::ChangeMaxConcurrency(new_max_concurrency) => {
                 trace!("[TASK] Strategy: change max concurrency: {new_max_concurrency}");
@@ -160,7 +137,7 @@ impl DownloadLoop {
     /// The planned split size for the chunk of `runner_id` (design §9.3).
     pub(super) fn planned_split_size(&self, runner_id: RunnerId) -> u64 {
         planned_split_size(
-            self.rates.as_ref().and_then(|rates| rates.rate(runner_id)),
+            self.rates.rate(runner_id),
             self.throughput.per_runner_speed,
             self.manager.min_chunk_size(),
         )

@@ -14,23 +14,18 @@ use super::{
     },
     *,
 };
-use crate::{adapter::UnretryableError, task::GrowthStrategy};
+use crate::adapter::UnretryableError;
 
 const TOTAL: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 const NANO: Duration = Duration::from_nanos(1);
 const TICK: Duration = DEFAULT_STRATEGY_TICK_INTERVAL;
 
-/// A loop with `growth` and `max_connections` on `rt`, whose runners are
-/// parked and never connect.
-async fn growth_loop(
-    rt: &ScriptedRuntime,
-    growth: GrowthStrategy,
-    max_connections: usize,
-) -> (DownloadLoop, FileWriter) {
-    let options = TaskOptions::default()
-        .max_connections(NonZeroUsize::new(max_connections).unwrap())
-        .growth_strategy(growth);
+/// A loop with `max_connections` on `rt`, whose runners are parked and
+/// never connect.
+async fn growth_loop(rt: &ScriptedRuntime, max_connections: usize) -> (DownloadLoop, FileWriter) {
+    let options =
+        TaskOptions::default().max_connections(NonZeroUsize::new(max_connections).unwrap());
     loop_with_options(
         ThreadedRuntimeImpl::new_other_rt(rt.clone()),
         DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
@@ -94,7 +89,7 @@ fn assert_covered(download: &DownloadLoop) {
 #[tokio::test]
 async fn doubling_grows_through_split_up_to_the_limit() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 4).await;
+    let (mut download, file_writer) = growth_loop(&rt, 4).await;
     let t0 = Instant::now();
     // The first tick creates the first runner.
     download.on_strategy_tick(t0);
@@ -144,7 +139,7 @@ async fn doubling_grows_through_split_up_to_the_limit() {
 #[tokio::test]
 async fn doubling_counts_only_the_splits_a_slot_took() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 4).await;
+    let (mut download, file_writer) = growth_loop(&rt, 4).await;
     let t0 = Instant::now();
     download.on_strategy_tick(t0);
     deliver(&mut download, MIB);
@@ -200,7 +195,7 @@ async fn recover_a_step_at_a_time(bytes: impl Fn(u64) -> u64) -> (Vec<usize>, us
     const RUNNERS: u64 = 8;
     const MAX: usize = 16;
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, MAX).await;
+    let (mut download, file_writer) = growth_loop(&rt, MAX).await;
     let chunk = TOTAL / RUNNERS;
     let _slots: Vec<_> = (0..RUNNERS)
         .map(|i| {
@@ -276,7 +271,7 @@ async fn doubling_refills_a_step_at_a_time_without_any_gain() {
 #[tokio::test]
 async fn doubling_waits_for_every_runner_and_the_congestion() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 4).await;
+    let (mut download, file_writer) = growth_loop(&rt, 4).await;
     let t0 = Instant::now();
     download.on_strategy_tick(t0);
     // Still connecting.
@@ -320,12 +315,10 @@ async fn doubling_waits_for_every_runner_and_the_congestion() {
             .strategy
             .execute(
                 download.max_concurrency,
-                0.0,
-                0.0,
                 &mut download.manager,
                 now,
                 signals,
-                Some(&tick),
+                &tick,
             )
             .map(|(name, actions)| (name, format!("{actions:?}")))
     };
@@ -347,7 +340,7 @@ async fn doubling_waits_for_every_runner_and_the_congestion() {
 #[tokio::test]
 async fn doubling_stops_at_a_plateau() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 8).await;
+    let (mut download, file_writer) = growth_loop(&rt, 8).await;
     let t0 = Instant::now();
     download.on_strategy_tick(t0);
     deliver(&mut download, 10 * MIB);
@@ -375,7 +368,7 @@ async fn doubling_stops_at_a_plateau() {
 #[tokio::test]
 async fn doubling_judges_the_doubling_at_the_limit() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 2).await;
+    let (mut download, file_writer) = growth_loop(&rt, 2).await;
     let t0 = Instant::now();
     download.on_strategy_tick(t0);
     deliver(&mut download, 10 * MIB);
@@ -408,8 +401,7 @@ async fn eight_then_one_completes(
     rt: &ScriptedRuntime,
     max_connections: usize,
 ) -> (DownloadLoop, Instant, FileWriter) {
-    let (mut download, file_writer) =
-        growth_loop(rt, GrowthStrategy::Doubling, max_connections).await;
+    let (mut download, file_writer) = growth_loop(rt, max_connections).await;
     let t0 = Instant::now();
     download.on_strategy_tick(t0);
     for n in 1..=5 {
@@ -480,7 +472,7 @@ async fn doubling_to_the_limit_does_not_refill_before_it_is_judged() {
 #[tokio::test]
 async fn a_small_stalled_chunk_does_not_freeze_the_growth() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 8).await;
+    let (mut download, file_writer) = growth_loop(&rt, 8).await;
     let t0 = Instant::now();
     // Start the connecting runners; every running one but `stalled`
     // delivers a MiB, noted at `now`.
@@ -516,7 +508,7 @@ async fn a_small_stalled_chunk_does_not_freeze_the_growth() {
     assert_eq!(download.manager.get_active_runners_count(), 4, "too early");
     feed(&mut download, Some(0), t0 + TICK * 5);
     download.on_strategy_tick(t0 + TICK * 5);
-    assert!(download.rates.as_ref().unwrap().tick().silent);
+    assert!(download.rates.tick().silent);
     assert_eq!(download.manager.get_active_runners_count(), 8);
     assert!(!download.manager.is_stopping(0), "left to the hedge");
     assert_covered(&download);
@@ -535,7 +527,7 @@ async fn doubling_splits_only_a_chunk_of_the_planned_size() {
     const FIRST: u64 = 14 * MIB;
     const SECOND_RATE: u64 = (2 * FIRST - 1) / 3;
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 4).await;
+    let (mut download, file_writer) = growth_loop(&rt, 4).await;
     let t0 = Instant::now();
     let mut slot = download
         .manager
@@ -575,7 +567,7 @@ async fn planned_split_size_follows_the_donor_rate() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
     let mut planned = Vec::new();
     for active in [2, 8] {
-        let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 8).await;
+        let (mut download, file_writer) = growth_loop(&rt, 8).await;
         let t0 = Instant::now();
         let chunk = TOTAL / active;
         let _slots: Vec<_> = (0..active)
@@ -610,64 +602,47 @@ async fn planned_split_size_follows_the_donor_rate() {
     assert_eq!(planned, [6 * MIB, 6 * MIB]);
 }
 
-/// Without the switch, or with `Legacy`, the loop splits as it always did:
-/// the dynamic strategy on the task's speed.
+/// The default options grow by doubling (design §14.20): a tick with every
+/// runner delivering, past the grow interval, asks to double the one
+/// runner.
 #[tokio::test]
-async fn legacy_is_the_default_and_unchanged() {
+async fn doubling_is_the_default() {
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    for options in [
-        TaskOptions::default(),
-        TaskOptions::default().growth_strategy(GrowthStrategy::Legacy),
-    ] {
-        assert_eq!(options.resolved_growth_strategy(), GrowthStrategy::Legacy);
-        let (mut download, file_writer) = loop_with_options(
-            ThreadedRuntimeImpl::new_other_rt(rt.clone()),
-            DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
-            TOTAL,
-            &options,
+    let (mut download, file_writer) = loop_with_options(
+        ThreadedRuntimeImpl::new_other_rt(rt.clone()),
+        DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
+        TOTAL,
+        &TaskOptions::default(),
+    )
+    .await;
+    let _slot = download
+        .manager
+        .allocate_runner_with_chunk(0..TOTAL)
+        .unwrap();
+    let tick = super::super::super::strategy::TickSample {
+        speed: Some(MIB as f64),
+        all_delivering: true,
+        silent: false,
+        rates: Default::default(),
+    };
+    let now = Instant::now();
+    let signals = download.signals(now);
+    let actions = download
+        .strategy
+        .execute(
+            download.max_concurrency,
+            &mut download.manager,
+            now,
+            signals,
+            &tick,
         )
-        .await;
-        assert!(!download.strategy.is_doubling());
-        assert!(download.rates.is_none());
-        let _slot = download
-            .manager
-            .allocate_runner_with_chunk(0..TOTAL)
-            .unwrap();
-        let execute = |download: &mut DownloadLoop, speed: f64| {
-            let now = Instant::now();
-            let signals = download.signals(now);
-            download
-                .strategy
-                .execute(
-                    download.max_concurrency,
-                    speed,
-                    speed,
-                    &mut download.manager,
-                    now,
-                    signals,
-                    None,
-                )
-                .map(|(name, actions)| (name, format!("{actions:?}")))
-        };
-        // Planned at twice the task's speed.
-        assert_eq!(
-            execute(&mut download, 1.5 * MIB as f64),
-            Some((
-                "dynamic",
-                format!("{:?}", [StrategyAction::SplitAllTask(3 * MIB)])
-            ))
-        );
-        // `abs()`: a drop splits too.
-        assert_eq!(
-            execute(&mut download, 0.5 * MIB as f64),
-            Some((
-                "dynamic",
-                format!("{:?}", [StrategyAction::SplitAllTask(MIB)])
-            ))
-        );
-        drop(download);
-        file_writer.finalize().await.unwrap();
-    }
+        .map(|(name, actions)| (name, format!("{actions:?}")));
+    assert_eq!(
+        actions,
+        Some(("doubling", format!("{:?}", [StrategyAction::Grow(1)])))
+    );
+    drop(download);
+    file_writer.finalize().await.unwrap();
 }
 
 /// The gain is judged by the task's speed in the tick before the growth
@@ -682,7 +657,7 @@ async fn doubling_judges_the_gain_at_ten_percent() {
         (11 * MIB / 2 - 1024, false),
     ] {
         let rt = ScriptedRuntime::new(TimerKind::Scripted);
-        let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 8).await;
+        let (mut download, file_writer) = growth_loop(&rt, 8).await;
         let t0 = Instant::now();
         download.on_strategy_tick(t0);
         deliver(&mut download, 10 * MIB);
@@ -709,7 +684,7 @@ async fn doubling_judges_the_gain_at_ten_percent() {
 async fn doubling_opens_no_trial_for_a_marked_step() {
     const RUNNERS: u64 = 4;
     let rt = ScriptedRuntime::new(TimerKind::Scripted);
-    let (mut download, file_writer) = growth_loop(&rt, GrowthStrategy::Doubling, 8).await;
+    let (mut download, file_writer) = growth_loop(&rt, 8).await;
     let chunk = TOTAL / RUNNERS;
     let _slots: Vec<_> = (0..RUNNERS)
         .map(|i| {
@@ -756,12 +731,10 @@ async fn doubling_opens_no_trial_for_a_marked_step() {
     let signals = download.signals(late);
     let acted = download.strategy.execute(
         download.max_concurrency,
-        0.0,
-        0.0,
         &mut download.manager,
         late,
         signals,
-        Some(&tick),
+        &tick,
     );
     assert!(acted.is_none(), "{acted:?}");
     assert!(

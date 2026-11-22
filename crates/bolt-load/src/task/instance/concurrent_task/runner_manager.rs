@@ -274,7 +274,7 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 
 use super::{
     ChunkPlanner, PlannerGuard,
-    chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SideFailure, SplitCandidate},
+    chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SideFailure},
     strategy::{
         AdmissionClass, AdmissionEvidence, AttemptPhase, charges_range, classify, is_restart,
     },
@@ -829,12 +829,6 @@ impl RunnerManager {
         self.chunk_planner.get_runner_state(runner_id)
     }
 
-    /// Finds a chunk that can be split at `now`
-    #[inline]
-    pub fn find_chunk_to_split(&self, required_size: u64, now: Instant) -> Option<SplitCandidate> {
-        self.chunk_planner.find_chunk_to_split(required_size, now)
-    }
-
     /// The running runner with the most left to download, see
     /// [`ChunkPlanner::largest_running_chunk`]; not one that is stopping,
     /// whose range is about to be released.
@@ -850,20 +844,17 @@ impl RunnerManager {
         self.chunk_planner.min_chunk_size
     }
 
+    /// Set the smallest chunk the planner hands out.
+    #[cfg(test)]
+    pub(super) fn set_min_chunk_size(&mut self, size: u64) {
+        self.chunk_planner.min_chunk_size = size;
+    }
+
     /// The chunks of the connecting and the running runners
     pub(super) fn active_chunks(&self) -> impl Iterator<Item = &ChunkState> {
         self.chunk_planner
             .iter_chunks()
             .filter(|chunk| chunk.status.is_active())
-    }
-
-    /// Gets incomplete states
-    #[inline]
-    pub fn get_incomplete_states(
-        &self,
-        min_chunk_size: Option<u64>,
-    ) -> Vec<(RunnerId, Range<u64>)> {
-        self.chunk_planner.get_incomplete_states(min_chunk_size)
     }
 
     // ==================== Combined Operations ====================
