@@ -137,4 +137,51 @@ mod tests {
         assert!(step(4, 4).is_empty());
         assert!(step(1, 1).is_empty());
     }
+
+    /// The `Legacy` control of the A/B (design §9.1): its thresholds of
+    /// 1 MiB/s, exclusive, and `abs()`, which splits on a drop too.
+    #[test]
+    fn test_legacy_thresholds_and_abs() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        let context = |speed: f64, per_runner_speed: f64| DynamicStrategyContext {
+            speed,
+            per_runner_speed,
+            current_concurrency: 1,
+            max_concurrency: 8,
+            planned_chunk_size: 1,
+            remaining_largest_runner_id: 0,
+        };
+        let split_all = |actions: Vec<StrategyAction>| {
+            matches!(actions.as_slice(), [StrategyAction::SplitAllTask(1)])
+        };
+
+        // Quick start: more than 1 MiB/s away from twice the last speed.
+        assert!(
+            DynamicStrategy::default()
+                .step(&mut context(MIB, 0.0))
+                .is_empty()
+        );
+        let mut strategy = DynamicStrategy::default();
+        assert!(split_all(strategy.step(&mut context(MIB + 1.0, 0.0))));
+        // Twice the last speed is 2 MiB/s + 2; 0.5 MiB/s is far below.
+        assert!(split_all(strategy.step(&mut context(0.5 * MIB, 0.0))));
+
+        // Normal: more than 1 MiB/s away from the last speed plus a
+        // runner's, either way.
+        let normal = |previous: f64, speed: f64| {
+            let mut strategy = DynamicStrategy {
+                current_stage: DynamicPlannerStage::Normal,
+                previous_total_download_speed: previous,
+                ..DynamicStrategy::default()
+            };
+            strategy.step(&mut context(speed, MIB))
+        };
+        let split_given = |actions: Vec<StrategyAction>| {
+            matches!(actions[..], [StrategyAction::SplitGivenTask(0)])
+        };
+        assert!(split_given(normal(2.0 * MIB, 4.0 * MIB + 1.0)));
+        assert!(normal(2.0 * MIB, 4.0 * MIB).is_empty());
+        assert!(split_given(normal(2.0 * MIB, 2.0 * MIB - 1.0)));
+        assert!(normal(2.0 * MIB, 2.0 * MIB).is_empty());
+    }
 }
