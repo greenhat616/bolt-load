@@ -547,12 +547,12 @@ fn test_custom_timer_survives_other_events() {
             ["strategy", "strategy", "strategy", "throughput"]
         );
         assert!(harness.download.writer.is_idle());
-        let stats = harness
-            .download
-            .manager
-            .runner_outcome_sampler_mut()
-            .stats();
-        assert_eq!(stats.connect_failed_retryable, 1, "{stats:?}");
+        // The lost connection was handled: its range backs off once.
+        let cooldowns = harness.download.manager.cooldowns();
+        assert!(
+            matches!(cooldowns[..], [(_, ref cooldown)] if cooldown.attempts == 1),
+            "{cooldowns:?}"
+        );
         assert!(progress_published(&mut harness.events));
         harness.teardown().await;
     });
@@ -910,13 +910,15 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
     let mut rounds = Vec::new();
     for _ in 0..ticks {
         // `on_strategy_tick`, observing each split.
+        let now = Instant::now();
+        let signals = download.signals(now);
         let Some((_, actions)) = download.strategy.execute(
             download.max_concurrency,
             download.throughput.speed,
             download.throughput.per_runner_speed,
             &mut download.manager,
-            Instant::now(),
-            false,
+            now,
+            signals,
         ) else {
             continue;
         };
@@ -1235,6 +1237,7 @@ async fn test_rejected_split_spawn_reclaims_its_slot_once() {
     file_writer.finalize().await.unwrap();
 }
 
+mod admission;
 mod retry;
 
 /// Random sequences of the loop's steps, including failures that back their

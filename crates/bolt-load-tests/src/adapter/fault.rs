@@ -213,6 +213,19 @@ impl RangeFault {
     }
 }
 
+/// How [`create_limited_range_server`](super::http_server::create_limited_range_server)
+/// turns away a connection past its limit, as a server with a silent
+/// connection limit does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitMode {
+    /// Close the connection as soon as it is accepted, before reading the
+    /// request: the client sees the connection closed or reset.
+    Close,
+    /// Accept the connection, then never read or answer the request: the
+    /// client waits until its own timeout.
+    Hang,
+}
+
 /// Increments a counter for as long as it is alive.
 #[derive(Debug)]
 pub struct CounterGuard(Arc<AtomicUsize>);

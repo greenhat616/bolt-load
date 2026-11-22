@@ -10,8 +10,7 @@ use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
 use super::{
-    AttemptFailure, RunnerFailureKind, RunnerManager, RunnerTick, SpawnFailed,
-    is_attempt_retryable,
+    AttemptFailure, AttemptPhase, RunnerManager, RunnerTick, SpawnFailed, is_attempt_retryable,
     stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem},
 };
 use crate::{
@@ -143,6 +142,7 @@ impl RunnerManager {
                     .remove(&runner_id)
                     .expect("a connecting runner has a data receiver");
                 self.data_aggregator.register(runner_id, data_rx);
+                self.record_started(runner_id);
                 return RunnerTick::downloading();
             }
             LifecycleEvent::Stopped(reason) => reason,
@@ -183,12 +183,7 @@ impl RunnerManager {
         if kind.is_cancelled() {
             return RunnerTick::downloading();
         }
-        self.runner_outcome_sampler
-            .record_stream_closed(if kind.is_retryable() {
-                RunnerFailureKind::Retryable
-            } else {
-                RunnerFailureKind::Unretryable
-            });
+        self.record_attempt_end(AttemptPhase::Streaming, &kind);
         RunnerTick::with_failure(AttemptFailure {
             runner_id,
             retryable: is_attempt_retryable(&kind),
@@ -210,13 +205,8 @@ impl RunnerManager {
             return RunnerTick::downloading();
         }
         error!("runner {runner_id} failed to connect: {error:?}");
+        self.record_attempt_end(AttemptPhase::Connecting, &error);
         let retryable = is_attempt_retryable(&error);
-        self.runner_outcome_sampler
-            .record_connect_failed(if retryable {
-                RunnerFailureKind::Retryable
-            } else {
-                RunnerFailureKind::Unretryable
-            });
         RunnerTick::with_failure(AttemptFailure {
             runner_id,
             error,
@@ -248,14 +238,13 @@ impl RunnerManager {
             .chunk_planner
             .mark_failed(runner_id)
             .expect("chunk planner should not fail");
-        if connecting {
-            self.runner_outcome_sampler
-                .record_connect_failed(RunnerFailureKind::Retryable);
-        } else {
-            self.runner_outcome_sampler
-                .record_stream_closed(RunnerFailureKind::Retryable);
-        }
         self.release_runner(runner_id);
+        let phase = if connecting {
+            AttemptPhase::Connecting
+        } else {
+            AttemptPhase::Streaming
+        };
+        self.record_attempt_end(phase, &TaskError::ChannelClosed);
         trace!(
             "runner {runner_id} lost, released range: {:?}",
             released.range
@@ -277,6 +266,22 @@ impl RunnerManager {
             LifecycleStreamEvent::Event(tagged) => self.handle_lifecycle(tagged),
             LifecycleStreamEvent::Closed(runner_id) => self.handle_runner_lost(runner_id),
         }
+    }
+
+    /// Handle `item` as if runner `runner_id` had sent it.
+    #[cfg(test)]
+    pub(in super::super) fn inject_lifecycle(
+        &mut self,
+        runner_id: RunnerId,
+        item: LifecycleEvent,
+    ) -> RunnerTick {
+        self.handle_lifecycle(RunnerTaggedStreamItem { runner_id, item })
+    }
+
+    /// Handle runner `runner_id` as if its lifecycle stream had closed.
+    #[cfg(test)]
+    pub(in super::super) fn inject_lost(&mut self, runner_id: RunnerId) -> RunnerTick {
+        self.handle_runner_lost(runner_id)
     }
 
     /// The next rejected spawn, which the lifecycle reports before anything else.
