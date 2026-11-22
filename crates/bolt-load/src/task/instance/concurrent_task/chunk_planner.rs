@@ -1015,6 +1015,24 @@ impl ChunkPlanner {
         })
     }
 
+    /// The ranges a resumed download kept (design §11.5.10 step 5): each
+    /// becomes a finished chunk, downloaded and written, so only the rest
+    /// is planned. Call it before any chunk is allocated; `kept` is sorted,
+    /// neither overlapping nor adjacent, and within the total.
+    pub fn seed_kept(&mut self, kept: &[Range<u64>]) {
+        debug_assert!(self.chunks.is_empty(), "seeded after planning");
+        for range in kept {
+            debug_assert!(range.start < range.end && range.end <= self.total);
+            let generation = self.take_generation();
+            let mut chunk = ChunkState::new(range.clone(), None, ChunkStatus::Finished);
+            chunk.downloaded = range.clone();
+            chunk.generation = generation;
+            self.chunks.insert(range.start, chunk);
+            self.accepted_bytes += range.end - range.start;
+            self.written.insert(range.clone());
+        }
+    }
+
     /// Check if all chunks are finished
     pub fn is_complete(&self) -> bool {
         !self.chunks.is_empty()

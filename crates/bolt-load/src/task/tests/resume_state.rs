@@ -37,16 +37,17 @@ use crate::{
     },
 };
 
-const BLOCK: u64 = BLOCK_SIZE.get();
+pub(super) const BLOCK: u64 = BLOCK_SIZE.get();
 /// Three blocks and a short one.
-const SIZE: u64 = 3 * BLOCK + 4321;
+pub(super) const SIZE: u64 = 3 * BLOCK + 4321;
 /// Where a faulty source stops: within the third block.
-const HALF: u64 = 2 * BLOCK + 100;
+pub(super) const HALF: u64 = 2 * BLOCK + 100;
 const FRAME: u64 = 32 << 10;
 
-/// What a [`Source`] does once a range reaches [`HALF`].
+/// What a [`Source`] does once a range reaches [`HALF`], or where
+/// [`Source::fault_at`] says.
 #[derive(Clone)]
-enum Fault {
+pub(super) enum Fault {
     /// Nothing: the whole range.
     None,
     /// End a range's stream with this error.
@@ -60,29 +61,44 @@ enum Fault {
 /// The content of a [`SimpleTestAdapter`], by range, with a validator in
 /// its metadata, failing or held as `fault` says.
 #[derive(Clone)]
-struct Source {
-    content: Bytes,
-    fault: Fault,
+pub(super) struct Source {
+    pub(super) content: Bytes,
+    pub(super) fault: Fault,
     /// Whether it serves ranges.
-    ranges: bool,
+    pub(super) ranges: bool,
+    /// Where a range meets its fault; [`HALF`] unless set.
+    pub(super) fault_at: u64,
+    /// Hold every range check after the first at this gate.
+    pub(super) stall_range_check: Option<Gate>,
+    /// The range checks so far.
+    pub(super) range_checks: Arc<AtomicUsize>,
+    /// The metadata it retrieves.
+    pub(super) meta: BoltLoadAdapterMeta,
+    /// The ranges requested, in order.
+    pub(super) requested: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
     /// The range streams open now, and the most open at once.
-    open: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
+    pub(super) open: Arc<AtomicUsize>,
+    pub(super) peak: Arc<AtomicUsize>,
 }
 
 impl Source {
-    fn new(fault: Fault) -> Self {
+    pub(super) fn new(fault: Fault) -> Self {
         Self {
             content: SimpleTestAdapter::new(SIZE as usize).content().clone(),
             fault,
             ranges: true,
+            fault_at: HALF,
+            stall_range_check: None,
+            range_checks: Arc::default(),
+            meta: meta(),
+            requested: Arc::default(),
             open: Arc::default(),
             peak: Arc::default(),
         }
     }
 
     /// A source that serves no ranges.
-    fn without_ranges(fault: Fault) -> Self {
+    pub(super) fn without_ranges(fault: Fault) -> Self {
         Self {
             ranges: false,
             ..Self::new(fault)
@@ -99,17 +115,23 @@ impl Drop for Open {
     }
 }
 
-fn meta() -> BoltLoadAdapterMeta {
+pub(super) fn meta() -> BoltLoadAdapterMeta {
     BoltLoadAdapterMeta::new(SIZE).with_validator(Some(Validator::StrongEtag("\"v1\"".to_owned())))
 }
 
 impl BoltLoadAdapter for Source {
     async fn is_range_stream_available(&self) -> bool {
+        let checks = self.range_checks.fetch_add(1, Ordering::SeqCst) + 1;
+        if checks > 1
+            && let Some(gate) = &self.stall_range_check
+        {
+            gate.pass().await;
+        }
         self.ranges
     }
 
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
-        Ok(meta())
+        Ok(self.meta.clone())
     }
 
     /// The whole content; with [`Fault::Everywhere`], the bytes before
@@ -126,8 +148,10 @@ impl BoltLoadAdapter for Source {
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
+        self.requested.lock().unwrap().push(start..end);
         let content = self.content.clone();
         let fault = self.fault.clone();
+        let half = self.fault_at;
         let open = self.open.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(open, Ordering::SeqCst);
         let held = Arc::new(Open(self.open.clone()));
@@ -141,7 +165,7 @@ impl BoltLoadAdapter for Source {
                     if at >= end {
                         return None;
                     }
-                    if at >= HALF && !faulted {
+                    if at >= half && !faulted {
                         match fault {
                             Fault::None => {}
                             Fault::Error(error) | Fault::Everywhere(error) => {
@@ -151,12 +175,12 @@ impl BoltLoadAdapter for Source {
                         }
                     }
                     let mut next = (at + FRAME).min(end);
-                    if at < HALF && next > HALF {
-                        next = HALF;
+                    if at < half && next > half {
+                        next = half;
                     }
                     Some((
                         Ok(content.slice(at as usize..next as usize)),
-                        (next, at >= HALF),
+                        (next, at >= half),
                     ))
                 }
             },
@@ -164,7 +188,7 @@ impl BoltLoadAdapter for Source {
     }
 }
 
-fn dest() -> (TempDir, PathBuf) {
+pub(super) fn dest() -> (TempDir, PathBuf) {
     let dir = TempDir::new().unwrap();
     let dest = dir.path().join("file.bin");
     (dir, dest)
@@ -172,14 +196,19 @@ fn dest() -> (TempDir, PathBuf) {
 
 /// One connection, so the source's fault comes at a known place, and a
 /// checkpoint after every megabyte.
-fn options() -> TaskOptions {
+pub(super) fn options() -> TaskOptions {
     TaskOptions::default()
         .max_connections(std::num::NonZeroUsize::new(1).unwrap())
         .checkpoint_bytes(std::num::NonZeroU64::new(BLOCK).unwrap())
 }
 
 /// A resumable task on `source` to `dest`, its file steps logged by `log`.
-fn resumable(source: Source, dest: &Path, log: &StepLog, token: &CancellationToken) -> Task {
+pub(super) fn resumable(
+    source: Source,
+    dest: &Path,
+    log: &StepLog,
+    token: &CancellationToken,
+) -> Task {
     builder(DownloadMode::Concurrent, source, dest, token)
         .meta(meta())
         .options(options())
@@ -190,13 +219,13 @@ fn resumable(source: Source, dest: &Path, log: &StepLog, token: &CancellationTok
 }
 
 /// The terminal status of `task`.
-async fn finish(task: Task) -> std::sync::Arc<TaskStatus> {
+pub(super) async fn finish(task: Task) -> std::sync::Arc<TaskStatus> {
     let status = task.status();
     let _ = watchdog(task).await;
     status.borrow().clone()
 }
 
-const NEW_START: [Step; 5] = [
+pub(super) const NEW_START: [Step; 5] = [
     Step::CreatePartial,
     Step::SyncPartial,
     Step::WriteState,
@@ -204,7 +233,7 @@ const NEW_START: [Step; 5] = [
     Step::SyncDirAfterStart,
 ];
 
-const COMPLETION: [Step; 6] = [
+pub(super) const COMPLETION: [Step; 6] = [
     Step::Rename,
     Step::SyncDirAfterRename,
     Step::TruncateState,
@@ -213,7 +242,7 @@ const COMPLETION: [Step; 6] = [
     Step::SyncDirAfterState,
 ];
 
-const DISCARD: [Step; 6] = [
+pub(super) const DISCARD: [Step; 6] = [
     Step::Invalidate,
     Step::SyncInvalidation,
     Step::RemovePartial,
@@ -224,7 +253,7 @@ const DISCARD: [Step; 6] = [
 
 /// The steps between the new start and the end are the checkpoints':
 /// writes and syncs of the state file, a write synced before the next.
-fn assert_checkpoints(steps: &[Step]) {
+pub(super) fn assert_checkpoints(steps: &[Step]) {
     assert!(
         steps
             .chunks(2)
@@ -235,7 +264,7 @@ fn assert_checkpoints(steps: &[Step]) {
 
 /// The state file is a valid header followed by valid records only, each
 /// of a block whose bytes in the partial file have its CRC.
-fn assert_kept_state(dest: &Path) -> usize {
+pub(super) fn assert_kept_state(dest: &Path) -> usize {
     let state = std::fs::read(state_path_for(dest)).unwrap();
     let header = decode_header(&state).expect("a valid header");
     assert_eq!(header.total, SIZE);
@@ -256,7 +285,7 @@ fn assert_kept_state(dest: &Path) -> usize {
 }
 
 /// The lock is free: another task can take the destination.
-fn assert_unlocked(dest: &Path) {
+pub(super) fn assert_unlocked(dest: &Path) {
     let lock = crate::task::instance::destination_lock::DestinationLock::acquire(
         dest,
         crate::task::instance::destination_lock::Unsupported::Fail,
@@ -857,7 +886,7 @@ async fn test_a_task_that_cannot_resume_ends_as_one_with_resume_off() {
 }
 
 /// Wait, off the async runtime, until a gated step is reached.
-async fn entered(entered: std::sync::mpsc::Receiver<()>) {
+pub(super) async fn entered(entered: std::sync::mpsc::Receiver<()>) {
     tokio::task::spawn_blocking(move || {
         entered
             .recv_timeout(Duration::from_secs(30))

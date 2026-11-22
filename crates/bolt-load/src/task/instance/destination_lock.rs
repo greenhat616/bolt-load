@@ -242,7 +242,6 @@ impl DestinationLock {
     }
 
     /// Whether this task created the lock file.
-    #[cfg_attr(not(test), expect(dead_code, reason = "resume arrives with C33"))]
     pub(crate) fn created(&self) -> bool {
         self.created
     }

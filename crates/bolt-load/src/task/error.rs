@@ -1,5 +1,6 @@
 use std::{fmt, io, path::PathBuf, sync::Arc};
 
+use super::RejectReason;
 use crate::{
     adapter::AdapterError,
     runner::{TaskError, storage_hint},
@@ -33,6 +34,9 @@ pub enum IoOp {
     Lock,
     /// Removing a partial file kept for a resume (design §11.5.5).
     Remove,
+    /// Reading the state file, or the partial file to check it, before a
+    /// resume (design §11.5.10). Resuming cannot be switched on yet (C20c).
+    Read,
 }
 
 impl fmt::Display for IoOp {
@@ -46,6 +50,7 @@ impl fmt::Display for IoOp {
             Self::Rename => "rename to",
             Self::Lock => "lock",
             Self::Remove => "remove",
+            Self::Read => "read",
         })
     }
 }
@@ -117,6 +122,18 @@ pub enum DownloadError {
     /// #152). Nothing was written; try again once that task ended.
     #[snafu(display("another task is downloading to {}", path.display()))]
     InUse { path: PathBuf },
+    /// The partial file and the state file an earlier task kept cannot be
+    /// continued, for `reason` (design §11.5.10). The task changed neither
+    /// file; continuing is impossible, so starting over is up to the
+    /// caller.
+    ///
+    /// Resuming cannot be switched on yet (it arrives with C20c), so no
+    /// task fails with this until then.
+    #[snafu(display("cannot resume from {}: {reason}", state_file.display()))]
+    ResumeRejected {
+        reason: RejectReason,
+        state_file: PathBuf,
+    },
     /// The destination cannot be written, for example its directory is
     /// missing or it is a directory.
     #[snafu(display("invalid destination {}: {reason}", path.display()))]
