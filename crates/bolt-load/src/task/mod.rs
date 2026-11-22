@@ -9,6 +9,7 @@ mod handle;
 pub mod instance;
 mod meta;
 mod options;
+mod resume;
 mod status;
 #[cfg(test)]
 mod test_support;
