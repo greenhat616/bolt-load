@@ -55,6 +55,10 @@
 | PR-9 续传 | C18 `feat(task)!: track written ranges separately from received ranges` | T19 | PR-1、PR-2 |
 | PR-9a 性质测试的失败 | C30 `test(task): fail runners in the split property test as the loop does` | design §14.22 | PR-9 的 C18 |
 | | C19 `feat(core)!: carry validators in adapter meta and send If-Range` | T20 | |
+| PR-9c 目标路径的锁（#152，建议） | C31 `fix(task)!: lock a destination for the whole task` | T21 | PR-9 的 C19 |
+| PR-9d 续传（建议） | C34 `feat(core): carry the If-Range validator in adapter meta` | T21 | PR-9c |
+| | C32 `feat(task): checksum and sync written blocks at checkpoints` | T21 | |
+| | C33 `feat(task): write a state file while downloading` | T21 | |
 | | C20 `feat(task): resume from a checked state file` | T21 | |
 
 **合并约束**：
@@ -602,18 +606,24 @@
   - 服务器忽略 `If-Range`、发新版本的 206：同样失败，不拼两个版本。
   - 没有 ETag 时用 `Last-Modified`；只有弱 ETag 时什么都不发（lead 决定，2026-11-09，RFC 9110 §13.1.5，见 design §14.23）。
 
-## T21 — 状态文件与续传（C20，P3）
+## T21 — 状态文件与续传（C31–C34、C20，P3）
 
-- [ ] `<file>.boltload` 使用 JSON Lines 格式（design §11.3）。区间在 `fsync` 之后才追加写入；任务完成后删除这个文件。
-- [ ] 续传前的一致性检查，按 design §11.4 的四步执行。丢弃了哪些区间、为什么丢弃，都要上报。
-- [ ] 新增续传入口。具体 API 形状先在 design 里补一节再实现，必须和 `task-api-spec.md` 的 builder 规则一致。
+设计见 design §11.5（D15–D19）；提交拆分是建议，见 §11.5.13。
+
+- [ ] C31：整个任务期间对 `<dest>.boltload` 加独占的建议锁（`fs4`），拿不到以 `InUse` 失败；核对文件 ID；只经锁住的句柄读写；锁的所有权在 unwind 和取消之外，panic 时等 worker 退出；`Off` 在动部分文件之前作废旧状态；修 #152（design §11.5.4）。
+- [ ] C34：meta 带上实际用于 `If-Range` 的验证器（design §11.5.7）。
+- [ ] C32：writer 的 `sync`，按 1 MiB 块的 CRC32C，串行的检查点（每 8 MiB 或 2 s、teardown 时一次）和失败时的回滚；测同步和 CRC 的开销（design §11.5.5、§11.5.6）。
+- [ ] C33：`<file>.boltload` 使用带 CRC 的二进制格式（design §11.3、§11.5.5）。记录在数据同步之后才追加；新开始、完成、回退、丢弃都按 §11.5.5 的顺序；按阶段保留或删除文件，`kept_for_resume`，`discard_partial`（design §11.5.9）。
+- [ ] C20：续传前的检查，按 design §11.4、§11.5.10 的顺序执行，逐块校验 CRC；丢弃了哪些记录、为什么丢弃，都要上报（`TaskInfo::resumed`）；不能续时以 `ResumeRejected` 失败。
+- [ ] C20：新增续传入口 `TaskBuilder::resume(Resume)`（D15、D16），符合 `task-api-spec.md` 的规则（STATUS-12、STATUS-13）。
 
 **验证**
 
 - 集成测试：
   - 在随机字节位置取消任务，再续传，最终 hash 正确（G9，至少 20 个种子）；
   - 人为构造状态文件的三种问题——重叠、越界、长度超过目标文件——断言对应的区间被丢弃并上报，最终 hash 正确；
-  - `total` 不一致时，从头下载。
+  - `total` 不一致时，以 `ResumeRejected` 失败，不改动文件（D16 修订：从头来由上层决定）；
+  - 部分文件里被改坏的块按 CRC 发现、重新下载，最终 hash 正确（D19）。
 
 ---
 
