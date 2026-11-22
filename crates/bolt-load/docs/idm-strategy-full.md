@@ -10,12 +10,14 @@
 > - **未知**：静态证据无法确认。
 
 > **b16 复核勘误（2026-10-31）**：本机 IDM 已升级到 v6.43b16（SHA-256 `75ac33a7…2145285`，6 490 480 字节），下文的 b15 地址在 b16 上全部失效。我们用 `dsh --profile headless` 和 IDA Pro（idalib + Hex-Rays）在 b16 上做了复核，被更正的结论都在原位用 **「b16 复核」** 标出；证据地址见 [`idm-improvement-plan.md`](./idm-improvement-plan.md) §8。要点：
-> 1. Q **不会**自适应：初值固定为 11680。增长式作用在 `Insert` 里的一个局部切分候选值上，这个值由**连接速率**推出（§3.4）。
+> 1. ~~Q **不会**自适应：初值固定为 11680。~~（b18 复核：初值是 11680，但会在两档之间切换，见下。）增长式作用在 `Insert` 里的一个局部切分候选值上，这个值由**连接速率**推出（§3.4）。
 > 2. `Try rollback, set chunksize` 发生在**续传前重建分片文件**的阶段，用来截掉比自身区间更长的临时文件，和 416 无关（§4.6）。
 > 3. 有两个连接状态机：一个的 body 空闲阈值是 30 s，另一个是 120 s，`response_state == 2` 时都是 300 s（§4.2）。
 > 4. 重连路径上**没有任何延时**（§4.8）。`Retry-After` 只出现在静态头名表里，没有被读取（§8）。
 > 5. `sites_sf` 是标志位，`&1` 让该站点**豁免**单连接降级；按站点的连接数存放在 `MCN\<scheme>://host\number` 里（§3.7）。
-> 6. `ApplyAlternative` 留下的是**已提交字节更多**的那一份，不是“谁先完成用谁”（§3.5，仅 dsh 一个来源，IDA 未复核）。
+> 6. ~~`ApplyAlternative` 留下的是**已提交字节更多**的那一份，不是“谁先完成用谁”（§3.5，仅 dsh 一个来源，IDA 未复核）。~~（b18 复核：不成立，见下。）
+>
+> **b18 复核（2026-11-06）**：本机 IDM 已是 v6.43b18。第 1 条和第 6 条要再更正：Q 在 11680 B 和 116800 B 两档之间切换（§3.4）；下载过程中留下的是先写入数据的那一份，“保留较大的那份”只发生在续传重建时（§3.5）。
 >
 > §6 的 bolt-load 一列引用的是旧版代码结构（`concurrent_task/mod.rs`），当前代码的核验结果以改进方案 §1 为准。
 
@@ -29,7 +31,7 @@ IDM 的下载器不是「把文件均分成 N 段、N 个线程跑完」这种�
 2. **几何扩张**：一个独立的 fan-out 控制器（`HTTPSession::TryStartNewOptionalConnections`）每隔 ≥ 2 秒把「允许的连接数」**翻倍**（2→4→8），直到配置上限；
    扩张的前置条件是「所有已启动连接都在活跃传输」且「总速率还没顶到限速的 85%」。
 3. **每加一个连接就切一刀**：新连接不预先分配固定大小的段，而是从当前**剩余最多**的 chunk 上切走它剩余量的一半（边界按「包大小」对齐），并且要求最大剩余量 ≥ `2×Q+3`（Q 为 chunk 量子）。
-4. **冗余对冲**：对慢/可疑的 chunk，IDM 会让第二个连接（可能来自备用地址）**重复下载同一区间**（`AddAlternative`），~~谁先完成用谁的文件~~（`ApplyAlternative`）。**b16 复核**（仅 dsh）：保留已提交字节更多的那一份。
+4. **冗余对冲**：对慢/可疑的 chunk，IDM 会让第二个连接~~（可能来自备用地址）~~**重复下载同一区间**（`AddAlternative`），~~谁先完成用谁的文件~~（`ApplyAlternative`）。~~**b16 复核**（仅 dsh）：保留已提交字节更多的那一份。~~ **b18 复核**：只在慢连接静默超过阈值时对冲，同一来源，原连接不停，先写入数据的一份胜出（§3.5）。
 5. **失败不等于重来**：连接级超时（~~30 s / 300 s~~ **b16 复核**：30 s 或 120 s，`response_state == 2` 时为 300 s，秒级）只触发「提交已收字节 → 重连」，**不消耗失败预算**，也**不做退避**；分片可被改派给其它连接；只有「无法续传 / 数据不一致 / 磁盘不足」才上升到任务级。
 6. **每片一个临时文件**，完成时 `JoinFile` 合并；分片位点写进注册表（`<id>` 与 `<id>a` 两条 16 字节记录），用于崩溃恢复与备选回滚。
 7. **恢复时做内容一致性校验**：`If-Range` + 保存的 `Last-Modified`/`FileSize`，以及对文件前 2 KiB 的指纹比对，防止「服务器换文件后接着写」把文件写脏。
@@ -62,14 +64,14 @@ IDM 的下载器不是「把文件均分成 N 段、N 个线程跑完」这种�
 | `0x5646cc` → `0x564670` | `ChunksList::AddAlternative` | `Add alternative connection (%ld) for connection %ld` |
 | `0x55e9e0` | `ChunksList::ApplyAlternative` | `Apply alternative for connection %ld`、`MoveFileW` 覆盖 |
 | `0x559b50` | `ChunksList::FindMaxFreeChunk` | 返回「剩余最多的块」及其剩余量 |
-| `0x57cbe0` | `ChunksList::CheckAlternative` | 扫描连接表，挑「该给冗余的那个连接」 |
+| `0x57cbe0` | ~~`ChunksList::CheckAlternative`~~（b15 误标；实为 FTP 的 `GetSlowestConnection`，见 §3.5 b18 复核） | 扫描连接表，挑静默最久、可以加对冲的那条连接 |
 | `0x5970d0` | `HTTPSession::TryStartNewOptionalConnections` | 连接数翻倍、2 s 冷却、85% 限速闸门 |
 | `0x58fdf0` | HTTP 连接状态机（非阻塞） | `Connection restarted because of timeout (1/2/3)`、`No data, restarting y_sc` |
 | `0x566d70` | 秒级「距上次活动」计时 | `_ftime32_s` → 取 `time_t`（秒）字段 |
 | `0x5b2ae0` | 「Change chunk size」日志点 | `ntohl` 解析后写入 `+0x3488` |
 | `0x5dcb84` | 发送 `If-Range:` 的请求构造点 | 字符串 `If-Range:` 的唯一 xref |
 
-会话中产生的 Evidence：`ev_36be70…`（fan-out 状态机）、`ev_baedce…`（InitFirst）、`ev_eacf59…`（AddAlternative）、`ev_bc5d19…`（ApplyAlternative）、`ev_0c2106…`（FindMaxFreeChunk）、`ev_090901…`（NeedNewConnection）、`ev_f09972…`（CheckAlternative）、`ev_1ad81f…`（HTTP 状态机）、`ev_f065c3…`/`ev_8ecc26…`（计时器）。
+会话中产生的 Evidence：`ev_36be70…`（fan-out 状态机）、`ev_baedce…`（InitFirst）、`ev_eacf59…`（AddAlternative）、`ev_bc5d19…`（ApplyAlternative）、`ev_0c2106…`（FindMaxFreeChunk）、`ev_090901…`（NeedNewConnection）、`ev_f09972…`（~~CheckAlternative~~ GetSlowestConnection，b18 复核）、`ev_1ad81f…`（HTTP 状态机）、`ev_f065c3…`/`ev_8ecc26…`（计时器）。
 
 ---
 
@@ -84,7 +86,7 @@ IDM 的下载器不是「把文件均分成 N 段、N 个线程跑完」这种�
   - `+0x1bc`：上一次扩张的时间戳（秒）；
   - `+0x1c0/+0x1c4`：新槽位初始化的区间端点；
   - `+0x274`：连接数组基址；
-  - `+0x13c`：响应状态（`2` 表示「已拿到完整响应头/进入传输」的某个态）；
+  - `+0x13c`：响应状态（~~`2` 表示「已拿到完整响应头/进入传输」的某个态~~ b16 复核：`2` 是某个特定响应态，含义未知，见 §4.2）；
   - `+0x25c/+0x25d`：暂停/恢复标志。
 - 每个连接内部：
   - `+0x18/+0x1c`：**已确认位置**（64 位，相对文件）；`+0x20/+0x24`：**在途未确认字节**；
@@ -193,18 +195,24 @@ return size >= 2 * Q + 3;                     // Q = 分片量子
   - 插入会让「当前块」成为空块（`endPacket < startPacket`）→ 记录 `Err in Chl:Ins` 并放弃。
 - 新分片立即：分配临时文件 `<base><id>`、写注册表记录、链接进链表、把连接指向它。
 
-**Step 3 — 备选优先**
+**Step 3 — ~~备选优先~~ 对冲还是切分（b18 复核）**
 
-`0x578370` 这个「启动下一块」的状态里，先 `NeedNewConnection`，再 `CheckAlternative`：
+`0x578370` 这个「启动下一块」的状态里，先 `NeedNewConnection`，再 ~~`CheckAlternative`~~ `GetSlowestConnection`（b18 复核）：
 
 ```text
+# b18 复核：b15 把 GetSlowestConnection 误标为 CheckAlternative，也漏了“复用的连接”这个条件
 need = NeedNewConnection(0)
-alt  = CheckAlternative(&a, &b, need)
-if (no alt)          -> Insert()            # 普通切分
-else                 -> AddAlternative(...) # 冗余对冲（见 3.5）
+slow = GetSlowestConnection(need)
+if (conn 是复用的 && slow) -> AddAlternative(...) # 冗余对冲（见 3.5）
+else                       -> Insert()            # 普通切分
 ```
 
-**推断的完整语义**：当「剩余最多的块」很大时，IDM 优先做冗余（同一区间并行两份），只有没有可用备选时才切分。这解释了为什么在实际下载里能看到「分片数远大于连接数」。
+~~**推断的完整语义**：当「剩余最多的块」很大时，IDM 优先做冗余（同一区间并行两份），只有没有可用备选时才切分。这解释了为什么在实际下载里能看到「分片数远大于连接数」。~~
+
+> **b18 复核**（IDA 静态分析 + 一次动态测试（2026-11-06，6.43 b16/b18））：
+> - b15 版伪代码里的 `CheckAlternative` 其实是 `GetSlowestConnection`（HTTP 和 FTP 各有一份）。真正叫 `CheckAlternative` 的函数只在续传前的重建阶段运行（§3.5）。高。
+> - 这一步发生在一条还没有分片的连接刚连上的时候。只有“复用”的连接才会走对冲分支，新开的连接一律切分。高。
+> - “块很大时优先做冗余”**不成立**。还有可切的块时，只有慢连接的静默超过本下载的历史阈值才对冲，否则照常切分（§3.5）。高。所以这条推断也解释不了“分片数远大于连接数”。
 
 ### 3.4 目标量子 Q 与几组常量
 
@@ -221,56 +229,71 @@ else                 -> AddAlternative(...) # 冗余对冲（见 3.5）
 并且有增长式：
 
 ```c
-if (Q * 5 < 0x2DA0) Q += 0x2DA0;
-else                Q  = Q * 2 + 0x5B43;
+// b16 复核：增长式作用在 Insert 里的局部切分候选值 c 上，不是 Q
+if (c * 5 < 0x2DA0) c += 0x2DA0;
+else                c  = c * 2 + 0x5B43;
 ```
 
 **推断**：
 
 - 这一族常量是「以网络包为单位的量化粒度」：8/16/32 个 MSS 的台阶；
-- `Q` 的更新是「小值加性、大值乘性」的自适应放大（AIMD 风格），`+3` 是给对齐留的余量；
+- ~~`Q` 的更新是「小值加性、大值乘性」的自适应放大（AIMD 风格），~~（b16 复核：增长式不作用在 Q 上）`+3` 是给对齐留的余量；
 - `2Q+3` 的切分阈值、`3×packet` 的插入闸门、`23 KB` 的绝对下限，三者是同一个「粒度体系」的不同侧面。
 
-**未知**：`Q` 的初值与更新频率（写入点未定位），以及它是否直接等于「目标分片大小」还是「对齐单位」。可以确定的是：**分片大小不是 `总大小 / 连接数`，而是一个会随吞吐自适应的量子**。
+**未知**：~~`Q` 的初值与更新频率（写入点未定位），以及~~（b18 复核：初值 11680，每次判断连接能否复用时在两档之间重设，见下）它是否直接等于「目标分片大小」还是「对齐单位」。可以确定的是：**分片大小不是 `总大小 / 连接数`**~~，而是一个会随吞吐自适应的量子~~（b18 复核：新分片拿最大剩余块的一半；Q 只在两档之间切换）。
 
 > **b16 复核（IDA 确认）**：上面的“AIMD 自适应 Q”**不成立**。
-> - Q 的初值是 `mov [eax+0C0h], 2DA0h`（11680 B，b16 `0x559A81`），没有找到其它写入点。“没有其它写入点”是推断。
+> - Q 的初值是 `mov [eax+0C0h], 2DA0h`（11680 B，b16 `0x559A81`）~~，没有找到其它写入点。“没有其它写入点”是推断~~。
 > - 增长式 `5c < 0x2DA0 ? c + 0x2DA0 : 2c + 0x5B43` 作用在 `Insert`（b16 `sub_5605D0`，`0x560BE7–0x560C1A`）里的一个**局部切分候选值 c** 上。c 由该连接的速率 `[conn+0x3D0]` 乘以 −1000.0 推出，再取 `min(c, 上限)`，减半后作为新分片的起点。
-> - 所以会随吞吐变化的是**切分点**，依据是**被切连接自己的速率**，不是任务总速率。Q 本身是一个固定的粒度。
+> - 所以会随吞吐变化的是**切分点**，依据是**被切连接自己的速率**，不是任务总速率。~~Q 本身是一个固定的粒度。~~
+
+> **b18 复核**（IDA 静态分析，2026-11-06，6.43 b16/b18）：Q **不是**固定的，上面“没有其它写入点”不成立。每次判断一条连接能否复用时，IDM 都会重设 Q：本下载 body 写入间隔的均值 < 1.1 s、且下载速度 > 116800 B/s 时取 116800 B，否则取 11680 B。所以 `2Q+3` 的切分门槛是 23 363 B 或 233 603 B。这是两档切换，不是 AIMD。两档取值：高；判据里那个量是下载速度：中。
 
 ### 3.5 冗余对冲：`AddAlternative` / `CheckAlternative` / `ApplyAlternative`
 
 这是 IDM 最不像「常规下载器」的地方。
 
-**`CheckAlternative`（`0x57cbe0`）**：遍历连接表（步长 15 000 = `0x3A98` 的另一个视图），统计各状态连接数，挑出一个「值得对冲」的连接：
+**~~`CheckAlternative`~~ `GetSlowestConnection`（`0x57cbe0`，b18 复核：b15 误标）**：遍历连接表（步长 15 000 = `0x3A98` 的另一个视图），统计各状态连接数，挑出一个「值得对冲」的连接：
 
 ```text
+# b18 复核：b15 把 need==0 的条件写反成 < 2；need!=0 时比较的是静默秒数和静默统计，不是吞吐
 候选：state ∈ {4, 6}，且已绑定分片，且分片 flags(+0x5c)==0 且 (+0x14)==0
-选择：记录「距上次数据的最长时间」最大的那个
-阈值：need==0 时，仅当该时间 < 2 才返回候选；need!=0 时，再比较该连接的吞吐
+选择：记录「距上次数据的最长时间」（整秒）最大的那个
+阈值：need==0 时，该时间 >= 2 才返回候选；need!=0 时，该时间要超过本下载历史的 min(均值 + 3σ, 最大值)
 ```
 
 **`AddAlternative(item, conn)`（`0x564670`）**：
 
 1. 校验分片临时文件已有内容（`GetFileSize > 0`）；
-2. 把原分片**按 `pos` 切开**：`[start, pos)` 保留为原分片，`[pos, end)` 成为新分片；
+2. 把原分片**按 `pos` 切开**：`[start, pos)` 保留为原分片，`[pos, end)` 成为新分片（b18 复核：前段算完成；原连接用原来的 socket 接着下新分片）；
 3. 让新连接从 `pos` 开始下载同一段 `[pos, end)`；
-4. 新分片被挂成原分片的 **alternative**（`item->alt`、`alt->parent`），`alt_state` 标记 1/2；
+4. ~~新分片被挂成原分片的 **alternative**~~（b18 复核：新连接拿到一个起止相同的孪生项，挂成新分片的 **alternative**）（`item->alt`、`alt->parent`），`alt_state` 标记 1/2；
 5. 注册表写 `<id>a` 记录（`{altId, startPos, nextID}`）。
 
 **`ApplyAlternative(item)`（`0x55e9e0`）**：
 
-1. 删除备选自己的临时文件；
-2. 用 `MoveFileW(alt.tmp, item.tmp)` 把备选文件**覆盖**到主分片上；
+1. 删除~~备选自己的~~落败一方的临时文件（b18 复核）；
+2. 用 `MoveFileW(alt.tmp, item.tmp)` 把备选文件**覆盖**到主分片上（b18 复核：只在备选先写入数据时；原份先写入时没有这一步）；
 3. 把主分片的 `end` 更新为备选的 `end`，把备选从链表摘除，删除 `<id>a` 注册表记录，状态归零。
 
-**推断的语义**：这是一次「对冲式重复下载（hedged download）」——对慢或可疑的分片，用第二个连接（可能是备用 IP/域名）**重复下载同一区间**，谁先完成就采用谁的数据；另一份被丢弃。它用带宽换「尾延迟」与「连接质量不确定性」。
+**推断的语义**：这是一次「对冲式重复下载（hedged download）」——对慢或可疑的分片，用第二个连接~~（可能是备用 IP/域名）~~**重复下载同一区间**，~~谁先完成就采用谁的数据~~（b18 复核：同一来源，先写入数据的一份胜出）；另一份被丢弃。它用带宽换「尾延迟」与「连接质量不确定性」。
 
 > **b16 复核（只有 dsh 一个来源，IDA 未复核）**：
-> - `ApplyAlternative`（b16 `0x55F4D0`）比较两份的已提交字节数，保留**更多**的那一份，并不是“谁先完成用谁”。
-> - `CheckAlternative` 的触发条件在 b16 上还没有定位。
+> - ~~`ApplyAlternative`（b16 `0x55F4D0`）比较两份的已提交字节数，保留**更多**的那一份，并不是“谁先完成用谁”。~~
+> - ~~`CheckAlternative` 的触发条件在 b16 上还没有定位。~~
 
-备注：`AddAlternative` 里 `param_1[5] = 1` 与 `FUN_00568f20(0)` 说明原连接在切出备选后会被「停/让位」，避免同一区间被同一连接重复读。
+> **b18 复核**（IDA 静态分析 + 一次动态测试（2026-11-06，6.43 b16/b18））：上面 b16 复核的两条都要更正。
+> - **`CheckAlternative` 只在续传时运行**。它在续传前的重建阶段处理中断时还没分出胜负的对冲：保留较大的那个临时文件，相等时保留原份。上文“遍历连接表、挑出值得对冲的连接”的其实是 `GetSlowestConnection`。高。
+> - **触发**：一条还没有分片的连接刚连上（或 TLS 握完）时，决定切分还是对冲。只有“复用”的连接会对冲：它刚下完自己的分片、在对冲中落败被回收，或者从空闲中被唤醒。新开的连接一律切分。续传重建阶段不对冲。高。
+> - **对象**：处于“等响应头”或“收 body”状态、分片还没有对冲、静默最久的那一条。静默按整秒计，从上次写入数据（等响应头时从发出请求）算起。每个分片同时最多一份对冲。高。
+> - **阈值**：还有可切的块（`NeedNewConnection` 为真）时，静默要超过本下载历史的 min(均值 + 3σ, 最大值)。body 状态用两次写入的间隔，等响应头用请求到响应头的延迟。统计从 0 开始，所以没有历史时静默 ≥ 1 s 就够。没有可切的块（收尾）时，静默 ≥ 2 s 就对冲。比较的是静默秒数，不是吞吐。高。
+> - **唤醒**：有连接静默 ≥ 2 s、且停顿的连接多于正在建连的连接时，空闲连接会被唤醒去对冲。其中一条路径还要求本下载 body 写入间隔的均值 ≥ 1.1 s。下完分片的连接，在还有可切的块、或满足同样条件时留下来，否则转为空闲。高。
+> - **同一来源**：新连接是同一个下载的另一条连接，请求同一区间，没有换地址或镜像。所以这是对冲，不是故障转移。高；“URL 一定相同”：中。
+> - **原连接不停**：慢分片在已提交位置切开，前段算完成；慢连接用原来的 socket 继续下后段。高。
+> - **胜负**：哪一份先写入数据，就用 `ApplyAlternative` 留下哪一份。另一份的连接立即关闭，临时文件删除，连接回收后再找活。不是“字节更多”，也不是“谁先完成”。高。
+> - **动态测试**：一条连接在已提交位置停顿后，IDM 从这个位置对同一区间发出了第二个请求，当时原连接仍然开着；原连接最后被 30 s 空闲超时关掉。测试受本机代理干扰，没观察到胜负。中。
+
+备注：~~`AddAlternative` 里 `param_1[5] = 1` 与 `FUN_00568f20(0)` 说明原连接在切出备选后会被「停/让位」，避免同一区间被同一连接重复读。~~ **b18 复核**：原连接不停。被标记的是切开后的前段分片（算作已完成）；那个调用只刷新界面。
 
 ### 3.6 合并：`JoinWithNext`
 
@@ -285,7 +308,7 @@ else                Q  = Q * 2 + 0x5B43;
 
 - 全局：`MaxConnectionsNumber`（默认 8，本机 8）。fan-out 的 `slots` 直接来自这里。
 - 按服务器：UI 文案 `Max. connections number for a server`；RTTI 类名 `.?AVCMaxConnNumbers@@`、`.?AVCAddMaxConnDlg@@`；注册表存在 `MCN` 键（本机为空）与 `sites_sf`（本机：`factorio.com = 2`、`deepseek.com = 2`）。
-- 推断：`sites_sf` 的数值是「该站点的连接数上限/档位」，`MCN` 是按 host 存上限的容器；运行时 `min(全局, 站点)` 生效。
+- 推断：~~`sites_sf` 的数值是「该站点的连接数上限/档位」，~~`MCN` 是按 host 存上限的容器；运行时 `min(全局, 站点)` 生效。（b16 复核：`sites_sf` 是标志位，不是连接数，见下。）
 
 > **b16 复核（IDA 确认读写函数和位解码）**：`sites_sf` 不是连接数，是**标志位**。
 > - 读取函数是 `sub_5DA420`，唯一的调用者在 `0x59CBEF`。位解码在 `0x59CBFB–0x59CC24`：`&1 → +0x36E`，`&2 → +0x36D`，`&4 → +0x36F`。
@@ -307,7 +330,7 @@ else                Q  = Q * 2 + 0x5B43;
 | 0 | 待发起 / 等待连接建立 | 20 s 相关检查 + 200 tick |
 | 1 | 等待写就绪（已连上，准备发请求） | 30 s → `timeout (2)` |
 | 4 | 等待首字节 / 首包 | 30 s → `timeout (4 分支)`；或 `1e`/`12c` 分支 |
-| 6 | 传输中（body） | 30 s 或 **300 s** → `timeout (3)` |
+| 6 | 传输中（body） | 30 s 或 **300 s** → `timeout (3)`（b16 复核：另一个状态机是 120 s；300 s 只在某个特定响应态，见 §4.2） |
 | 0x10 | 收尾 / 读最后一段 | 30 s |
 | 0x1C..0x20 | TLS / HTTP2 / 特殊握手阶段 | 30 s → `timeout (1)` |
 | 0x26 | HTTP/2 数据流 | 30 s |
@@ -324,7 +347,7 @@ close_and_restart(conn);           // 然后才断开重连
 
 含义：**重连的 Range 起点永不回退，也永不重复写同一段**。同时「重启连接」在 IDM 里是**维护动作**，不是失败。
 
-### 4.2 两级空闲超时：30 s / 300 s（秒级）
+### 4.2 两级空闲超时：30 s / 300 s（秒级；b16 复核：另一个状态机是 120 s / 300 s）
 
 - 计时器 `FUN_00566d70` → `_ftime32_s()` 取 `time_t`（秒）字段相减，粒度 1 s。
 - 阈值：`0x1E` = 30，`0x12C` = 300。
@@ -335,7 +358,7 @@ limit = (response_state != 2) ? 30 : 300;
 if (idle > limit) restart("Connection restarted because of timeout (3)");
 ```
 
-即：**头部/握手阶段 30 s 无进展就重连；已经进入 body 阶段则容忍到 5 分钟**（慢速大文件很常见）。
+~~即：**头部/握手阶段 30 s 无进展就重连；已经进入 body 阶段则容忍到 5 分钟**（慢速大文件很常见）。~~（b16 复核：`response_state == 2` 是某个特定响应态，不是“已进入 body”。普通 body 的空闲阈值是 30 s 或 120 s，只有那个响应态才是 300 s，见下。）
 
 此外还有 `No data, restarting y_sc`：当「已收到字节数 > 0 且实测速率低于期望值的 1.3 倍关系」时也会主动重启——这是一条**吞吐异常**判据，不只是「完全没数据」。
 
@@ -367,6 +390,8 @@ if (idle > limit) restart("Connection restarted because of timeout (3)");
 
 > **b16 复核（只有 dsh 一个来源）**：dsh 报告每个会话有一个 ECONNRESET 计数器，累计 3 次就让该连接退役，把分片改派出去（b16 `0x5B2210` 附近）。IDA 里改派相关的字符串没有直接 xref，这一条**未复核**。
 
+> **b18 复核**（IDA 静态分析 + 一次动态测试（2026-11-06，6.43 b16/b18））：HTTP 实现里，这条日志对应的是**接管**。连接下完自己的分片后，如果请求区间还覆盖下一个分片、两片首尾相接，而下一个分片的连接只收到不超过 64 字节，就由它接着下完下一个分片，原连接被停掉并回收。测试日志里反复出现这一行。高。“失败后转交”这条推断仍未复核。
+
 ### 4.6 Range 相关的失败分类
 
 - ~~416（`Range Not Satisfiable`）/ 尾部越界 → `Try rollback, set chunksize to %I64d`：**回滚分片尺寸**后重试，而不是重试同一请求；~~
@@ -385,7 +410,7 @@ if (idle > limit) restart("Connection restarted because of timeout (3)");
 - `Not enough disk space to store files chunks, canceling download.`
 - `Not enough disk space to rebuild downloaded chunks.`
 
-`CheckAlternative`/`Insert` 都会建临时文件，因此每次「加片」都会评估磁盘。
+`AddAlternative`/`Insert` 都会建临时文件，因此每次「加片」都会评估磁盘。（b18 复核：原文写的是 `CheckAlternative`，但它不建临时文件，只在续传重建时比较、删除或改名已有的临时文件。）
 
 ### 4.8 任务级 vs 连接级：失败的边界
 
@@ -416,7 +441,7 @@ if (idle > limit) restart("Connection restarted because of timeout (3)");
 // ---- 连接扩张（每 ~2 s 一次机会） ----
 fn try_grow(session: &mut Session) {
     if session.allowed >= session.slots { return; }
-    if session.response_state == Done { return; }
+    if session.response_state == 2 { return; }     // b16 复核：某个特定响应态，不一定是完成
     if session.paused && !session.resumed { return; }
     if let Some(limit) = session.speed_limit {
         if session.speed >= limit * 85 / 100 { return; }     // 85% 闸门
@@ -437,8 +462,9 @@ fn try_grow(session: &mut Session) {
 // ---- 新连接拿什么 ----
 fn assign_chunk(session: &mut Session, conn: &mut Conn) {
     let need = session.need_new_connection();      // 最大剩余 >= 2Q+3
-    if let Some(alt) = session.check_alternative(need) {
-        session.add_alternative(alt, conn);        // 对冲：同区间第二份
+    // b18 复核：只有复用的连接才对冲；对象是静默最久、且超过阈值的那条连接
+    if let Some(slow) = session.slowest_connection(need).filter(|_| conn.reused) {
+        session.add_alternative(slow, conn);       // 对冲：同区间第二份，原连接不停
     } else {
         session.insert_split(conn);                // 切走最大块剩余量的一半
     }
@@ -479,16 +505,16 @@ fn restart_connection(conn: &mut Conn, reason: Reason) {
 | 限速协同 | 速率 ≥85% 限速则停止扩张 | 无限速概念 | 可选 |
 | 切分对象 | 「剩余最多的块」，切走其剩余量的一半 | 只按 `runner_id` 切它自己的 `incomplete_range` 的一半（`mod.rs:726-733`） | 等价度较高，但 bolt-load 缺「全局最大块」视角 |
 | 切分闸门 | 最大剩余 ≥ `2Q+3`；且 ≥23 KB / ≥3×packet；且插入后不得为空 | 仅 `remaining >= 2*min_chunk_size`（`chunk_planner.rs:400-422`），无包对齐、无「插入后为空」防护 | **应补** |
-| 量子 Q | ~~自适应（AIMD 式增长）~~ b16 复核：固定 11680；切分点按**被切连接的速率**推出 | 固定 1 MiB（`chunk_planner.rs:11`）；切分尺寸 = **任务总速率** × 2（`strategy/mod.rs:80`） | 不引入 Q；切分尺寸改用单连接速率（见改进方案 P1-5） |
+| 量子 Q | ~~自适应（AIMD 式增长）~~ ~~b16 复核：固定 11680~~ b18 复核：11680 或 116800 两档切换；切分点按**被切连接的速率**推出 | 固定 1 MiB（`chunk_planner.rs:11`）；切分尺寸 = **任务总速率** × 2（`strategy/mod.rs:80`） | 不引入 Q；切分尺寸改用单连接速率（见改进方案 P1-5） |
 | 并发上限的落地校验 | 扩张前统一算 `target`，逐个启动，绝不越界 | `SplitAllTask` 逐个 split，**不校验 `active < max`**，一个 tick 可翻倍越界（`mod.rs:690-697`） | ~~必修 bug~~ 当前闸门下不会越界；真正的风险是 `split()` 先 resize 再 spawn 不是原子操作，外加 `expect`（改进方案 C2） |
-| 冗余对冲 | 同区间第二份（备选文件 + registry `<id>a`） | 无 | 可选（成本高） |
+| 冗余对冲 | 同区间第二份（备选文件 + registry `<id>a`）；b18 复核：只对静默最久的连接，先写入数据的一份胜出 | 无 | ~~可选（成本高）~~ D5 已定（2026-11-06）：只做收尾版对冲 |
 | 尾部处理 | `JoinWithNext` 合并（合并的是**已完成**的项） | 只切不合，但尾片仍有连接在下，不白占槽 | ~~应补 merge~~ 不做（改进方案 §2.3） |
 | 分片存储 | 每片一个临时文件 + `JoinFile` | 单文件区间写（mmap/pool） | 保持现状 |
 | 连接级超时 | 30 s（握手）；body 30 或 120 s，特定态 300 s（b16 复核）；「重启不计失败、无延时」 | `connect_timeout` + `stream_idle_timeout`，超时计为一次 retryable 失败（`failure_policy.rs`） | **应改语义**（重启不计失败，但要有退避） |
 | 失败预算 | 连接级几乎无预算（改派/重连/对冲），任务级交给调度器 30 s 无限重试 | 全局 `max_consecutive_failures`，一次成功写就清零 | **应改维度** |
 | 分片改派 | 有（4 个调用点） | 失败分片回到 available，靠调度器重新领取；但会与「全局预算」耦合 | 部分等价 |
 | Range 校验 | `Content-Range`、`multipart/byteranges`、`If-Range`、首 2 KiB 指纹 | 只 `error_for_status()`；200 全量响应会被当区间数据写入（`reqwest.rs:301-315`） | **必修（正确性）** |
-| 4xx 语义 | 416→回滚尺寸；不支持续传→降级单连接；其余分级 | 除 404/401/403/429/503 外全归 `RetryableError::Io`（`reqwest.rs:108-114`） | **应改** |
+| 4xx 语义 | ~~416→回滚尺寸~~（b16 复核：`Try rollback` 和 416 无关，见 §4.6）；不支持续传→降级单连接；其余分级 | 除 404/401/403/429/503 外全归 `RetryableError::Io`（`reqwest.rs:108-114`） | **应改** |
 | `Retry-After` | 头名只在静态头表里，**不读取**（b16 IDA 确认） | 未解析 | 应补（bolt-load 没有调度器兜底） |
 | 限速整形 | 按单个下载做延时整形，单次最长 12 s，`select()` 等待；不分摊（b16 IDA 确认） | 无 | 可选（做成跨任务共享） |
 | 磁盘前置检查 | 加片前检查 | 无 | 应补 |
@@ -508,7 +534,7 @@ fn restart_connection(conn: &mut Conn, reason: Reason) {
 | `grow_factor` | ×2（加速档 3/6/8） | 2 |
 | `grow_requires_all_active` | `started == active` | true |
 | `speed_limit_headroom` | 85% | 0.85（若有限速） |
-| `chunk_quantum` | ~~自适应 Q~~ 固定 Q（b16 复核） | 保持 1 MiB 下限；切分尺寸按单连接速率推算 |
+| `chunk_quantum` | ~~自适应 Q~~ ~~固定 Q（b16 复核）~~ 两档 Q：11680 或 116800（b18 复核） | 保持 1 MiB 下限；切分尺寸按单连接速率推算 |
 | `min_split_remain` | `2Q+3` | `2*quantum` |
 | `split_align` | packet（MSS 倍数） | 64 KiB（或 4 KiB 文件块） |
 | `idle_timeout_handshake` | 30 s | 30 s |
@@ -527,16 +553,19 @@ fn restart_connection(conn: &mut Conn, reason: Reason) {
 
 ## 8. 未知与边界
 
-> **b16 复核后的状态**：第 1 条已解决（初值 11680，没有自适应）；第 5 条已解决（不读取）；第 6 条大部分解决（`&2`/`&4` 的含义仍未知）；第 7 条有补充（存在两个状态机）。其余各条仍未解决。
+> **b16 复核后的状态**：~~第 1 条已解决（初值 11680，没有自适应）；~~第 5 条已解决（不读取）；第 6 条大部分解决（`&2`/`&4` 的含义仍未知）；第 7 条有补充（存在两个状态机）。其余各条仍未解决。
+>
+> **b18 复核后的状态**：第 1 条改为部分解决：Q 在两档之间切换（§3.4）。第 4 条已解决：比较的是静默秒数和本下载的静默统计，不是吞吐（§3.5）。新增第 9 条。
 
-1. `Q` 的初值、更新触发点与单位；`0x2DA0/0x5B40/0xB680` 虽与 `1460×{8,16,32}` 完全吻合，但业务口径仍是推断。
+1. ~~`Q` 的初值、更新触发点与单位；~~（b18 复核：初值 11680 B，每次判断连接能否复用时在两档之间重设，§3.4。）`0x2DA0/0x5B40/0xB680` 虽与 `1460×{8,16,32}` 完全吻合，但业务口径仍是推断；Q 判据里的那个量是不是下载速度，也还没确认。
 2. `NeedNewConnection` 中 `FindMaxFreeChunk(&size, packet)` 的第二参数（packet）的来源与取值。
 3. 加速档标志 `+600` 的开启条件（推测与「服务器类型/网络类型」或用户档位有关）。
-4. `CheckAlternative` 里 `fVar6 < local_20` 的精确含义（吞吐 vs 空闲秒数的混用，反编译有歧义）。
-5. `Retry-After` 仅确认存在于已知头名表，是否真的用于调度未验证。
-6. 按站点连接上限（`sites_sf` 的数值语义、`MCN` 的结构）未逐条验证。
-7. 连接状态机的完整状态枚举（只覆盖了 `0/1/4/6/0x10/0x1C..0x20/0x26/0x27`）。
+4. ~~`CheckAlternative` 里 `fVar6 < local_20` 的精确含义（吞吐 vs 空闲秒数的混用，反编译有歧义）。~~ b18 复核：已解决。这段代码在 `GetSlowestConnection` 里，比较的是静默秒数和本下载的静默统计，不是吞吐（§3.5）。
+5. ~~`Retry-After` 仅确认存在于已知头名表，是否真的用于调度未验证。~~ b16 复核：已解决，IDM 不读取它的值（改进方案 §8 B1）。
+6. 按站点连接上限~~（`sites_sf` 的数值语义、`MCN` 的结构）未逐条验证~~：b16 复核之后，只剩 `sites_sf` 的 `&2`、`&4` 是什么意思（§3.7）。
+7. 连接状态机的完整状态枚举（只覆盖了 `0/1/4/6/0x10/0x1C..0x20/0x26/0x27`）。b16 复核：至少有两个状态机（§4.2）。
 8. 反编译的 `ChunksListItem` 字段偏移在不同版本间可能变化；本文只使用**语义**，未把偏移当契约。
+9. 对冲还没确认的几点：新开的连接为什么不对冲、对冲是否总用原连接的 URL、几个会话级条件的含义，以及触发时序和胜负的动态验证。见改进方案 §8 的“仍未解决的问题”。
 
 ---
 
@@ -556,7 +585,7 @@ fn restart_connection(conn: &mut Conn, reason: Reason) {
 | `0x1E` / `0x12C` + `_ftime32_s` 秒差 | 30 s / 300 s 两级空闲超时（b16 复核：另一个状态机是 120 s / 300 s） |
 | `If-Range:` 唯一 xref | 请求侧做资源一致性校验 |
 | 读前 `0x800` 字节 + `Strart data … matched with start of the file` | 落盘侧做内容指纹校验 |
-| `MoveFileW(alt.tmp, item.tmp)` | 备选是「同区间第二份」；b16 复核（仅 dsh）：保留已提交字节更多的一份 |
+| `MoveFileW(alt.tmp, item.tmp)` | 备选是「同区间第二份」；~~b16 复核（仅 dsh）：保留已提交字节更多的一份~~ b18 复核：下载中先写入数据的一份胜出；续传重建时才保留较大的那份 |
 | `<id>` / `<id>a` 两条 16 字节注册表值 | 分片与备选各自持久化位点 |
 | `DwnlData` 下 19 个分片文件 vs 8 连接上限 | chunk 数 ≠ 连接数，分片按会话累积 |
 | `sites_sf` + `MCN` + `CMaxConnNumbers` | 存在按站点的连接上限（b16 复核：上限在 `MCN\…\number`；`sites_sf` 是标志位） |
