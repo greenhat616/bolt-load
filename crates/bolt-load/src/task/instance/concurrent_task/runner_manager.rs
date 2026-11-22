@@ -7,7 +7,7 @@
 //! - Channels for sending control messages to specific runners
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     ops::Range,
     task::{Context, Poll},
     time::Instant,
@@ -20,6 +20,8 @@ use smol_cancellation_token::CancellationToken;
 /// A chunk of data downloaded by a runner, ready to be written to disk.
 #[derive(Debug)]
 pub(super) struct DownloadedChunk {
+    /// The runner that delivered it, whose silence it ends (design §9.6).
+    pub runner_id: RunnerId,
     pub range: Range<u64>,
     pub bytes: Bytes,
 }
@@ -43,12 +45,22 @@ pub(super) struct AttemptFailure {
     pub charged: u32,
     /// Bytes the planner accepted from this attempt, see
     /// [`Released::received`](super::chunk_planner::Released::received);
-    /// 0 for a failed connect.
+    /// 0 for a failed connect. Of a hedged attempt, only those of the
+    /// failing runner's own side (design §9.6).
     pub received: u64,
     /// What the attempt says about the server's admission (design §8.3).
+    // Not `expect`, as for `slow` below.
+    #[cfg_attr(
+        not(feature = "tracing"),
+        allow(dead_code, reason = "only read by tracing and the tests")
+    )]
     pub class: AdmissionClass,
     /// Whether the failure is a refusal above the proven window, which is
     /// not charged (design §14.13a).
+    #[cfg_attr(
+        not(feature = "tracing"),
+        allow(dead_code, reason = "only read by tracing and the tests")
+    )]
     pub exempt: bool,
     /// The loop stopped the runner for being slow (design §9.5), see
     /// [`Self::slow`].
@@ -70,15 +82,58 @@ pub(super) struct Admission {
     pub exempt: bool,
 }
 
+impl Admission {
+    /// An attempt that says nothing about the server's admission.
+    pub(super) const NONE: Self = Self {
+        class: AdmissionClass::NoEvidence,
+        exempt: false,
+    };
+}
+
 impl AttemptFailure {
     /// The failure of the runner whose range was `released`.
+    #[cfg(test)]
     pub(super) fn new(
         runner_id: RunnerId,
         error: TaskError,
         retryable: bool,
         released: Released,
     ) -> Self {
-        let charge = charges_range(&error, retryable, released.received);
+        let own = released.received;
+        Self::of_attempt(
+            runner_id,
+            error,
+            retryable,
+            released,
+            own,
+            None,
+            Admission::NONE,
+        )
+    }
+
+    /// The failure of the runner whose range was `released`, which
+    /// delivered `own` bytes itself; `first` is how the other side of its
+    /// hedged attempt failed, if it did (design §9.6).
+    ///
+    /// The attempt is charged at most once for both sides: when neither is
+    /// a restart and either is charged. Alone, a runner is charged as
+    /// [`charges_range`] has it, unless `admission` exempts it: a refusal
+    /// above the proven window (design §14.13a). Each side is classified
+    /// when it fails, so `first` carries the exemption of its moment.
+    pub(super) fn of_attempt(
+        runner_id: RunnerId,
+        error: TaskError,
+        retryable: bool,
+        released: Released,
+        own: u64,
+        first: Option<SideFailure>,
+        admission: Admission,
+    ) -> Self {
+        let charges = charges_range(&error, retryable, own) && !admission.exempt;
+        let charge = match first {
+            None => charges,
+            Some(first) => !first.restart && !is_restart(&error, own) && (first.charged || charges),
+        };
         Self {
             runner_id,
             charged: released.charged.saturating_add(charge.into()),
@@ -86,9 +141,9 @@ impl AttemptFailure {
             retryable,
             range: released.range,
             attempts: released.attempts,
-            received: released.received,
-            class: AdmissionClass::NoEvidence,
-            exempt: false,
+            received: own,
+            class: admission.class,
+            exempt: admission.exempt,
             slow: false,
         }
     }
@@ -102,27 +157,49 @@ impl AttemptFailure {
     /// is neither charged nor a consecutive failure; without, it is
     /// charged, so a runner that never delivers cannot be restarted
     /// forever.
+    #[cfg(test)]
     pub(super) fn slow(runner_id: RunnerId, released: Released) -> Self {
-        Self {
-            slow: true,
-            ..Self::new(runner_id, TaskError::Timeout, true, released)
-        }
+        let own = released.received;
+        Self::slow_of_attempt(runner_id, released, own, None)
     }
 
-    /// The failure as the manager classified it: an exempt refusal is not
-    /// charged to its range.
-    pub(super) fn with_admission(mut self, admission: Admission) -> Self {
-        if admission.exempt {
-            debug_assert!(
-                charges_range(&self.error, self.retryable, self.received),
-                "only a charged refusal is exempted"
-            );
-            self.charged -= 1;
+    /// [`Self::slow`] of a runner that delivered `own` bytes itself, see
+    /// [`Self::of_attempt`].
+    pub(super) fn slow_of_attempt(
+        runner_id: RunnerId,
+        released: Released,
+        own: u64,
+        first: Option<SideFailure>,
+    ) -> Self {
+        Self {
+            slow: true,
+            ..Self::of_attempt(
+                runner_id,
+                TaskError::Timeout,
+                true,
+                released,
+                own,
+                first,
+                Admission::NONE,
+            )
         }
-        self.class = admission.class;
-        self.exempt = admission.exempt;
-        self
     }
+}
+
+/// A side of an undecided pair that failed while the other ran on (design
+/// §9.6): its range stays with the other side, so nothing is released or
+/// backed off, and the budget waits for the pair.
+#[derive(Debug, Clone)]
+pub(super) struct SideFailed {
+    #[expect(dead_code, reason = "kept for diagnostics in `Debug` output")]
+    pub runner_id: RunnerId,
+    pub error: TaskError,
+    pub retryable: bool,
+    /// Bytes the planner accepted from this side itself.
+    pub received: u64,
+    /// The failed attempts of the range should it fail now, which set the
+    /// backoff of a congestion without `Retry-After`.
+    pub attempts: u32,
 }
 
 /// Bytes received from runners since the previous snapshot.
@@ -140,6 +217,8 @@ pub(super) struct RunnerTick {
     pub state: TaskState,
     pub downloaded: Option<DownloadedChunk>,
     pub failure: Option<AttemptFailure>,
+    /// Boxed: it is rare and large, and every runner event carries a tick.
+    pub side_failure: Option<Box<SideFailed>>,
 }
 
 impl RunnerTick {
@@ -148,30 +227,35 @@ impl RunnerTick {
             state: TaskState::Downloading,
             downloaded: None,
             failure: None,
+            side_failure: None,
         }
     }
 
     fn finished() -> Self {
         Self {
             state: TaskState::Finished,
-            downloaded: None,
-            failure: None,
+            ..Self::downloading()
         }
     }
 
     fn with_chunk(chunk: DownloadedChunk) -> Self {
         Self {
-            state: TaskState::Downloading,
             downloaded: Some(chunk),
-            failure: None,
+            ..Self::downloading()
         }
     }
 
     fn with_failure(failure: AttemptFailure) -> Self {
         Self {
-            state: TaskState::Downloading,
-            downloaded: None,
             failure: Some(failure),
+            ..Self::downloading()
+        }
+    }
+
+    fn with_side_failure(failure: SideFailed) -> Self {
+        Self {
+            side_failure: Some(Box::new(failure)),
+            ..Self::downloading()
         }
     }
 }
@@ -190,8 +274,10 @@ fn is_attempt_retryable(error: &TaskError) -> bool {
 
 use super::{
     ChunkPlanner, PlannerGuard,
-    chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SplitCandidate},
-    strategy::{AdmissionClass, AdmissionEvidence, AttemptPhase, charges_range, classify},
+    chunk_planner::{ChunkState, ChunkStatus, Released, Resize, SideFailure, SplitCandidate},
+    strategy::{
+        AdmissionClass, AdmissionEvidence, AttemptPhase, charges_range, classify, is_restart,
+    },
 };
 use crate::{
     runner::{
@@ -220,6 +306,16 @@ pub(super) struct RunnerChannels {
 #[derive(Debug)]
 pub(super) struct SpawnFailed {
     pub message: String,
+}
+
+/// Why the loop stopped a runner through its own stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StopReason {
+    /// Too slow (design §9.5, §14.15): its range is restarted.
+    Slow,
+    /// The beaten side of a hedged pair (design §9.6): nothing of it
+    /// counts, and only its slot is reclaimed.
+    Loser,
 }
 
 /// Errors that may occur when sending messages
@@ -291,9 +387,13 @@ pub struct RunnerManager {
     meters: HashMap<RunnerId, usize>,
     /// Each spawned runner's own stop, until it is released.
     stops: HashMap<RunnerId, CancellationToken>,
-    /// Runners stopped by [`Self::stop_runner`] that have not reported
-    /// `Stopped` yet.
-    stopping: HashSet<RunnerId>,
+    /// Runners the loop stopped that did not confirm it yet, and why:
+    /// by [`Self::stop_runner`], or beaten in a hedged pair.
+    stopping: HashMap<RunnerId, StopReason>,
+    /// When each runner last delivered a non-empty frame the planner
+    /// accepted, or was spawned, or the writer could take data again: the
+    /// start of its silence (design §9.6).
+    last_delivery: HashMap<RunnerId, Instant>,
 }
 
 impl RunnerManager {
@@ -314,7 +414,8 @@ impl RunnerManager {
             data_aggregator: DataAggregator::with_capacity(max_concurrency),
             meters: HashMap::with_capacity(max_concurrency),
             stops: HashMap::with_capacity(max_concurrency),
-            stopping: HashSet::new(),
+            stopping: HashMap::new(),
+            last_delivery: HashMap::with_capacity(max_concurrency),
         }
     }
 
@@ -331,14 +432,14 @@ impl RunnerManager {
         &mut self.admission
     }
 
-    #[cfg(test)]
+    /// What ended attempts tell about the connections the server admits.
     pub(super) fn admission(&self) -> &AdmissionEvidence {
         &self.admission
     }
 
     /// Record that runner `runner_id` reported `Started`.
     fn record_started(&mut self, runner_id: RunnerId) {
-        let others = self.allocated_runner_count().saturating_sub(1);
+        let others = self.in_flight().saturating_sub(1);
         self.admission.on_started(runner_id, others);
     }
 
@@ -351,7 +452,7 @@ impl RunnerManager {
     fn record_attempt_end(&mut self, phase: AttemptPhase, error: &TaskError) -> Admission {
         let class = classify(phase, error);
         let proven = self.chunk_planner.get_proven_runners_count();
-        let others = self.allocated_runner_count();
+        let others = self.in_flight();
         self.admission.on_attempt_ended(class, proven, others);
         Admission {
             class,
@@ -382,7 +483,7 @@ impl RunnerManager {
     /// This will:
     /// - Close and remove the limit mailbox
     /// - Remove from RunnerNotification (legacy) and aggregators (new)
-    /// - Forget the runner's stop, and that it was stopping
+    /// - Forget the runner's stop, that it was stopping, and its silence
     /// - Recycle the runner ID
     pub fn release_runner(&mut self, runner_id: RunnerId) {
         // The runner sees its limits closed once the sender is dropped
@@ -392,6 +493,7 @@ impl RunnerManager {
         self.data_aggregator.unregister(runner_id);
         self.stops.remove(&runner_id);
         self.stopping.remove(&runner_id);
+        self.last_delivery.remove(&runner_id);
         self.id_generator.release(runner_id);
         self.admission.on_ended(runner_id);
     }
@@ -407,31 +509,106 @@ impl RunnerManager {
     /// as such.
     ///
     /// Only a running runner with bytes left is stopped, once; not one
-    /// without a stop of its own.
+    /// without a stop of its own, nor a side of an undecided pair (design
+    /// §9.6).
     pub fn stop_runner(&mut self, runner_id: RunnerId) -> bool {
         let running = self
             .chunk_planner
             .get_runner_state(runner_id)
-            .is_some_and(|state| state.status == ChunkStatus::Running && !state.is_complete());
-        if !running || self.stopping.contains(&runner_id) {
+            .is_some_and(|state| {
+                state.status == ChunkStatus::Running
+                    && !state.is_complete()
+                    && !state.is_undecided()
+            });
+        if !running || self.stopping.contains_key(&runner_id) {
             return false;
         }
         let Some(stop) = self.stops.get(&runner_id) else {
             return false;
         };
         stop.cancel();
-        self.stopping.insert(runner_id);
+        self.stopping.insert(runner_id, StopReason::Slow);
         true
     }
 
-    /// Whether the runner was stopped by [`Self::stop_runner`] and has not
-    /// reported `Stopped` yet.
+    /// Whether the loop stopped the runner, for being slow or beaten in a
+    /// hedged pair, and it has not confirmed it yet.
     #[inline]
     pub fn is_stopping(&self, runner_id: RunnerId) -> bool {
-        self.stopping.contains(&runner_id)
+        self.stopping.contains_key(&runner_id)
+    }
+
+    /// The chunk `runner_id` downloads: its own, or as the hedge of an
+    /// undecided pair, the original's.
+    #[cfg(test)]
+    pub(super) fn chunk_of(&self, runner_id: RunnerId) -> Option<&ChunkState> {
+        self.chunk_planner
+            .partner_chunk(runner_id)
+            .or_else(|| self.chunk_planner.get_runner_state(runner_id))
+    }
+
+    /// Why the loop stopped the runner, while it has not confirmed it.
+    #[inline]
+    pub(super) fn stop_reason(&self, runner_id: RunnerId) -> Option<StopReason> {
+        self.stopping.get(&runner_id).copied()
+    }
+
+    /// Whether the runner is a side of an undecided pair (design §9.6):
+    /// either side while both run, or the side left after the other
+    /// failed, until it delivers.
+    pub fn is_in_undecided_pair(&self, runner_id: RunnerId) -> bool {
+        self.chunk_planner.partner_chunk(runner_id).is_some()
+            || self
+                .chunk_planner
+                .get_runner_state(runner_id)
+                .is_some_and(ChunkState::is_undecided)
+    }
+
+    /// The other attempts in flight when one fails: the runners holding a
+    /// slot, without those the loop stopped (design §9.6, M3). The runner
+    /// that failed was released before.
+    pub fn in_flight(&self) -> usize {
+        self.id_generator.allocated_count() - self.stopping.len()
+    }
+
+    /// Beat `loser` in its hedged pair: stop it and drop its data, queued
+    /// frames included. Its slot is kept until it confirms, see
+    /// [`StopReason::Loser`]. The planner must have let it go already.
+    fn stop_loser(&mut self, loser: RunnerId) {
+        if let Some(stop) = self.stops.get(&loser) {
+            stop.cancel();
+        }
+        self.stopping.insert(loser, StopReason::Loser);
+        self.data_aggregator.unregister(loser);
+        self.connecting_data.remove(&loser);
+        self.meters.remove(&loser);
+        self.last_delivery.remove(&loser);
+    }
+
+    // ==================== Silence (design §9.6) ====================
+
+    /// The runner delivered a non-empty frame the planner accepted at `now`.
+    pub(super) fn note_delivery(&mut self, runner_id: RunnerId, now: Instant) {
+        if let Some(at) = self.last_delivery.get_mut(&runner_id) {
+            *at = now;
+        }
+    }
+
+    /// The writer can take data again at `now`: every silence starts over.
+    pub(super) fn restart_silences(&mut self, now: Instant) {
+        for at in self.last_delivery.values_mut() {
+            *at = now;
+        }
+    }
+
+    /// When the silence of `runner_id` started; `None` for a runner the
+    /// loop did not spawn.
+    pub(super) fn last_delivery(&self, runner_id: RunnerId) -> Option<Instant> {
+        self.last_delivery.get(&runner_id).copied()
     }
 
     /// Gets the number of currently allocated runners
+    #[cfg(test)]
     #[inline]
     pub fn allocated_runner_count(&self) -> usize {
         self.id_generator.allocated_count()
@@ -623,7 +800,7 @@ impl RunnerManager {
     #[inline]
     pub fn largest_running_chunk(&self) -> Option<(RunnerId, Range<u64>)> {
         self.chunk_planner
-            .largest_running_chunk(|runner_id| self.stopping.contains(&runner_id))
+            .largest_running_chunk(|runner_id| self.stopping.contains_key(&runner_id))
     }
 
     /// The smallest chunk the planner hands out
@@ -678,10 +855,12 @@ impl RunnerManager {
         spawn: impl FnOnce(RunnerId, LimitReceiver) -> Result<RunnerChannels, SpawnFailed>,
     ) -> Option<()> {
         let slot = self.try_reserve_slot()?;
-        self.spawn_in(slot, range, spawn).then_some(())
+        self.spawn_in(slot, range, Instant::now(), spawn)
+            .then_some(())
     }
 
-    /// Allocate `range` to the runner of `slot` and spawn it with `spawn`.
+    /// Allocate `range` to the runner of `slot` and spawn it with `spawn`
+    /// at `now`, where its silence starts (design §9.6).
     ///
     /// The chunk stays pending until the runner reports `Started`. A rejected
     /// spawn is reported by the next tick, once.
@@ -692,6 +871,7 @@ impl RunnerManager {
         &mut self,
         slot: RunnerSlot,
         range: Range<u64>,
+        now: Instant,
         spawn: impl FnOnce(RunnerId, LimitReceiver) -> Result<RunnerChannels, SpawnFailed>,
     ) -> bool {
         let runner_id = slot.runner_id;
@@ -699,14 +879,52 @@ impl RunnerManager {
             self.release(slot);
             return false;
         }
-        match spawn(runner_id, slot.limits) {
+        self.start_runner(runner_id, slot.limits, now, spawn);
+        true
+    }
+
+    /// Hedge the chunk of `owner` with a runner in `slot`, spawned with
+    /// `spawn` at `now` on the rest of the chunk (design §9.6).
+    ///
+    /// The planner allocates no range: the runner joins the chunk as the
+    /// hedge side of an undecided pair. A rejected spawn is reported by the
+    /// next tick, once.
+    ///
+    /// Returns `false`, with the slot released, when the chunk cannot be
+    /// hedged.
+    pub fn spawn_hedge(
+        &mut self,
+        slot: RunnerSlot,
+        owner: RunnerId,
+        now: Instant,
+        spawn: impl FnOnce(RunnerId, LimitReceiver, Range<u64>) -> Result<RunnerChannels, SpawnFailed>,
+    ) -> bool {
+        let runner_id = slot.runner_id;
+        let Ok(range) = self.chunk_planner.fork_hedge(owner, runner_id) else {
+            self.release(slot);
+            return false;
+        };
+        self.start_runner(runner_id, slot.limits, now, |runner_id, limits| {
+            spawn(runner_id, limits, range)
+        });
+        true
+    }
+
+    fn start_runner(
+        &mut self,
+        runner_id: RunnerId,
+        limits: LimitReceiver,
+        now: Instant,
+        spawn: impl FnOnce(RunnerId, LimitReceiver) -> Result<RunnerChannels, SpawnFailed>,
+    ) {
+        self.last_delivery.insert(runner_id, now);
+        match spawn(runner_id, limits) {
             Ok(channels) => {
                 self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx);
                 self.stops.insert(runner_id, channels.stop);
             }
             Err(failed) => self.spawn_failures.push_back((runner_id, failed)),
         }
-        true
     }
 
     #[cfg(test)]
@@ -775,6 +993,9 @@ impl RunnerManager {
 
     /// Whether the runner has not reported `Started` yet.
     fn is_connecting(&self, runner_id: RunnerId) -> bool {
+        if let Some(chunk) = self.chunk_planner.partner_chunk(runner_id) {
+            return chunk.partner().is_some_and(|partner| !partner.running);
+        }
         self.chunk_planner
             .get_runner_state(runner_id)
             .is_some_and(|state| state.status == ChunkStatus::Pending)
