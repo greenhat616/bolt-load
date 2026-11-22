@@ -13,7 +13,7 @@ use futures_concurrency::stream::{StreamGroup, stream_group::Key};
 use pin_project_lite::pin_project;
 
 use super::{
-    DownloadedChunk, RunnerManager, RunnerTick, StopReason,
+    ChunkStatus, DownloadedChunk, RunnerManager, RunnerTick, StopReason,
     stream::{RunnerStreamEvent, RunnerTaggedStream, RunnerTaggedStreamItem},
 };
 use crate::{
@@ -258,6 +258,12 @@ impl RunnerManager {
     fn handle_data_frame(&mut self, runner_id: RunnerId, mut data_frame: Bytes) -> DownloadedChunk {
         let bytes_len = data_frame.len();
         *self.meters.entry(runner_id).or_insert(0) += bytes_len;
+        // Whether bytes of this frame prove the attempt: it runs, and had
+        // none of its own accepted yet.
+        let unproven = self
+            .chunk_planner
+            .get_runner_state(runner_id)
+            .is_some_and(|state| state.status == ChunkStatus::Running && !state.is_proven());
 
         // The progress comes before the write, which the loop dispatches
         // next: only `downloaded` runs ahead. The written bytes follow the
@@ -268,6 +274,15 @@ impl RunnerManager {
             .expect("chunk planner should not fail");
         let picked_size = fixed_downloaded_range.end - fixed_downloaded_range.start;
         data_frame.truncate(picked_size as usize);
+        // The attempt just became proven: the connects beside it are seen
+        // now, though it may finish before the next tick (design §8.3).
+        // A frame that completes the chunk finishes it at once, so the
+        // attempt counts as proven here even then.
+        if unproven && picked_size > 0 {
+            let finished = !self.chunk_planner.is_proven(runner_id);
+            let proven = self.chunk_planner.get_proven_runners_count() + usize::from(finished);
+            self.observe_connecting_with(proven);
+        }
 
         DownloadedChunk {
             runner_id,

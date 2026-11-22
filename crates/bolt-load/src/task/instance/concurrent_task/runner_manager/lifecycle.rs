@@ -313,7 +313,7 @@ impl RunnerManager {
         match phase {
             None => AttemptFailure::slow_of_attempt(runner_id, released, own, first),
             Some(phase) => {
-                let admission = self.record_attempt_end(phase, &error);
+                let admission = self.record_attempt_end(runner_id, phase, &error);
                 AttemptFailure::of_attempt(
                     runner_id, error, retryable, released, own, first, admission,
                 )
@@ -353,6 +353,7 @@ impl RunnerManager {
         self.meters.remove(&runner_id);
         self.release_runner(runner_id);
         if error.is_cancelled() {
+            self.admission.forget(runner_id);
             trace!("runner {runner_id} cancelled while hedged");
             self.chunk_planner
                 .record_side_failure(survivor, SideFailure::default());
@@ -367,7 +368,7 @@ impl RunnerManager {
         } else {
             AttemptPhase::Streaming
         };
-        let admission = self.record_attempt_end(phase, &error);
+        let admission = self.record_attempt_end(runner_id, phase, &error);
         self.chunk_planner.record_side_failure(
             survivor,
             SideFailure {
@@ -435,6 +436,7 @@ impl RunnerManager {
             self.chunk_planner
                 .mark_failed(runner_id)
                 .expect("chunk planner should not fail");
+            self.admission.forget(runner_id);
             trace!("runner {runner_id} cancelled while connecting");
             return RunnerTick::downloading();
         }
