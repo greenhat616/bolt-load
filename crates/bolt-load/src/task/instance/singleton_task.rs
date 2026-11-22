@@ -1,13 +1,14 @@
 use std::{
+    future::poll_fn,
     path::Path,
     pin::pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll, ready},
 };
 
-use async_io::Timer;
 use bolt_load_utils::telemetry::*;
 use futures::{FutureExt, StreamExt};
 use smol_cancellation_token::CancellationToken;
@@ -23,7 +24,7 @@ use super::{
 use crate::{
     adapter::{AnyAdapter, BoltLoadAdapter},
     runner::{LifecycleEvent, StoppedReason, TaskError, TaskRunner},
-    runtime::ThreadedRuntimeImpl,
+    runtime::{EventTimer, ThreadedRuntimeImpl, TimerBuilder},
     task::{DownloadError, IoOp, Progress, RunnerId, Speed, TaskOptions, status::ProgressReporter},
 };
 
@@ -31,6 +32,36 @@ use crate::{
 const STATIC_RUNNER_ID: RunnerId = 0;
 
 const CONTROL_CHANNEL_CAPACITY: usize = 8;
+
+/// The sampling ticks, on the task's runtime: the immediate first tick of
+/// the periodic timer is taken without sampling, so the first sample is
+/// the backend's second tick, about a period after the ticks were built,
+/// as the singleton's loop polls them at once. When the first poll comes
+/// late, tokio keeps that target, up to its 5 ms of tolerance, and smol
+/// waits a full period from that poll.
+struct SampleTicks {
+    timer: EventTimer,
+    /// Whether the periodic timer's first tick, which is immediate, was
+    /// taken.
+    started: bool,
+}
+
+impl SampleTicks {
+    fn new(rt: &ThreadedRuntimeImpl) -> Self {
+        Self {
+            timer: rt.create_delayed_timer(DEFAULT_SAMPLE_INTERVAL).into(),
+            started: false,
+        }
+    }
+
+    fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.started {
+            ready!(self.timer.poll_tick(cx));
+            self.started = true;
+        }
+        self.timer.poll_tick(cx)
+    }
+}
 
 /// The transfer of the singleton mode: one runner streams the whole content.
 pub(crate) struct SingletonTaskInner {
@@ -42,6 +73,8 @@ pub(crate) struct SingletonTaskInner {
     adapter: Arc<AnyAdapter>,
     reporter: ProgressReporter,
     options: TaskOptions,
+    /// The runtime the runner's clock and the sampling are on.
+    rt: ThreadedRuntimeImpl,
 }
 
 impl SingletonTaskInner {
@@ -49,7 +82,7 @@ impl SingletonTaskInner {
         adapter: Arc<AnyAdapter>,
         output: OutputFile,
         total: Option<u64>,
-        _rt: ThreadedRuntimeImpl,
+        rt: ThreadedRuntimeImpl,
         options: TaskOptions,
         reporter: ProgressReporter,
     ) -> Self {
@@ -60,6 +93,7 @@ impl SingletonTaskInner {
             adapter,
             reporter,
             options,
+            rt,
         }
     }
 }
@@ -115,7 +149,7 @@ impl SingletonTaskInner {
 
     /// Publish a periodic progress sample.
     fn handle_timer_tick(&self, sampler: &mut SpeedSampler, meter: &mut usize) {
-        let (_, ema_speed) = sampler.sample(meter);
+        let (_, ema_speed) = sampler.sample(meter, self.rt.now());
         if self.reporter.is_observed() {
             self.reporter
                 .report(Transfer::progress(self), Speed::new(ema_speed, 0.0));
@@ -166,12 +200,13 @@ impl SingletonTaskInner {
             .cancel_token(runner_token.clone())
             .idle_timeout(self.options.stream_idle_timeout)
             .connect_timeout(self.options.connect_timeout)
+            .timer_source(&self.rt)
             .build()
             .expect("failed to build task runner");
 
         let mut meter = 0;
-        let mut sampler = SpeedSampler::new();
-        let mut timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
+        let mut sampler = SpeedSampler::new(self.rt.now());
+        let mut ticks = SampleTicks::new(&self.rt);
         // Opened once the runner is connected; data is consumed only then.
         let mut file = None;
 
@@ -209,7 +244,7 @@ impl SingletonTaskInner {
                 let mut lifecycle_next = pin!(lifecycle_next);
 
                 futures::select_biased! {
-                    _ = timer.next().fuse() => {
+                    _ = poll_fn(|cx| ticks.poll_tick(cx)).fuse() => {
                         if file.is_some() {
                             self.handle_timer_tick(&mut sampler, &mut meter);
                         }
@@ -240,8 +275,8 @@ impl SingletonTaskInner {
                                 }
                                 file = Some(self.create_file(tmp_path).await?);
                                 // Measure the speed from the first byte on.
-                                sampler = SpeedSampler::new();
-                                timer = Timer::interval(DEFAULT_SAMPLE_INTERVAL);
+                                sampler = SpeedSampler::new(self.rt.now());
+                                ticks = SampleTicks::new(&self.rt);
                                 if let Some(file_ready_tx) = file_ready_tx.take() {
                                     let _ = file_ready_tx.send(self.total);
                                 }
@@ -323,5 +358,129 @@ fn connect_error(reason: StoppedReason) -> DownloadError {
     match reason {
         StoppedReason::Failed(error) => DownloadError::transfer(error),
         StoppedReason::Finished => DownloadError::other("the runner finished before it connected"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::runtime::test_support::{ManualClock, ManualRuntime};
+
+    const NS: Duration = Duration::from_nanos(1);
+
+    /// The singleton's runner runs its timeouts on the task's runtime: a
+    /// connect that never ends fails when that runtime's clock says so.
+    #[tokio::test]
+    async fn test_runner_times_out_on_the_task_clock() {
+        use bolt_load_tests::adapter::{fault::FaultPlan, simple::SimpleTestAdapterBuilder};
+
+        use crate::{
+            adapter::DynBoltLoadAdapter,
+            task::{instance::ownership::Ownership, status::ProgressReporter},
+        };
+
+        const CONNECT: Duration = Duration::from_secs(30);
+        let dir = tempfile::TempDir::new().unwrap();
+        let clock = ManualClock::new();
+        let rt = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        });
+        let adapter = SimpleTestAdapterBuilder::new()
+            .content_size(1000)
+            .full_connect_plan(FaultPlan::HangAt(0))
+            .build()
+            .unwrap();
+        let (reporter, _status) = ProgressReporter::for_test();
+        let mut inner = SingletonTaskInner::new(
+            DynBoltLoadAdapter::new_arc(adapter),
+            OutputFile::new(dir.path().join("out.bin"), Ownership::new()),
+            Some(1000),
+            rt,
+            TaskOptions::default().connect_timeout(CONNECT),
+            reporter,
+        );
+        let tmp = inner.output.tmp.clone();
+        let token = CancellationToken::new();
+        let advance = async {
+            clock.until_waited_on().await;
+            clock.advance(CONNECT);
+        };
+        let (result, ()) = futures::join!(
+            tokio::time::timeout(Duration::from_secs(5), inner.download_to(&tmp, &token)),
+            advance
+        );
+        let result = result.expect("the runner timed out on the task's clock");
+        assert!(
+            matches!(&result, Err(DownloadError::Transfer { source }) if matches!(**source, TaskError::Timeout)),
+            "{result:?}"
+        );
+    }
+
+    /// On the runtime's clock, a sample is due a full period after the
+    /// ticks start, then every period; so after a restart, as at
+    /// `Started`.
+    #[test]
+    fn test_samples_a_period_after_the_start() {
+        let clock = ManualClock::new();
+        let rt = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        });
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for start in ["the start", "a restart"] {
+            let mut ticks = SampleTicks::new(&rt);
+            assert!(
+                ticks.poll_tick(&mut cx).is_pending(),
+                "{start}: none at once"
+            );
+            clock.advance(DEFAULT_SAMPLE_INTERVAL - NS);
+            assert!(
+                ticks.poll_tick(&mut cx).is_pending(),
+                "{start}: a nanosecond early"
+            );
+            clock.advance(NS);
+            assert!(
+                ticks.poll_tick(&mut cx).is_ready(),
+                "{start}: a period after"
+            );
+            assert!(ticks.poll_tick(&mut cx).is_pending());
+            clock.advance(DEFAULT_SAMPLE_INTERVAL);
+            assert!(ticks.poll_tick(&mut cx).is_ready(), "{start}: every period");
+            // Time passes before the restart.
+            clock.advance(DEFAULT_SAMPLE_INTERVAL / 3);
+        }
+    }
+
+    /// The same on tokio's ticks, on the paused clock of the task's
+    /// runtime.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn test_samples_a_period_after_the_start_on_tokio() {
+        let paused = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let rt = ThreadedRuntimeImpl::Tokio(crate::runtime::TokioThreadedRuntime::Handle(
+            paused.handle().clone(),
+        ));
+        let mut ticks = SampleTicks::new(&rt);
+        let within = |ticks: &mut SampleTicks, within| {
+            paused.block_on(async {
+                tokio::time::timeout(within, poll_fn(|cx| ticks.poll_tick(cx)))
+                    .await
+                    .is_ok()
+            })
+        };
+        let ms = Duration::from_millis(1);
+        assert!(
+            !within(&mut ticks, DEFAULT_SAMPLE_INTERVAL - ms),
+            "none before a period"
+        );
+        assert!(within(&mut ticks, 2 * ms), "a period after the start");
+        assert!(!within(&mut ticks, DEFAULT_SAMPLE_INTERVAL - ms));
+        assert!(within(&mut ticks, 2 * ms), "every period");
     }
 }

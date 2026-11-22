@@ -22,13 +22,14 @@ use std::{
 use bolt_load_core::adapter::{AdapterError, RetryableError};
 
 use super::failure_policy::congestion_retry_after;
-use crate::{runner::TaskError, task::RunnerId};
+use crate::{runner::TaskError, runtime::capped_wait, task::RunnerId};
 
 /// A streak of refusals ends when no refusal arrives for this long, given
 /// that a connect may take `connect_timeout`: long enough for three connect
-/// timeouts in a row. Saturates rather than overflow.
+/// timeouts in a row. The connect timeout counts as the runners wait for
+/// it, capped at 30 years.
 pub fn streak_gap(connect_timeout: Duration) -> Duration {
-    connect_timeout
+    capped_wait(connect_timeout)
         .saturating_mul(2)
         .saturating_add(Duration::from_secs(30))
 }
@@ -653,12 +654,18 @@ mod tests {
         assert_eq!(evidence.streak_count(), 0);
     }
 
-    /// The gap of a connect timeout so long that `2 ×` it overflows
-    /// saturates.
+    /// The gap of a connect timeout over 30 years counts with the 30 years
+    /// the runners wait for it.
     #[test]
-    fn test_the_streak_gap_saturates() {
-        assert_eq!(streak_gap(Duration::MAX), Duration::MAX);
-        assert_eq!(streak_gap(Duration::MAX / 2), Duration::MAX);
+    fn test_the_streak_gap_counts_the_capped_connect_timeout() {
+        let thirty_years = Duration::from_secs(86400 * 365 * 30);
+        let capped = 2 * thirty_years + Duration::from_secs(30);
+        assert_eq!(streak_gap(Duration::MAX), capped);
+        assert_eq!(streak_gap(Duration::MAX / 2), capped);
+        assert_eq!(
+            streak_gap(thirty_years + Duration::from_secs(86400 * 365)),
+            capped
+        );
         assert_eq!(streak_gap(Duration::from_secs(30)), Duration::from_secs(90));
         let t0 = Instant::now();
         let mut evidence = AdmissionEvidence::with_streak_gap(Duration::MAX);

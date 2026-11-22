@@ -597,7 +597,6 @@ mod tests {
         super::{RunnerManager, RunnerSpawner, runner_manager::TaskState},
         *,
     };
-    use crate::runtime::ThreadedRuntimeImpl;
 
     /// Every kind of writer that holds the file keeps the drain group open
     /// until its workers exited, whichever kind the features would suggest.
@@ -855,6 +854,7 @@ mod tests {
         assert_eq!(&buffer2, &data2[..]);
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn test_file_writer_kind_equality() {
         assert_eq!(FileRangeWriterKind::Mmap, FileRangeWriterKind::Mmap);
@@ -862,6 +862,7 @@ mod tests {
         assert_ne!(FileRangeWriterKind::Mmap, FileRangeWriterKind::Pool);
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn test_file_writer_kind_copy() {
         let kind = FileRangeWriterKind::Mmap;
@@ -869,6 +870,7 @@ mod tests {
         assert_eq!(kind, copied);
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn test_file_writer_kind_debug() {
         let kind = FileRangeWriterKind::Mmap;
@@ -965,7 +967,7 @@ mod tests {
             }
         }
 
-        let rt = ThreadedRuntimeImpl::new_tokio_rt();
+        let rt = crate::runtime::test_support::current_tokio();
         let adapter = SimpleTestAdapterBuilder::new()
             .content_size(TOTAL_SIZE)
             .chunk_size(CHUNK_SIZE)

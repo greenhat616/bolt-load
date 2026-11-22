@@ -63,6 +63,11 @@
 | PR-7e 停滞之后再试探 | C40 `feat(task): hold a plateau and probe it again` | T31 | PR-6a、PR-7b；放在 PR-9d 之上（`feat/hardening-47-adaptive-window`） |
 | | C41 `bench(task): add the silent limit and the plateau scenarios` | T31 | |
 | PR-6b 挂起连接的佐证 | C42 `fix(task): corroborate a refused connect by the peers it overlapped` | T32 | PR-6a、PR-7e；放在 PR-7e 之上（`fix/hardening-48-hung-connect-evidence`） |
+| PR-6c 运行时的计时器 | C43 `feat(runtime): add the runtime clock and bind periodic timers` | T33 | PR-6b；放在 PR-6b 之上（`refactor/hardening-49-runtime-timers`） |
+| | C44 `feat(task): read engine time from the runtime` | T33 | |
+| | C45 `refactor(runner): drive timeouts through runtime deadlines` | T33 | |
+| | C46 `refactor(task): drive loop deadlines and singleton sampling through the runtime` | T33 | |
+| | C47 `test(runtime): cover timer migration across engine paths` | T33 | |
 
 **合并约束**：
 
@@ -673,3 +678,32 @@
 - 已有测试（性质测试在内）都不变，只是 `on_attempt_ended` 多传一个 runner ID。
 - 变异检查：去掉记录的佐证，s5 形态的下载循环测试和 3 个单元测试失败；水平改用分类时的 `others`，s5 形态的下载循环测试和 2 个单元测试失败；变成已证实时不采样，两个 tick 之间的下载循环测试和 manager 的测试失败；一帧下完时看不到它或不把它算进已证实的数，一帧下完的下载循环测试失败；取消、被打败时不去掉记录，各自的测试失败。
 - 基准测试：s5 的 `Close` 和 `Hang` 各 10 次（design §14.17）。
+
+---
+
+## T33 — 运行时的时钟与计时器（C43–C47，D33）
+
+维护者 2026-11-13 的决定（D33）：引擎的计时器走运行时抽象（`TimerBuilder` / `ThreadedRuntimeImpl`），tokio 下用 tokio 的计时器，让 tokio-console 能看到、`tokio::time::pause` 能控制；不新增 `async_io::Timer`。`async-io` 只留在三处：没有运行时（`rt: None`）时的 meta 重试、没有计时源的独立 runner、`runtime::timeout`（保留，不废弃）。runner 加一个可选的 `.timer_source(..)`，没有时退回 `async-io`。放在栈顶单独一个 PR（PR-6c）是实现的安排，不是维护者的决定；其余细节也由实现定（design §14.34）。
+
+- [x] C43：`TimerBuilder::now`（默认标准时钟），两个包装枚举（含 `Other`）转发；tokio 的 `now` 和周期计时器都用运行时自己的 handle，周期计时器每次 poll 也进入它。tokio 生产依赖显式要 `time`，开发依赖加 `test-util`、`tracing`。测试用的手动时钟和 `current_tokio()`；关掉默认特性时测试、示例和基准测试的特性门（下面的验证）。
+- [x] C44：runner 的构建时间、连接耗时和读活动读计时源的时钟；`TaskRunnerBuilder::timer_source(&ThreadedRuntimeImpl)` 借用运行时，tokio 只留句柄、smol 什么都不留，自定义运行时留它的 `Arc` 的克隆（setter 写明它要活得比 runner 久的情形），单连接模式传任务的运行时。测速器和检查点改成接收传入的时间，循环和单连接模式的测速这时仍传标准时钟。
+- [x] C45：crate 内部的 `Deadline`（tokio、smol、自定义运行时、`async-io` 回退）和 `TimerBuilder::sleep_until`（tokio、smol 按绝对时刻注册，默认实现的保证有限定）；runner 的连接、空闲、排空超时改用它；超时的溢出处理，引擎的每次等待最多 30 年（lead 的决定；`capped_wait`，从连接超时推出的策略窗口也用截过的连接超时），tokio 的截止时间离尽头留 1 ms；`TimerBuilder::now` 写明时钟的约定（离 `Instant` 的尽头至少 30 年加最长的配置时长，超过 30 年的时长按 30 年算，tokio 的时钟离它计时器范围的尽头也有同样的余量，目标都在范围之内；lead 的决定）；runner 每次 poll 最多 64 步。
+- [x] C46：循环的截止时间改用 `Deadline`，循环的事件时间、失败策略、检查点和它启动的 runner 的计时源同时换到运行时的时钟；无进展截止时间、重试时刻和拥塞保持时刻的溢出处理；meta 重试的等待改成运行时上的绝对截止时间；单连接模式的测速改用运行时的周期计时器和时钟，第一次采样是后端的第二次 tick；没开计时器的 tokio 运行时（按 tokio 的完整 panic 信息认）报 `DownloadError::Runtime`，`TaskBuilder::runtime` 写明运行时的要求。
+- [x] C47：跨路径的测试；`docs/runtime.md`、`docs/runner.md`；本节和 design §14.34。
+
+**验证**
+
+- 单元测试：时钟的转发（含 `Other` 和本地运行时）；tokio 的时钟和周期计时器在没有 tokio 上下文、在另一个运行时里构建时都绑定到自己的运行时，在另一个时钟快一小时的暂停运行时里拿到的 tick 之后，下一个 tick 仍在自己的时钟上一个周期之后；`Deadline` 的四种实现：到点触发、不提前（tokio 上离 `Instant` 尽头不到 1 ms 的目标除外，它提前 1 ms，可能早触发最多 1 ms；时钟约定之内每个目标都离尽头约 30 年，引擎走不到那里），第一次 poll 晚了目标不变，提前、推后、触发后重置，触发后一直就绪到重置，已经过去的目标不睡（自定义运行时的默认 `sleep` 不会拿到 0），重置和丢弃会丢掉旧的 sleep；自定义运行时的截止时间用它的 `sleep_until`：按绝对时刻注册的运行时，sleep 开始时时钟动了，也在目标时刻、poll 之前唤醒它（手动时钟只唤醒到期的 sleep，丢掉的 sleep 也取消它的登记，重置之后旧的目标不再唤醒）；默认实现下 sleep 开始时时钟正好到了目标就触发，sleep 晚注册了，到了目标的 poll 会触发，唤醒要等晚了的 sleep 结束；tokio 上离 `Instant` 尽头不到 1 ms 的目标不溢出；`sleep_until` 的默认实现和两个包装枚举的转发；`Instant` 放不下的超时在离尽头不到 30 年的时钟上不 panic；测速按传入的时间算。
+- runner：暂停的 tokio 上，连接超时从第一次 poll 起算，空闲超时在每个非空的块重新起算、在 `run_after_started` 就绪后起算，排空超时，取消先于超时；一直就绪的空块：一次 poll 在读完之前就让出并唤醒自己，单线程的 tokio 上照样空闲超时；sleep 开始时时钟到了连接截止时间的自定义运行时上，不再动时钟也超时；离 `Instant` 尽头一天的时钟上 `Duration::MAX` 的连接超时不 panic、不提前触发；丢在自己计时源运行时的工作线程上的 runner 不 panic；没有计时源的原有测试不变。
+- 下载循环：手动时钟上截止时间在旧截止点触发后重新挂上、在新截止点失败（早 1 ns 不失败）；退避结束提前唤醒后重新挂上（这两个测试每次只取一个事件，截止时间一直就绪时测试失败，不会空转）；比标准时钟慢一分钟的冻结时钟上，第一个事件不是截止时间；`no_progress_timeout(Duration::MAX)` 建循环不 panic，一年后也不触发；离尽头 100 ms 的时钟上，退避的重试时刻和拥塞保持时刻不 panic；meta 重试：手动时钟上 `Duration::MAX` 的等待正好 30 年（以前自定义运行时的 `sleep` 溢出 panic），暂停的 tokio 上 31 年的等待按引擎写明的上限等 30 年（截在交给 tokio 之前）；自定义运行时的时钟在默认 `sleep_until` 开始 sleep 时动了 20 年，150 年的生成等待先截到 30 年，不溢出，30 年时触发（以前在注册时溢出 panic）；只读计数的自定义运行时用固定的时钟，不再和墙上时钟赛跑；事件的时间、失败策略和吞吐量取运行时的时钟；在没有上下文、在另一个运行时里构建的循环在自己的暂停时钟上跑完，截止之前策略启动了 runner、发布了吞吐量。
+- 两处构建 runner 的地方（`runner_spawner.rs`、`singleton_task.rs`）启动的 runner 都按任务运行时的时钟超时；没开计时器的 tokio 运行时上，单连接任务以 `DownloadError::Runtime` 失败，不写目标文件；适配器的 panic 信息里提到 timers are disabled 时仍是 `Panicked`。
+- 生产代码里的 `async_io` 只剩三处例外；`strategy/` 里没有新计时器，也没有 `Instant::now()`，只是无进展截止时间、重试时刻和拥塞保持时刻改用 `runtime::instant_after`。
+- gpt-6.2-astra 审查（2026-11-19）和 codex 的复核：上面的这些修正都是对它的发现的处理，每个新测试都在修正之前失败过（或者对修正做变异时失败）：runner 每次 poll 的步数上限去掉，两个空块测试失败；自定义截止时间改回只 poll 存下的 sleep、按剩余时间睡，三个截止时间测试和 runner 的测试失败；溢出改回不检查的加法，离尽头的两个测试 panic；计时源按值拿走 tokio 运行时，丢 runner 的测试 panic；周期计时器 poll 时不进入自己的 handle，跨运行时的 tick 测试失败；循环的截止时间改回标准时钟上的 `async-io` 计时器，冻结时钟的测试报出截止时间；不重挂截止时间，两个手动时钟的循环测试立刻失败；去掉策略 tick 或吞吐量 tick，跨运行时的循环测试失败；panic 不分类，没开计时器的任务测试拿到 `Panicked`。第二轮审查（同日）：截止时间改回按剩余时间睡，按绝对时刻注册的运行时的唤醒测试失败；tokio 的截止时间不留 1 ms，离尽头的 tokio 测试在 tokio 的取整里 panic；重试和拥塞保持改回不检查的加法，退避的测试 panic；panic 分类改回只看 `timers are disabled` 这几个词，提到它的适配器 panic 被报成 `Runtime`，测试失败。第三轮审查（同日）：吞吐量、并发控制和翻倍策略里其余的时刻加法、tokio 自己的周期计时器和相对 sleep 只在离 `Instant` 尽头几分钟以内的时钟上溢出，lead 决定不再逐个改，写成时钟的约定（design §14.34）；手动时钟丢掉的 sleep 不再唤醒，丢弃时不取消登记的话重置测试失败。第四轮审查（同日）：一天的余量比能配置的时长短（三天的 meta 重试等待、两天的连接超时在默认 `sleep_until` 晚注册时溢出），tokio 计时轮的毫秒范围也是另一条界限，lead 把约定改成 30 年加最长的配置时长、tokio 的时钟在计时轮范围之内，只改文档；runtime.md 对饱和的描述改成约定之内 30 年总放得下。第五轮审查（同日）：meta 重试把原样的时长交给运行时的 `sleep`，31 年的等待被 tokio 截到 30 年、`Duration::MAX` 让手动时钟溢出，改成绝对截止时间，两个新测试在改之前都失败（30 年就结束；`now + duration` 溢出 panic）；tokio 的那一条改成目标也要在计时轮范围之内（lead 的决定）。第七轮审查（同日）：runner 把 31 年的连接超时截到 30 年，策略的增长期限、一步的期限和拒绝连串的间隔却还按 31 年算，改成按截过的连接超时再加余量（三个窗口函数的测试：超过 30 年的连接超时得到 30 年加余量；原来“饱和到 `Duration::MAX`”的两条断言改成截过的值）；无进展失败报的超时和 meta 重试通知的时长改成截过的值，各有测试；文档里“不提前触发”改成指截过的截止时间。第六轮审查（同日）：抖动能生成 150 年的 meta 重试等待，在默认 `sleep_until` 晚注册时溢出；lead 决定引擎的每次等待最多 30 年，`instant_after` 先截再加，约定里超过 30 年的时长按 30 年算；新的测试在截断之前 panic（`now + 150 年` 溢出），31 年的测试改成期望 30 年；`runtime.md` 不再说 meta 重试直接用 `TimerBuilder::sleep`。
+- 后续：30 年的上限和时钟约定暂时照旧；#219 跟踪把这个界限挪到参数检查，拒绝超过 30 年的配置时长（维护者 2026-11-20 决定推迟到 #219，并已同意那次公开 API 的改动），之后 `capped_wait` 可以改成断言（design §14.34）。
+- 特性矩阵（`crates/bolt-load`，C47 的提交上，`RUSTC_WRAPPER=` 和 `cargo +nightly-2026-11-06`）：
+  - 默认特性：`cargo test -p bolt-load`，872 通过、1 忽略。
+  - 只开 tokio：`cargo test -p bolt-load --no-default-features --features tokio`，856 通过、5 忽略（4 个解码 gzip 的测试）。
+  - 只开 smol：`cargo test -p bolt-load --no-default-features --features smol`，746 通过、4 忽略。
+  - 两者都开：`cargo test -p bolt-load --no-default-features --features tokio,smol`，864 通过、5 忽略。
+  - 都不开：`cargo test -p bolt-load --no-default-features`，714 通过、4 忽略。
+  - 这五种组合上 `cargo clippy -p bolt-load <同样的特性> --all-targets -- -D warnings` 和 `cargo bench -p bolt-load <同样的特性> --no-run` 都通过（cargo 对没开 smol 时用不到的 `async-broadcast` 依赖给出的警告不是编译警告，本 PR 之前就有）。`cargo test` 编译 lib、集成测试和示例；`--no-default-features` 也关掉了 `serde`、`tracing`、`progressbar`、`mmap`、`gzip`、`deflate`，要求这些特性的示例、基准测试和测试按上面的特性门跳过或忽略。

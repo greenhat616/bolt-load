@@ -172,6 +172,86 @@ async fn test_read_activity_follows_the_body() {
     handle.abort();
 }
 
+/// A runner given a timer source stamps its read activity on that
+/// source's clock, not the standard one.
+#[tokio::test]
+async fn test_read_activity_is_stamped_on_the_timer_source_clock() {
+    use crate::runtime::{
+        ThreadedRuntimeImpl,
+        test_support::{ManualClock, ManualRuntime},
+    };
+
+    let clock = ManualClock::new();
+    clock.advance(Duration::from_secs(3600));
+    let activity = ReadActivity::default();
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let items = [patterned_frame(100), patterned_frame(BUFFER_SIZE)];
+    let (mut runner, _lifecycle_rx, data_rx) = TaskRunner::builder()
+        .stream(futures::stream::iter(items.map(Ok::<_, AdapterError>)).boxed())
+        .runner_id(1)
+        .control_signal(control_rx)
+        .cancel_token(CancellationToken::new())
+        .read_activity(activity.clone())
+        .timer_source(&ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+            clock: clock.clone(),
+        }))
+        .build()
+        .unwrap();
+    let handle = tokio::spawn(async move { runner.run().await });
+    let mut data_rx = pin!(data_rx);
+    let mut received = 0;
+    while let Some(frame) = timeout(Duration::from_secs(5), data_rx.next())
+        .await
+        .unwrap()
+    {
+        received += frame.data.len();
+    }
+    handle.await.unwrap();
+    assert_eq!(received, 100 + BUFFER_SIZE);
+    let stamps: Vec<_> = activity
+        .seen()
+        .into_iter()
+        .filter_map(|(last, _)| last)
+        .collect();
+    assert!(!stamps.is_empty(), "the items were stamped");
+    assert!(
+        stamps.iter().all(|&stamp| stamp == clock.now()),
+        "{stamps:?} on a clock at {:?}",
+        clock.now()
+    );
+}
+
+/// A runner keeps only a handle of its timer source: the caller still owns
+/// the runtime, and a runner dropped on a worker of that runtime shuts
+/// nothing down, which tokio forbids from within it.
+#[cfg(feature = "tokio")]
+#[test]
+fn test_a_runner_dropped_on_its_timer_source_runtime() {
+    use crate::runtime::{ThreadedRuntimeImpl, TokioThreadedRuntime};
+
+    let rt = ThreadedRuntimeImpl::new_tokio_rt();
+    let ThreadedRuntimeImpl::Tokio(TokioThreadedRuntime::Runtime(owner)) = &rt else {
+        panic!("built outside tokio, it owns its runtime");
+    };
+    let handle = owner.handle().clone();
+    let (_control_tx, control_rx) = async_channel::bounded(1);
+    let (mut runner, _lifecycle_rx, _data_rx) = TaskRunner::builder()
+        .stream(futures::stream::empty().boxed())
+        .runner_id(1)
+        .control_signal(control_rx)
+        .cancel_token(CancellationToken::new())
+        .timer_source(&rt)
+        .build()
+        .unwrap();
+    let worker = handle.spawn(async move {
+        runner.run().await;
+        drop(runner);
+    });
+    let joined = handle.block_on(worker);
+    assert!(joined.is_ok(), "the worker dropped its runner: {joined:?}");
+    drop(rt);
+}
+
 /// A runner that pushed against backpressure, then reads on, is never
 /// seen silent: every state a tick could read, after the loop took a frame,
 /// has the runner pushing or stamped since (design §14.19). A tick between
@@ -2689,5 +2769,358 @@ async fn test_a_stop_keeps_the_end_a_runner_decided() {
     ] {
         let reason = end_after_a_stop(stream, total, control, true).await;
         assert!(is_cancelled(&reason), "{reason:?}");
+    }
+}
+
+// ── Timeouts on the timer source's clock ──
+
+/// A runner connecting through a connector that never connects, timing
+/// out on `rt`'s clock after `connect_timeout`, and the sender of its
+/// limits, which it needs open.
+fn never_connecting(
+    rt: &crate::runtime::ThreadedRuntimeImpl,
+    connect_timeout: Duration,
+    token: CancellationToken,
+) -> (TaskRunner, LifecycleReceiver, LimitSender) {
+    let (limit_tx, limits) = limit_mailbox();
+    let (runner, lifecycle_rx, _data_rx) = TaskRunner::builder()
+        .total(10)
+        .connector(StreamConnector::from(futures::future::pending()))
+        .runner_id(1)
+        .limit_receiver(limits)
+        .cancel_token(token)
+        .connect_timeout(connect_timeout)
+        .timer_source(rt)
+        .build()
+        .unwrap();
+    (runner, lifecycle_rx, limit_tx)
+}
+
+/// A runner on a custom runtime whose clock reaches the connect deadline
+/// while the sleep for it starts, which the default `sleep_until` then arms
+/// a full timeout late, times out at the deadline, with no further move of
+/// the clock.
+#[tokio::test]
+async fn test_connect_times_out_when_the_clock_reaches_it_as_the_sleep_starts() {
+    use crate::runtime::{
+        ThreadedRuntimeImpl,
+        test_support::{ManualClock, SlippingRuntime},
+    };
+
+    const CONNECT: Duration = Duration::from_secs(30);
+    let clock = ManualClock::new();
+    let rt = ThreadedRuntimeImpl::new_other_rt(SlippingRuntime {
+        clock: clock.clone(),
+        slip: CONNECT,
+        absolute: false,
+    });
+    let (mut runner, mut lifecycle_rx, _limits) =
+        never_connecting(&rt, CONNECT, CancellationToken::new());
+    timeout(Duration::from_secs(5), runner.run())
+        .await
+        .expect("timed out at the deadline the clock reached");
+    assert!(
+        matches!(
+            lifecycle_rx.try_pop(),
+            Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+                TaskError::Timeout
+            )))
+        ),
+        "failed with the connect timeout"
+    );
+}
+
+/// On a clock with less than 30 years left before the end of what an
+/// `Instant` holds, a connect timeout too long for an `Instant` neither
+/// panics nor fires early: its deadline is at least half of what is left
+/// away.
+#[tokio::test]
+async fn test_a_timeout_past_the_end_of_instants() {
+    use crate::runtime::{
+        ThreadedRuntimeImpl,
+        test_support::{ManualClock, ManualRuntime, last_instant},
+    };
+
+    const DAY: Duration = Duration::from_secs(86400);
+    let clock = ManualClock::starting_at(last_instant(std::time::Instant::now()) - DAY);
+    let rt = ThreadedRuntimeImpl::new_other_rt(ManualRuntime {
+        clock: clock.clone(),
+    });
+    let token = CancellationToken::new();
+    let (mut runner, mut lifecycle_rx, _limits) =
+        never_connecting(&rt, Duration::MAX, token.clone());
+    {
+        let mut run = pin!(runner.run());
+        assert!(futures::poll!(run.as_mut()).is_pending());
+        clock.advance(DAY / 3);
+        assert!(
+            futures::poll!(run.as_mut()).is_pending(),
+            "not timed out within half of what is left"
+        );
+        token.cancel();
+        timeout(Duration::from_secs(5), run).await.unwrap();
+    }
+    assert!(
+        matches!(
+            lifecycle_rx.try_pop(),
+            Some(LifecycleEvent::Stopped(StoppedReason::Failed(
+                TaskError::Cancelled
+            )))
+        ),
+        "ended by the cancel"
+    );
+}
+
+/// Runners given the paused tokio runtime they run on as their timer
+/// source: their timeouts follow its clock, and no real time passes.
+#[cfg(feature = "tokio")]
+mod on_the_source_clock {
+    use pretty_assertions::assert_eq;
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::runtime::ThreadedRuntimeImpl;
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// A runner on the current, paused, tokio runtime's clock.
+    fn on_paused_clock() -> TaskRunnerBuilder {
+        TaskRunner::builder()
+            .runner_id(1)
+            .cancel_token(CancellationToken::new())
+            .timer_source(&ThreadedRuntimeImpl::new_tokio_rt())
+    }
+
+    /// The lifecycle events a runner reported.
+    fn events(lifecycle_rx: &mut LifecycleReceiver) -> Vec<String> {
+        std::iter::from_fn(|| lifecycle_rx.try_pop())
+            .map(|event| match event {
+                LifecycleEvent::Started => "started".to_owned(),
+                LifecycleEvent::Stopped(StoppedReason::Finished) => "finished".to_owned(),
+                LifecycleEvent::Stopped(StoppedReason::Failed(e)) => format!("failed: {e:?}"),
+            })
+            .collect()
+    }
+
+    /// Run `run` to its end within an hour of the paused clock and a few
+    /// real seconds; returns how long it took on the paused clock.
+    async fn paused_time_of(run: impl Future<Output = ()>) -> Duration {
+        let real = std::time::Instant::now();
+        let start = Instant::now();
+        timeout(3600 * SECOND, run)
+            .await
+            .expect("the runner ended within an hour of the paused clock");
+        assert!(
+            real.elapsed() < 10 * SECOND,
+            "the runner waited in real time"
+        );
+        start.elapsed()
+    }
+
+    /// `elapsed` is `expected`, give or take tokio's millisecond rounding.
+    fn assert_about(elapsed: Duration, expected: Duration) {
+        assert!(
+            elapsed >= expected && elapsed < expected + 10 * Duration::from_millis(1),
+            "{elapsed:?}, expected {expected:?}"
+        );
+    }
+
+    /// The connect timeout runs from the first poll, not from the build.
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_times_out_on_the_source_clock() {
+        let (_limit_tx, limits) = limit_mailbox();
+        let (mut runner, mut lifecycle_rx, _data_rx) = on_paused_clock()
+            .total(10)
+            .connector(StreamConnector::from(futures::future::pending()))
+            .limit_receiver(limits)
+            .connect_timeout(30 * SECOND)
+            .build()
+            .unwrap();
+        tokio::time::advance(20 * SECOND).await;
+        let elapsed = paused_time_of(runner.run()).await;
+        assert_about(elapsed, 30 * SECOND);
+        assert_eq!(events(&mut lifecycle_rx), ["failed: Timeout"]);
+    }
+
+    /// Each non-empty item restarts the idle timeout: items 20 s apart
+    /// never reach 30 s, and the runner times out 30 s after the last.
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_restarts_at_every_item_on_the_source_clock() {
+        let stream = stream! {
+            for _ in 0..5 {
+                sleep(20 * SECOND).await;
+                yield Ok::<_, AdapterError>(Bytes::from_static(b"x"));
+            }
+            futures::future::pending::<()>().await;
+        };
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let (mut runner, mut lifecycle_rx, data_rx) = on_paused_clock()
+            .stream(Box::pin(stream))
+            .control_signal(control_rx)
+            .idle_timeout(30 * SECOND)
+            .build()
+            .unwrap();
+        let received = tokio::spawn(async move {
+            let mut data_rx = pin!(data_rx);
+            let mut received = Vec::new();
+            while let Some(frame) = data_rx.next().await {
+                received.extend_from_slice(&frame.data);
+            }
+            received
+        });
+        let elapsed = paused_time_of(runner.run()).await;
+        assert_about(elapsed, 5 * 20 * SECOND + 30 * SECOND);
+        assert_eq!(events(&mut lifecycle_rx), ["started", "failed: Timeout"]);
+        drop(runner);
+        let received = timeout(5 * SECOND, received)
+            .await
+            .expect("the consumer ends with the runner");
+        assert_eq!(received.unwrap(), b"xxxxx", "flushed before failing");
+    }
+
+    /// The idle timeout of a runner run after `Started` runs from when it
+    /// was ready, not from when it connected.
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_runs_from_ready_on_the_source_clock() {
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let (mut runner, mut lifecycle_rx, _data_rx) = on_paused_clock()
+            .stream(Box::pin(futures::stream::pending()))
+            .control_signal(control_rx)
+            .idle_timeout(30 * SECOND)
+            .build()
+            .unwrap();
+        let ready = async {
+            sleep(50 * SECOND).await;
+            None
+        };
+        let elapsed = paused_time_of(runner.run_after_started(ready)).await;
+        assert_about(elapsed, 80 * SECOND);
+        assert_eq!(events(&mut lifecycle_rx), ["started", "failed: Timeout"]);
+    }
+
+    /// A runner whose frames are never taken gives up after the drain
+    /// timeout and fails, so its bytes are downloaded again.
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_times_out_on_the_source_clock() {
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let (mut runner, mut lifecycle_rx, _data_rx) = on_paused_clock()
+            .stream(frames(1))
+            .control_signal(control_rx)
+            .data_drain_timeout(7 * SECOND)
+            .build()
+            .unwrap();
+        let elapsed = paused_time_of(runner.run()).await;
+        assert_about(elapsed, 7 * SECOND);
+        assert_eq!(events(&mut lifecycle_rx), ["started", "failed: Timeout"]);
+    }
+
+    /// A cancellation while connecting ends the runner at once, and its
+    /// timeout no longer fires.
+    #[tokio::test(start_paused = true)]
+    async fn test_cancel_wins_over_the_connect_timeout_on_the_source_clock() {
+        let token = CancellationToken::new();
+        let (_limit_tx, limits) = limit_mailbox();
+        let (mut runner, mut lifecycle_rx, _data_rx) = on_paused_clock()
+            .total(10)
+            .connector(StreamConnector::from(futures::future::pending()))
+            .limit_receiver(limits)
+            .cancel_token(token.clone())
+            .connect_timeout(30 * SECOND)
+            .build()
+            .unwrap();
+        let cancel = async {
+            sleep(10 * SECOND).await;
+            token.cancel();
+        };
+        let elapsed = paused_time_of(async {
+            futures::join!(runner.run(), cancel);
+        })
+        .await;
+        assert_about(elapsed, 10 * SECOND);
+        assert_eq!(events(&mut lifecycle_rx), ["failed: Cancelled"]);
+    }
+
+    /// A stream of ready empty items does not hold one poll of the runner:
+    /// it yields, waking itself, long before the end of them, and goes on
+    /// at the next poll.
+    #[tokio::test(start_paused = true)]
+    async fn test_ready_empty_items_yield_the_poll() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use super::super::run_loop::MAX_STEPS_PER_POLL;
+
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+        impl futures::task::ArcWake for WakeCount {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let reached = Arc::new(AtomicBool::new(false));
+        let sentinel = {
+            let reached = reached.clone();
+            futures::stream::poll_fn(move |_| {
+                reached.store(true, Ordering::SeqCst);
+                std::task::Poll::<Option<Result<Bytes, AdapterError>>>::Pending
+            })
+        };
+        let items = futures::stream::iter(
+            (0..4 * MAX_STEPS_PER_POLL).map(|_| Ok::<_, AdapterError>(Bytes::new())),
+        );
+        let (_control_tx, control_rx) = async_channel::bounded(1);
+        let (mut runner, _lifecycle_rx, _data_rx) = on_paused_clock()
+            .stream(items.chain(sentinel).boxed())
+            .control_signal(control_rx)
+            .build()
+            .unwrap();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut run = pin!(runner.run());
+        assert!(run.as_mut().poll(&mut cx).is_pending());
+        assert!(!reached.load(Ordering::SeqCst), "the first poll yielded");
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "it woke itself");
+        for _ in 0..8 {
+            if reached.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(run.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(reached.load(Ordering::SeqCst), "the next polls went on");
+    }
+
+    /// On a single-threaded tokio runtime with a real clock, a stream of
+    /// ready empty items still times out idle: the runner leaves the
+    /// timer driver its turn.
+    #[test]
+    fn test_ready_empty_items_time_out_idle_on_one_thread() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let events = rt.block_on(async {
+                let items = futures::stream::repeat_with(|| Ok::<_, AdapterError>(Bytes::new()));
+                let (_control_tx, control_rx) = async_channel::bounded(1);
+                let (mut runner, mut lifecycle_rx, _data_rx) = TaskRunner::builder()
+                    .stream(items.boxed())
+                    .runner_id(1)
+                    .control_signal(control_rx)
+                    .cancel_token(CancellationToken::new())
+                    .idle_timeout(Duration::from_millis(50))
+                    .timer_source(&ThreadedRuntimeImpl::new_tokio_rt())
+                    .build()
+                    .unwrap();
+                runner.run().await;
+                events(&mut lifecycle_rx)
+            });
+            let _ = tx.send(events);
+        });
+        let events = rx
+            .recv_timeout(10 * SECOND)
+            .expect("the runner timed out idle within seconds");
+        assert_eq!(events, ["started", "failed: Timeout"]);
     }
 }

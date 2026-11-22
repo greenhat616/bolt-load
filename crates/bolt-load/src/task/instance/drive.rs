@@ -78,7 +78,10 @@ pub(crate) struct Attempt {
 /// The attempt's future is built on that thread, so it does not need to be
 /// `Send`. A panic is caught there and published as
 /// [`DownloadError::Panicked`], after the cleanup its phase requires; the
-/// state that cleanup needs lives here, outside the unwind boundary.
+/// state that cleanup needs lives here, outside the unwind boundary. Tokio's
+/// panic at a timer of a runtime built without them, its whole message, is
+/// the caller's configuration instead, published as
+/// [`DownloadError::Runtime`].
 pub(crate) fn spawn(
     attempt: Attempt,
     rt: ThreadedRuntimeImpl,
@@ -139,11 +142,29 @@ fn report_panic(
     match cleanup.published {
         Some(completed) => publisher.finish(Ok(()), completed, None),
         None => publisher.finish_keeping(
-            Err(DownloadError::Panicked { message }),
+            Err(panic_error(message)),
             publisher.progress(),
             cleanup.leftover_temp_file,
             cleanup.kept_for_resume,
         ),
+    }
+}
+
+/// Tokio's panic at a timer of a runtime built without them, as tokio 1.x
+/// words it.
+const TOKIO_TIMERS_DISABLED: &str = "A Tokio 1.x context was found, but timers are disabled. Call \
+                                     `enable_time` on the runtime builder to enable timers.";
+
+/// The error an attempt that panicked with `message` ends with: a tokio
+/// runtime without timers, which the engine's timeouts and sampling run on,
+/// is a configuration of the caller's, any other panic a bug.
+fn panic_error(message: String) -> DownloadError {
+    if message == TOKIO_TIMERS_DISABLED {
+        DownloadError::Runtime {
+            message: format!("the runtime cannot run the task's timers: {message}"),
+        }
+    } else {
+        DownloadError::Panicked { message }
     }
 }
 

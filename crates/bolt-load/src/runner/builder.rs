@@ -8,7 +8,10 @@ use super::{
     LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent, LifecycleReceiver, LimitReceiver, RunnerInput,
     StreamConnector, TaskRunner,
 };
-use crate::task::RunnerId;
+use crate::{
+    runtime::{ThreadedRuntimeImpl, TimerSource},
+    task::RunnerId,
+};
 
 #[derive(Debug, snafu::Snafu)]
 pub enum TaskRunnerBuilderError {
@@ -47,6 +50,8 @@ pub struct TaskRunnerBuilder {
     idle_timeout: Option<std::time::Duration>,
     /// how long connecting may take before the runner fails with `Timeout`
     connect_timeout: Option<std::time::Duration>,
+    /// the clock of the runner and its timeouts
+    timer_source: TimerSource,
 }
 
 impl TaskRunnerBuilder {
@@ -145,6 +150,26 @@ impl TaskRunnerBuilder {
         self
     }
 
+    /// Read the time from `rt`, the runtime the runner runs on, instead
+    /// of the standard clock.
+    ///
+    /// The runner's timestamps then share the clock of the task that runs
+    /// it, and follow it when it is paused or advanced.
+    ///
+    /// The runner does not take `rt` over. Of a tokio runtime it keeps the
+    /// handle and of a smol runtime nothing, so the caller keeps owning
+    /// those, and dropping the runner shuts none of them down: it may be
+    /// dropped on a worker of the runtime it times on. Of a custom runtime,
+    /// [`ThreadedRuntimeImpl::Other`], it keeps a clone of the `Arc` the
+    /// runtime is shared in, which the runner's drop may release last: a
+    /// custom runtime whose drop must not run where the runner is dropped,
+    /// such as one that owns a tokio runtime and runs the runner on it, must
+    /// outlive the runner through another clone of it.
+    pub fn timer_source(mut self, rt: &ThreadedRuntimeImpl) -> Self {
+        self.timer_source = TimerSource::new(rt);
+        self
+    }
+
     #[cfg(test)]
     pub fn data_drain_timeout(mut self, data_drain_timeout: std::time::Duration) -> Self {
         self.data_drain_timeout = Some(data_drain_timeout);
@@ -177,12 +202,13 @@ impl TaskRunnerBuilder {
             data_drain_timeout: self.data_drain_timeout.unwrap_or(DATA_DRAIN_TIMEOUT),
             idle_timeout: self.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
-            built_at: std::time::Instant::now(),
+            built_at: self.timer_source.now(),
             cancel_token: self
                 .cancel_token
                 .ok_or(TaskRunnerBuilderError::CancelTokenNotSet)?,
             stop_token: self.stop_token,
             read_activity: self.read_activity,
+            timer_source: self.timer_source,
         };
         Ok((runner, lifecycle_cons, data_cons))
     }

@@ -750,7 +750,7 @@ async fn retry_after_holds_back_the_requests_to_the_server() {
     let path = dir.path().join("out.bin");
     let file_writer = FileWriter::new(&path, SIZE).await.unwrap();
     let spawner = RunnerSpawner::new(
-        ThreadedRuntimeImpl::new_tokio_rt(),
+        crate::runtime::test_support::current_tokio(),
         adapter,
         WaitGroup::new(),
         CancellationToken::new(),

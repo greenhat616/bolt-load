@@ -110,7 +110,8 @@ impl DownloadLoop {
             AdmissionEvidence::with_streak_gap(streak_gap(options.connect_timeout));
         let strategy = StrategyControl::new(max_concurrency, options.connect_timeout);
         let rates = RunnerRates::default();
-        let policy = FailurePolicy::new(options, Instant::now());
+        let now = spawner.rt.now();
+        let policy = FailurePolicy::new(options, now);
         let writer = PendingWriter::new_direct(
             Arc::new(file_writer.clone()),
             spawner.rt.clone(),
@@ -120,7 +121,7 @@ impl DownloadLoop {
         let strategy_timer = spawner
             .rt
             .create_delayed_timer(DEFAULT_STRATEGY_TICK_INTERVAL);
-        let deadline = DeadlineSource::new(policy.deadline());
+        let deadline = DeadlineSource::new(&spawner.rt, policy.deadline());
         Self {
             spawner,
             manager,
@@ -133,7 +134,7 @@ impl DownloadLoop {
             cancel: CancelSource::new(cancel_token),
             deadline,
             strategy_tick: StrategyTick::new(strategy_timer.into()),
-            throughput: ThroughputSampler::new(throughput_timer.into()),
+            throughput: ThroughputSampler::new(throughput_timer.into(), now),
             rates,
             checkpoints: None,
             #[cfg(test)]
@@ -216,10 +217,11 @@ impl DownloadLoop {
         self.poll_runner(cx)
     }
 
-    /// Handle `event`; the handlers take the time from here, so tests can
-    /// pass their own.
+    /// Handle `event`; the handlers take the time from here, the clock of
+    /// the task's runtime, so tests can pass their own.
     fn handle_event(&mut self, event: LoopEvent) -> Result<ControlFlow<()>> {
-        self.handle_event_at(event, Instant::now())
+        let now = self.spawner.rt.now();
+        self.handle_event_at(event, now)
     }
 
     /// Handle `event` at `now`.
@@ -235,7 +237,7 @@ impl DownloadLoop {
             )),
             LoopEvent::Checkpoint(outcome) => {
                 if let Some(checkpoints) = self.checkpoints.as_mut() {
-                    checkpoints.apply(outcome);
+                    checkpoints.apply(outcome, now);
                     if checkpoints.is_stopped() {
                         // No checkpoint will use them any more.
                         self.writer.stop_checksumming();
@@ -250,7 +252,7 @@ impl DownloadLoop {
                 Ok(ControlFlow::Continue(()))
             }
             LoopEvent::ThroughputTimer => {
-                self.on_throughput_tick();
+                self.on_throughput_tick(now);
                 Ok(ControlFlow::Continue(()))
             }
             LoopEvent::Runner(tick) => self.on_runner(tick, now),
@@ -290,10 +292,11 @@ impl DownloadLoop {
         // ended the task. The data of a changed resource is of the old
         // version: no new checkpoint records it (design §11.5.9).
         if let Some(mut checkpoints) = checkpoints {
+            let now = || spawner.rt.now();
             if matches!(transfer_result, Err(DownloadError::ResourceChanged { .. })) {
-                checkpoints.settle().await;
+                checkpoints.settle(now).await;
             } else {
-                checkpoints.finish(&written).await;
+                checkpoints.finish(&written, now).await;
             }
         }
         progress.downloaded_chunks = written.into_ranges();
