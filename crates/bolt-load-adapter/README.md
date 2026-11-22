@@ -46,6 +46,20 @@ let adapter = agent.into_ureq_adapter(("GET", url));
 - One cached HEAD response for the meta, range detection and the total
   that range responses must name
 
+**Known limitation:** a request, or a body read, that is already running
+on the `blocking` thread pool is not stopped when its future or stream
+is dropped. The thread keeps the connection until the call returns, so
+after an idle timeout or a cancellation the task may open its next
+connection while the old one is still open, briefly exceeding
+`max_connections` (forever, if the server stalls; ureq has no timeouts
+by default). `AgentBuilder::timeout_read` bounds only a single stalled
+socket read: a server that trickles bytes, such as chunk extensions, keeps
+the read alive, and blocked writes are not covered. The broader bound is
+`AgentBuilder::timeout`, a deadline for the whole request, including DNS
+resolution, connecting, redirects and reading the body; it must exceed
+the longest range transfer. As ureq notes, slow DNS resolution may still
+exceed it, because the DNS request cannot be interrupted.
+
 ## Range Request Detection
 
 Both adapters probe the server to determine range request support:

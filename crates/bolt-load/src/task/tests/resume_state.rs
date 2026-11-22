@@ -5,6 +5,10 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -59,6 +63,11 @@ enum Fault {
 struct Source {
     content: Bytes,
     fault: Fault,
+    /// Whether it serves ranges.
+    ranges: bool,
+    /// The range streams open now, and the most open at once.
+    open: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl Source {
@@ -66,7 +75,27 @@ impl Source {
         Self {
             content: SimpleTestAdapter::new(SIZE as usize).content().clone(),
             fault,
+            ranges: true,
+            open: Arc::default(),
+            peak: Arc::default(),
         }
+    }
+
+    /// A source that serves no ranges.
+    fn without_ranges(fault: Fault) -> Self {
+        Self {
+            ranges: false,
+            ..Self::new(fault)
+        }
+    }
+}
+
+/// Counts an open range stream until dropped.
+struct Open(Arc<AtomicUsize>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -76,7 +105,7 @@ fn meta() -> BoltLoadAdapterMeta {
 
 impl BoltLoadAdapter for Source {
     async fn is_range_stream_available(&self) -> bool {
-        true
+        self.ranges
     }
 
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
@@ -99,11 +128,15 @@ impl BoltLoadAdapter for Source {
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
         let content = self.content.clone();
         let fault = self.fault.clone();
+        let open = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(open, Ordering::SeqCst);
+        let held = Arc::new(Open(self.open.clone()));
         Ok(Box::pin(futures::stream::unfold(
             (start, false),
             move |(at, faulted)| {
                 let content = content.clone();
                 let fault = fault.clone();
+                let _held = held.clone();
                 async move {
                     if at >= end {
                         return None;
@@ -564,8 +597,9 @@ async fn test_a_fallback_invalidates_the_state_first() {
 }
 
 /// A task with `Resume::Off`, and a task with `Resume::On` that is not
-/// resumable (no validator, or one connection preferred), take none of
-/// the steps: no state is written, and the files end as before C33.
+/// resumable (no validator, or one connection preferred with no ranges to
+/// route it through), take none of the steps: no state is written, and the
+/// files end as before C33.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_task_that_keeps_no_state_takes_none_of_the_steps() {
     for (resume, validator, mode) in [
@@ -576,7 +610,11 @@ async fn test_a_task_that_keeps_no_state_takes_none_of_the_steps() {
     ] {
         let (_dir, dest) = dest();
         let log = StepLog::default();
-        let source = Source::new(Fault::None);
+        let source = if resume == Resume::On && mode == DownloadMode::Singleton {
+            Source::without_ranges(Fault::None)
+        } else {
+            Source::new(Fault::None)
+        };
         let content = source.content.clone();
         let meta = if validator {
             meta()
@@ -699,6 +737,8 @@ async fn test_a_held_state_write_keeps_the_lock() {
 #[derive(Debug, PartialEq)]
 struct Outcome {
     state: TaskState,
+    /// The mode it downloaded in, last.
+    mode: Option<DownloadMode>,
     error: Option<String>,
     dest: bool,
     partial: bool,
@@ -714,6 +754,7 @@ async fn outcome(
     resume: Resume,
     meta: BoltLoadAdapterMeta,
     mode: DownloadMode,
+    ranges: bool,
     fails: bool,
 ) -> Outcome {
     let (dir, dest) = dest();
@@ -723,7 +764,12 @@ async fn outcome(
     } else {
         Fault::None
     };
-    let task = builder(mode, Source::new(fault), &dest, &CancellationToken::new())
+    let source = if ranges {
+        Source::new(fault)
+    } else {
+        Source::without_ranges(fault)
+    };
+    let task = builder(mode, source, &dest, &CancellationToken::new())
         .meta(meta)
         .options(options())
         .resume(resume)
@@ -734,6 +780,7 @@ async fn outcome(
     let dir = dir.path().display().to_string();
     Outcome {
         state: status.state,
+        mode: status.info.as_ref().map(|info| info.mode),
         error: status
             .error
             .as_ref()
@@ -753,24 +800,46 @@ async fn outcome(
 /// the lock it takes is the only difference (design §11.5.3).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_task_that_cannot_resume_ends_as_one_with_resume_off() {
+    let unknown = || {
+        BoltLoadAdapterMeta::new(0).with_validator(Some(Validator::StrongEtag("\"v1\"".to_owned())))
+    };
     let cases = [
-        ("one connection preferred", meta(), DownloadMode::Singleton),
+        (
+            "one connection preferred, no ranges",
+            meta(),
+            DownloadMode::Singleton,
+            false,
+        ),
+        (
+            "one connection preferred, an unknown total",
+            unknown(),
+            DownloadMode::Singleton,
+            true,
+        ),
+        (
+            "one connection preferred, no validator",
+            BoltLoadAdapterMeta::new(SIZE),
+            DownloadMode::Singleton,
+            true,
+        ),
         (
             "an unknown total",
-            BoltLoadAdapterMeta::new(0)
-                .with_validator(Some(Validator::StrongEtag("\"v1\"".to_owned()))),
+            unknown(),
             DownloadMode::Concurrent,
+            true,
         ),
+        ("no ranges", meta(), DownloadMode::Concurrent, false),
         (
             "no validator",
             BoltLoadAdapterMeta::new(SIZE),
             DownloadMode::Concurrent,
+            true,
         ),
     ];
-    for (case, meta, mode) in cases {
+    for (case, meta, mode, ranges) in cases {
         for fails in [false, true] {
-            let off = outcome(Resume::Off, meta.clone(), mode, fails).await;
-            let on = outcome(Resume::On, meta.clone(), mode, fails).await;
+            let off = outcome(Resume::Off, meta.clone(), mode, ranges, fails).await;
+            let on = outcome(Resume::On, meta.clone(), mode, ranges, fails).await;
             assert_eq!(on, off, "{case}, fails: {fails}");
             let expected = if fails {
                 TaskState::Failed
@@ -1137,5 +1206,270 @@ async fn test_a_new_start_retries_its_invalidation_after_a_panic() {
             assert_eq!(steps[at + 1..], DISCARD, "{case}: {steps:?}");
         }
         assert_unlocked(&dest);
+    }
+}
+
+/// A task that may resume and prefers one connection goes through the
+/// concurrent engine with one connection when it can keep a state file
+/// (design §11.5.8): its info says concurrent, no two ranges are open at
+/// once, and its files follow the resumable order. It ends as one, and
+/// when it fails it keeps a valid state.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_single_connection_task_that_may_resume_goes_through_ranges() {
+    for fails in [false, true] {
+        let (_dir, dest) = dest();
+        let log = StepLog::default();
+        let fault = if fails {
+            Fault::Error(UnretryableError::NotFound { status: 404 }.into())
+        } else {
+            Fault::None
+        };
+        let source = Source::new(fault);
+        let (content, peak) = (source.content.clone(), source.peak.clone());
+        let task = builder(
+            DownloadMode::Singleton,
+            source,
+            &dest,
+            &CancellationToken::new(),
+        )
+        .meta(meta())
+        .options(TaskOptions::default().checkpoint_bytes(std::num::NonZeroU64::new(BLOCK).unwrap()))
+        .resume(Resume::On)
+        .file_hooks(log.hooks())
+        .spawn()
+        .unwrap();
+        let status = finish(task).await;
+        let info = status.info.clone().expect("an info");
+        assert_eq!(info.mode, DownloadMode::Concurrent, "{fails}");
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "one connection: {fails}");
+        let steps = log.steps();
+        assert_eq!(steps[..5], NEW_START, "{steps:?}");
+        if fails {
+            assert_eq!(status.state, TaskState::Failed);
+            assert_eq!(status.kept_for_resume, Some(tmp_path(&dest)));
+            assert_eq!(assert_kept_state(&dest), 2);
+            assert_checkpoints(&steps[5..]);
+        } else {
+            assert_eq!(status.state, TaskState::Finished, "{:?}", status.error);
+            assert_eq!(std::fs::read(&dest).unwrap(), content);
+            assert!(!tmp_path(&dest).exists() && !state_path_for(&dest).exists());
+            assert_eq!(steps[steps.len() - 6..], COMPLETION);
+            assert_checkpoints(&steps[5..steps.len() - 6]);
+        }
+        assert_unlocked(&dest);
+    }
+}
+
+/// A task with `Resume::Off` that prefers one connection stays with one
+/// connection's full download: no range is requested, no file step taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_single_connection_task_without_resume_is_unchanged() {
+    let (_dir, dest) = dest();
+    let log = StepLog::default();
+    let source = Source::new(Fault::None);
+    let (content, peak) = (source.content.clone(), source.peak.clone());
+    let task = builder(
+        DownloadMode::Singleton,
+        source,
+        &dest,
+        &CancellationToken::new(),
+    )
+    .meta(meta())
+    .file_hooks(log.hooks())
+    .spawn()
+    .unwrap();
+    let status = finish(task).await;
+    assert_eq!(status.state, TaskState::Finished);
+    assert_eq!(status.info.clone().unwrap().mode, DownloadMode::Singleton);
+    assert_eq!(peak.load(Ordering::SeqCst), 0, "no range");
+    assert_eq!(std::fs::read(&dest).unwrap(), content);
+    assert_eq!(log.steps(), []);
+}
+
+/// A source whose first range fails, retryably, past [`HALF`], and whose
+/// first stream holds its destruction at a gate; it counts the live
+/// streams and reports every range request.
+struct HeldDrop {
+    content: Bytes,
+    first: std::sync::atomic::AtomicBool,
+    live: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    requested: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    /// Reports that the first stream's destruction began, and holds it
+    /// until the test sends or drops the release.
+    entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Release,
+}
+
+/// The release a held destruction waits for.
+type Release = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>;
+
+/// A live stream, until its destruction ends.
+struct Live {
+    live: Arc<AtomicUsize>,
+    /// Report that the destruction began, then wait for the release.
+    hold: Option<(std::sync::mpsc::Sender<()>, Release)>,
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if let Some((entered, release)) = self.hold.take() {
+            let _ = entered.send(());
+            let _ = release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+        }
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl BoltLoadAdapter for HeldDrop {
+    async fn is_range_stream_available(&self) -> bool {
+        true
+    }
+
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
+        Ok(meta())
+    }
+
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
+        unreachable!("the task goes through ranges")
+    }
+
+    async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
+        let _ = self.requested.lock().unwrap().send(());
+        let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(live, Ordering::SeqCst);
+        let first = self.first.swap(false, Ordering::SeqCst);
+        let guard = Arc::new(Live {
+            live: self.live.clone(),
+            hold: first.then(|| {
+                (
+                    self.entered.lock().unwrap().take().unwrap(),
+                    self.release.clone(),
+                )
+            }),
+        });
+        let content = self.content.clone();
+        Ok(Box::pin(futures::stream::unfold(start, move |at| {
+            let content = content.clone();
+            let guard = guard.clone();
+            async move {
+                let _guard = guard;
+                if at >= end {
+                    return None;
+                }
+                if first && at >= HALF {
+                    let error = AdapterError::Retryable {
+                        source: crate::adapter::RetryableError::Io {
+                            source: Arc::new(io::Error::other("reset")),
+                        },
+                    };
+                    return Some((Err(error), end));
+                }
+                let mut next = (at + FRAME).min(end);
+                if first && at < HALF && next > HALF {
+                    next = HALF;
+                }
+                Some((Ok(content.slice(at as usize..next as usize)), next))
+            }
+        })))
+    }
+}
+
+/// A routed task keeps one connection through a retry: the stream of the
+/// failed attempt is destroyed before its runner reports the stop, so the
+/// retry waits for it. While its destruction is held, no other range is
+/// requested; at most one stream is ever alive. A spare worker lets the
+/// manager go on while the destruction blocks its thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_retry_waits_for_the_old_stream() {
+    let (_dir, dest) = dest();
+    let (requested_tx, requested) = std::sync::mpsc::channel();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let source = HeldDrop {
+        content: SimpleTestAdapter::new(SIZE as usize).content().clone(),
+        first: std::sync::atomic::AtomicBool::new(true),
+        live: Arc::default(),
+        peak: Arc::default(),
+        requested: std::sync::Mutex::new(requested_tx),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: Arc::new(std::sync::Mutex::new(release_rx)),
+    };
+    let (content, peak) = (source.content.clone(), source.peak.clone());
+    let task = builder(
+        DownloadMode::Singleton,
+        source,
+        &dest,
+        &CancellationToken::new(),
+    )
+    .meta(meta())
+    .resume(Resume::On)
+    .spawn()
+    .unwrap();
+    let held = tokio::task::spawn_blocking(move || {
+        requested
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first range");
+        entered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first stream is destroyed");
+        // Well past the retry's backoff: no range while the old stream
+        // lives. Nothing signals that none comes, so this waits.
+        let second = requested.recv_timeout(Duration::from_secs(3));
+        (second.is_err(), requested)
+    })
+    .await
+    .unwrap();
+    assert!(held.0, "a range was requested while the old stream lived");
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
+    release.send(()).unwrap();
+    let status = finish(task).await;
+    assert_eq!(status.state, TaskState::Finished, "{:?}", status.error);
+    assert_eq!(std::fs::read(&dest).unwrap(), content);
+    assert_eq!(peak.load(Ordering::SeqCst), 1, "one stream at a time");
+}
+
+/// A quoted strong entity tag of `len` bytes.
+fn tag_of(len: usize) -> Validator {
+    Validator::StrongEtag(format!("\"{}\"", "v".repeat(len - 2)))
+}
+
+/// More metadata that cannot resume: content-coded, and a validator one
+/// byte over the header's limit. A task with `Resume::On` ends exactly as
+/// with `Resume::Off`, preferring one connection or not; a validator of
+/// exactly 1024 bytes resumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_coded_or_oversized_metadata_cannot_resume() {
+    let coded = meta().with_content_encoding(Some("gzip".to_owned()));
+    let oversized = BoltLoadAdapterMeta::new(SIZE).with_validator(Some(tag_of(1025)));
+    for (case, meta) in [
+        ("content-coded", coded),
+        ("a validator of 1025 bytes", oversized),
+    ] {
+        for mode in [DownloadMode::Singleton, DownloadMode::Concurrent] {
+            for fails in [false, true] {
+                let off = outcome(Resume::Off, meta.clone(), mode, true, fails).await;
+                let on = outcome(Resume::On, meta.clone(), mode, true, fails).await;
+                assert_eq!(on, off, "{case}, {mode:?}, fails: {fails}");
+                assert!(
+                    !off.partial && !off.state_file && off.steps.is_empty(),
+                    "{case}"
+                );
+            }
+        }
+    }
+    for mode in [DownloadMode::Singleton, DownloadMode::Concurrent] {
+        let limit = BoltLoadAdapterMeta::new(SIZE).with_validator(Some(tag_of(1024)));
+        let on = outcome(Resume::On, limit, mode, true, false).await;
+        assert_eq!(on.state, TaskState::Finished, "{mode:?}");
+        assert_eq!(on.mode, Some(DownloadMode::Concurrent), "{mode:?}");
+        assert_eq!(
+            on.steps[..5],
+            NEW_START,
+            "a validator of 1024 bytes resumes"
+        );
     }
 }
