@@ -15,6 +15,7 @@ mod pool_writer;
 mod slow;
 
 use std::{
+    io,
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -66,6 +67,22 @@ pub enum FileWriterError {
     },
     #[snafu(display("failed to finalize, sync all data to disk etc, in path: {path:?}"))]
     Finalize { source: CommandError, path: PathBuf },
+}
+
+impl FileWriterError {
+    /// The io error behind this error, keeping its kind. A closed worker
+    /// queue is not an io error and becomes [`io::ErrorKind::BrokenPipe`],
+    /// like a write submitted to a closed queue.
+    pub(super) fn into_io_error(self) -> io::Error {
+        let (Self::OpenOrCreateFile { source, .. }
+        | Self::AllocateFile { source, .. }
+        | Self::WriteRange { source, .. }
+        | Self::Finalize { source, .. }) = self;
+        match source {
+            CommandError::Io { source } => source,
+            queue => io::Error::new(io::ErrorKind::BrokenPipe, queue),
+        }
+    }
 }
 
 pub trait FileRangeWriter

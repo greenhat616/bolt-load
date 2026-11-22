@@ -85,6 +85,13 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
   meanwhile. A concurrent task retries its range; runners still connecting
   are never split. A singleton task fails, and creates its temporary file
   only once connected; a failed connection keeps the adapter's error.
+- **Write failures** end the task at once and are never retried. The
+  concurrent mode reports `TaskError::Write` with the range and the io
+  error. The singleton mode buffers its writes, so a failure may surface
+  on a later write or on the flush: it reports `DownloadError::Io` with
+  `IoOp::Write` or `IoOp::Flush`, without a range. Both keep the
+  `io::ErrorKind`, and a full disk or an exceeded quota adds a hint to
+  the message.
 - **Metadata request**: [`TaskBuilder::retrieve_meta`] and the task's
   initialization retry retryable metadata errors as
   [`TaskOptions::meta_retry`] allows, with jittered exponential backoff
