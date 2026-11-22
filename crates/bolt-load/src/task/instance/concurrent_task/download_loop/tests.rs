@@ -779,7 +779,7 @@ impl crate::adapter::BoltLoadAdapter for HandshakeAdapter {
         unreachable!("the loop is given its total")
     }
 
-    async fn full_stream(&self) -> Result<crate::adapter::AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<crate::adapter::FullResponse, AdapterError> {
         unreachable!("the loop only connects ranges")
     }
 

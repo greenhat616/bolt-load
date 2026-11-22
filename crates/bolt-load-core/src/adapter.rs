@@ -1,3 +1,5 @@
+use std::fmt;
+
 use futures::stream::BoxStream;
 mod content_range;
 pub mod error;
@@ -23,8 +25,12 @@ pub trait BoltLoadAdapter: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<BoltLoadAdapterMeta, AdapterError>> + Send;
 
-    /// Get a full content stream from the adapter
-    fn full_stream(&self) -> impl Future<Output = Result<AnyBytesStream, AdapterError>> + Send;
+    /// Get the full content from the adapter.
+    ///
+    /// The task decodes the body as [`FullResponse::content_encoding`]
+    /// says, so an HTTP adapter sets it and
+    /// [`FullResponse::content_type`] from the response.
+    fn full_stream(&self) -> impl Future<Output = Result<FullResponse, AdapterError>> + Send;
 
     /// Get a range content stream from the adapter
     /// Note: the range is followed as [start, end)
@@ -80,6 +86,54 @@ impl BoltLoadAdapterMeta {
     }
 }
 
+/// The response to [`BoltLoadAdapter::full_stream`]: the body, and the
+/// headers the task needs to turn it into the file.
+#[non_exhaustive]
+pub struct FullResponse {
+    /// The body, as the HTTP client hands it out.
+    pub body: AnyBytesStream,
+    /// The combined `Content-Encoding` of the body as handed out: `None`
+    /// when the response has none, or when the HTTP client decoded the body
+    /// and dropped the header. The task decodes what it lists.
+    pub content_encoding: Option<String>,
+    /// The combined `Content-Type`. A body whose type is the format of its
+    /// only coding, such as `application/gzip` with `Content-Encoding:
+    /// gzip`, is the file as it is.
+    pub content_type: Option<String>,
+}
+
+impl FullResponse {
+    /// A response whose body is the file, with no coding and no type.
+    pub fn new(body: AnyBytesStream) -> Self {
+        Self {
+            body,
+            content_encoding: None,
+            content_type: None,
+        }
+    }
+
+    /// Set the combined `Content-Encoding`.
+    pub fn with_content_encoding(mut self, content_encoding: Option<String>) -> Self {
+        self.content_encoding = content_encoding;
+        self
+    }
+
+    /// Set the combined `Content-Type`.
+    pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
+        self.content_type = content_type;
+        self
+    }
+}
+
+impl fmt::Debug for FullResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullResponse")
+            .field("content_encoding", &self.content_encoding)
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Whether a combined `Content-Encoding` value lists only `identity`.
 fn is_identity(content_encoding: &str) -> bool {
     content_encoding
@@ -113,8 +167,8 @@ mod tests {
             Ok(BoltLoadAdapterMeta::new(1))
         }
 
-        async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
-            Ok(Box::pin(futures::stream::empty()))
+        async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
+            Ok(FullResponse::new(Box::pin(futures::stream::empty())))
         }
     }
 

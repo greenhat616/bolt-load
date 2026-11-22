@@ -71,11 +71,11 @@ fn outcome(fault: RangeFault, client: Client) -> Outcome {
         (RangeFault::IgnoreRange | RangeFault::ReplacedAfterShortRange, _) => Outcome::Completes {
             fallback: Some(FallbackReason::RangeIgnored),
         },
-        (RangeFault::Gzip, _) | (RangeFault::EncodedRepresentation, Client::DecodingReqwest) => {
-            Outcome::Completes {
-                fallback: Some(FallbackReason::ContentCoded),
-            }
-        }
+        // A client that decodes hands out the file; the task decodes for
+        // one that does not.
+        (RangeFault::Gzip | RangeFault::EncodedRepresentation, _) => Outcome::Completes {
+            fallback: Some(FallbackReason::ContentCoded),
+        },
         (RangeFault::Truncated, _) => Outcome::Completes { fallback: None },
         _ => Outcome::Fails,
     }
@@ -121,11 +121,6 @@ fn is_expected_failure(fault: RangeFault, error: &DownloadError) -> bool {
             UnretryableError::Congestion { status: 503, retry_after: Some(delay) }
                 if *delay == Duration::from_secs(CONGESTED_RETRY_AFTER_SECS)
         ),
-        // A client that does not decode is left with the coded body, which
-        // is not the file. Decoding it is T23.
-        RangeFault::EncodedRepresentation => {
-            matches!(source, UnretryableError::ContentCoded { coding } if coding == "gzip")
-        }
         _ => false,
     }
 }

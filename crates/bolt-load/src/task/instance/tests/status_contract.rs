@@ -6,15 +6,18 @@ use std::time::Duration;
 
 use bolt_load_tests::adapter::{
     fault::Gate,
-    simple::{SimpleTestAdapter, SimpleTestAdapterBuilder},
+    http_server::gzip,
+    simple::{SimpleTestAdapter, SimpleTestAdapterBuilder, create_deterministic_content},
 };
+use bytes::Bytes;
 use pretty_assertions::assert_eq;
 use smol_cancellation_token::CancellationToken;
 use tempfile::TempDir;
 
 use crate::{
     adapter::{
-        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, UnretryableError,
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, FullResponse,
+        UnretryableError,
     },
     task::{
         DownloadError, DownloadMode, FallbackReason, TaskState,
@@ -149,7 +152,7 @@ impl BoltLoadAdapter for UnknownSizeAdapter {
         Ok(meta)
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         self.0.full_stream().await
     }
 
@@ -205,7 +208,7 @@ impl BoltLoadAdapter for RangeUnusableAdapter {
         })
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         self.inner.full_stream().await
     }
 
@@ -258,6 +261,104 @@ async fn test_unusable_ranges_fall_back_to_one_connection() {
         assert_eq!(output.progress.total, Some(SIZE as u64), "{reason:?}");
         assert_eq!(std::fs::read(&dest).unwrap().len(), SIZE, "{reason:?}");
     }
+}
+
+/// Codes its full response with `content_encoding`, while the metadata
+/// names the coded length and no coding: a server that codes `GET` only.
+struct CodedBodyAdapter {
+    encoded: Bytes,
+    content_encoding: &'static str,
+}
+
+impl BoltLoadAdapter for CodedBodyAdapter {
+    async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError> {
+        Ok(BoltLoadAdapterMeta::new(self.encoded.len() as u64))
+    }
+
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
+        let chunks: Vec<_> = self
+            .encoded
+            .chunks(4096)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        Ok(FullResponse::new(Box::pin(futures::stream::iter(chunks)))
+            .with_content_encoding(Some(self.content_encoding.to_owned())))
+    }
+}
+
+/// Bytes that do not compress, so gzip makes them longer.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// A full response that turns out to be coded is decoded. The size the
+/// metadata names counts the coded bytes, so the total is unknown from the
+/// first byte on, whether the file is longer or shorter than that.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_coded_full_response_is_decoded_with_an_unknown_total() {
+    for (case, content) in [
+        ("compressible", create_deterministic_content(SIZE)),
+        ("incompressible", incompressible(SIZE)),
+    ] {
+        let encoded = gzip(&content).unwrap();
+        assert_ne!(encoded.len(), content.len(), "{case}");
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("coded.bin");
+        let token = CancellationToken::new();
+        let adapter = CodedBodyAdapter {
+            encoded,
+            content_encoding: "gzip",
+        };
+        let task = spawn(DownloadMode::Singleton, adapter, &dest, &token);
+
+        let statuses = record(task.status()).await;
+        let output = watchdog(task).await.unwrap();
+
+        assert_transitions(&statuses);
+        for status in &statuses {
+            if status.state == TaskState::Downloading && status.progress.downloaded > 0 {
+                assert_eq!(status.progress.total, None, "{case}");
+            }
+        }
+        assert_eq!(output.mode, DownloadMode::Singleton, "{case}");
+        assert_eq!(output.progress.total, Some(SIZE as u64), "{case}");
+        assert!(std::fs::read(&dest).unwrap() == content, "{case}");
+    }
+}
+
+/// A coding the task cannot decode fails the task before any byte is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_coding_the_task_cannot_decode_fails() {
+    let dir = TempDir::new().unwrap();
+    let dest = dir.path().join("compress.bin");
+    let token = CancellationToken::new();
+    let adapter = CodedBodyAdapter {
+        encoded: Bytes::from_static(b"coded"),
+        content_encoding: "compress",
+    };
+    let task = spawn(DownloadMode::Singleton, adapter, &dest, &token);
+
+    let error = watchdog(task).await.unwrap_err();
+    assert!(
+        matches!(
+            error.as_transfer(),
+            Some(crate::runner::TaskError::StreamError {
+                source: AdapterError::Unretryable {
+                    source: UnretryableError::ContentCoded { coding }
+                }
+            }) if coding == "compress"
+        ),
+        "{error:?}"
+    );
+    assert!(!dest.exists());
 }
 
 /// Throttled so that the transfer spans several progress samples.

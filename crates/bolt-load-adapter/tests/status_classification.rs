@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use bolt_load_adapter::{reqwest::IntoReqwestAdapter, ureq2::IntoUreqAdapter};
-use bolt_load_core::adapter::{AdapterError, AnyBytesStream, BoltLoadAdapter, UnretryableError};
+use bolt_load_core::adapter::{AdapterError, BoltLoadAdapter, UnretryableError};
 use bolt_load_http::classify_status;
 use bolt_load_tests::adapter::http_server::{self, STATUS_RETRY_AFTER_SECS};
 use url::Url;
@@ -14,9 +14,9 @@ const STATUSES: [u16; 13] = [
     401, 403, 404, 408, 410, 416, 429, 500, 503, 599, 409, 412, 418,
 ];
 
-fn error(result: Result<AnyBytesStream, AdapterError>) -> AdapterError {
+fn error<T>(result: Result<T, AdapterError>) -> AdapterError {
     match result {
-        Ok(_) => panic!("an error status must not yield a stream"),
+        Ok(_) => panic!("an error status must not yield a body"),
         Err(e) => e,
     }
 }

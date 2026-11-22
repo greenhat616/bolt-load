@@ -1,13 +1,10 @@
 //! Content codings of responses.
 //!
-//! Like [`validate_range_response`](crate::validate_range_response), this is
-//! part of the adapter contract: the task writes a body as the file, so an
-//! HTTP adapter should check a full response with [`check_content_coding`]
-//! before handing out its body.
+//! The task writes the body of a full response as the file, decoded by
+//! [`codings_to_decode`]. An HTTP adapter hands the task the headers this
+//! reads, in `FullResponse`.
 
 use std::fmt;
-
-use bolt_load_core::adapter::{AdapterError, UnretryableError};
 
 /// A content coding (RFC 9110 §8.4.1) other than `identity`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -84,49 +81,31 @@ impl fmt::Display for ContentCoding {
     }
 }
 
-/// Check the `Content-Encoding` of a full response whose body the HTTP client
-/// did not decode, so that only the file's bytes are written.
+/// The codings to remove from the body of a full response, in the order
+/// applied, to get the file.
 ///
-/// Pass combined values, as for [`RangeHeaders`](crate::RangeHeaders). A
-/// response without a coding passes. So does one whose `Content-Type` is the
-/// format of its only coding, such as `application/gzip` with
-/// `Content-Encoding: gzip`: a server that marks a `.tar.gz` file this way
-/// means the archive itself. Any other coding fails with
-/// [`UnretryableError::ContentCoded`].
-pub fn check_content_coding(
+/// Pass combined values, as for [`RangeHeaders`](crate::RangeHeaders). The
+/// list is empty for a response without a coding, and for one whose
+/// `Content-Type` is the format of its only coding, such as
+/// `application/gzip` with `Content-Encoding: gzip`: a server that marks a
+/// `.tar.gz` file this way means the archive itself.
+pub fn codings_to_decode(
     content_encoding: Option<&str>,
     content_type: Option<&str>,
-) -> Result<(), AdapterError> {
+) -> Vec<ContentCoding> {
     let Some(content_encoding) = content_encoding else {
-        return Ok(());
+        return Vec::new();
     };
-    let is_format = match ContentCoding::parse_list(content_encoding).as_slice() {
-        [] => return Ok(()),
-        [only] => content_type.is_some_and(|content_type| only.is_format_of(content_type)),
-        _ => false,
-    };
-    if is_format {
-        return Ok(());
+    let codings = ContentCoding::parse_list(content_encoding);
+    match (codings.as_slice(), content_type) {
+        ([only], Some(content_type)) if only.is_format_of(content_type) => Vec::new(),
+        _ => codings,
     }
-    Err(UnretryableError::ContentCoded {
-        coding: content_encoding.to_owned(),
-    }
-    .into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn coded(result: Result<(), AdapterError>) -> Option<String> {
-        match result {
-            Ok(()) => None,
-            Err(AdapterError::Unretryable {
-                source: UnretryableError::ContentCoded { coding },
-            }) => Some(coding),
-            Err(other) => panic!("unexpected error {other:?}"),
-        }
-    }
 
     #[test]
     fn identity_is_no_coding() {
@@ -181,31 +160,34 @@ mod tests {
     }
 
     #[test]
-    fn passes_a_response_without_a_coding() {
-        assert_eq!(coded(check_content_coding(None, None)), None);
-        assert_eq!(coded(check_content_coding(Some("identity"), None)), None);
+    fn decodes_nothing_without_a_coding() {
+        assert_eq!(codings_to_decode(None, None), []);
+        assert_eq!(codings_to_decode(None, Some("application/gzip")), []);
+        assert_eq!(codings_to_decode(Some("identity"), None), []);
     }
 
     #[test]
-    fn rejects_a_coded_response() {
-        for (encoding, content_type) in [
-            ("gzip", None),
-            ("br", Some("application/octet-stream")),
-            ("gzip", Some("text/plain")),
+    fn decodes_every_coding_of_a_coded_response() {
+        use ContentCoding::*;
+        for (encoding, content_type, codings) in [
+            ("gzip", None, vec![Gzip]),
+            ("br", Some("application/octet-stream"), vec![Brotli]),
+            ("gzip", Some("text/plain"), vec![Gzip]),
             // Decoding once would still leave gzip, so it is not the archive.
-            ("gzip, gzip", Some("application/gzip")),
-            ("br", Some("application/gzip")),
+            ("gzip, gzip", Some("application/gzip"), vec![Gzip, Gzip]),
+            ("br", Some("application/gzip"), vec![Brotli]),
+            ("compress", None, vec![Other("compress".into())]),
         ] {
             assert_eq!(
-                coded(check_content_coding(Some(encoding), content_type)),
-                Some(encoding.to_owned()),
+                codings_to_decode(Some(encoding), content_type),
+                codings,
                 "{encoding:?} {content_type:?}"
             );
         }
     }
 
     #[test]
-    fn passes_a_file_whose_type_is_its_coding() {
+    fn keeps_a_file_whose_type_is_its_coding() {
         for (encoding, content_type) in [
             ("gzip", "application/gzip"),
             ("GZIP", "Application/X-Gzip; charset=binary"),
@@ -215,8 +197,8 @@ mod tests {
             ("zstd", "application/zstd"),
         ] {
             assert_eq!(
-                coded(check_content_coding(Some(encoding), Some(content_type))),
-                None,
+                codings_to_decode(Some(encoding), Some(content_type)),
+                [],
                 "{encoding:?} {content_type:?}"
             );
         }

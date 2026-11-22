@@ -84,17 +84,22 @@ client cannot decode as `BodyUndecodable`, not as `Io`.
 
 ## Content codings
 
-The task writes a full stream as the file. An HTTP adapter should check
-a full response with `check_content_coding` before reading the body:
-it fails with `Unretryable(ContentCoded)` when the client left a coding
-in place. A response whose `Content-Type` is the format of its only
-coding passes, such as `application/gzip` with `Content-Encoding: gzip`,
-since a server that marks a `.tar.gz` file this way means the archive.
+The task writes the body of a full response as the file. An HTTP
+adapter passes the combined `Content-Encoding` and `Content-Type` of the
+response in `FullResponse`, and the task decodes the codings that
+`codings_to_decode` lists. The list leaves out the only coding of a
+response whose `Content-Type` is that coding's format, such as
+`application/gzip` with `Content-Encoding: gzip`: a server that marks a
+`.tar.gz` file this way means the archive.
 
 ```rust,ignore
-use bolt_load_http::check_content_coding;
+use bolt_load_http::{ContentCoding, codings_to_decode};
 
-check_content_coding(content_encoding, content_type)?;
+assert_eq!(
+    codings_to_decode(Some("gzip"), Some("text/plain")),
+    [ContentCoding::Gzip],
+);
+assert_eq!(codings_to_decode(Some("gzip"), Some("application/gzip")), []);
 ```
 
 Also set `BoltLoadAdapterMeta::with_content_encoding` from the metadata

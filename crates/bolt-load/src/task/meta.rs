@@ -67,7 +67,7 @@ mod tests {
 
     use super::*;
     use crate::adapter::{
-        AnyBytesStream, BoltLoadAdapter, DynBoltLoadAdapter, RetryableError, UnretryableError,
+        BoltLoadAdapter, DynBoltLoadAdapter, FullResponse, RetryableError, UnretryableError,
     };
 
     /// Fails `failures` times with `error`, then succeeds.
@@ -108,7 +108,7 @@ mod tests {
             Ok(BoltLoadAdapterMeta::new(42))
         }
 
-        async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+        async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
             unreachable!("only the metadata is requested")
         }
     }

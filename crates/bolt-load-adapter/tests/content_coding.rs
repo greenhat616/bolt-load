@@ -1,13 +1,18 @@
-//! A content-coded response never reaches the task as other bytes, and
-//! fails at once with an error the task falls back on instead of retrying.
+//! A content-coded range never reaches the task as other bytes, and fails
+//! at once with an error the task falls back on instead of retrying. A
+//! content-coded full response tells the task its coding.
 
 #![cfg(all(feature = "reqwest", feature = "ureq2"))]
 
 use bolt_load_adapter::{reqwest::IntoReqwestAdapter, ureq2::IntoUreqAdapter};
 use bolt_load_core::adapter::{
-    AdapterError, AnyAdapter, AnyBytesStream, BoltLoadAdapter, DynBoltLoadAdapter, UnretryableError,
+    AdapterError, AnyAdapter, AnyBytesStream, BoltLoadAdapter, DynBoltLoadAdapter, FullResponse,
+    UnretryableError,
 };
-use bolt_load_tests::adapter::{fault::RangeFault, http_server::create_range_fault_server};
+use bolt_load_tests::adapter::{
+    fault::RangeFault,
+    http_server::{create_range_fault_server, gzip},
+};
 use futures::StreamExt;
 use url::Url;
 
@@ -92,10 +97,21 @@ async fn an_encoded_range_fails_whether_or_not_the_client_decodes() {
     server.abort();
 }
 
+/// The whole body of a full response.
+async fn body(response: &mut FullResponse) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.body.next().await {
+        body.extend_from_slice(&chunk.unwrap());
+    }
+    body
+}
+
 #[tokio::test]
 async fn a_client_that_does_not_decode_reports_the_coding() {
     let content = "bolt-load ".repeat(8 * 1024);
-    let (port, server) = create_range_fault_server(content.into()).await.unwrap();
+    let (port, server) = create_range_fault_server(content.clone().into())
+        .await
+        .unwrap();
     let url = Url::parse(&format!(
         "http://127.0.0.1:{port}{}",
         RangeFault::EncodedRepresentation.path()
@@ -112,17 +128,42 @@ async fn a_client_that_does_not_decode_reports_the_coding() {
         ("reqwest", DynBoltLoadAdapter::new_box(reqwest)),
         ("ureq2", DynBoltLoadAdapter::new_box(ureq)),
     ];
+    let encoded = gzip(content.as_bytes()).unwrap();
     for (client, adapter) in adapters {
         // The meta shows the coding, so the task never tries ranges.
         let meta = adapter.retrieve_meta().await.unwrap();
         assert_eq!(meta.content_encoding.as_deref(), Some("gzip"), "{client}");
-        // The whole representation is not written as the file either.
-        let error = failure(adapter.full_stream().await).await;
-        assert!(
-            matches!(&error, UnretryableError::ContentCoded { coding } if coding == "gzip"),
-            "{client}: {error:?}"
+        // The full response hands out the coded body and says so.
+        let mut response = adapter.full_stream().await.unwrap();
+        assert_eq!(
+            response.content_encoding.as_deref(),
+            Some("gzip"),
+            "{client}"
         );
+        assert_eq!(body(&mut response).await, encoded, "{client}");
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_decoding_client_reports_no_coding() {
+    let content = "bolt-load ".repeat(8 * 1024);
+    let (port, server) = create_range_fault_server(content.clone().into())
+        .await
+        .unwrap();
+    let url = Url::parse(&format!(
+        "http://127.0.0.1:{port}{}",
+        RangeFault::EncodedRepresentation.path()
+    ))
+    .unwrap();
+    let decoding = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .into_reqwest_adapter((reqwest::Method::GET, url));
+    let mut response = decoding.full_stream().await.unwrap();
+    assert_eq!(response.content_encoding, None);
+    assert_eq!(body(&mut response).await, content.as_bytes());
     server.abort();
 }
 

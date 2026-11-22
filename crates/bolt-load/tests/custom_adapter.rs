@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use bolt_load::{
     adapter::{
-        AdapterError, AnyAdapter, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta,
-        DynBoltLoadAdapter,
+        AdapterError, AnyAdapter, BoltLoadAdapter, BoltLoadAdapterMeta, DynBoltLoadAdapter,
+        FullResponse,
     },
     task::{Task, TaskBuilder},
 };
@@ -19,8 +19,8 @@ impl BoltLoadAdapter for FixedMeta {
         Ok(BoltLoadAdapterMeta::new(SIZE))
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
-        Ok(Box::pin(futures::stream::empty()))
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
+        Ok(FullResponse::new(Box::pin(futures::stream::empty())))
     }
 }
 

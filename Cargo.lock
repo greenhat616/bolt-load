@@ -532,6 +532,8 @@ dependencies = [
  "blocking",
  "bolt-load-adapter",
  "bolt-load-core",
+ "bolt-load-decode",
+ "bolt-load-http",
  "bolt-load-sync",
  "bolt-load-tests",
  "bolt-load-utils",
@@ -617,12 +619,16 @@ name = "bolt-load-decode"
 version = "0.2.0"
 dependencies = [
  "bolt-load-http",
+ "bolt-load-tests",
  "bytes",
  "compression-codecs",
+ "criterion",
  "futures",
  "pin-project-lite",
  "proptest",
+ "reqwest",
  "snafu",
+ "tokio",
 ]
 
 [[package]]

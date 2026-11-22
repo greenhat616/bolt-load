@@ -101,7 +101,8 @@ mod test {
         let mut stream = adapter
             .full_stream()
             .await
-            .expect("Failed to get full stream");
+            .expect("Failed to get full stream")
+            .body;
 
         let mut sampler = SpeedSampler::new();
         let mut bytes: usize = 0;
@@ -203,7 +204,8 @@ mod test {
             let mut stream = adapter
                 .full_stream()
                 .await
-                .expect("Failed to get full stream");
+                .expect("Failed to get full stream")
+                .body;
 
             let mut sampler = SpeedSampler::new();
             let mut bytes_accumulated: usize = 0;
@@ -335,7 +337,8 @@ mod test {
             let mut stream = adapter
                 .full_stream()
                 .await
-                .expect("Failed to get full stream");
+                .expect("Failed to get full stream")
+                .body;
 
             let mut sampler = SpeedSampler::with_alpha(alpha);
             let mut bytes_accumulated: usize = 0;

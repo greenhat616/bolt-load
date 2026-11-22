@@ -10,7 +10,7 @@ use bolt_load_core::adapter::{
     UnretryableError, error::unretryable::IoSnafu as UnretryableIoSnafu,
 };
 use bolt_load_http::{
-    RangeHeaders, check_content_coding, classify_status,
+    RangeHeaders, classify_status,
     header::{ContentDisposition, parse_retry_after},
     limit_range_body, validate_range_response,
 };
@@ -21,7 +21,7 @@ use ureq2::{Agent, Request};
 
 use super::{
     AdapterError, AnyBytesStream, AnyStream, BoltLoadAdapter, BoltLoadAdapterMeta, ContentRange,
-    RetryableError,
+    FullResponse, RetryableError,
 };
 
 type BeforeRequestFn = Box<dyn Fn(Request) -> Request + Send + Sync>;
@@ -245,7 +245,7 @@ impl BoltLoadAdapter for UreqAdapter {
         .await
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         let request = self.apply_before_request(
             self.agent
                 .request_url(&self.target.0, &self.target.1)
@@ -255,14 +255,14 @@ impl BoltLoadAdapter for UreqAdapter {
         let res = unblock(move || Self::apply_call(call, request).map_err(UreqError::from))
             .await
             .map_err(AdapterError::from)?;
-        check_content_coding(
-            combined(&res, &http::header::CONTENT_ENCODING).as_deref(),
-            combined(&res, &http::header::CONTENT_TYPE).as_deref(),
-        )?;
+        let content_encoding = combined(&res, &http::header::CONTENT_ENCODING);
+        let content_type = combined(&res, &http::header::CONTENT_TYPE);
         let reader = res.into_reader();
         let stream = CrossRuntimeStream::new(reader, BUFFER_SIZE);
         let ureq_stream = UreqStream(Box::pin(stream));
-        Ok(Box::pin(ureq_stream))
+        Ok(FullResponse::new(Box::pin(ureq_stream))
+            .with_content_encoding(content_encoding)
+            .with_content_type(content_type))
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {
@@ -419,7 +419,7 @@ mod test {
         let url = Url::parse(&format!("http://localhost:{}/no_range", port)).unwrap();
         let agent = ureq2::Agent::new();
         let adapter = agent.clone().into_ureq_adapter(("get", url));
-        let mut stream = adapter.full_stream().await.unwrap();
+        let mut stream = adapter.full_stream().await.unwrap().body;
         let mut bytes = bytes::BytesMut::new();
         while let Some(item) = stream.next().await {
             bytes.extend_from_slice(&item.unwrap());

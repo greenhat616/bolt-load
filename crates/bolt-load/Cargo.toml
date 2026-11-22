@@ -11,7 +11,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["tokio", "serde", "tracing", "progressbar", "mmap"]
+default = ["tokio", "serde", "tracing", "progressbar", "mmap", "gzip", "deflate"]
 http = [
     "dep:headers",
     "dep:regex",
@@ -21,6 +21,14 @@ http = [
 ]
 # terminal progress
 progressbar = ["dep:indicatif"]
+
+# content codings a full download decodes; without one, a response coded
+# with it fails with `ContentCoded`
+gzip = ["bolt-load-decode/gzip"]
+deflate = ["bolt-load-decode/deflate"]
+br = ["bolt-load-decode/br"]
+# builds the libzstd C library
+zstd = ["bolt-load-decode/zstd"]
 
 # adapter group
 reqwest = ["bolt-load-adapter/reqwest"]
@@ -52,6 +60,8 @@ path = "src/lib.rs"
 [dependencies]
 bolt-load-core = { path = "../bolt-load-core", version = "0.2" }
 bolt-load-adapter = { path = "../bolt-load-adapter", version = "0.2" }
+bolt-load-http = { path = "../bolt-load-http", version = "0.2" }
+bolt-load-decode = { path = "../bolt-load-decode", version = "0.2", default-features = false }
 bolt-load-utils = { path = "../bolt-load-utils", version = "0.2" }
 bolt-load-sync = { path = "../bolt-load-sync", version = "0.2" }
 

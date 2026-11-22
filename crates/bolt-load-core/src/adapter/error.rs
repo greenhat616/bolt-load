@@ -84,14 +84,16 @@ pub mod unretryable {
              decoded it"
         ))]
         RangeBodyTooShort { got: ContentRange, received: u64 },
-        /// The HTTP client could not decode the body, for example a
-        /// content-coded range that starts mid-stream.
+        /// The body cannot be decoded: the HTTP client failed on it, for
+        /// example on a content-coded range that starts mid-stream, or the
+        /// task did, on a corrupt full response.
         #[snafu(display("response body cannot be decoded: {source}"))]
         BodyUndecodable { source: Arc<std::io::Error> },
-        /// A full response is content-coded and the HTTP client left it so.
-        /// Its body is not the file. `coding` is the combined
+        /// A full response is content-coded in a way the task cannot decode:
+        /// a coding it does not know or was built without, or more than two
+        /// codings. Its body is not the file. `coding` is the combined
         /// `Content-Encoding`.
-        #[snafu(display("response is content-coded ({coding}) and was not decoded"))]
+        #[snafu(display("response is content-coded ({coding}) and cannot be decoded"))]
         ContentCoded { coding: String },
         /// 416. `total` comes from `Content-Range: bytes */total`.
         #[snafu(display("range not satisfiable (total {total:?})"))]

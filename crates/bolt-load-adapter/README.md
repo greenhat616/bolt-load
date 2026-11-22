@@ -77,15 +77,20 @@ ends cleanly before.
 
 The task answers `RangeIgnored`, `RangeContentCoded`, these two errors
 and `BodyUndecodable` by starting over on one connection, with the size
-unknown. A full download that the client left content-coded fails with
-`ContentCoded` instead of writing the coded bytes, unless its
-`Content-Type` is the coding's own format (a `.tar.gz` served as
-`Content-Encoding: gzip`). The metadata records a coding it sees in
-`content_encoding`, and the task then skips ranges.
+unknown. A full download hands the task the `Content-Encoding` and
+`Content-Type` of the response, and the task decodes the body with
+`bolt-load-decode`, unless its `Content-Type` is the coding's own format
+(a `.tar.gz` served as `Content-Encoding: gzip`). The metadata records a
+coding it sees in `content_encoding`, and the task then skips ranges.
 
-- **Ureq** depends on ureq 2 without its default `gzip` feature. If
-  another crate in your build enables it, ureq decodes again and only the
-  cap is left.
+A client that decodes cannot make a download write the wrong bytes: its
+decoded ranges fail the length check, and over one connection its
+decoded body is the file. It still costs the ranges, and it also decodes
+a `.tar.gz` served as `Content-Encoding: gzip`. So the adapters keep
+the clients from decoding where they can:
+
+- **Ureq** depends on ureq 2 without its default `gzip` feature. Another
+  crate in your build can still enable it.
 - **Reqwest** uses the `Client` you pass in. Build it with `no_gzip()`,
   `no_brotli()`, `no_zstd()` and `no_deflate()` if it may enable
   decoding; these exist even without the features.
@@ -111,7 +116,6 @@ call it too; see the `bolt-load-http` README.
 | Network errors, including a body cut off mid-stream | `Retryable(Io)` |
 | A body that cannot be decoded, such as invalid gzip from a decoding reqwest `Client`, or `InvalidData` on ureq2 | `Unretryable(BodyUndecodable)` |
 | ureq2 only: a body read error of another kind, such as `InvalidInput` | `Unretryable(Io)` |
-| A full response left content-coded | `Unretryable(ContentCoded)` |
 
 `Retry-After` is parsed with `bolt_load_http::header::parse_retry_after`
 (delay-seconds or an HTTP-date) and clamped to 120 s

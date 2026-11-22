@@ -10,7 +10,8 @@ use tempfile::TempDir;
 
 use crate::{
     adapter::{
-        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, UnretryableError,
+        AdapterError, AnyBytesStream, BoltLoadAdapter, BoltLoadAdapterMeta, FullResponse,
+        UnretryableError,
     },
     task::{
         DownloadError, DownloadMode, TaskState,
@@ -74,7 +75,7 @@ impl BoltLoadAdapter for MockAdapter {
         Ok(self.meta.clone())
     }
 
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError> {
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError> {
         if self.should_fail {
             return Err(AdapterError::Unretryable {
                 source: UnretryableError::Internal {
@@ -89,7 +90,7 @@ impl BoltLoadAdapter for MockAdapter {
                 yield Ok(Bytes::from(chunk.to_vec()));
             }
         };
-        Ok(Box::pin(stream))
+        Ok(FullResponse::new(Box::pin(stream)))
     }
 
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError> {

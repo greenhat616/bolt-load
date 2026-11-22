@@ -12,7 +12,7 @@ single import point for all adapter-related types.
 pub trait BoltLoadAdapter: Send + Sync {
     async fn is_range_stream_available(&self) -> bool;
     async fn retrieve_meta(&self) -> Result<BoltLoadAdapterMeta, AdapterError>;
-    async fn full_stream(&self) -> Result<AnyBytesStream, AdapterError>;
+    async fn full_stream(&self) -> Result<FullResponse, AdapterError>;
     async fn range_stream(&self, start: u64, end: u64) -> Result<AnyBytesStream, AdapterError>;
 }
 ```
@@ -35,6 +35,11 @@ a `Box<AnyAdapter>` implements the trait itself.
 
 The erased adapter implements the trait rather than inherent methods, so
 calling its methods through `AnyAdapter` needs `BoltLoadAdapter` in scope.
+
+`full_stream` returns the body with the `Content-Encoding` and
+`Content-Type` of the response, in a [`FullResponse`]. The task decodes a
+content-coded body as it writes it, so a source without codings returns
+`FullResponse::new(body)`.
 
 # Error Model
 
