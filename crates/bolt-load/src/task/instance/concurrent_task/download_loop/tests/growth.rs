@@ -499,6 +499,7 @@ async fn a_long_download_grows_again_when_capacity_returns() {
     }
     assert_eq!(active, [4, 8, 8, 8]);
     assert_eq!(download.strategy.want(), 8);
+    assert_eq!(download.strategy.reprobe_at(), None, "the probe gained");
     assert_covered(&download);
     drop(download);
     file_writer.finalize().await.unwrap();
@@ -541,10 +542,73 @@ async fn a_hold_is_probed_from_the_runners_still_running() {
             want_after,
             "{bytes_after} B a tick"
         );
+        // Judged: a gain ramps on, with no probe left; no gain holds the
+        // four and is probed again.
+        assert_eq!(
+            download.strategy.reprobe_at().is_none(),
+            want_after == 8,
+            "{bytes_after} B a tick"
+        );
         assert_covered(&download);
         drop(download);
         file_writer.finalize().await.unwrap();
     }
+}
+
+/// One of the four runners a probe added fails before it connects, and
+/// its range's backoff ends at the probe's deadline: seven run, fewer than
+/// the probe made, so it waits for that deadline unjudged. The loop's
+/// wake-up for the range comes before the tick of the same instant: the
+/// probe is expired at the wake-up's time first, so the growth no longer
+/// wants its goal of eight, and nothing connects (design §14.33).
+#[tokio::test]
+async fn a_retry_at_the_probe_deadline_admits_for_the_hold() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, judged, file_writer) = held_at_two(&rt, two_mib_a_tick).await;
+    let probe = judged + Duration::from_secs(30);
+    let mut now = judged;
+    while now + TICK < probe {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(now);
+    }
+    deliver_reading(&mut download, two_mib_a_tick);
+    download.on_strategy_tick(probe);
+    assert_eq!(download.manager.get_active_runners_count(), 8);
+    assert_eq!(download.strategy.want(), 8);
+
+    let failed = *runners(&download, ChunkStatus::Pending).last().unwrap();
+    let error = TaskError::StreamError {
+        source: AdapterError::Retryable {
+            source: crate::adapter::RetryableError::Status { status: 500 },
+        },
+    };
+    let tick = download.manager.fail_runner(failed, error);
+    let range = tick.failure.as_ref().unwrap().range.clone();
+    assert!(download.on_runner(tick, probe).unwrap().is_continue());
+    let deadline = probe + growth_deadline(crate::runner::DEFAULT_CONNECT_TIMEOUT);
+    download.manager.cool_down(range, 1, 1, deadline);
+
+    let mut now = probe;
+    while now + TICK < deadline {
+        now += TICK;
+        deliver_reading(&mut download, two_mib_a_tick);
+        download.on_strategy_tick(now);
+        assert_eq!(download.manager.get_active_runners_count(), 7, "{now:?}");
+        assert_eq!(download.strategy.want(), 8, "{now:?}");
+    }
+    // The runners delivered all along: no deadline for lack of progress.
+    download.policy.on_progress(now);
+    download.on_deadline(deadline).unwrap();
+    assert_eq!(
+        download.manager.get_active_runners_count(),
+        7,
+        "a runner connected past the probe's deadline"
+    );
+    assert_eq!(download.strategy.want(), 2);
+    drop(rt.take_parked());
+    drop(download);
+    file_writer.finalize().await.unwrap();
 }
 
 /// Let the pending runners connect, and each running one deliver

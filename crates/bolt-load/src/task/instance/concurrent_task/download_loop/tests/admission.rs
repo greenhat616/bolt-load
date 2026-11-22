@@ -84,7 +84,7 @@ impl BoltLoadAdapter for ServerAdapter {
 /// The ends of a runner the test drives.
 struct TestRunner {
     lifecycle: LifecycleSender,
-    _data: DataFrameSender,
+    data: DataFrameSender,
     _limits: LimitReceiver,
 }
 
@@ -108,7 +108,7 @@ fn spawn_test_runner(download: &mut DownloadLoop, range: Range<u64>) -> TestRunn
         .unwrap();
     TestRunner {
         lifecycle,
-        _data: data,
+        data,
         _limits: limits.unwrap(),
     }
 }
@@ -184,8 +184,9 @@ async fn admission_loop(
 }
 
 /// Complete the parked `writes`, hand their completions to the loop at
-/// `now`, and
-/// complete the writes that dispatches in turn, until the writer is idle.
+/// `now`, and complete the writes that dispatches in turn, until the
+/// writer is idle. A round that completes nothing fails: a lost completion
+/// would otherwise spin forever.
 fn drain(
     download: &mut DownloadLoop,
     rt: &ScriptedRuntime,
@@ -193,16 +194,19 @@ fn drain(
     now: Instant,
 ) {
     while !download.writer.is_idle() {
+        let mut progressed = !writes.is_empty();
         for write in writes.drain(..) {
             futures::executor::block_on(write);
         }
         while let Some(LoopEvent::WriterCompleted(Some(completions), was_full)) =
             std::future::poll_fn(|cx| download.poll_writer(cx)).now_or_never()
         {
+            progressed = true;
             download
                 .record_completions(completions, was_full, now)
                 .unwrap();
         }
+        assert!(progressed, "the writer is busy, but no write completes");
         // The write the writer held back, dispatched once a slot freed.
         writes.extend(rt.take_parked());
     }
@@ -343,19 +347,23 @@ impl Sim {
     /// while the writer is full, as the loop then polls no data.
     ///
     /// Without `delivering`, they still deliver, so that none is silent,
-    /// but the loop's failure policy sees no progress.
+    /// but the loop's failure policy sees no progress. Nor does it when no
+    /// runner had bytes accepted.
     fn deliver(&mut self) {
         if !self.download.writer.can_write() {
             return;
         }
+        let mut accepted = false;
         for runner_id in self.runners(ChunkStatus::Running) {
-            self.download
+            let range = self
+                .download
                 .manager
                 .update_progress(runner_id, DELIVERED)
                 .unwrap();
+            accepted |= !range.is_empty();
             self.download.manager.note_delivery(runner_id, self.now);
         }
-        if self.delivering {
+        if self.delivering && accepted {
             self.download.policy.on_progress(self.now);
             self.download.policy.on_write_ok(1);
         }
@@ -797,6 +805,119 @@ async fn a_rejected_step_opens_no_second_trial_before_its_tick() {
     sim.teardown().await;
 }
 
+/// A runner's final frame finishes its chunk before the runner reports
+/// `Stopped`, and it holds its slot until then. With the limit lowered to
+/// three by a 503, whose range's backoff has ended, one of the three takes
+/// its last frame through its data channel: neither a wake-up for the
+/// range nor the next tick opens a fourth connection. Once the runner
+/// stopped, the range connects.
+#[tokio::test]
+async fn a_finished_runner_holds_its_slot_until_it_stops() {
+    const FRAME: u64 = 1 << 10;
+    let mut sim = Sim::new(Server::Hangs, 8, &whole(4)).await;
+    let t0 = sim.t0();
+    sim.run_until(t0 + TICK);
+    sim.fail_healthy(3, congestion());
+    sim.run_until(t0 + 2 * TICK);
+    assert_eq!(sim.limits[1..], [(t0 + 2 * TICK, 3)]);
+    assert_eq!(sim.download.manager.get_eligible_ranges(sim.now).len(), 1);
+
+    // All of runner 0's chunk but its last frame, then that frame through
+    // its channel, as the runner pushes it before it reports `Stopped`.
+    let left = sim
+        .download
+        .manager
+        .get_runner_state(0)
+        .unwrap()
+        .remaining();
+    sim.download
+        .manager
+        .update_progress(0, left - FRAME)
+        .unwrap();
+    sim.healthy[0]
+        .data
+        .try_push(DataFrame {
+            data: bytes::Bytes::from(vec![0; FRAME as usize]),
+        })
+        .unwrap();
+    let Some(LoopEvent::Runner(tick)) =
+        std::future::poll_fn(|cx| sim.download.poll_runner(cx)).now_or_never()
+    else {
+        panic!("the frame is queued");
+    };
+    assert!(tick.downloaded.is_some());
+    assert!(sim.download.on_runner(tick, sim.now).unwrap().is_continue());
+    // Its write, parked in the test's runtime: no runner.
+    sim.writes.extend(sim.rt.take_parked());
+    sim.drain_writer();
+    assert_eq!(
+        sim.download.manager.get_runner_state(0).unwrap().status,
+        ChunkStatus::Finished
+    );
+    assert_eq!(sim.download.manager.get_active_runners_count(), 2);
+    assert_eq!(sim.download.manager.allocated_runner_count(), 3);
+
+    // The loop's wake-up for a range whose backoff ended.
+    sim.download.on_deadline(sim.now).unwrap();
+    sim.settle();
+    sim.run_until(sim.next_tick);
+    assert!(
+        sim.spawned.is_empty(),
+        "a fourth connection: {:?}",
+        sim.spawned
+    );
+
+    sim.healthy[0]
+        .lifecycle
+        .try_push(LifecycleEvent::finished())
+        .unwrap();
+    sim.settle();
+    assert_eq!(sim.download.manager.allocated_runner_count(), 2);
+    sim.run_until(sim.next_tick);
+    assert_eq!(sim.spawned, [sim.now]);
+    assert_eq!(sim.download.manager.allocated_runner_count(), 3);
+    sim.teardown().await;
+}
+
+/// A step's trial is lost before it connects: no refusal, so the step is
+/// neither rejected nor unclear. Its range backs off for less than a tick,
+/// and the retry opens no second trial in the same step: one connection
+/// above the limit per step (G10). Nothing reopens the trial slot, so the
+/// next tick ends the step inconclusive, with the wait unchanged.
+#[tokio::test]
+async fn a_lost_trial_opens_no_second_trial_in_its_step() {
+    let mut sim = Sim::new(Server::Hangs, 8, &whole(4)).await;
+    let t0 = sim.t0();
+    sim.run_until(t0 + TICK);
+    sim.fail_healthy(3, congestion());
+    let mut steps = Steps::default();
+    sim.run_recording_steps(sim.next_tick, &mut steps);
+    let (_, 3) = sim.limits[1] else {
+        panic!("{:?}", sim.limits);
+    };
+    while steps.began.is_empty() {
+        assert!(sim.now < t0 + 40 * SECOND, "no step began");
+        sim.run_recording_steps(sim.next_tick, &mut steps);
+    }
+    let began = steps.began[0];
+    assert_eq!(sim.spawned, [began]);
+    // The trial's connect is lost.
+    for (_, future) in std::mem::take(&mut sim.connecting) {
+        drop(future);
+    }
+    sim.settle();
+    assert_eq!(sim.failures.len(), 2, "{:?}", sim.failures);
+    assert!(matches!(sim.failures[1].1, TaskError::ChannelClosed));
+    let retry = sim.download.next_retry(sim.now).unwrap();
+    assert!(retry < began + TICK, "{:?}", retry - began);
+
+    sim.run_recording_steps(began + 20 * SECOND, &mut steps);
+    assert_eq!(sim.spawned, [began], "a second trial opened");
+    let base = Duration::from_secs(30);
+    assert_eq!(steps.ended, [(began + TICK, began + TICK + base)]);
+    sim.teardown().await;
+}
+
 /// Sixteenth `i` of the file.
 fn sixteenth(i: u64) -> Range<u64> {
     i * TOTAL / 16..(i + 1) * TOTAL / 16
@@ -849,6 +970,9 @@ async fn hung_connects_that_outlast_the_proven_runners_lower_the_limit() {
         sim.failures
     );
     assert_eq!(sim.failures.len(), 4);
+    // Corroborated only by what the connects were seen beside, so charged
+    // (D27): nothing is proven at the moment of their classification.
+    assert_eq!(sim.charges, [(1, false); 4]);
     assert_eq!(sim.download.manager.admission().streak_count(), 4);
     assert_eq!(sim.limits.len(), 1, "none connected yet");
 
@@ -1532,6 +1656,80 @@ mod admission_properties {
         }
     }
 
+    /// Invariant 1 for what `op` added: no more runners than the free slots
+    /// below the cap, `cap − allocated`, and the hedges it began, which
+    /// the limit's cap alone gates; never above that cap, neither the
+    /// active runners nor the slots held.
+    fn check_added(op: &Op, before: &Snapshot, after: &Snapshot, limit_cap: usize) {
+        if after.allocated <= before.allocated {
+            return;
+        }
+        let hedges = after.hedged.saturating_sub(before.hedged);
+        let added = after.allocated - before.allocated;
+        assert!(
+            added <= after.cap.saturating_sub(before.allocated) + hedges
+                && after.active <= limit_cap
+                && after.allocated <= limit_cap,
+            "{op:?} added runners above the cap: {before:?} -> {after:?}"
+        );
+    }
+
+    /// A hold of two, four runners and a limit's cap of six: a hedge may
+    /// bring the active runners to five, above what the growth wants.
+    #[test]
+    fn a_hedge_above_a_hold_is_legal() {
+        let t0 = Instant::now();
+        let before = Snapshot {
+            limit: 6,
+            step: None,
+            due: None,
+            cap: 2,
+            want: 2,
+            hedged: 0,
+            active: 4,
+            allocated: 4,
+            loop_limit: 6,
+            streak: 0,
+            third: None,
+            congestion_pending: false,
+            rejected: false,
+            unclear: false,
+            writer_ready: true,
+            last_progress_at: t0,
+            occupied_since: None,
+        };
+        let after = Snapshot {
+            hedged: 1,
+            active: 5,
+            allocated: 5,
+            ..before.clone()
+        };
+        check_added(&Op::Tick(1), &before, &after, 6);
+        let split = Snapshot {
+            hedged: 0,
+            ..after.clone()
+        };
+        let added = std::panic::catch_unwind(|| check_added(&Op::Tick(1), &before, &split, 6));
+        assert!(added.is_err(), "a split above the hold");
+        // Five active and a slot still held at a cap of six: a hedge would
+        // hold seven slots.
+        let held = Snapshot {
+            cap: 6,
+            want: 6,
+            active: 5,
+            allocated: 6,
+            ..before.clone()
+        };
+        let over = Snapshot {
+            hedged: 1,
+            active: 6,
+            allocated: 7,
+            ..held.clone()
+        };
+        let added = std::panic::catch_unwind(|| check_added(&Op::Tick(1), &held, &over, 6));
+        assert!(added.is_err(), "a hedge above the slots");
+    }
+
     /// Invariant 7: the range's charged failures grow only by a failure
     /// that is not exempt, at most once per attempt; only a refusal is
     /// exempt, and a refusal that is not exempt is charged.
@@ -1595,13 +1793,7 @@ mod admission_properties {
         assert!((1..=max_connections).contains(&after.limit), "{after:?}");
         let limit_cap = after.limit + usize::from(after.step.is_some());
         assert_eq!(after.cap, limit_cap.min(after.want), "{after:?}");
-        if after.allocated > before.allocated {
-            let hedges = after.hedged.saturating_sub(before.hedged);
-            assert!(
-                after.active <= after.cap + hedges && after.active <= limit_cap,
-                "{op:?} added runners above the cap: {before:?} -> {after:?}"
-            );
-        }
+        check_added(op, before, after, limit_cap);
         // 2, 3. It rises only by one, when a step is accepted: an on-time
         // tick, after the model's unbroken occupancy for the observation
         // period.
@@ -1684,12 +1876,12 @@ mod admission_properties {
 mod fault_server {
     use bolt_load_tests::adapter::{
         fault::LimitMode,
-        http_server::create_limited_range_server,
+        http_server::{ConnectionLog, create_limited_range_server},
         simple::{calculate_blake3, create_deterministic_content},
     };
     use pretty_assertions::assert_eq;
 
-    use super::*;
+    use super::{super::super::super::strategy::ConcurrencyControlConfig, *};
     use crate::task::Progress;
 
     /// The limit controller's state, see `StrategyControl::limit_state`.
@@ -1704,15 +1896,40 @@ mod fault_server {
         }
     }
 
+    /// What [`drive`] records.
+    struct Record {
+        /// Each change of the loop's limit, at the test's time.
+        limits: Vec<(Instant, usize)>,
+        /// Each change of the limit controller's state, whose instants are
+        /// the loop's own.
+        states: Vec<LimitState>,
+        /// The charged failures of each failure's range.
+        charges: Vec<u32>,
+        /// The server's log.
+        log: ConnectionLog,
+        /// When the limit was first lowered.
+        at_lowering: Option<Lowering>,
+    }
+
+    /// The first lowering of the limit, as [`drive`] saw it.
+    struct Lowering {
+        /// The loop's time of the event that lowered the limit, which
+        /// [`drive`] passed it.
+        at: Instant,
+        /// The connections the server had turned away by then.
+        turned_away: usize,
+        /// The loop's connects still pending, which the server may turn
+        /// away later.
+        pending: usize,
+        /// The failures, charged or not, by then.
+        failures: usize,
+    }
+
     /// Handle the loop's events one by one until `done` holds, or until
-    /// the loop ends when `done` is `None`; record each change of the
-    /// limit, and each change of the limit controller's state, whose
-    /// instants are the loop's own.
+    /// the loop ends when `done` is `None`, and record them in `record`.
     async fn drive(
         download: &mut DownloadLoop,
-        limits: &mut Vec<(Instant, usize)>,
-        states: &mut Vec<LimitState>,
-        charges: &mut Vec<u32>,
+        record: &mut Record,
         mut done: Option<&mut dyn FnMut(&DownloadLoop) -> bool>,
     ) -> Result<()> {
         loop {
@@ -1725,15 +1942,33 @@ mod fault_server {
                 ..
             }) = &event
             {
-                charges.push(failure.charged);
+                record.charges.push(failure.charged);
             }
-            let flow = download.handle_event(event)?;
-            if download.max_concurrency != limits.last().unwrap().1 {
-                limits.push((Instant::now(), download.max_concurrency));
+            // One reading of the loop's clock, which the loop handles the
+            // event at, so a lowering's recorded time is its own.
+            let now = download.spawner.rt.now();
+            let flow = download.handle_event_at(event, now)?;
+            if download.max_concurrency != record.limits.last().unwrap().1 {
+                record
+                    .limits
+                    .push((Instant::now(), download.max_concurrency));
+                if record.at_lowering.is_none() {
+                    let pending = download
+                        .manager
+                        .active_chunks()
+                        .filter(|chunk| chunk.status == ChunkStatus::Pending)
+                        .count();
+                    record.at_lowering = Some(Lowering {
+                        at: now,
+                        turned_away: record.log.turned_away().len(),
+                        pending,
+                        failures: record.charges.len(),
+                    });
+                }
             }
             let state = download.strategy.limit_state();
-            if states.last() != Some(&state) {
-                states.push(state);
+            if record.states.last() != Some(&state) {
+                record.states.push(state);
             }
             if flow.is_break() {
                 return match done {
@@ -1785,18 +2020,22 @@ mod fault_server {
     /// reqwest adapter and the loop's real timers: eight connections
     /// allowed, three admitted, the others turned away as `mode` says.
     ///
-    /// The test opens the fourth connection itself by splitting: a task
-    /// only splits on its own when the dynamic strategy's speed samples
-    /// call for it. The download completes with the right content, the
-    /// server never serves more than three at once, the limit is lowered
-    /// to the three, and no connection is turned away after that.
+    /// The test opens the fourth connection itself by splitting: the
+    /// growth only splits when its speed samples call for it. The download
+    /// completes with the right content, the server never serves more than
+    /// three at once, and the limit is lowered to the three. The steps wait
+    /// 3 s instead of 30 s, so that they come while the three transfer: at
+    /// least one begins, no earlier than its due time, and after the
+    /// lowering the server turns away at least one connection, and no more
+    /// than the steps' trials and the connects pending at the lowering
+    /// (G10).
     async fn a_silent_limit_completes(mode: LimitMode) {
         use bolt_load_adapter::reqwest::IntoReqwestAdapter;
 
         const RATE: u64 = 256 << 10;
-        // Four ranges of 10 s each at the rate: the limit is lowered
-        // before the first of them ends.
-        const SIZE: u64 = 40 * RATE;
+        // Eight ranges of 10 s each at the rate: the three transfer for
+        // about 25 s after the limit is lowered, past several steps.
+        const SIZE: u64 = 80 * RATE;
         let dir = tempfile::TempDir::new().unwrap();
         let content = bytes::Bytes::from(create_deterministic_content(SIZE as usize));
         let (port, server, log) = create_limited_range_server(content.clone(), 3, mode, RATE)
@@ -1827,36 +2066,45 @@ mod fault_server {
             &options,
             CancellationToken::new(),
         );
-        let mut limits = vec![(Instant::now(), download.max_concurrency)];
-        let mut states = vec![download.strategy.limit_state()];
-        let mut charges = Vec::new();
+        let config = ConcurrencyControlConfig {
+            base_wait: Duration::from_secs(3),
+            ..ConcurrencyControlConfig::with_connect_timeout(options.connect_timeout)
+        };
+        let base = config.base_wait;
+        download.strategy =
+            StrategyControl::with_concurrency_control(8, options.connect_timeout, config);
+        let mut record = Record {
+            limits: vec![(Instant::now(), download.max_concurrency)],
+            states: vec![download.strategy.limit_state()],
+            charges: Vec::new(),
+            log: log.clone(),
+            at_lowering: None,
+        };
 
         // The first step creates the first runner.
         download.on_strategy_tick(Instant::now());
         let driven = within_a_minute(async {
-            drive(
-                &mut download,
-                &mut limits,
-                &mut states,
-                &mut charges,
-                Some(&mut |d| running(d, 0)),
-            )
-            .await?;
+            drive(&mut download, &mut record, Some(&mut |d| running(d, 0))).await?;
             split(&mut download, 0);
             drive(
                 &mut download,
-                &mut limits,
-                &mut states,
-                &mut charges,
+                &mut record,
                 Some(&mut |d| proven(d, 0) && proven(d, 1)),
             )
             .await?;
             // Both split: a fourth connection, refused beside two proven.
             split(&mut download, 0);
             split(&mut download, 1);
-            drive(&mut download, &mut limits, &mut states, &mut charges, None).await
+            drive(&mut download, &mut record, None).await
         })
         .await;
+        let Record {
+            limits,
+            states,
+            charges,
+            at_lowering,
+            ..
+        } = record;
         let mut progress = Progress::default();
         let finished = within_a_minute(download.finish(driven, &mut progress)).await;
         let finalized = file_writer.finalize().await;
@@ -1870,11 +2118,15 @@ mod fault_server {
             calculate_blake3(&content)
         );
         assert!(log.max_open() <= 3, "{mode:?}: {:?}", log.events());
-        // Every refusal came beside proven connections, above the proven
-        // window: no range was charged (design §14.13).
+        // Every refusal up to the lowering came beside proven connections,
+        // above the proven window: no range was charged (design §14.13). A
+        // step's trial may be refused later, when one of the three just
+        // finished: inside the window, and charged (D27).
+        let lowering = at_lowering.expect("the limit was lowered");
+        let charged_by = lowering.failures;
         assert!(
-            !charges.is_empty() && charges.iter().all(|c| *c == 0),
-            "{mode:?}: {charges:?}"
+            charged_by > 0 && charges[..charged_by].iter().all(|c| *c == 0),
+            "{mode:?}: {charges:?}, {charged_by} by the lowering"
         );
         // Lowered to the three first; the cadence of recovery is asserted
         // in the tests with injected time.
@@ -1886,15 +2138,9 @@ mod fault_server {
             states.iter().all(|(limit, ..)| *limit == 3 || *limit == 8),
             "{mode:?}: the limit rose: {states:?}"
         );
-        // The controller's own instants, taken before it acted: when it
-        // lowered the limit, and when each step began.
-        let base = Duration::from_secs(30);
-        let lowered_at = states
-            .iter()
-            .find(|(limit, ..)| *limit == 3)
-            .and_then(|(_, _, due, _)| *due)
-            .expect("the lowering sets the next step's due time")
-            - base;
+        // When each step began, by the controller's own instants; the
+        // lowering by the loop's clock, not by the controller's due time.
+        let lowered_at = lowering.at;
         let steps: Vec<Instant> = states
             .windows(2)
             .filter_map(|pair| match (pair[0].1, pair[1].1) {
@@ -1902,16 +2148,30 @@ mod fault_server {
                 _ => None,
             })
             .collect();
-        // The server's log is compared with nothing the loop recorded: when
-        // the server logs a connection it turned away may lag the loop's
-        // instants, as with a connect that is never answered. Which
-        // connections the steps opened, and when, is asserted with
-        // injected time.
+        let first = *steps
+            .first()
+            .unwrap_or_else(|| panic!("{mode:?}: no step began: {states:?}"));
+        assert!(first >= lowered_at + base, "{mode:?}");
+        // The server's instants are compared with nothing the loop
+        // recorded: when the server logs a connection it turned away may
+        // lag the loop's instants, as with a connect that is never
+        // answered. Its connections are counted by phase instead, before
+        // and after the lowering; when the steps opened their trials is
+        // asserted with injected time.
         let turned_away = log.turned_away();
         assert!(turned_away.len() >= 3, "{mode:?}: {turned_away:?}");
-        if let Some(&first) = steps.first() {
-            assert!(first >= lowered_at + base, "{mode:?}");
-        }
+        let Lowering {
+            turned_away: before,
+            pending,
+            ..
+        } = lowering;
+        let after = turned_away.len() - before;
+        assert!(
+            (1..=steps.len() + pending).contains(&after),
+            "{mode:?}: {after} turned away after the lowering, {} steps, {pending} pending: \
+             {states:?}",
+            steps.len()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

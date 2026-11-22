@@ -51,7 +51,15 @@ impl DownloadLoop {
             }
             self.back_off(&failure, now);
         }
-        Ok(if tick.state == TaskState::Finished {
+        // A runner may end with a tolerated failure after its last bytes
+        // were accepted, as a drain timeout that raced the loop taking the
+        // last frame: with every byte received and no runner left, the
+        // download is complete, and the writer is flushed as for any end.
+        // The slot count comes first and costs nothing, so a frame with
+        // runners still running never scans the planner.
+        let complete = tick.state == TaskState::Finished
+            || (self.manager.allocated_runner_count() == 0 && self.manager.is_complete());
+        Ok(if complete {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())

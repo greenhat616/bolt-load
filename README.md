@@ -271,7 +271,11 @@ splitting the running ranges with the most left. A running runner that
 has been silent for at least 2 s, and running at least that long, does
 not hold the growth back. Each split needs at least 2 s of work at the
 split runner's own rate, or at the average rate per runner when it has
-none yet. Once a doubling gains less than 10% in speed, it stops growing. Slow or silent runners are
+none yet. Once a doubling gains less than 10% in speed, the growth holds
+the runners it doubled from, and 30 s later probes again by doubling the
+runners active then, up to the current limit: a gain resumes the doubling,
+and no gain holds again and doubles the wait, up to 300 s. The runners a
+gainless doubling added are not stopped. Slow or silent runners are
 restarted, and a stalled range at the end of the download is hedged by a
 second runner. The [crate README](crates/bolt-load/README.md#concurrency-control)
 describes the rules in full.

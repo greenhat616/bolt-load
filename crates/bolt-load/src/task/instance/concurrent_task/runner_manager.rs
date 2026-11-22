@@ -477,7 +477,24 @@ impl RunnerManager {
     /// are proven beside them (design §8.3): at each spawn, strategy tick
     /// and failure, and when an attempt becomes proven.
     pub(super) fn observe_connecting(&mut self) {
-        self.observe_connecting_with(self.chunk_planner.get_proven_runners_count());
+        if self.connecting_data.is_empty() {
+            return;
+        }
+        self.observe_connecting_with(self.proven_witnesses());
+    }
+
+    /// The proven attempts that witness the connects beside them: not
+    /// those the loop stopped, which may be gone long before a connect
+    /// beside them times out (design §8.3, §14.35).
+    fn proven_witnesses(&self) -> usize {
+        let stopping = self
+            .stopping
+            .keys()
+            .filter(|&&runner_id| self.chunk_planner.is_proven(runner_id))
+            .count();
+        self.chunk_planner
+            .get_proven_runners_count()
+            .saturating_sub(stopping)
     }
 
     /// [`Self::observe_connecting`] with `proven` attempts proven.
@@ -673,8 +690,10 @@ impl RunnerManager {
         self.reads.get(&runner_id)?.last_active(now)
     }
 
-    /// Gets the number of currently allocated runners
-    #[cfg(test)]
+    /// The runners that hold a slot: every runner until it is released,
+    /// also once its chunk is finished or the loop stopped it. Each may
+    /// still hold a connection to the server, so new runners are admitted
+    /// against them (design §8.3).
     #[inline]
     pub fn allocated_runner_count(&self) -> usize {
         self.id_generator.allocated_count()
@@ -999,6 +1018,8 @@ impl RunnerManager {
         spawn: impl FnOnce(RunnerId, LimitReceiver) -> Result<RunnerChannels, SpawnFailed>,
     ) {
         self.last_delivery.insert(runner_id, now);
+        self.admission
+            .on_opened(runner_id, self.id_generator.allocated_count());
         match spawn(runner_id, limits) {
             Ok(channels) => {
                 self.register_runner_channels(runner_id, channels.lifecycle_rx, channels.data_rx);
@@ -1141,7 +1162,7 @@ mod tests {
     use std::{pin::pin, time::Duration};
 
     use async_ringbuf::traits::Producer;
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
 
     use super::*;
     use crate::runner::{
@@ -2153,6 +2174,55 @@ mod tests {
         (admission.streak_count(), admission.take_congestion())
     }
 
+    /// A hedge opened in a running step's trial slot, beaten before its
+    /// first lifecycle event, spends the step's trial: no other connection
+    /// above the limit opens in that step, whatever ended the trial
+    /// (design §8.3, G10).
+    #[tokio::test]
+    async fn test_a_beaten_hedge_in_the_trial_slot_spends_the_trial() {
+        let (mut manager, _lifecycle, mut data_tx) = manager_with_a_proven_runner().await;
+        // A step at a limit of one: the second connection is its trial.
+        manager.admission_mut().begin_step(2, Instant::now());
+        let slot = manager.try_reserve_slot().unwrap();
+        let (channels, hedge_lifecycle, _hedge_data) = test_channels();
+        assert!(manager.spawn_hedge(slot, 0, Instant::now(), |_, _, _| Ok(channels)));
+        assert!(!manager.admission().trial_spent());
+        // The original delivers first: the hedge, still connecting, loses.
+        push_frame(&mut data_tx, 10).await;
+        let tick = manager.tick().now_or_never().expect("the frame is queued");
+        assert!(tick.downloaded.is_some());
+        assert_eq!(manager.stop_reason(1), Some(StopReason::Loser));
+        assert!(manager.admission().trial_spent());
+        // It ends without a word; the trial stays spent.
+        drop(hedge_lifecycle);
+        let tick = manager
+            .tick_lifecycle_only()
+            .now_or_never()
+            .expect("the closed channel is seen");
+        assert!(tick.failure.is_none());
+        assert_eq!(manager.allocated_runner_count(), 1);
+        assert!(manager.admission().trial_spent());
+    }
+
+    /// An attempt below the limit that fails to connect during a step
+    /// leaves the trial open.
+    #[tokio::test]
+    async fn test_a_failed_connect_below_the_limit_leaves_the_trial() {
+        let (mut manager, _lifecycle, _data) = manager_with_a_proven_runner().await;
+        // A step at a limit of two: the third connection is its trial.
+        manager.admission_mut().begin_step(3, Instant::now());
+        let (mut lifecycle_tx, _data_tx) = spawn_test_runner(&mut manager, 500..1000).unwrap();
+        lifecycle_tx
+            .try_push(LifecycleEvent::failed(TaskError::Timeout))
+            .unwrap();
+        let tick = manager
+            .tick_lifecycle_only()
+            .now_or_never()
+            .expect("the failure is queued");
+        assert!(tick.failure.is_some());
+        assert!(!manager.admission().trial_spent());
+    }
+
     /// The first bytes accepted of an attempt show the evidence the
     /// connects beside it at once, though no tick may come before it
     /// finishes (design §8.3).
@@ -2161,12 +2231,32 @@ mod tests {
         let mut manager = RunnerManager::new(1000, 4);
         let (mut lifecycle_tx, mut data_tx) = spawn_test_runner(&mut manager, 0..500).unwrap();
         lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
-        manager.tick().await;
+        // Queued already: bounded, a lost event fails rather than hangs.
+        manager.tick().now_or_never().expect("Started is queued");
         let (_connecting, _data) = spawn_test_runner(&mut manager, 500..1000).unwrap();
         assert!(!manager.admission().is_seen(1), "nothing proven yet");
         push_frame(&mut data_tx, 10).await;
-        assert!(manager.tick().await.downloaded.is_some());
+        let tick = manager.tick().now_or_never().expect("the frame is queued");
+        assert!(tick.downloaded.is_some());
         assert!(manager.admission().is_seen(1));
+    }
+
+    /// A proven runner the loop stopped witnesses no connect: it may be
+    /// gone long before a connect beside it times out (design §14.35).
+    #[tokio::test]
+    async fn test_a_stopping_runner_is_no_witness() {
+        let mut manager = RunnerManager::new(1000, 4);
+        let (mut lifecycle_tx, mut data_tx, _stop) = spawn_stoppable_runner(&mut manager, 0..500);
+        lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+        manager.tick().now_or_never().expect("Started is queued");
+        push_frame(&mut data_tx, 10).await;
+        let tick = manager.tick().now_or_never().expect("the frame is queued");
+        assert!(tick.downloaded.is_some());
+        assert!(manager.stop_runner(0));
+        let (_connecting, _data) = spawn_test_runner(&mut manager, 500..1000).unwrap();
+        assert!(!manager.admission().is_seen(1));
+        manager.observe_connecting();
+        assert!(!manager.admission().is_seen(1));
     }
 
     /// A connect seen beside a proven runner, then cancelled, is never
@@ -2179,7 +2269,11 @@ mod tests {
         lifecycle_tx
             .try_push(LifecycleEvent::failed(TaskError::Cancelled))
             .unwrap();
-        assert!(manager.tick_lifecycle_only().await.failure.is_none());
+        let tick = manager
+            .tick_lifecycle_only()
+            .now_or_never()
+            .expect("the cancellation is queued");
+        assert!(tick.failure.is_none());
         assert!(!manager.admission().is_seen(1));
     }
 

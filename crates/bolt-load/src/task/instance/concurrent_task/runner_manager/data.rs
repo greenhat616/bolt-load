@@ -278,9 +278,16 @@ impl RunnerManager {
         // now, though it may finish before the next tick (design §8.3).
         // A frame that completes the chunk finishes it at once, so the
         // attempt counts as proven here even then.
-        if unproven && picked_size > 0 {
-            let finished = !self.chunk_planner.is_proven(runner_id);
-            let proven = self.chunk_planner.get_proven_runners_count() + usize::from(finished);
+        //
+        // The evidence only asks whether an attempt is proven: the one this
+        // frame proved is, unless the loop stopped it, so the chunks are
+        // counted only then.
+        if unproven && picked_size > 0 && !self.connecting_data.is_empty() {
+            let proven = if self.is_stopping(runner_id) {
+                self.proven_witnesses()
+            } else {
+                1
+            };
             self.observe_connecting_with(proven);
         }
 

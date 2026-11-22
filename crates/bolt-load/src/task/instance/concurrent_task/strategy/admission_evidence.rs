@@ -136,6 +136,13 @@ struct StepMarks {
     rejected: bool,
     /// An uncorroborated refusal.
     unclear: bool,
+    /// The step's trial: the first attempt [opened](AdmissionEvidence::on_opened)
+    /// above the limit since the step began. Later ones that take the
+    /// slot of a runner that finished meanwhile are ordinary connections.
+    owner: Option<RunnerId>,
+    /// The trial ended or lost, whatever the reason: the trial is spent.
+    /// Unlike the other marks it decides nothing by itself.
+    spent: bool,
 }
 
 /// What ended attempts tell about the connections the server admits.
@@ -161,6 +168,12 @@ pub struct AdmissionEvidence {
     /// at its `Started` or its classification, and forgotten when it ends
     /// unclassified or its runner ID is reserved again.
     overlaps: HashMap<RunnerId, usize>,
+    /// How many times the limit was lowered.
+    lowerings: u64,
+    /// For each attempt still connecting, the [`Self::lowerings`] when it
+    /// opened: its `overlaps` corroborate only under that limit. Removed
+    /// and forgotten as `overlaps` is.
+    opened: HashMap<RunnerId, u64>,
 }
 
 impl Default for AdmissionEvidence {
@@ -183,6 +196,8 @@ impl AdmissionEvidence {
             proven_window: 0,
             occupied_since: None,
             overlaps: HashMap::new(),
+            lowerings: 0,
+            opened: HashMap::new(),
         }
     }
 
@@ -202,6 +217,7 @@ impl AdmissionEvidence {
     pub fn on_started(&mut self, runner_id: RunnerId, others: usize) {
         self.connected.insert(runner_id);
         self.overlaps.remove(&runner_id);
+        self.opened.remove(&runner_id);
         if self.streak_level_any().is_some_and(|level| others >= level) {
             self.reset_streak();
         }
@@ -218,6 +234,7 @@ impl AdmissionEvidence {
     /// A release that drops the connected runners below the trial breaks
     /// the occupancy, even one not stamped yet.
     pub fn on_ended(&mut self, runner_id: RunnerId) {
+        self.end_trial(runner_id);
         if !self.connected.remove(&runner_id) {
             return;
         }
@@ -234,6 +251,39 @@ impl AdmissionEvidence {
     /// its ID was reserved for a new attempt.
     pub fn forget(&mut self, runner_id: RunnerId) {
         self.overlaps.remove(&runner_id);
+        self.opened.remove(&runner_id);
+        self.end_trial(runner_id);
+    }
+
+    /// The attempt of `runner_id` opened, with `allocated` slots held, its
+    /// own included, under the limit in force now.
+    ///
+    /// What it is seen beside corroborates its refusal only while that
+    /// limit is not lowered (design §8.3, §14.35). An attempt the evidence
+    /// never saw open is taken as opened under the limit of its refusal.
+    ///
+    /// While a step runs, the first one above the limit is the step's
+    /// trial, which spends the trial once it ends or loses, whatever the
+    /// reason (design §8.3, G10).
+    pub fn on_opened(&mut self, runner_id: RunnerId, allocated: usize) {
+        self.overlaps.remove(&runner_id);
+        self.opened.insert(runner_id, self.lowerings);
+        if let Some(step) = &mut self.step
+            && step.owner.is_none()
+            && allocated >= step.trial
+        {
+            step.owner = Some(runner_id);
+        }
+    }
+
+    /// The attempt of `runner_id` ended or lost: if it was the step's
+    /// trial, the trial is spent.
+    fn end_trial(&mut self, runner_id: RunnerId) {
+        if let Some(step) = &mut self.step
+            && step.owner == Some(runner_id)
+        {
+            step.spent = true;
+        }
     }
 
     /// Whether the attempt of `runner_id` was seen connecting beside a
@@ -248,7 +298,7 @@ impl AdmissionEvidence {
     ///
     /// Beside a proven attempt, each keeps the most `others` seen, which
     /// [corroborates](Self::on_attempt_ended) its refusal even once no
-    /// attempt is proven any more.
+    /// attempt is proven any more. Only whether `proven` is zero matters.
     pub fn observe_connecting(
         &mut self,
         connecting: impl IntoIterator<Item = RunnerId>,
@@ -272,8 +322,10 @@ impl AdmissionEvidence {
     /// connect that hangs until its timeout may outlast every proven
     /// attempt. Its level is the most other attempts in flight at any of
     /// those moments, so the reconnects of the ranges it held, at a lower
-    /// level, do not end the streak. An uncorroborated refusal only makes a
-    /// running step unclear.
+    /// level, do not end the streak. What an attempt opened under a limit
+    /// lowered since was seen beside, whenever it was seen, corroborates
+    /// nothing: the server was not asked under the new limit. An
+    /// uncorroborated refusal only makes a running step unclear.
     pub fn on_attempt_ended(
         &mut self,
         runner_id: RunnerId,
@@ -282,7 +334,11 @@ impl AdmissionEvidence {
         others: usize,
     ) {
         self.observe_proven(proven);
-        let overlap = self.overlaps.remove(&runner_id);
+        let opened = self.opened.remove(&runner_id);
+        let overlap = self
+            .overlaps
+            .remove(&runner_id)
+            .filter(|_| opened.is_none_or(|lowerings| lowerings == self.lowerings));
         let beside_now = (proven > 0).then_some(others);
         let level = beside_now.into_iter().chain(overlap).max();
         match (class, level) {
@@ -349,6 +405,7 @@ impl AdmissionEvidence {
     /// The limit was lowered to `limit`.
     pub fn on_lowered(&mut self, limit: usize) {
         self.proven_window = self.proven_window.min(limit);
+        self.lowerings += 1;
         self.reset_streak();
     }
 
@@ -376,6 +433,8 @@ impl AdmissionEvidence {
             trial,
             rejected: false,
             unclear: false,
+            owner: None,
+            spent: false,
         });
         self.occupied_since = (self.connected.len() >= trial).then_some(Stamp::At(now));
         self.reset_streak();
@@ -441,6 +500,26 @@ impl AdmissionEvidence {
     /// step began.
     pub fn step_unclear(&self) -> bool {
         self.step.is_some_and(|step| step.unclear)
+    }
+
+    /// Whether an attempt in the running step's trial slot ended or lost:
+    /// a 502, a lost or cancelled connect or a beaten hedge says nothing
+    /// about the limit, but the step opens no other trial (design §8.3,
+    /// G10).
+    pub fn trial_spent(&self) -> bool {
+        self.step.is_some_and(|step| step.spent)
+    }
+
+    /// Whether the running step's trial opened: from then on, nothing else
+    /// opens above the limit in this step (G10).
+    pub fn trial_opened(&self) -> bool {
+        self.step.is_some_and(|step| step.owner.is_some())
+    }
+
+    /// Whether the running step's trial is connected now, its occupancy
+    /// stamped or not.
+    pub fn is_occupied(&self) -> bool {
+        self.occupied_since.is_some()
     }
 
     /// Since when the running step's trial has been connected without a

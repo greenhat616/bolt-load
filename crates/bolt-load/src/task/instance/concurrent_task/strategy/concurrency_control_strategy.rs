@@ -66,6 +66,10 @@ pub struct ConcurrencyControlContext<'a> {
     pub want: usize,
     /// The current active runner count
     pub active_runners: usize,
+    /// The runners holding a slot, which new runners are admitted against:
+    /// a runner keeps its slot, and may keep its connection, until it is
+    /// released, also once its chunk is finished.
+    pub allocated_runners: usize,
     /// The runners that are running and had bytes accepted
     pub proven_runners: usize,
     /// What ended attempts tell about the connections the server admits
@@ -138,10 +142,18 @@ impl ConcurrencyControlStrategy {
 
     /// The connections new runners may take now, with `want` wanted: the
     /// [cap](Self::cap), except that a running step already marked rejected
-    /// or unclear opens no other trial before its next tick decides it.
-    /// Runners below the limit are still replaced.
+    /// or unclear opens no other trial before its next tick decides it,
+    /// and one whose trial opened opens nothing else above the limit: one
+    /// connection above it per step (G10), whatever frees a slot below.
+    /// Runners below the limit are still replaced. The refills, the
+    /// growth's splits and the endgame hedge all take this cap.
     pub fn refill_cap(&self, want: usize, admission: &AdmissionEvidence) -> usize {
-        if self.step.is_some() && (admission.step_rejected() || admission.step_unclear()) {
+        if self.step.is_some()
+            && (admission.step_rejected()
+                || admission.step_unclear()
+                || admission.trial_spent()
+                || admission.trial_opened())
+        {
             self.limit.min(want).min(self.max_connections)
         } else {
             self.cap(want)
@@ -224,6 +236,11 @@ impl ConcurrencyControlStrategy {
         if !late && admission.step_unclear() {
             return Some(StepOutcome::Inconclusive);
         }
+        // Nothing reopens a spent trial slot: the occupancy cannot come,
+        // whether or not the deadline can be represented.
+        if !late && admission.trial_spent() && !admission.is_occupied() {
+            return Some(StepOutcome::Inconclusive);
+        }
         if started_at
             .checked_add(self.config.step_deadline)
             .is_some_and(|deadline| now >= deadline)
@@ -297,14 +314,15 @@ impl ConcurrencyControlStrategy {
     }
 
     /// One runner per available range, up to the free slots:
-    /// `refill_cap.saturating_sub(active)`.
+    /// `refill_cap.saturating_sub(allocated)`. A runner whose chunk is
+    /// finished holds its slot until it stops, so it is counted until then.
     fn fill_free_slots(&self, context: &ConcurrencyControlContext) -> Vec<StrategyAction> {
         context
             .available_chunks
             .iter()
             .take(
                 self.refill_cap(context.want, context.admission)
-                    .saturating_sub(context.active_runners),
+                    .saturating_sub(context.allocated_runners),
             )
             .map(|chunk| StrategyAction::CreateTask(chunk.clone()))
             .collect()
@@ -318,7 +336,8 @@ enum StepOutcome {
     Accepted,
     /// A corroborated refusal or a congestion since the step began.
     Rejected,
-    /// An uncorroborated refusal, or the deadline.
+    /// An uncorroborated refusal, a spent trial whose occupancy broke, or
+    /// the deadline.
     Inconclusive,
 }
 
@@ -369,7 +388,9 @@ impl Strategy for ConcurrencyControlStrategy {
             );
             self.limit = lowered;
             context.admission.on_lowered(lowered);
-            self.due = Some(now + self.config.base_wait);
+            // A later due time, as a congestion's hold sets, stays.
+            let due = now + self.config.base_wait;
+            self.due = Some(self.due.map_or(due, |current| current.max(due)));
             actions.push(StrategyAction::ChangeMaxConcurrency(lowered));
         } else if self.may_step(context, late) {
             self.step = Some(now);

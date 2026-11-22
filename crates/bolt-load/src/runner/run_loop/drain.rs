@@ -37,12 +37,17 @@ impl DrainState {
 }
 
 impl TaskRunner {
+    /// Whether the delivered bytes count for `result`: then they are taken
+    /// before it is reported. A stream that ended short, a valid `206`
+    /// whose `Content-Range` ends early included, is retried from the
+    /// bytes the task took (design §14.35).
     pub(super) fn should_wait_data_drain(result: &RunResult) -> bool {
         matches!(
             result,
             Ok(())
                 | Err(TaskRunError::Failed(
                     TaskError::ExceededTotalSize
+                        | TaskError::SmallerThanTotalSize
                         | TaskError::StreamError { .. }
                         | TaskError::Timeout,
                 ))

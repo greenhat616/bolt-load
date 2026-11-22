@@ -52,7 +52,9 @@ leaves the executor and its timers their turn.
   [`TaskError::Timeout`] without reporting `Started`. Control signals do not
   extend it.
 - **Data drain timeout**: when the stream ends, waits up to 5 seconds
-  for the consumer to accept remaining buffered data.
+  for the consumer to accept remaining buffered data. A stream that ends
+  short of its total waits too, so that the consumer can retry from the
+  bytes it took.
 - **Size validation**: checks that downloaded bytes match the declared
   total (if known), producing [`ExceededTotalSize`] or
   [`SmallerThanTotalSize`] errors on mismatch. An unknown total accepts

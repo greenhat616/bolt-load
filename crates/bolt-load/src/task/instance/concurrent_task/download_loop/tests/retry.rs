@@ -1,10 +1,12 @@
 //! Backoff of failed ranges, `Retry-After` and the failure budget of a
 //! range in the loop (design §8.1, §8.2).
 //!
-//! Every step gets its time passed in, except in two tests that wait for
+//! Every step gets its time passed in, except in three tests that wait for
 //! real time: `loop_retries_after_the_backoff_without_a_tick` waits for the
-//! loop's own timer, and `retry_after_holds_back_the_requests_to_the_server`
-//! for `Retry-After` at a real server.
+//! loop's own timer, `retry_after_holds_back_the_requests_to_the_server`
+//! for `Retry-After` at a real server, and
+//! `a_short_range_response_is_retried_from_its_end` for real runners.
+//! Every wait for a runner's event or a write is bounded by the watchdog.
 
 use std::{num::NonZeroU32, ops::Range, pin::pin, sync::Arc, task::Context};
 
@@ -115,7 +117,7 @@ async fn failed_range_waits_for_its_backoff() {
     download.on_strategy_tick(t0);
     assert_eq!(download.manager.allocated_runner_count(), 1);
     drop(rt.take_parked());
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     assert!(download.on_runner(tick, t0).unwrap().is_continue());
 
     let (range, cooldown) = single_cooldown(&download);
@@ -146,7 +148,7 @@ async fn failed_range_waits_for_its_backoff() {
 
     // The second failure backs off for twice as long; a tick claims it.
     drop(rt.take_parked());
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     assert!(download.on_runner(tick, end).unwrap().is_continue());
     let (_, cooldown) = single_cooldown(&download);
     assert_eq!(cooldown.attempts, 2);
@@ -177,12 +179,12 @@ async fn congested_loop(
     // The first tick has no range to create a runner for.
     download.on_strategy_tick(Instant::now());
     running.lifecycle.try_push(LifecycleEvent::Started).unwrap();
-    download.manager.tick().await;
+    with_watchdog(download.manager.tick()).await;
     rejected
         .lifecycle
         .try_push(LifecycleEvent::failed(congestion(retry_after)))
         .unwrap();
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     let t0 = Instant::now();
     // Runner 0 is in flight, so the task goes on.
     assert!(download.on_runner(tick, t0).unwrap().is_continue());
@@ -336,12 +338,12 @@ async fn wake_up_without_a_free_slot_does_not_spin() {
     let mut failing = spawn_test_runner(&mut download, HALF..TOTAL);
     download.on_strategy_tick(Instant::now());
     running.lifecycle.try_push(LifecycleEvent::Started).unwrap();
-    download.manager.tick().await;
+    with_watchdog(download.manager.tick()).await;
     failing
         .lifecycle
         .try_push(LifecycleEvent::failed(TaskError::Timeout))
         .unwrap();
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     let t0 = Instant::now();
     assert!(download.on_runner(tick, t0).unwrap().is_continue());
     let end = single_cooldown(&download).1.not_before;
@@ -441,10 +443,10 @@ async fn deliver_and_write(
             data: bytes::Bytes::from(vec![0; len]),
         })
         .unwrap();
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     assert!(tick.downloaded.is_some());
     assert!(download.on_runner(tick, now).unwrap().is_continue());
-    let completions = download.writer.tick().await.unwrap();
+    let completions = with_watchdog(download.writer.tick()).await.unwrap();
     download
         .record_completions(completions, false, now)
         .unwrap();
@@ -474,7 +476,7 @@ async fn retry_and_fail(
     download.on_deadline(*now).unwrap();
     assert_eq!(download.manager.allocated_runner_count(), 2);
     single_parked(rt).await;
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     let failure = tick.failure.clone().unwrap();
     assert!(download.on_runner(tick, *now).unwrap().is_continue());
     failure
@@ -498,7 +500,7 @@ async fn a_failing_range_ends_the_task_while_another_runner_writes() {
     let mut doomed = spawn_test_runner(&mut download, HALF..TOTAL);
     for runner in [&mut healthy, &mut doomed] {
         runner.lifecycle.try_push(LifecycleEvent::Started).unwrap();
-        download.manager.tick().await;
+        with_watchdog(download.manager.tick()).await;
     }
     let mut now = Instant::now();
     download.on_strategy_tick(now);
@@ -514,7 +516,7 @@ async fn a_failing_range_ends_the_task_while_another_runner_writes() {
         .lifecycle
         .try_push(LifecycleEvent::failed(reset()))
         .unwrap();
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     let failure = tick.failure.as_ref().unwrap();
     assert_eq!((failure.received, failure.charged), (1024, 0));
     assert!(download.on_runner(tick, now).unwrap().is_continue());
@@ -543,7 +545,7 @@ async fn a_failing_range_ends_the_task_while_another_runner_writes() {
     now = cooldown.not_before;
     download.on_deadline(now).unwrap();
     drop(single_parked(&rt));
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     match download.on_runner(tick, now) {
         Err(DownloadError::Transfer { source }) => match &*source {
             TaskError::RangeExhausted {
@@ -578,14 +580,14 @@ async fn a_range_never_proven_is_exempt_above_the_window() {
     let (mut download, file_writer) = failing_loop(&rt, &options).await;
     let mut healthy = spawn_test_runner(&mut download, 0..HALF);
     healthy.lifecycle.try_push(LifecycleEvent::Started).unwrap();
-    download.manager.tick().await;
+    with_watchdog(download.manager.tick()).await;
     // The first step creates a runner for the other half.
     let mut now = Instant::now();
     download.on_strategy_tick(now);
 
     // Refused while nothing is proven: charged.
     single_parked(&rt).await;
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     let failure = tick.failure.clone().unwrap();
     assert_eq!((failure.charged, failure.exempt), (1, false));
     assert!(download.on_runner(tick, now).unwrap().is_continue());
@@ -606,7 +608,7 @@ async fn a_range_never_proven_is_exempt_above_the_window() {
     now = cooldown.not_before;
     download.on_deadline(now).unwrap();
     drop(single_parked(&rt));
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     let failure = tick.failure.clone().unwrap();
     assert_eq!((failure.charged, failure.exempt), (2, false));
     assert!(download.on_runner(tick, now).unwrap().is_continue());
@@ -630,7 +632,7 @@ async fn a_timeout_after_data_restarts_the_range() {
     let (mut download, file_writer) = failing_loop(&rt, &options).await;
     let mut runner = spawn_test_runner(&mut download, 0..TOTAL);
     runner.lifecycle.try_push(LifecycleEvent::Started).unwrap();
-    download.manager.tick().await;
+    with_watchdog(download.manager.tick()).await;
     let t0 = Instant::now();
     deliver_and_write(&mut download, &mut runner, 1024, t0).await;
 
@@ -638,7 +640,7 @@ async fn a_timeout_after_data_restarts_the_range() {
         .lifecycle
         .try_push(LifecycleEvent::failed(TaskError::Timeout))
         .unwrap();
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     let failure = tick.failure.as_ref().unwrap();
     assert_eq!(
         (failure.received, failure.attempts, failure.charged),
@@ -660,7 +662,7 @@ async fn a_timeout_after_data_restarts_the_range() {
         (1024..TOTAL, 1, 0)
     );
     drop(single_parked(&rt));
-    let tick = download.manager.tick().await;
+    let tick = with_watchdog(download.manager.tick()).await;
     assert!(matches!(
         download.on_runner(tick, end),
         Err(DownloadError::Transfer { source })
@@ -669,6 +671,154 @@ async fn a_timeout_after_data_restarts_the_range() {
 
     drop(download);
     file_writer.finalize().await.unwrap();
+}
+
+/// A refusal above the proven window is not charged to its range, but it
+/// still counts as a consecutive failure (design §14.13a): with one proven
+/// runner beside it, one consecutive failure allowed and no write after it,
+/// the first exempt refusal ends the task with `RetryLimitExceeded`, whose
+/// source is the refusal.
+#[tokio::test]
+async fn an_exempt_refusal_still_counts_as_a_consecutive_failure() {
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let options = TaskOptions::default()
+        .max_connections(NonZeroUsize::new(2).unwrap())
+        .max_consecutive_failures(1)
+        .max_attempts_per_range(NonZeroU32::new(3).unwrap());
+    let (mut download, file_writer) = failing_loop(&rt, &options).await;
+    let mut healthy = spawn_test_runner(&mut download, 0..HALF);
+    healthy.lifecycle.try_push(LifecycleEvent::Started).unwrap();
+    with_watchdog(download.manager.tick()).await;
+    // The first step creates a runner for the other half.
+    let now = Instant::now();
+    download.on_strategy_tick(now);
+    deliver_and_write(&mut download, &mut healthy, 1024, now).await;
+
+    // Refused beside the proven runner, with one other in flight.
+    single_parked(&rt).await;
+    let tick = with_watchdog(download.manager.tick()).await;
+    let failure = tick.failure.clone().unwrap();
+    assert_eq!((failure.charged, failure.exempt), (0, true));
+    match download.on_runner(tick, now) {
+        Err(DownloadError::Transfer { source }) => match &*source {
+            TaskError::RetryLimitExceeded { limit, source } => {
+                assert_eq!(*limit, 1);
+                assert!(
+                    matches!(
+                        &**source,
+                        TaskError::StreamError {
+                            source: AdapterError::Retryable { .. }
+                        }
+                    ),
+                    "{source:?}"
+                );
+            }
+            other => panic!("expected RetryLimitExceeded, got {other:?}"),
+        },
+        other => panic!("expected RetryLimitExceeded, got {other:?}"),
+    }
+
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// The last runner's drain times out while its last frame is queued, and
+/// the loop takes that frame before the runner reports the timeout: the
+/// failure releases an empty range and is a restart, which the task
+/// tolerates. Every byte is received and no runner is left, so the loop
+/// ends there, not at the no-progress deadline, and the writer is flushed
+/// as at any end.
+///
+/// The runner's channels are driven in that order: a real runner has no
+/// hook between choosing the timeout and reporting it.
+#[tokio::test]
+async fn a_tolerated_failure_after_the_last_frame_completes_the_download() {
+    const FRAME: u64 = 1 << 10;
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, file_writer) = scripted_loop(&rt, 1).await;
+    let mut runner = spawn_test_runner(&mut download, 0..TOTAL);
+    runner.lifecycle.try_push(LifecycleEvent::Started).unwrap();
+    with_watchdog(download.manager.tick()).await;
+    let t0 = Instant::now();
+    download.manager.update_progress(0, TOTAL - FRAME).unwrap();
+    deliver_and_write(&mut download, &mut runner, FRAME as usize, t0).await;
+    assert!(download.manager.is_complete());
+
+    runner
+        .lifecycle
+        .try_push(LifecycleEvent::failed(TaskError::Timeout))
+        .unwrap();
+    let tick = with_watchdog(download.manager.tick()).await;
+    let failure = tick.failure.as_ref().unwrap();
+    assert!(failure.range.is_empty(), "{failure:?}");
+    assert_eq!(failure.received, TOTAL);
+    assert!(
+        download.on_runner(tick, t0).unwrap().is_break(),
+        "the loop goes on with nothing to download"
+    );
+    let mut progress = crate::task::Progress::default();
+    with_watchdog(download.finish(Ok(()), &mut progress))
+        .await
+        .unwrap();
+    assert_eq!(progress.downloaded, TOTAL);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A valid short `206` (design §4.1): the first range response ends after
+/// 1 KiB without an error, as a `Content-Range` that ends early allows.
+/// The real runner reports `SmallerThanTotalSize` only once the loop took
+/// its frame, so the range is retried from 1 KiB, a restart that charges
+/// nothing: with one attempt per range, the download completes with the
+/// right content.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn a_short_range_response_is_retried_from_its_end() {
+    use bolt_load_tests::adapter::simple::calculate_blake3;
+
+    use crate::task::Progress;
+
+    const SIZE: u64 = 64 << 10;
+    let adapter = SimpleTestAdapterBuilder::new()
+        .content_size(SIZE as usize)
+        .support_range(true)
+        .short_first_range(1024)
+        .build()
+        .unwrap();
+    let content = adapter.content().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("out.bin");
+    let file_writer = FileWriter::new(&path, SIZE).await.unwrap();
+    let options = TaskOptions::default().max_attempts_per_range(NonZeroU32::new(1).unwrap());
+    let spawner = RunnerSpawner::new(
+        crate::runtime::test_support::current_tokio(),
+        DynBoltLoadAdapter::new_arc(adapter),
+        WaitGroup::new(),
+        CancellationToken::new(),
+        crate::runner::DEFAULT_IDLE_TIMEOUT,
+    );
+    let (reporter, _status) = ProgressReporter::for_test();
+    let mut download = DownloadLoop::new(
+        SIZE,
+        spawner,
+        &file_writer,
+        reporter,
+        &options,
+        CancellationToken::new(),
+    );
+    // The first step creates the first runner, on the whole file.
+    download.on_strategy_tick(Instant::now());
+    let result = with_watchdog(download.run()).await;
+    let mut progress = Progress::default();
+    let finished = with_watchdog(download.finish(result, &mut progress)).await;
+    let finalized = file_writer.finalize().await;
+
+    finished.expect("the download completes");
+    finalized.unwrap();
+    assert_eq!(progress.downloaded, SIZE);
+    assert_eq!(
+        calculate_blake3(&std::fs::read(&path).unwrap()),
+        calculate_blake3(&content)
+    );
 }
 
 /// Aborts the server task when dropped, also when a test panics, so that

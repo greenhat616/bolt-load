@@ -331,7 +331,12 @@ The concurrent download path includes several sub-systems:
     holds at least 2 s of work at its runner's own rate; a split reserves
     the new runner's slot first, so a task never runs more than
     `max_connections` runners. A doubling that
-    gains less than 10% in speed stops it for the rest of the task. It
+    gains less than 10% in speed holds the runners it doubled from, and
+    30 s later it probes again from the runners active then, doubling
+    them up to the current limit if that adds at least half of them: a
+    gain resumes the doubling, no gain holds those runners and doubles
+    the wait, up to 300 s. The runners a gainless doubling added are not
+    stopped. It
     only adds runners; lowering the limit stays with the concurrency
     strategy. At most one runner a strategy tick is restarted: one that
     delivered under a quarter of the median of at least three runners

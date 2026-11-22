@@ -235,8 +235,13 @@ and is not pushing a frame. That is not so while the writer is full, nor
 for a runner with frames the engine has not taken yet. A split first
 reserves a slot for the new runner, so it never exceeds
 `max_connections`, and needs at least 2 s of work at the split runner's
-own rate. Once a doubling gains less than 10% in speed, no more runners
-are added.
+own rate. Once a doubling gains less than 10% in speed, the growth holds
+the runners it doubled from: it refills up to them and adds nothing more.
+30 s later it probes again from the runners active then, doubling them up
+to the current limit, if that adds at least half of them. A probe that
+gains resumes the doubling; one that does not holds those runners and
+doubles the wait, up to 300 s. The runners a gainless doubling added are
+not stopped: they finish their ranges.
 
 A runner that delivered under a quarter of the median of at least three
 runners over the last 10 s, allowing one 32 KiB buffer either way, is

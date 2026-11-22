@@ -692,6 +692,9 @@ const S5_RATE: u64 = MIB;
 /// About 50 s at four connections: long enough for the first recovery
 /// step, 30 s after the limit is lowered.
 const S5_SIZE: u64 = 192 * MIB;
+/// How long a run may take, whatever the engine's own timeouts: a lost
+/// wake-up fails the round instead of hanging the bench.
+const S5_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct LimitedRun {
     secs: f64,
@@ -726,9 +729,12 @@ async fn run_limited(
         .save_to(&path)
         .spawn()
         .expect("a valid task");
-    let output = task.await.expect("the download completes");
-    let secs = started.elapsed().as_secs_f64();
+    let output = tokio::time::timeout(S5_TIMEOUT, task).await;
     server.abort();
+    let output = output
+        .unwrap_or_else(|_| panic!("s5 {mode:?}: no end within {S5_TIMEOUT:?}"))
+        .expect("the download completes");
+    let secs = started.elapsed().as_secs_f64();
     if tracing_all() {
         for (at, message) in probe.take() {
             eprintln!(
