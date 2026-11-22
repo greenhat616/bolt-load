@@ -74,7 +74,8 @@ impl Strategy for DynamicStrategy {
                 DynamicPlannerStage::QuickStart => {
                     if (total_download_speed - 2.0 * self.previous_total_download_speed).abs()
                         > self.threashold1
-                        && context.current_concurrency.saturating_mul(2) < context.max_concurrency
+                        // Every running runner is split: room for twice as many.
+                        && context.current_concurrency.saturating_mul(2) <= context.max_concurrency
                     {
                         result.push(StrategyAction::SplitAllTask(context.planned_chunk_size));
                         self.previous_total_download_speed = total_download_speed;
@@ -87,7 +88,8 @@ impl Strategy for DynamicStrategy {
                         - (self.previous_total_download_speed + context.per_runner_speed))
                         .abs()
                         > self.threashold2
-                        && context.current_concurrency.saturating_add(1) < context.max_concurrency
+                        // Room for one more runner.
+                        && context.current_concurrency < context.max_concurrency
                     {
                         // If the current thread download speed is faster than threashold2, split it into two task
                         result.push(StrategyAction::SplitGivenTask(
@@ -102,5 +104,37 @@ impl Strategy for DynamicStrategy {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPEED: f64 = 2.0 * 1024.0 * 1024.0;
+
+    fn step(current_concurrency: usize, max_concurrency: usize) -> Vec<StrategyAction> {
+        DynamicStrategy::default().step(&mut DynamicStrategyContext {
+            speed: SPEED,
+            per_runner_speed: 0.0,
+            current_concurrency,
+            max_concurrency,
+            planned_chunk_size: 1,
+            remaining_largest_runner_id: 0,
+        })
+    }
+
+    /// A quick start round may double the runners up to the limit, and a
+    /// split in the normal stage may take the last slot.
+    #[test]
+    fn test_every_slot_up_to_the_limit_is_used() {
+        assert!(matches!(step(2, 4)[..], [StrategyAction::SplitAllTask(1)]));
+        assert!(matches!(
+            step(3, 4)[..],
+            [StrategyAction::SplitGivenTask(0)]
+        ));
+        assert!(matches!(step(1, 2)[..], [StrategyAction::SplitAllTask(1)]));
+        assert!(step(4, 4).is_empty());
+        assert!(step(1, 1).is_empty());
     }
 }

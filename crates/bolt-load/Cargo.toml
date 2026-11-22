@@ -139,6 +139,7 @@ ureq2 = { version = "2", package = "ureq", default-features = false, features = 
 ] }
 
 pretty_assertions = { workspace = true }
+proptest = "1"
 n0-tracing-test = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-util = { workspace = true, features = ["full"] }

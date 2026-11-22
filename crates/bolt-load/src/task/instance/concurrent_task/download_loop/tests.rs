@@ -75,6 +75,8 @@ async fn test_split_after_failed_resize_does_not_allocate_tail() {
     );
     assert_eq!(download.manager.get_available_ranges(), vec![100..1000]);
     assert_eq!(spawns.load(Ordering::SeqCst), 0, "no runner may be spawned");
+    // The slot reserved for the second half is given back.
+    assert_eq!(download.manager.allocated_runner_count(), 1);
     assert_eq!(reg.limits.try_recv(), None);
     drop(download);
     file_writer.finalize().await.unwrap();
@@ -973,6 +975,432 @@ async fn test_strategy_splits_only_running_runners() {
                 targets.is_empty() || targets == &[0],
                 "max_concurrency {max_concurrency}: {targets:?}"
             );
+        }
+    }
+}
+
+// ── Splitting within the connection limit ───────────────────────────
+
+/// With every runner slot taken, splitting or creating a runner changes
+/// nothing; a freed slot is used again.
+#[tokio::test]
+#[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
+async fn test_no_free_slot_skips_splits_and_new_runners() {
+    use super::super::strategy::StrategyAction;
+
+    const TOTAL: u64 = 1 << 30;
+    const HALF: u64 = TOTAL / 2;
+    let (mut download, file_writer) = parked_loop(TOTAL, 2).await;
+    let mut first = download
+        .manager
+        .allocate_runner_with_chunk(0..HALF)
+        .unwrap();
+    let mut second = download
+        .manager
+        .allocate_runner_with_chunk(HALF..TOTAL)
+        .unwrap();
+
+    download.apply(StrategyAction::SplitAllTask(1));
+    download.apply(StrategyAction::SplitGivenTask(first.runner_id));
+    // Not a runner: skipped too.
+    download.apply(StrategyAction::SplitGivenTask(7));
+    let allocated = |download: &DownloadLoop, runner_id| {
+        download
+            .manager
+            .get_runner_state(runner_id)
+            .unwrap()
+            .allocated
+            .clone()
+    };
+    assert_eq!(allocated(&download, first.runner_id), 0..HALF);
+    assert_eq!(allocated(&download, second.runner_id), HALF..TOTAL);
+    assert_eq!(first.limits.try_recv(), None);
+    assert_eq!(second.limits.try_recv(), None);
+    assert_eq!(download.manager.allocated_runner_count(), 2);
+    assert_eq!(download.manager.get_available_ranges(), []);
+
+    // The second runner fails, and its slot is taken before a runner is
+    // created for its range.
+    download
+        .manager
+        .release_runner_full(second.runner_id, false)
+        .unwrap();
+    let taken = download.manager.try_reserve_slot().unwrap();
+    download.apply(StrategyAction::CreateTask(HALF..TOTAL));
+    assert_eq!(download.manager.get_available_ranges(), [HALF..TOTAL]);
+
+    download.manager.release(taken);
+    download.apply(StrategyAction::CreateTask(HALF..TOTAL));
+    assert_eq!(download.manager.get_available_ranges(), []);
+    assert_eq!(download.manager.allocated_runner_count(), 2);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A runner whose chunk is complete keeps its slot until it stops, so the
+/// strategy may see room that the slots do not have.
+#[tokio::test]
+async fn test_strategy_tick_while_finished_runners_keep_their_slots() {
+    const TOTAL: u64 = 1 << 34;
+    const QUARTER: u64 = TOTAL / 4;
+    let (mut download, file_writer) = parked_loop(TOTAL, 4).await;
+    let mut slots: Vec<_> = (0..4)
+        .map(|i| {
+            download
+                .manager
+                .allocate_runner_with_chunk(i * QUARTER..(i + 1) * QUARTER)
+                .unwrap()
+        })
+        .collect();
+    // Runners 2 and 3 received their whole chunk but have not stopped.
+    for runner_id in [2, 3] {
+        download
+            .manager
+            .update_progress(runner_id, QUARTER)
+            .unwrap();
+    }
+    assert_eq!(download.manager.get_active_runners_count(), 2);
+    // 4 MiB/s, a quarter of it from each runner.
+    download.throughput.speed = 4.0 * 1024.0 * 1024.0;
+    download.throughput.per_runner_speed = download.throughput.speed / 4.0;
+
+    // Two active runners of four allowed: the strategy splits, but no
+    // slot is free.
+    download.on_strategy_tick();
+    for (runner_id, slot) in slots.iter_mut().enumerate() {
+        assert_eq!(
+            download
+                .manager
+                .get_runner_state(runner_id)
+                .unwrap()
+                .allocated,
+            runner_id as u64 * QUARTER..(runner_id as u64 + 1) * QUARTER
+        );
+        assert_eq!(slot.limits.try_recv(), None, "runner {runner_id}");
+    }
+    assert_eq!(download.manager.get_available_ranges(), []);
+
+    // Runner 3 stops: one split takes its slot, the next finds none.
+    download.manager.release_runner_full(3, true).unwrap();
+    download.on_strategy_tick();
+    let split = |download: &DownloadLoop, runner_id: usize| {
+        download
+            .manager
+            .get_runner_state(runner_id)
+            .unwrap()
+            .allocated
+            .end
+            < (runner_id as u64 + 1) * QUARTER
+    };
+    assert!(split(&download, 0));
+    assert!(slots[0].limits.try_recv().is_some());
+    assert!(!split(&download, 1));
+    assert_eq!(slots[1].limits.try_recv(), None);
+    assert_eq!(download.manager.allocated_runner_count(), 4);
+    assert_eq!(download.manager.get_available_ranges(), []);
+    drop(download);
+    file_writer.finalize().await.unwrap();
+}
+
+/// A split whose new runner the runtime rejects keeps the new slot until
+/// the loop handles the rejection from the runner manager's lifecycle
+/// poll, then reclaims that slot once: a second split in between keeps
+/// its own. The original runner stays shrunk and the tail becomes
+/// assignable again.
+///
+/// A rejected spawn is an unretryable connect failure, so it ends the
+/// task; the loop's state afterwards is what it leaves for its teardown.
+/// The loop creates no runner after that; the test creates one by hand
+/// to probe that the freed slot and the tail can be allocated again.
+#[tokio::test]
+#[expect(clippy::single_range_in_vec_init, reason = "a list holding one range")]
+async fn test_rejected_split_spawn_reclaims_its_slot_once() {
+    use async_ringbuf::{
+        AsyncHeapRb,
+        traits::{Producer, Split},
+    };
+
+    use super::super::{
+        chunk_planner::ChunkStatus, runner_manager::RunnerChannels, strategy::StrategyAction,
+    };
+    use crate::runner::{
+        DATA_FRAME_CHANNEL_CAPACITY, DataFrame, LIFECYCLE_CHANNEL_CAPACITY, LifecycleEvent,
+    };
+
+    const TOTAL: u64 = 1 << 30;
+    const HALF: u64 = TOTAL / 2;
+    const QUARTER: u64 = TOTAL / 4;
+    let rt = ScriptedRuntime::new(TimerKind::Scripted);
+    let (mut download, file_writer) = connecting_loop(
+        ThreadedRuntimeImpl::new_other_rt(rt.clone()),
+        DynBoltLoadAdapter::new_arc(SimpleTestAdapter::new(1).with_range_support(true)),
+        TOTAL,
+        3,
+    )
+    .await;
+    // Runner 0 starts through its lifecycle channel.
+    let (_data_tx, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
+    let (mut lifecycle_tx, lifecycle_rx) =
+        AsyncHeapRb::<LifecycleEvent>::new(LIFECYCLE_CHANNEL_CAPACITY).split();
+    let mut limits = None;
+    download
+        .manager
+        .spawn_runner_with_chunk(0..TOTAL, |_, runner_limits| {
+            limits = Some(runner_limits);
+            Ok(RunnerChannels {
+                lifecycle_rx,
+                data_rx,
+            })
+        })
+        .unwrap();
+    let mut limits = limits.unwrap();
+    lifecycle_tx.try_push(LifecycleEvent::Started).unwrap();
+    download.manager.tick().await;
+    let state = |download: &DownloadLoop, runner_id| {
+        download
+            .manager
+            .get_runner_state(runner_id)
+            .map(|state| (state.allocated.clone(), state.status.clone()))
+    };
+    assert_eq!(state(&download, 0), Some((0..TOTAL, ChunkStatus::Running)));
+
+    // The runtime rejects the split's runner, which keeps its slot until
+    // the rejection is handled.
+    rt.set_mode(SpawnMode::Fail);
+    download.split(0, 0..TOTAL);
+    rt.set_mode(SpawnMode::Park);
+    assert_eq!(limits.try_recv(), Some(HALF));
+    assert_eq!(state(&download, 0), Some((0..HALF, ChunkStatus::Running)));
+    assert_eq!(
+        state(&download, 1),
+        Some((HALF..TOTAL, ChunkStatus::Pending))
+    );
+    assert_eq!(download.manager.allocated_runner_count(), 2);
+
+    // Meanwhile another split takes the last slot.
+    download.apply(StrategyAction::SplitGivenTask(0));
+    assert_eq!(limits.try_recv(), Some(QUARTER));
+    assert_eq!(
+        state(&download, 2),
+        Some((QUARTER..HALF, ChunkStatus::Pending))
+    );
+    assert_eq!(download.manager.allocated_runner_count(), 3);
+    // Parked, so its lifecycle stays open.
+    let mut parked = rt.take_parked();
+    assert_eq!(parked.len(), 1);
+
+    // The lifecycle poll reports the rejection; the loop ends the task.
+    let tick = download.manager.tick().await;
+    let failure = tick.failure.as_ref().expect("the rejection is reported");
+    assert!(
+        matches!(failure.error, TaskError::Other { .. }) && !failure.retryable,
+        "{failure:?}"
+    );
+    assert!(matches!(
+        download.on_runner(tick),
+        Err(DownloadError::Transfer { .. })
+    ));
+    // Only the rejected runner's slot is reclaimed, and only once.
+    assert_eq!(download.manager.allocated_runner_count(), 2);
+    assert_eq!(state(&download, 1), None);
+    assert_eq!(
+        state(&download, 0),
+        Some((0..QUARTER, ChunkStatus::Running))
+    );
+    assert_eq!(
+        state(&download, 2),
+        Some((QUARTER..HALF, ChunkStatus::Pending))
+    );
+    assert_eq!(download.manager.get_available_ranges(), [HALF..TOTAL]);
+    assert!(futures::poll!(pin!(download.manager.tick())).is_pending());
+
+    // Probe by hand: the tail can get a runner in the freed slot.
+    download.apply(StrategyAction::CreateTask(HALF..TOTAL));
+    assert_eq!(
+        state(&download, 1),
+        Some((HALF..TOTAL, ChunkStatus::Pending))
+    );
+    assert_eq!(download.manager.allocated_runner_count(), 3);
+    assert_eq!(download.manager.get_available_ranges(), []);
+    parked.extend(rt.take_parked());
+    assert_eq!(parked.len(), 2);
+
+    drop(download);
+    drop(parked);
+    file_writer.finalize().await.unwrap();
+}
+
+mod split_properties {
+    use pretty_assertions::assert_eq;
+    use proptest::prelude::*;
+
+    use super::{
+        super::super::{chunk_planner::ChunkStatus, strategy::StrategyAction},
+        *,
+    };
+
+    const TOTAL: u64 = 64 << 20;
+    const MAX_CONNECTIONS: usize = 8;
+
+    /// One step of a download, as the loop would take it.
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// Create a runner for the `n`th unassigned range, or, past the
+        /// last, for the whole file, which is taken unless it is all
+        /// unassigned.
+        Create(usize),
+        /// The `n`th connecting runner reports `Started`.
+        Start(usize),
+        /// The `n`th running runner receives `bytes`.
+        Progress(usize, u64),
+        /// The `n`th running runner, or one whose chunk is complete,
+        /// receives the rest of its chunk and stops.
+        Finish(usize),
+        /// The `n`th connecting or running runner fails.
+        Fail(usize),
+        SplitAll(u64),
+        /// Split runner `id`, which may not exist.
+        SplitGiven(usize),
+        ChangeMaxConcurrency(usize),
+        /// A strategy tick at `speed` bytes per second.
+        Tick(u64),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            any::<usize>().prop_map(Op::Create),
+            any::<usize>().prop_map(Op::Start),
+            (any::<usize>(), 0..TOTAL / 4).prop_map(|(n, bytes)| Op::Progress(n, bytes)),
+            any::<usize>().prop_map(Op::Finish),
+            any::<usize>().prop_map(Op::Fail),
+            (0..TOTAL).prop_map(Op::SplitAll),
+            (0..2 * MAX_CONNECTIONS).prop_map(Op::SplitGiven),
+            (1..=2 * MAX_CONNECTIONS).prop_map(Op::ChangeMaxConcurrency),
+            (0..TOTAL).prop_map(Op::Tick),
+        ]
+    }
+
+    /// The runners whose chunk has one of `statuses`, by ID.
+    fn runners(
+        download: &DownloadLoop,
+        max_connections: usize,
+        statuses: &[ChunkStatus],
+    ) -> Vec<crate::task::RunnerId> {
+        (0..max_connections)
+            .filter(|&runner_id| {
+                download
+                    .manager
+                    .get_runner_state(runner_id)
+                    .is_some_and(|state| statuses.contains(&state.status))
+            })
+            .collect()
+    }
+
+    fn nth<T: Copy>(items: &[T], n: usize) -> Option<T> {
+        (!items.is_empty()).then(|| items[n % items.len()])
+    }
+
+    fn step(download: &mut DownloadLoop, max_connections: usize, op: Op) {
+        use ChunkStatus::{Finished, Pending, Running};
+
+        match op {
+            Op::Create(n) => {
+                let mut ranges = download.manager.get_available_ranges();
+                ranges.push(0..TOTAL);
+                download.apply(StrategyAction::CreateTask(ranges[n % ranges.len()].clone()));
+            }
+            Op::Start(n) => {
+                if let Some(runner_id) = nth(&runners(download, max_connections, &[Pending]), n) {
+                    download.manager.mark_started(runner_id);
+                }
+            }
+            Op::Progress(n, bytes) => {
+                if let Some(runner_id) = nth(&runners(download, max_connections, &[Running]), n) {
+                    download.manager.update_progress(runner_id, bytes).unwrap();
+                }
+            }
+            Op::Finish(n) => {
+                let held = runners(download, max_connections, &[Running, Finished]);
+                if let Some(runner_id) = nth(&held, n) {
+                    download
+                        .manager
+                        .update_progress(runner_id, u64::MAX)
+                        .unwrap();
+                    download
+                        .manager
+                        .release_runner_full(runner_id, true)
+                        .unwrap();
+                }
+            }
+            Op::Fail(n) => {
+                let active = runners(download, max_connections, &[Pending, Running]);
+                if let Some(runner_id) = nth(&active, n) {
+                    download
+                        .manager
+                        .release_runner_full(runner_id, false)
+                        .unwrap();
+                }
+            }
+            Op::SplitAll(planned) => download.apply(StrategyAction::SplitAllTask(planned)),
+            Op::SplitGiven(runner_id) => download.apply(StrategyAction::SplitGivenTask(runner_id)),
+            Op::ChangeMaxConcurrency(n) => {
+                download.apply(StrategyAction::ChangeMaxConcurrency(n));
+            }
+            Op::Tick(speed) => {
+                let active = download.manager.get_active_runners_count().max(1);
+                download.throughput.speed = speed as f64;
+                download.throughput.per_runner_speed = speed as f64 / active as f64;
+                download.on_strategy_tick();
+            }
+        }
+    }
+
+    /// No more runners than allowed, every slot held by a runner with a
+    /// chunk, and the chunks and the unassigned ranges cover the file
+    /// exactly once.
+    fn check(download: &DownloadLoop, max_connections: usize) {
+        use ChunkStatus::{Finished, Pending, Running};
+
+        let manager = &download.manager;
+        assert!(manager.allocated_runner_count() <= max_connections);
+        assert!(manager.get_active_runners_count() <= max_connections);
+        assert_eq!(
+            manager.allocated_runner_count(),
+            runners(download, max_connections, &[Pending, Running, Finished]).len(),
+            "a slot leaked"
+        );
+        let mut ranges = manager.chunk_ranges();
+        ranges.extend(manager.get_available_ranges());
+        ranges.sort_by_key(|range| range.start);
+        let mut end = 0;
+        for range in ranges {
+            assert!(
+                range.start == end && range.start < range.end,
+                "{range:?} after {end}"
+            );
+            end = range.end;
+        }
+        assert_eq!(end, TOTAL);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn splits_stay_within_the_limit_and_cover_the_file(
+            max_connections in 1..=MAX_CONNECTIONS,
+            ops in prop::collection::vec(op(), 1..64),
+        ) {
+            let (mut download, _file_writer) =
+                futures::executor::block_on(parked_loop(TOTAL, max_connections));
+            let mut downloaded = 0;
+            for op in ops {
+                step(&mut download, max_connections, op);
+                check(&download, max_connections);
+                let now = download.manager.get_total_downloaded();
+                prop_assert!(now >= downloaded, "downloaded bytes were dropped");
+                downloaded = now;
+            }
         }
     }
 }

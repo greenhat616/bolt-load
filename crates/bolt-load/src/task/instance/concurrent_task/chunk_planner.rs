@@ -56,6 +56,16 @@ pub enum Error {
     InvalidResize { runner_id: RunnerId, new_size: u64 },
 }
 
+/// A range the strategy may hand to a new runner, see
+/// [`ChunkPlanner::find_chunk_to_split`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitCandidate {
+    /// A range no chunk covers yet.
+    Unassigned(Range<u64>),
+    /// The part of a running runner's chunk after its downloaded bytes.
+    Running { runner: RunnerId, range: Range<u64> },
+}
+
 /// The outcome of [`ChunkPlanner::resize_runner_state`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resize {
@@ -431,10 +441,7 @@ impl ChunkPlanner {
     }
 
     /// Find a chunk to split or evict based on download progress
-    pub fn find_chunk_to_split(
-        &self,
-        required_size: u64,
-    ) -> Option<(Option<RunnerId>, Range<u64>)> {
+    pub fn find_chunk_to_split(&self, required_size: u64) -> Option<SplitCandidate> {
         // If there are still range that is not being asigned to a runner
         let mut available_range: Option<Range<u64>> = None;
         // First try to find a suitable available range
@@ -456,27 +463,19 @@ impl ChunkPlanner {
         }
 
         if let Some(available_range) = available_range {
-            return Some((None, available_range));
+            return Some(SplitCandidate::Unassigned(available_range));
         }
 
         // Find the chunk with the most remaining work
-        let best_candidate = self
-            .chunks
+        self.chunks
             .values()
-            .filter(|c| {
-                c.status == ChunkStatus::Running
-                    && c.runner_id.is_some()
-                    && c.remaining() >= self.min_chunk_size
+            .filter(|c| c.status == ChunkStatus::Running && c.remaining() >= self.min_chunk_size)
+            .filter_map(|c| Some((c.runner_id?, c)))
+            .max_by_key(|(_, c)| c.remaining())
+            .map(|(runner, chunk)| SplitCandidate::Running {
+                runner,
+                range: chunk.downloaded.end..chunk.downloaded.end + required_size,
             })
-            .max_by_key(|c| c.remaining());
-
-        if let Some(chunk) = best_candidate {
-            let split_pos = chunk.downloaded.end + required_size;
-            debug_assert!(chunk.runner_id.is_some(), "chunk should have a runner id");
-            return Some((chunk.runner_id, chunk.downloaded.end..split_pos));
-        }
-
-        None
     }
 
     /// Get state of a specific runner
@@ -1244,10 +1243,9 @@ mod tests {
         let mut planner = ChunkPlanner::new(10 * 1024 * 1024); // 10MB total
 
         // When no chunks exist, entire file is available, should return available range
-        let result = planner.find_chunk_to_split(100);
-        assert!(result.is_some());
-        let (runner_id, range) = result.unwrap();
-        assert_eq!(runner_id, None); // Should return available range instead of runner
+        let Some(SplitCandidate::Unassigned(range)) = planner.find_chunk_to_split(100) else {
+            panic!("the whole file is unassigned");
+        };
         assert!(range.end - range.start >= 100);
 
         // Allocate some chunks, leaving gaps
@@ -1258,10 +1256,9 @@ mod tests {
         assert!(planner.mark_running(2).is_ok());
 
         // Should return available range when available ranges exist
-        let result = planner.find_chunk_to_split(100);
-        assert!(result.is_some());
-        let (runner_id, range) = result.unwrap();
-        assert_eq!(runner_id, None);
+        let Some(SplitCandidate::Unassigned(range)) = planner.find_chunk_to_split(100) else {
+            panic!("a gap is unassigned");
+        };
         // Check if range is reasonable, exact match not required
         assert!(range.end - range.start >= 100);
 
@@ -1276,11 +1273,15 @@ mod tests {
         assert!(planner.update_progress(2, 600 * 1024).is_ok()); // 600KB
         assert!(planner.update_progress(4, 700 * 1024).is_ok()); // 700KB
 
-        // Should now find chunk with most remaining work
-        let result = planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE);
-        assert!(result.is_some());
-        let (runner_id, _) = result.unwrap();
-        assert!(runner_id.is_some());
+        // Should now find chunk with most remaining work: runner 3 has not
+        // downloaded anything of its 3MB.
+        assert_eq!(
+            planner.find_chunk_to_split(DEFAULT_MIN_CHUNK_SIZE),
+            Some(SplitCandidate::Running {
+                runner: 3,
+                range: chunk_size..chunk_size + DEFAULT_MIN_CHUNK_SIZE,
+            })
+        );
 
         // Test edge case: required chunk size close to minimum but insufficient remaining space
         // Complete all chunks first, so no splittable chunks remain
