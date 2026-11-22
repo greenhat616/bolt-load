@@ -72,8 +72,30 @@ struct RunnerSample {
 
 impl RunnerRates {
     /// Sample the runners of `manager` at `now`, returning what they did
-    /// since the previous sample.
+    /// since the previous sample; no runner is let off as silent.
+    #[cfg(test)]
     pub(super) fn sample(&mut self, manager: &RunnerManager, now: Instant) -> &TickSample {
+        self.sample_at(manager, now, None)
+    }
+
+    /// Sample the runners of `manager` at `now`, returning what they did
+    /// since the previous sample.
+    ///
+    /// A running runner that had no bytes accepted in the tick does not
+    /// count against [`TickSample::all_delivering`] when it is silent at
+    /// `silent_since`: it neither delivered a frame nor read its body
+    /// since then, see [`RunnerManager::silent_since`], it has no frame
+    /// queued that the loop has not taken, and it was already running at a
+    /// sample at or before it, so the time it took to connect does not
+    /// count. The restart and the hedge
+    /// deal with it (design §9.2, §14.19). `None` lets none off, as while
+    /// the writer is full.
+    pub(super) fn sample_at(
+        &mut self,
+        manager: &RunnerManager,
+        now: Instant,
+        silent_since: Option<Instant>,
+    ) -> &TickSample {
         let mut sample = RatesSample {
             at: now,
             total: manager.get_total_downloaded(),
@@ -81,6 +103,7 @@ impl RunnerRates {
         };
         let last = self.history.back();
         let mut all_delivering = true;
+        let mut silent = false;
         let mut rates = HashMap::new();
         let elapsed = last
             .map(|last| now.saturating_duration_since(last.at).as_secs_f64())
@@ -96,7 +119,18 @@ impl RunnerRates {
                 .and_then(|last| last.runners.get(&runner_id))
                 .filter(|previous| previous.generation == chunk.generation)
                 .map(|previous| previous.accepted);
-            all_delivering &= running && accepted > previous.unwrap_or(0);
+            let delivered = accepted > previous.unwrap_or(0);
+            let let_off = running
+                && !delivered
+                && silent_since.is_some_and(|since| {
+                    !manager.has_queued_data(runner_id)
+                        && manager
+                            .silent_since(runner_id, now)
+                            .is_some_and(|last| last <= since)
+                        && self.was_running(runner_id, chunk.generation, since)
+                });
+            silent |= let_off;
+            all_delivering &= running && delivered || let_off;
             if let (Some(previous), Some(elapsed)) = (previous, elapsed) {
                 rates.insert(runner_id, (accepted - previous) as f64 / elapsed);
             }
@@ -124,6 +158,7 @@ impl RunnerRates {
         self.tick = TickSample {
             speed,
             all_delivering,
+            silent,
             rates,
         };
         &self.tick
@@ -132,6 +167,27 @@ impl RunnerRates {
     /// What the runners did over the tick that ended at the last sample.
     pub(super) fn tick(&self) -> &TickSample {
         &self.tick
+    }
+
+    /// Whether the attempt `runner_id` is on at the last sample was
+    /// already running at the latest sample at or before `at`: it has been
+    /// connected since then at least (design §14.19).
+    pub(super) fn running_since(&self, runner_id: RunnerId, at: Instant) -> bool {
+        self.history
+            .back()
+            .and_then(|last| last.runners.get(&runner_id))
+            .is_some_and(|current| self.was_running(runner_id, current.generation, at))
+    }
+
+    /// Whether `runner_id` was running the attempt of `generation` at the
+    /// latest sample at or before `at`.
+    fn was_running(&self, runner_id: RunnerId, generation: u64, at: Instant) -> bool {
+        self.history
+            .iter()
+            .rev()
+            .find(|sample| sample.at <= at)
+            .and_then(|sample| sample.runners.get(&runner_id))
+            .is_some_and(|then| then.running && then.generation == generation)
     }
 
     /// The rate of `runner_id` at the last sample, if it had one.
@@ -288,6 +344,40 @@ mod tests {
         let tick = sampler.sample(&manager, t0 + TICK * 2).clone();
         assert_eq!(tick.speed, Some(47.0 * MIB as f64 / 1.5));
         assert_eq!(rates(&tick), []);
+    }
+
+    /// A runner has been running since `at` when it ran the same attempt at
+    /// the latest sample at or before `at` (design §14.19).
+    #[test]
+    fn test_running_since() {
+        let mut manager = RunnerManager::new(100 * MIB, 4);
+        let _a = manager.allocate_runner_with_chunk(0..20 * MIB).unwrap();
+        let _b = manager
+            .allocate_runner_with_chunk(20 * MIB..40 * MIB)
+            .unwrap();
+        assert!(manager.allocate_chunk(40 * MIB..60 * MIB, 2));
+        let mut sampler = RunnerRates::default();
+        let t0 = Instant::now();
+        sampler.sample(&manager, t0);
+        // Runner 2 connects after the first sample; 0 delivers 3 MiB a
+        // tick, 1 a MiB in the first tick only, 2 nothing.
+        manager.mark_started(2);
+        for n in 1..=3 {
+            manager.update_progress(0, 3 * MIB).unwrap();
+            if n == 1 {
+                manager.update_progress(1, MIB).unwrap();
+            }
+            sampler.sample(&manager, t0 + TICK * n);
+        }
+        let nano = Duration::from_nanos(1);
+        assert!(sampler.running_since(0, t0));
+        assert!(!sampler.running_since(0, t0 - nano), "no sample that early");
+        assert!(
+            !sampler.running_since(2, t0 + TICK - nano),
+            "connecting then"
+        );
+        assert!(sampler.running_since(2, t0 + TICK));
+        assert!(!sampler.running_since(3, t0 + TICK), "no such runner");
     }
 
     /// A runner new since the last sample delivers when it had bytes
