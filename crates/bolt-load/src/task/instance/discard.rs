@@ -1,7 +1,5 @@
 //! Discarding what a resumable task kept for a destination (design
 //! §11.5.2, §11.5.5): `<dest>.downloading` and `<dest>.boltload`.
-//!
-//! Crate internal until resuming is public (C20, a lead decision).
 
 use std::{path::Path, sync::Arc};
 
@@ -30,11 +28,7 @@ use crate::task::{DownloadError, IoOp};
 /// A missing partial file, or none of the files, is no error. The state
 /// file that cannot be removed is only logged: it is empty, and the next
 /// task takes it as no state (Q6).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "public with resuming, C20 (lead decision)")
-)]
-pub(crate) async fn discard_partial(dest: impl AsRef<Path>) -> Result<(), DownloadError> {
+pub async fn discard_partial(dest: impl AsRef<Path>) -> Result<(), DownloadError> {
     discard_partial_with(dest.as_ref(), FileHooks::default(), LockHooks::default()).await
 }
 
