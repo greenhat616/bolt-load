@@ -42,14 +42,19 @@ impl DownloadLoop {
         }
     }
 
+    /// Restart a slow runner, then step the strategies at `now`.
+    ///
+    /// The restart comes first, so the growth of the same tick leaves the
+    /// stopped runner alone.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(super) fn on_strategy_tick(&mut self, now: Instant) {
-        let signals = self.signals(now);
         // Every tick, so each sample spans one tick.
-        let tick = self
-            .rates
-            .as_mut()
-            .map(|rates| rates.sample(&self.manager, now));
+        if let Some(rates) = self.rates.as_mut() {
+            rates.sample(&self.manager, now);
+        }
+        self.restart_slow_runner(now);
+        let signals = self.signals(now);
+        let tick = self.rates.as_ref().map(|rates| rates.tick());
         let Some((strategy_name, actions)) = self.strategy.execute(
             self.max_concurrency,
             self.throughput.speed,

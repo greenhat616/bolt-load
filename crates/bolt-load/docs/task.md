@@ -230,7 +230,14 @@ The concurrent download path includes several sub-systems:
     holds at least 2 s of work at its runner's own rate. A doubling that
     gains less than 10% in speed stops it for the rest of the task. It
     only adds runners; lowering the limit stays with the concurrency
-    strategy.
+    strategy. At most one runner a strategy tick is restarted: one that
+    delivered under a quarter of the median of at least three runners
+    over the last 10 s, allowing one 32 KiB buffer either way, with at
+    least twice the minimum chunk size left, outside a 429 or 503 hold.
+    It is stopped alone, unless it is already ending with a result of
+    its own, which it then reports, and its
+    range retried from the accepted bytes after a backoff; the range's
+    failure budget is charged only when it had none accepted.
 - **SpeedSampler** — EMA-based speed calculation (α = 0.33,
   interval = 250 ms).
 - **ID Generator** — [`BitVec`]-backed runner ID allocator with

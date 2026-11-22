@@ -22,7 +22,8 @@ pub(crate) use control::{LimitReceiver, LimitSender, limit_mailbox};
 pub use error::*;
 
 // TODO: make it configurable or detect the local disk performance?
-const BUFFER_SIZE: usize = 32 * 1024; // 32KB
+/// The most bytes a runner buffers before it delivers them as a frame.
+pub(crate) const BUFFER_SIZE: usize = 32 * 1024; // 32KB
 
 /// The default period without non-empty upstream data after which a runner
 /// fails with a retryable [`TaskError::Timeout`]
@@ -149,6 +150,8 @@ pub struct TaskRunner {
     built_at: std::time::Instant,
     /// the cancel token
     cancel_token: CancellationToken,
+    /// Stops this runner alone, see [`TaskRunnerBuilder::stop_token`].
+    stop_token: Option<CancellationToken>,
 }
 
 impl TaskRunner {

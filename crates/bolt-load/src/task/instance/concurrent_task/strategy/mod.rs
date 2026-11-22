@@ -11,6 +11,7 @@ mod concurrency_control_strategy;
 mod doubling_strategy;
 mod dynamic_strategy;
 mod failure_policy;
+mod slow_restart;
 
 pub use admission_evidence::{
     AdmissionClass, AdmissionEvidence, AttemptPhase, classify, streak_gap,
@@ -27,6 +28,7 @@ pub use doubling_strategy::{TickSample, planned_split_size};
 use dynamic_strategy::{DynamicStrategy, DynamicStrategyContext};
 pub use failure_policy::FailurePolicy;
 pub(super) use failure_policy::charges_range;
+pub use slow_restart::{JudgedRunner, SLOW_WINDOW, SlowRestartContext, slow_runner};
 
 use super::chunk_planner::SplitCandidate;
 use crate::task::GrowthStrategy;
