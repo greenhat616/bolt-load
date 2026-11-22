@@ -38,7 +38,7 @@ pub use self::{
     pending_writer::{PendingWrite, PendingWriter, WriteCompletion, WriteStatus, WriterFullError},
     pool_writer::PoolWriterBuilder,
 };
-use crate::runtime::yield_now;
+use crate::{runtime::yield_now, task::IoOp};
 
 const FILE_WRITER_QUEUE_SIZE: usize = 2048;
 
@@ -70,6 +70,18 @@ pub enum FileWriterError {
 }
 
 impl FileWriterError {
+    /// The file operation that failed, as [`DownloadError::Io`](crate::task::DownloadError::Io)
+    /// names it. Finalizing joins the workers and syncs the file, so it is
+    /// the flush.
+    pub(super) fn op(&self) -> IoOp {
+        match self {
+            Self::OpenOrCreateFile { .. } => IoOp::Create,
+            Self::AllocateFile { .. } => IoOp::Allocate,
+            Self::WriteRange { .. } => IoOp::Write,
+            Self::Finalize { .. } => IoOp::Flush,
+        }
+    }
+
     /// The io error behind this error, keeping its kind. A closed worker
     /// queue is not an io error and becomes [`io::ErrorKind::BrokenPipe`],
     /// like a write submitted to a closed queue.

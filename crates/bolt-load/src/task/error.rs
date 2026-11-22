@@ -11,7 +11,9 @@ use crate::{
 pub enum IoOp {
     /// Reading the metadata of the destination or its directory.
     Inspect,
-    /// Creating or opening the temporary file.
+    /// Creating or opening the temporary file. The concurrent mode also
+    /// reports here a failure to give its writer workers their own handles
+    /// or mapping of the file.
     Create,
     /// Sizing the temporary file.
     Allocate,
@@ -19,7 +21,8 @@ pub enum IoOp {
     /// reports [`TaskError::Write`] instead, with the range.
     Write,
     /// Flushing the content. The singleton mode buffers its writes, so a
-    /// write may also fail here.
+    /// write may also fail here. The concurrent mode joins its writer
+    /// workers and syncs the file to disk here.
     Flush,
     /// Moving the temporary file to the destination.
     Rename,
