@@ -49,6 +49,10 @@ pub(super) struct Ends {
     pub(super) stop: CancellationToken,
     /// The runner's read activity, which the test advances.
     pub(super) reads: crate::runner::ReadActivity,
+    /// The bytes [`Self::send_pattern`] queued, and what makes them differ
+    /// from those of other ends.
+    sent: u64,
+    salt: u8,
 }
 
 impl Ends {
@@ -58,11 +62,14 @@ impl Ends {
         let (data, data_rx) = AsyncHeapRb::<DataFrame>::new(DATA_FRAME_CHANNEL_CAPACITY).split();
         let stop = CancellationToken::new();
         let reads = crate::runner::ReadActivity::default();
+        static SALT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
         let ends = Self {
             lifecycle,
             data,
             stop: stop.clone(),
             reads: reads.clone(),
+            sent: 0,
+            salt: SALT.fetch_add(37, std::sync::atomic::Ordering::Relaxed),
         };
         let channels = RunnerChannels {
             lifecycle_rx,
@@ -84,6 +91,16 @@ impl Ends {
                 data: Bytes::from(vec![0; len as usize]),
             })
             .unwrap();
+    }
+
+    /// Queue a frame of `len` bytes that differ from byte to byte, from
+    /// frame to frame and from the frames of other ends.
+    pub(super) fn send_pattern(&mut self, len: u64) {
+        let data = crate::task::instance::concurrent_task::checkpoint::tests::pattern(
+            self.sent, len, self.salt,
+        );
+        self.sent += len;
+        self.data.try_push(DataFrame { data }).unwrap();
     }
 
     pub(super) fn end(&mut self, event: LifecycleEvent) {
@@ -175,6 +192,95 @@ impl Harness {
         )
     }
 
+    /// A harness whose writes of the ranges in `fail` fail, which keeps the
+    /// bytes it writes, and takes checkpoints of blocks of `block` bytes on
+    /// the schedule of `options`, handed to a recording receiver.
+    pub(super) fn checkpointed(
+        total: u64,
+        options: &TaskOptions,
+        fail: Vec<Range<u64>>,
+        block: u64,
+    ) -> (Self, Checkpointed) {
+        Self::checkpointing(total, options, fail, block, false)
+    }
+
+    /// [`Self::checkpointed`], with the first record held at a gate.
+    pub(super) fn checkpointed_gated(
+        total: u64,
+        options: &TaskOptions,
+        block: u64,
+    ) -> (Self, Checkpointed) {
+        Self::checkpointing(total, options, Vec::new(), block, true)
+    }
+
+    fn checkpointing(
+        total: u64,
+        options: &TaskOptions,
+        fail: Vec<Range<u64>>,
+        block: u64,
+        gated: bool,
+    ) -> (Self, Checkpointed) {
+        use crate::task::instance::concurrent_task::checkpoint::{
+            Checkpoints, Schedule,
+            tests::{MemoryBlocks, RecordingReceiver},
+        };
+
+        let rt = ScriptedRuntime::new(TimerKind::Scripted);
+        let (file_writer, written, memory, syncs) = FileWriter::in_memory(total, fail);
+        let (receiver, received) = RecordingReceiver::new(syncs.clone(), block, total);
+        let (receiver, gate) = if gated {
+            let (receiver, gate) = receiver.gated();
+            (receiver, Some(gate))
+        } else {
+            (receiver, None)
+        };
+        let reader = MemoryBlocks::new(memory.clone(), syncs.clone());
+        let drain = WaitGroup::new();
+        let schedule = Schedule {
+            block_size: std::num::NonZeroU64::new(block).unwrap(),
+            bytes: options.checkpoint_bytes,
+            interval: options.checkpoint_interval,
+        };
+        let checkpoints = Checkpoints::new(
+            total,
+            schedule,
+            receiver,
+            file_writer.clone(),
+            Arc::new(reader),
+            drain.clone(),
+            Instant::now(),
+        );
+        let mut harness = Self::with_writer(rt, total, options, file_writer, written);
+        harness.download = harness.download.with_checkpoints(checkpoints);
+        (
+            harness,
+            Checkpointed {
+                memory,
+                syncs,
+                received,
+                block,
+                gate,
+                drain,
+            },
+        )
+    }
+
+    /// A harness without checkpoints, with the probe of its writer's syncs.
+    pub(super) fn probed(
+        total: u64,
+        options: &TaskOptions,
+    ) -> (
+        Self,
+        crate::task::instance::concurrent_task::file_writer::SyncProbe,
+    ) {
+        let rt = ScriptedRuntime::new(TimerKind::Scripted);
+        let (file_writer, written, _, syncs) = FileWriter::in_memory(0, Vec::new());
+        (
+            Self::with_writer(rt, total, options, file_writer, written),
+            syncs,
+        )
+    }
+
     fn writing(
         rt: ScriptedRuntime,
         total: u64,
@@ -182,6 +288,16 @@ impl Harness {
         fail: Vec<Range<u64>>,
     ) -> Self {
         let (file_writer, written) = FileWriter::recording_failing(fail);
+        Self::with_writer(rt, total, options, file_writer, written)
+    }
+
+    fn with_writer(
+        rt: ScriptedRuntime,
+        total: u64,
+        options: &TaskOptions,
+        file_writer: FileWriter,
+        written: WrittenRanges,
+    ) -> Self {
         let spawner = RunnerSpawner::new(
             ThreadedRuntimeImpl::new_other_rt(rt.clone()),
             // Never connected: the hedge the trigger spawns stays parked.
@@ -346,6 +462,18 @@ impl Harness {
         let admission = self.download.manager.admission();
         (admission.streak_count(), admission.congestion_pending())
     }
+}
+
+/// What a [`Harness::checkpointed`] keeps for the test.
+pub(super) struct Checkpointed {
+    pub(super) memory: crate::task::instance::concurrent_task::file_writer::Memory,
+    pub(super) syncs: crate::task::instance::concurrent_task::file_writer::SyncProbe,
+    pub(super) received: crate::task::instance::concurrent_task::checkpoint::tests::Received,
+    pub(super) block: u64,
+    /// The gate of the first record, when gated.
+    pub(super) gate: Option<crate::task::instance::concurrent_task::checkpoint::tests::RecordGate>,
+    /// The drain group the work of a running checkpoint holds.
+    pub(super) drain: WaitGroup,
 }
 
 /// The task error a step ended with.
