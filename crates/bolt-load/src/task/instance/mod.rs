@@ -14,6 +14,7 @@ mod output_file;
 mod ownership;
 mod sampler;
 mod singleton_task;
+pub(crate) mod state_file;
 
 #[cfg(all(test, bolt_load_probe_send))]
 mod probe_send;

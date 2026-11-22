@@ -72,7 +72,9 @@ pub(crate) struct DestinationLock {
     path: PathBuf,
     /// The locked handle; `None` when the file system cannot lock files and
     /// the task goes on unlocked.
-    file: Option<File>,
+    /// Shared with the state file's writer (design §11.5.5): the file is
+    /// written only through this handle.
+    file: Option<Arc<File>>,
     /// Whether this task created the file.
     created: bool,
 }
@@ -217,7 +219,7 @@ impl DestinationLock {
                 Ok(true) => {
                     return Ok(Self {
                         path,
-                        file: Some(file),
+                        file: Some(Arc::new(file)),
                         created,
                     });
                 }
@@ -263,8 +265,22 @@ impl DestinationLock {
         file.sync_all()
     }
 
+    /// The locked handle, for the state file's writer; `None` when the task
+    /// went on unlocked. The lock is released with [`Self::release`],
+    /// whoever else holds the handle then, so every operation on the state
+    /// file through it must have ended before the release.
+    ///
+    /// On Windows, the writes go through `seek_write`, which moves the
+    /// handle's cursor, shared by every clone: any use of the cursor must
+    /// stay serialized with them.
+    #[cfg_attr(not(test), expect(dead_code, reason = "C33b writes the state file"))]
+    pub(crate) fn handle(&self) -> Option<Arc<File>> {
+        self.file.clone()
+    }
+
     /// Remove the lock file, then release the lock. Call it only after the
-    /// last operation on the temporary file. A failure to remove it is
+    /// last operation on the temporary file, and on the state file through
+    /// a [`Self::handle`]: a handle still held then outlives the lock. A failure to remove it is
     /// logged: the file is empty, and the next task takes it as having no
     /// state.
     pub(crate) fn release(self) {
