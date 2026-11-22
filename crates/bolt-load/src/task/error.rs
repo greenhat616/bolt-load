@@ -76,8 +76,9 @@ pub enum DownloadError {
     #[snafu(display("failed to retrieve the metadata: {source}"))]
     Metadata { source: AdapterError },
     /// The transfer failed: a stream error, a timeout, no progress, too
-    /// many consecutive failures, or a failed write in the concurrent mode
-    /// ([`TaskError::Write`]).
+    /// many consecutive failures, a range that failed too often
+    /// ([`TaskError::RangeExhausted`]), or a failed write in the concurrent
+    /// mode ([`TaskError::Write`]).
     #[snafu(display("the transfer failed: {source}"))]
     Transfer { source: Arc<TaskError> },
     /// Ranges cannot carry the file, for `reason`. The concurrent mode ends
