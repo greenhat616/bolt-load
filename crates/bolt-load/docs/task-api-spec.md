@@ -93,6 +93,7 @@ impl TaskBuilder {
     pub fn save_into(self, dir: impl Into<PathBuf>) -> Self;
     pub fn prefer_mode(self, mode: DownloadMode) -> Self;
     pub fn options(self, options: TaskOptions) -> Self;
+    pub fn max_connections(self, limit: NonZeroUsize) -> Self;
     pub fn cancel_token(self, parent: CancellationToken) -> Self;
     pub fn meta(self, meta: BoltLoadAdapterMeta) -> Self;
     pub fn cached_meta(&self) -> Option<&BoltLoadAdapterMeta>;

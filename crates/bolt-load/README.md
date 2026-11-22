@@ -98,7 +98,8 @@ decoded: a coded range makes the task fall back to one connection.
 
 The concurrent download engine continuously monitors runner outcomes:
 
-1. **Normal** — runners spawn up to `DEFAULT_MAX_CONCURRENCY` (CPU core count).
+1. **Normal** — runners spawn up to `TaskOptions::max_connections` (8 by
+   default, whatever the CPU count).
 2. **Degraded** — when the failure rate exceeds 30% over a sliding window,
    concurrency is reduced by `degradation_step` at a time.
 3. **Recovering** — after a `recovery_delay` (30 s), the engine probes with

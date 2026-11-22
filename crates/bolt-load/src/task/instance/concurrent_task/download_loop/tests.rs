@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroUsize,
     path::Path,
     pin::pin,
     sync::{
@@ -720,8 +721,8 @@ fn test_cancel_after_registration_wakes_loop() {
 
 // ── Connecting runners: control messages queued before the runner starts ─
 
-/// A loop on `rt` whose runners connect through `adapter`, with the given
-/// concurrency.
+/// A loop on `rt` whose runners connect through `adapter`, built as a task
+/// does with `max_concurrency` as [`TaskOptions::max_connections`].
 async fn connecting_loop(
     rt: ThreadedRuntimeImpl,
     adapter: Arc<crate::adapter::AnyAdapter>,
@@ -739,17 +740,16 @@ async fn connecting_loop(
         crate::runner::DEFAULT_IDLE_TIMEOUT,
     );
     let (reporter, _status) = ProgressReporter::for_test();
-    let mut download = DownloadLoop::new(
+    let options =
+        TaskOptions::default().max_connections(NonZeroUsize::new(max_concurrency).unwrap());
+    let download = DownloadLoop::new(
         total,
         spawner,
         &file_writer,
         reporter,
-        &TaskOptions::default(),
+        &options,
         CancellationToken::new(),
     );
-    download.max_concurrency = max_concurrency;
-    download.manager = RunnerManager::new(total, max_concurrency);
-    download.strategy = StrategyControl::new(max_concurrency);
     (download, file_writer)
 }
 
@@ -932,6 +932,11 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
             }
             rounds.push(targets.into_iter().map(|(id, _)| id).collect());
         }
+        assert!(
+            download.manager.get_active_runners_count() <= max_concurrency,
+            "{} runners, at most {max_concurrency}",
+            download.manager.get_active_runners_count()
+        );
         // The running runner reads its limits.
         limits.try_recv();
         for runner_id in 1..max_concurrency {
@@ -945,6 +950,14 @@ async fn probe_strategy(max_concurrency: usize, ticks: usize) -> Vec<Vec<crate::
     drop(download);
     file_writer.finalize().await.unwrap();
     rounds
+}
+
+/// With one connection allowed, the strategy never splits the only runner,
+/// however fast it downloads.
+#[tokio::test]
+async fn test_one_connection_is_never_split() {
+    let rounds = probe_strategy(1, 64).await;
+    assert!(rounds.is_empty(), "{rounds:?}");
 }
 
 /// Each quick start round splits every running runner: only runner 0 runs,

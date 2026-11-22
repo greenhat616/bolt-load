@@ -105,8 +105,9 @@ Every task ends in `Finished` or `Failed`; it never retries forever.
 
 | Option | Default |
 |--------|---------|
+| `max_connections` | 8, whatever the CPU count |
 | `no_progress_timeout` | 60 s |
-| `max_consecutive_failures` | `max(8, 2 × CPU count)` |
+| `max_consecutive_failures` | `max(8, 2 × max_connections)` |
 | `stream_idle_timeout` | 30 s |
 | `connect_timeout` | 30 s |
 | `meta_retry` | 3 retries, 200 ms – 2 s per wait |
@@ -202,7 +203,8 @@ The concurrent download path includes several sub-systems:
 [`TaskBuilder`] validates configuration and spawns a [`Task`]:
 - Created by [`Task::builder`] with the adapter; requires a runtime and a
   destination ([`TaskBuilder::save_to`] or [`TaskBuilder::save_into`]).
-- Accepts [`TaskOptions`] via [`TaskBuilder::options`].
+- Accepts [`TaskOptions`] via [`TaskBuilder::options`], and the
+  connection limit alone via [`TaskBuilder::max_connections`].
 - [`TaskBuilder::validate`] and [`TaskBuilder::spawn`] check the options
   and, best effort, that the destination's directory exists and the
   target is not a directory, returning a [`BuildError`]. Initialization
@@ -213,7 +215,7 @@ The concurrent download path includes several sub-systems:
 
 | Name | Value | Purpose |
 |------|-------|---------|
-| `DEFAULT_MAX_CONCURRENCY` | CPU core count | Initial concurrent runners |
+| `DEFAULT_MAX_CONNECTIONS` | 8 | Default of `TaskOptions::max_connections` |
 | `DEFAULT_SAMPLE_INTERVAL` | 250 ms | Speed measurement period |
 | `DEFAULT_STRATEGY_TICK_INTERVAL` | 1.5 s | Strategy evaluation period |
 | `FILE_WRITER_QUEUE_SIZE` | 2048 | Pending write queue depth |

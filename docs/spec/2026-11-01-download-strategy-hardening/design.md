@@ -96,7 +96,7 @@
 
 | # | 决策 | 采用 | 状态 |
 | --- | --- | --- | --- |
-| D1 | `max_connections` 的默认值 | 固定 8，与 CPU 核数无关 | 待确认 |
+| D1 | `max_connections` 的默认值 | 固定 8，与 CPU 核数无关 | 已确认（2026-11-05） |
 | D2 | Range 用不了时怎么办 | 自动截断文件，改用单连接从头下载，并通过 `TaskStatus` 上报降级。触发条件除了 `RangeIgnored`，还包括 range 响应带了内容编码，或者能看出被客户端解过码（§4.3），和 IDM 一致 | 已确认（2026-11-03，扩展到内容编码） |
 | D3 | 其它 4xx 归为不可重试 | 采纳（对齐 ureq2）；408 例外 | 已确认（2026-11-01，随 PR-1 开工） |
 | D4 | P2 什么时候做 | P1 完成之后再评估 | 待确认 |
@@ -821,3 +821,21 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - pool writer 把文件设为 `u64::MAX` 字节：报 `Io { op: Allocate }`。`FileWriter::new` 选的 writer 可能不预分配，所以这里直接指定 pool。
   - 注入一个 finalize 失败的 writer：报 `Io { op: Flush }`，kind 和消息不变。
   - 把建文件或 finalize 的映射改回 `Other`，或者把 `AllocateFile` 映射成 `Create`，各自对应的测试失败。
+
+### 14.10 连接上限（PR-5，C7）
+
+- **D1。** 用户 2026-11-05 确认：`max_connections` 默认固定为 8，与 CPU 核数无关。
+- **做法。**
+  - `TaskOptions` 新增公开字段 `max_connections: NonZeroUsize`，默认值 `DEFAULT_MAX_CONNECTIONS = 8`，由 `TaskOptions::max_connections(n)` 和 `TaskBuilder::max_connections(n)` 设置。测试专用的 `max_concurrency` 删掉了。
+  - `DownloadLoop::new` 改为读这个值，`RunnerManager`、`StrategyControl` 和 `PendingWriter` 的容量都随它确定。`available_parallelism()` 和 `DEFAULT_MAX_CONCURRENCY`（4，只在查询 CPU 核数失败时使用）一起删掉。
+  - 失败预算：`max_consecutive_failures` 改为 `Option<usize>`。`None` 表示用默认值，任务开始时由 `resolved_max_consecutive_failures()` 按 `max(8, 2 × max_connections)` 算出。这样 `max_connections` 和 `max_consecutive_failures` 的设置顺序不影响结果，显式设置的值也不会被覆盖。字段类型变了，所以提交信息带 `!`。
+  - 默认值的变化：连接上限从 CPU 核数变成 8，失败预算从 `max(8, 2 × CPU 核数)` 变成 16。4 核机器上，连接上限从 4 变成 8，预算从 8 变成 16；32 核机器上，连接上限从 32 变成 8，预算从 64 变成 16（§12 已列出）。
+  - `TaskBuilder::max_connections` 只改 `options` 里的这一项，之后再调用 `options(...)` 会整体替换掉它，文档里写明了。
+  - 内部仍叫 `max_concurrency`：它同时是策略在运行中调低、再调回的当前上限，起点是 `max_connections`。
+- **验证。**
+  - 默认值是 8，失败预算默认 16。`max_connections` 为 1、4、5、8、32 时，预算分别是 8、8、10、16、64；显式设置的 3 不随它变化。
+  - `FailurePolicy` 在 `max_connections = 16`、未设预算时，第 32 次连续失败才终止任务。
+  - 下载循环的测试改为像任务一样，用 `DownloadLoop::new` 和 `max_connections` 构造；原来是构造之后再改字段。`max_connections = 1` 时，策略在 2 MiB/s 下跑 64 个 tick 也不拆分；每个 tick 之后，活跃 runner 数都不超过上限。
+  - 整个任务级别的测试要单连接下载 4 s 以上，策略才会拆分，太慢，所以“只有一个 runner”放在下载循环里测。
+  - 变异检查：下载循环不读配置（固定为 8）、默认预算不随 `max_connections` 变化、`FailurePolicy` 不用解析后的值、`TaskBuilder::max_connections` 不写入，各自都有测试失败。
+  - `rg available_parallelism crates/bolt-load/src/task` 只剩 pool writer 的写入线程数，与连接数无关。
