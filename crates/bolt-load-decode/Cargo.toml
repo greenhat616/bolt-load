@@ -1,0 +1,38 @@
+[package]
+name = "bolt-load-decode"
+description = "Streaming content decoding for bolt-load: gzip and deflate, with br and zstd behind features"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["gzip", "deflate"]
+gzip = ["compression-codecs/gzip"]
+deflate = ["compression-codecs/zlib", "compression-codecs/deflate"]
+br = ["compression-codecs/brotli"]
+# libzstd is a C library.
+zstd = ["compression-codecs/zstd"]
+
+[dependencies]
+bolt-load-http = { path = "../bolt-load-http", version = "0.2" }
+
+bytes = { workspace = true }
+futures = { workspace = true }
+pin-project-lite = "0.2"
+snafu = { workspace = true }
+
+# Internal only: the 0.4 API still changes, so it stays out of the public API.
+compression-codecs = { version = "0.4.41", default-features = false }
+
+[dev-dependencies]
+compression-codecs = { version = "0.4.41", default-features = false, features = [
+    "gzip",
+    "zlib",
+    "deflate",
+] }
+proptest = "1"

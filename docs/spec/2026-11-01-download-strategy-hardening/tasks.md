@@ -14,7 +14,7 @@
 4. **测试不用 sleep**：
    - 退避、冷却、增益窗口相关的逻辑，都把 `now: Instant` 作为参数传入（design §8.1）。
    - 故障注入测试使用 `bolt-load-tests` 的服务器，不访问外网。
-5. **开工前的决策**：PR-1 开工前，确认 design §3 的 D3；PR-3 开工前，确认 D2；PR-3a 开工前，确认 D11（已确认）；PR-3b 开工前，确认 D9 和 D10；PR-5 开工前，确认 D1；PR-7 开工前，确认 D5 和 D6；PR-8 开工前，确认 D4、D7、D8。确认结果先写回 `design.md`，再动代码。
+5. **开工前的决策**：PR-1 开工前，确认 design §3 的 D3；PR-3 开工前，确认 D2；PR-3a 开工前，确认 D11（已确认）；PR-3b 开工前，确认 D9 和 D10（已确认）；PR-5 开工前，确认 D1；PR-7 开工前，确认 D5 和 D6；PR-8 开工前，确认 D4、D7、D8。确认结果先写回 `design.md`，再动代码。
 6. **偏差记录**：实现和 design 不一致时，在 design 末尾追加“实现说明”一节，写明原因。不要悄悄偏离设计。
 
 ## 1. 提交与 PR 划分
@@ -193,10 +193,11 @@
 
 编号接在 T22 之后，但顺序上紧跟 T24。
 
-- [ ] 新 crate `crates/bolt-load-decode`，依赖 `bolt-load-http`（取 `ContentCoding`），按 design §4.4 实现 `DecodeOptions`、`decode` 和 `DecodeError`：
+- [x] 新 crate `crates/bolt-load-decode`，依赖 `bolt-load-http`（取 `ContentCoding`），按 design §4.4 实现 `DecodeOptions`、`decode` 和 `DecodeError`：
   - 后端按 D9 的结论选；gzip、deflate 默认开启，br、zstd 放在 feature 后面；
   - 输入不拷贝，输出用固定大小的 `BytesMut`，每次 poll 最多产出一块；
   - 多层编码、多成员 gzip、zlib 和 raw deflate 两种格式、结束后的多余数据、`max_output`。
+  - 实现说明见 design §14.5。
 - [ ] C22：按 D10 的结论接入。方案 A：core 给 `full_stream` 新增带 `Content-Encoding` 和 `Content-Type` 的返回类型，由 Singleton 路径解码，两个 adapter 和测试 adapter 一起改。
 - [ ] T5 的 `ContentCoded` 失败改为解码；`Unsupported` 的编码仍然报错。
 - [ ] 更新 adapter README：用户不必再为了正确性关闭客户端的解压。
