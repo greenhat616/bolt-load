@@ -49,7 +49,7 @@
 | PR-7c 上限处的翻倍 | C28 `feat(task): judge the doubling at the connection cap` | T28 | PR-7 |
 | PR-7d 重启静默 runner | C29 `feat(task): restart silent runners under the doubling strategy` | T29 | PR-7c |
 | PR-7b 切换默认值 | C14 `feat(task)!: make doubling the default growth strategy` | T15 | PR-7、PR-7c、PR-7d，且 G7 达标 |
-| PR-8 跨任务限额（D4） | C15 `feat(task): admit tasks and cap connections per host through shared limits` | T16 | PR-5 |
+| PR-8 跨任务限额（D4；推迟，见 T16 前的说明） | C15 `feat(task): admit tasks and cap connections per host through shared limits` | T16 | PR-5 |
 | | C16 `feat(runner): shape throughput with a shared token bucket` | T17 | |
 | | C17 `feat(task): remember hosts that ignore ranges` | T18 | PR-3 |
 | PR-9 续传 | C18 `feat(task)!: track written ranges separately from received ranges` | T19 | PR-1、PR-2 |
@@ -539,6 +539,8 @@
 
 ---
 
+> **T16–T18 不在本计划中实施**（维护者 2026-11-11 决定推迟）：准入、按 host 的连接数、共享限速、按 host 的能力缓存都是跨任务的策略，按分层原则属于 Task 之上的客户端或 job 层，不属于单个 Task 的机制。下面三节的复选框不勾，留作以后在那一层实现时的参照；design §14.31 记了这个决定，§14.32 把它列进了缺口盘点。
+
 ## T16 — 准入与按 host 的连接数（C15，P2）
 
 - [ ] 新增 `bolt_load::Limits`（`max_active_tasks`、`max_connections_per_host`）和 `TaskBuilder::limits(Arc<Limits>)`；不注入时，行为与现在完全一致。
@@ -629,6 +631,7 @@
 
 ## T22 — 收尾
 
-- [ ] 每个 PR 合入之后，在 `crates/bolt-load/docs/idm-improvement-plan.md` §5 的表里，把对应的行标记为已完成，并链接到这份 spec。
-- [ ] 全部完成之后，对照 IDM 的策略（`crates/bolt-load/docs/idm-improvement-plan.md` §8、`idm-strategy-full.md`）盘点 bolt-load 还缺什么，写进 design 末尾的“实现说明”，再请用户决定要不要补。
-- [ ] 全部完成之后，更新 `crates/bolt-load/README.md` 和根目录 `README.md`，补充新配置项 `max_connections`、`max_attempts_per_range`、`Limits`，以及续传的说明。
+- [x] 每个 PR 合入之后，在 `crates/bolt-load/docs/idm-improvement-plan.md` §5 的表里，把对应的行标记为已完成，并链接到这份 spec。已按实现的 PR 标成“已实现，待合入”（2026-11-11，这些 PR 都还开着）；行 8 标成推迟。
+  - 注意：PR 合入之后还要再改一次，把“待合入”改成“已完成”。
+- [x] 全部完成之后，对照 IDM 的策略（`crates/bolt-load/docs/idm-improvement-plan.md` §8、`idm-strategy-full.md`）盘点 bolt-load 还缺什么，写进 design 末尾的“实现说明”，再请用户决定要不要补。见 design §14.32。
+- [x] 全部完成之后，更新 `crates/bolt-load/README.md` 和根目录 `README.md`，补充新配置项 `max_connections`、`max_attempts_per_range`、`Limits`，以及续传的说明。`Limits` 随 P2 推迟（§14.31），没有写；两份 README 都说明了跨任务的限额不在 bolt-load 里。
