@@ -15,7 +15,12 @@ use async_waitgroup::WaitGroup;
 use bolt_load_utils::telemetry::*;
 use smol_cancellation_token::CancellationToken;
 
-use super::{Result, ownership::Ownership};
+use super::{
+    Result,
+    destination_lock::state_path_for,
+    file_steps::Step,
+    ownership::{Invalidation, Ownership, Phase},
+};
 use crate::{
     DOWNLOADING_TMP_EXTENSION,
     task::{DownloadError, IoOp, Progress},
@@ -59,11 +64,103 @@ impl OutputFile {
         completed: Progress,
         cancel_token: &CancellationToken,
     ) -> Teardown {
+        if self.ownership.phase() == Phase::Resumable {
+            return self
+                .commit_resumable(transfer, completed, cancel_token)
+                .await;
+        }
         let teardown = commit(transfer, &self.tmp, &self.dest, cancel_token).await;
         if teardown.result.is_ok() {
             self.ownership.publish(completed);
         }
         teardown
+    }
+
+    /// The commit rule of a resumable task (design §11.5.5, §11.5.9, phase
+    /// C):
+    ///
+    /// - a finished transfer is renamed, then the completion steps sync the
+    ///   directory and empty the state file, whose removal comes with the
+    ///   release; a failed rename keeps both files;
+    /// - a changed resource discards both, the data being of the old
+    ///   version;
+    /// - a fallback to one connection invalidates the state and removes
+    ///   the partial file, and the task is no longer resumable; if the
+    ///   invalidation fails, it keeps both files and fails instead of
+    ///   falling back;
+    /// - any other failure, and a cancellation, keep both, for a resume.
+    async fn commit_resumable(
+        &self,
+        transfer: Result<()>,
+        completed: Progress,
+        cancel_token: &CancellationToken,
+    ) -> Teardown {
+        let transfer = match transfer {
+            Ok(()) if cancel_token.is_cancelled() => Err(DownloadError::Cancelled),
+            other => other,
+        };
+        let kept = |result| {
+            self.ownership.keep_files();
+            Teardown {
+                result,
+                leftover_temp_file: None,
+                kept_for_resume: Some(self.tmp.clone()),
+            }
+        };
+        match transfer {
+            Ok(()) => {
+                let renamed = match self.ownership.hooks().before(Step::Rename) {
+                    Ok(()) => publish(&self.tmp, &self.dest).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = renamed {
+                    return kept(Err(DownloadError::io(IoOp::Rename, &self.dest, e)));
+                }
+                self.ownership.publish(completed);
+                let ownership = self.ownership.clone();
+                blocking::unblock(move || ownership.complete_resumable()).await;
+                Teardown {
+                    result: Ok(()),
+                    leftover_temp_file: None,
+                    kept_for_resume: None,
+                }
+            }
+            Err(e @ DownloadError::ResourceChanged { .. }) => {
+                let ownership = self.ownership.clone();
+                let discarded = blocking::unblock(move || ownership.discard_resumable()).await;
+                Teardown {
+                    result: Err(e),
+                    leftover_temp_file: discarded.leftover,
+                    kept_for_resume: None,
+                }
+            }
+            Err(e @ DownloadError::RangeUnsupported { .. }) => {
+                let ownership = self.ownership.clone();
+                let discarded = blocking::unblock(move || ownership.discard_resumable()).await;
+                let failed = |source| DownloadError::Io {
+                    op: IoOp::Lock,
+                    path: state_path_for(&self.dest),
+                    source: Arc::new(source),
+                };
+                // A fallback would truncate the partial file under a state
+                // that may name it: fail with both kept instead, reported
+                // as kept only while the header is intact.
+                match discarded.invalidation {
+                    Invalidation::Done => Teardown {
+                        result: Err(e),
+                        leftover_temp_file: discarded.leftover,
+                        kept_for_resume: None,
+                    },
+                    Invalidation::Intact(source) => kept(Err(failed(source))),
+                    Invalidation::Unsynced(source) => Teardown {
+                        result: Err(failed(source)),
+                        leftover_temp_file: Some(self.tmp.clone()),
+                        kept_for_resume: None,
+                    },
+                }
+            }
+            Err(e) => kept(Err(e)),
+        }
     }
 }
 
@@ -73,6 +170,9 @@ pub(crate) struct Teardown {
     pub(crate) result: Result<()>,
     /// The temporary file that could not be removed.
     pub(crate) leftover_temp_file: Option<PathBuf>,
+    /// The partial file kept, with a state file whose header is valid, for
+    /// a later resume (design §11.5.9; task-api-spec STATUS-13).
+    pub(crate) kept_for_resume: Option<PathBuf>,
 }
 
 /// The temporary path for `dest`; always differs from `dest`.
@@ -130,6 +230,7 @@ pub(crate) async fn commit(
                 return Teardown {
                     result: Ok(()),
                     leftover_temp_file: None,
+                    kept_for_resume: None,
                 };
             }
             Err(e) => Err(DownloadError::io(IoOp::Rename, dest, e)),
@@ -138,6 +239,7 @@ pub(crate) async fn commit(
     Teardown {
         result,
         leftover_temp_file: discard(tmp).await,
+        kept_for_resume: None,
     }
 }
 
