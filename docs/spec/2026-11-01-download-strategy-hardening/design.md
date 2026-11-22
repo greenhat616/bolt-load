@@ -2485,3 +2485,10 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - ureq2 用 HEAD 的验证器：`the_validator_of_a_get_is_sent_not_that_of_a_head`、`head_validators_that_differ_from_a_get_are_not_sent`、`a_resource_changed_mid_download_fails_the_task` 等六个；
   - reqwest 回到 HEAD 时用 HEAD 的验证器：`a_200_with_the_validator_sent_ignores_the_range`、`ignored_ranges_with_the_same_validator_fall_back`；
   - `ResourceChanged` 走回退：`a_changed_resource_ends_the_mode_without_a_fallback`、`a_resource_changed_mid_download_fails_the_task`、`a_changed_resource_that_ignores_ranges_does_not_fall_back`、`parts_of_another_version_are_not_mixed_in`。
+
+### 14.24 测试服务器绑定系统分配的端口（测试设施）
+
+- **问题。** `bolt-load-tests` 的两个测试服务器（`create_http_server_with_file_size`、`create_range_fault_server_with_log`）先用 `portpicker::pick_unused_port()` 挑一个空闲端口，再去绑定它。两步之间别的进程（包括并行跑的其他测试）可以先占走这个端口，绑定就失败：Windows 上是 `os error 10048`。C19 的完整测试里出现过几次，和改动无关。
+- **做法。** 新函数 `bind_local()` 绑定 `127.0.0.1:0`，由系统在绑定时分配端口，再从 `local_addr()` 读出端口号。两个服务器都用它，公开函数的签名不变（仍返回端口号）。`portpicker` 没有别的用处，从 `bolt-load-tests` 的依赖里去掉，`Cargo.lock` 随之少了 `portpicker` 和它带来的 `rand 0.8`、`rand_chacha 0.3`、`rand_core 0.6`。
+- **其他地方。** 整个工作区里没有别的先挑后绑：`tests/empty_body.rs` 和 `bolt-load-adapter/tests/body_decoding.rs` 本来就绑定端口 0，没有写死的端口。
+- **验证。** `if_range` 和 `resource_changed` 各连续跑 40 次，没有失败，没有 10048；完整的工作区测试（全部 feature 782 个、默认 714 个）也没有。
