@@ -90,6 +90,7 @@
 | G8（P2） | 注入 `Limits` 后，跨任务的总速率误差不超过 `limit` 的 ±10%（2 s 窗口）；限速等待不会触发空闲超时 | 集成测试（T15） |
 | G9（P3） | 进程在任意时刻被杀掉后续传，最终 hash 正确；状态文件损坏、越界或重叠时，坏区间被丢弃并上报 | 集成测试（T19） |
 | G10 | 服务器静默限制连接数（拒绝或不应答超出的连接）时，任务完成，hash 正确；上限降到服务器接受的连接数之后，超出它的连接只有恢复步骤的试探：每个到期时刻至多一个，同时至多 `limit + 1` 个，间隔按退避拉开 | 故障服务器的端到端测试（T30） |
+| G11 | 停滞之后会再试探：一次没有增益的翻倍不让扩张永久停下。扩张保持翻倍前的连接数，按退避（30 s 起，每次没有增益翻倍，最多 300 s）从当时的连接数再试探，不等多开的连接下完；带宽回来时，试探有增益，扩张接着翻倍。2026-11-13 由维护者加入，“从当时的连接数”2026-11-16 由维护者确认（D31） | 单元测试和下载循环测试，注入时间（T31） |
 
 ---
 
@@ -126,6 +127,10 @@
 | D25 | 拒绝与 DNS、TLS 失败的区分 | 暂时靠佐证；core 里类型化的连接原因以后再做 | 已确认（2026-11-13） |
 | D26 | 是否检测接受连接之后不发数据或重置的服务器 | 暂不检测：需要 runner 报告是哪种超时 | 已确认（2026-11-13） |
 | D27 | 拒绝和区间预算 | 在已证实窗口之上的拒绝不记预算，其余照旧；不承诺 §14.13a 列出的几种情况能活下来 | 已确认（2026-11-13） |
+| D28 | 没有增益的翻倍多开的 runner | 不停掉：扩张保持翻倍前的连接数，多开的 runner 下完自己的块就结束，之间不补位；停掉它们留作以后的改进（§14.33） | 已确认（2026-11-13） |
+| D29 | 被上限截短的试探 | 至少加上保持数的一半（`⌈h/2⌉`）才试探，并照常判断；加不到一半就不试探（§14.33）；D31 起按试探时的活跃数 `b` 算，`⌈b/2⌉` | 已确认（2026-11-13） |
+| D30 | 试探的判断要几个 tick | 一个 tick，和翻倍的判断一样；判错的代价是一次试探的等待（§14.33） | 已确认（2026-11-13） |
+| D31 | 试探从多少个连接开始 | 从试探那一刻的活跃数 `b`（`b ≥ h`）开始：翻倍到 `min(2b, 上限)`，至少加上 `⌈b/2⌉` 才做，按 `b` 个连接时的速度判断，没有增益就保持 `b`。原因：要求活跃数回到 `h` 时，没有增益的翻倍多开的 runner 按对半切分拿到的块和留下的一样长，一直跑到下载结束，速度均匀的下载永远等不到试探（C41 的 s6，§14.17）（§14.33） | 已确认（2026-11-16） |
 
 ---
 
@@ -546,7 +551,7 @@ struct AvailableRange {
 
 **恢复：一次一步，要验证，按退避拉开（D22）。**
 
-- 两个控制器之间只交换两个数：扩张一侧给出 `want`（目前恒为 `max_connections`），并发控制给出 `limit_cap`，step 进行中是 `limit + 1`，否则是 `limit`。`cap = min(limit_cap, want, max_connections)`，能新增的 runner 数一律按 `free = cap.saturating_sub(active)` 计算：建 runner、唤醒后的创建、dynamic 策略的切分都一样。`active > cap` 是合法状态，多出来的 runner 不会被停掉，下完自己的块就结束。
+- 两个控制器之间只交换两个数：扩张一侧给出 `want`（扩张时是 `max_connections`，保持时是保持数 `h`，试探进行中是试探的目标，§9.2、§14.33），并发控制给出 `limit_cap`，step 进行中是 `limit + 1`，否则是 `limit`。收尾对冲只受 `limit_cap` 约束，不看 `want`，所以可以在保持之上多开一个连接。`cap = min(limit_cap, want, max_connections)`，能新增的 runner 数一律按 `free = cap.saturating_sub(active)` 计算：建 runner、唤醒后的创建、dynamic 策略的切分都一样。`active > cap` 是合法状态，多出来的 runner 不会被停掉，下完自己的块就结束。
 - 上限只能通过 step 升高。step 是对 `limit + 1` 的一次试探，在策略 tick 上开始，要求同时满足：没有 step 在进行；没有拥塞在挡新连接；`want > limit` 且 `limit < max_connections`；`now ≥ due`；`connected ≥ limit`；tick 不迟到。如果已经有超过 `limit` 个连接在活动，step 不新开连接，直接评判现有的连接：上一个 step 留下的试探连接就这样被下一个 step 计入，既不停掉也不忽略。
 - step 有四个出口，每个 tick 按顺序检查：
 
@@ -611,18 +616,36 @@ every grow_interval (2 s, aligned with the strategy tick):
   if any runner is Connecting or has no data this tick  -> skip
     (a running one silent for hedge_idle does not count, see below)
   if limits.speed_limit is set and speed >= 0.85 × limit -> skip
-  if the last full doubling is not judged yet:
+  if the last full doubling or probe is past its deadline -> drop it, no verdict
+                                                           (a probe: inconclusive)
+  if holding h and no probe is pending:
+    if allowed < min(h, cap) and no unassigned range is eligible
+                                                        -> split up to min(h, cap), not judged
+    else if allowed >= h and now >= reprobe_at and the tick is stable
+            (else: no stable tick for growth_deadline since the first
+             due tick -> inconclusive, reprobe_at = now + reprobe_wait)
+            and min(2b, cap) − b >= ⌈b/2⌉              (b = allowed)
+                                                        -> probe: split up to min(2b, cap)
+    else                                                -> skip
+  if the last full doubling or probe is not judged yet:
     if allowed < the runners right after it, or a running runner was let off as silent:
-      if it reached max_connections when it was made    -> skip, keep it unjudged
+      if it reached max_connections when it was made,
+         or it is a probe                               -> skip, keep it unjudged
       else                                              -> drop it, no verdict
+    else if the tick is not stable (a runner finished, failed, was added
+            or connected in it)                         -> skip, keep it unjudged
     else if speed_window_after < speed_window_before × 1.10
-                                                        -> plateau: stop growing
+                                                        -> hold the runners before it;
+                                                           probe again after reprobe_wait
+    else                                                -> ramp on (a probe: reprobe_wait reset)
   if allowed >= max_connections                         -> stop
   target = min(allowed × 2, max_connections)
   repeat (target − allowed): split(largest remaining) via §7.2
 ```
 
-- 上限处的规则（C28，2026-11-08 维护者决定，§14.18）：到了上限，上一次完整的翻倍照样判断。翻到了上限（按做出翻倍那个 tick 的上限算）、还没判断的翻倍，在活跃数回到翻倍后的数之前不扩张，所以 runner 下完不会补位；只有低速或静默重启停掉一个 runner 时，待判断的翻倍不下结论、直接丢掉（C29，2026-11-08 维护者决定，§14.19），重启的区间被重新领取后可以再切；上限以下的翻倍少了 runner 时不下结论，照常扩张（C11 的做法）。
+- 停滞之后（C40，PR-7e，D28–D30，2026-11-13 维护者决定，§14.33）：没有增益的翻倍不再让这次下载永久停止扩张，而是**保持**翻倍前的连接数 `h`。保持时扩张一侧的 `want` 是 `h`：没有可领取的区间时用切分补回 `h`（不判断），多出 `h` 的 runner 下完自己的块就结束，不停掉也不补位。等待（`reprobe_wait`，30 s 起）到了之后，**试探**一次：从这时的活跃数 `b ≥ h` 翻倍到 `min(2b, cap)`，至少加上 `⌈b/2⌉` 才做（D31，2026-11-16 维护者决定）；试探进行中 `want` 是试探的目标。试探有增益就回到扩张，等待恢复为 30 s；没有增益就保持 `b`，等待加倍，最多 300 s；不确定（截止时间到了、加的不到一半、低速或静默重启）时等待不变。每个待判断的扩张都有截止时间 `connect_timeout + 5 × grow_interval`（默认 40 s）：扩张中的翻倍到时不下结论、丢掉，试探到时算不确定。
+
+- 上限处的规则（C28，2026-11-08 维护者决定，§14.18）：到了上限，上一次完整的翻倍照样判断。翻到了上限（按做出翻倍那个 tick 的上限算）、还没判断的翻倍，在活跃数回到翻倍后的数之前不扩张，所以 runner 下完不会补位（C40 起最多等到它的截止时间，§14.33）；只有低速或静默重启停掉一个 runner 时，待判断的翻倍不下结论、直接丢掉（C29，2026-11-08 维护者决定，§14.19），重启的区间被重新领取后可以再切；上限以下的翻倍少了 runner 时不下结论，照常扩张（C11 的做法）。
 - 静默的 runner 不再挡住扩张（C29，2026-11-08 维护者决定，§14.19）：一个正在运行的 runner 已经静默满 `hedge_idle`（2 s），并且它连上也至少这么久了，检查 5 就不算它。静默指 runner 没有读到 body，起点取 runner 自己记下的最近一次读（没有就是 spawn），正在推送一帧的 runner 不算静默（§9.5）；数据通道里有循环还没取走的帧的 runner 不算静默（它在交数据，只是循环落后了）；writer 满的时候谁都不算静默。静默的 runner 不贡献速度，这样的 tick 量不出翻倍的效果，所以和活跃数不够时一样处理：翻到上限的翻倍继续等，上限以下的不下结论、照常扩张。
 - 降速交给 `ConcurrencyControlStrategy` 处理，扩张控制器只负责增加连接。
 - 增益的判断用扩张前后各一个稳定窗口的总速率来比较，不用每连接速率，因为 `per_runner_speed` 本身就是由总速率算出来的。
@@ -1458,6 +1481,8 @@ C20 太大，按顺序拆成五个提交，每一步树都是绿的：
 | 静默规则的误判二：排在满 writer 后面的帧在拒绝之后才被接收，也算作进度 | 只在 writer 能接收数据时降级；误差上限是每个 runner 32 帧的队列 |
 | 服务器接受连接之后不发数据或重置，§8.3 检测不到（D26） | 照旧按区间退避和预算处理；要检测，runner 先得报告是哪种超时 |
 | §8.3 的常量都没有校准（D23） | 用基准测试校准；在那之前按设计值 |
+| 没有增益的翻倍多开的 runner 不停掉（D28），保持期间连接数可能长时间高于 `h` | 它们是在工作的连接，下完自己的块就结束；停掉要新增停止原因、只算不在停止中的 runner、把区间连同计数原样放回的 planner 操作，留作以后的改进（§14.33） |
+| 上限比试探时的活跃数 `b` 多不到 `⌈b/2⌉` 时不试探（D29、D31） | 上限降下来或下载结束之前一直保持；让试探按 step 越过上限留作以后的改进（§14.33） |
 
 ---
 
@@ -1992,13 +2017,13 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `max_concurrency` 从 `max_connections` 起步，只有并发控制会改它。遇到不可重试的失败时，立即降到当前的活跃数；失败率高时每次减 1；恢复时每次加 1，最多回到 `max_connections`。
     - `Doubling` 只加 runner，不改上限，所以降级一直有效；上限恢复之后，扩张才能用上恢复出来的部分。
     - 两个策略就这样组合：减少连接归并发控制，增加连接归 `Doubling`，两者受同一个上限约束。
-    - 重排到 PR-6a 之后（§8.3）：`Doubling` 的上限是 `min(max_concurrency, refill_cap)`，`refill_cap` 即 `cap = min(limit_cap, want, max_connections)`（`want` 目前恒为 `max_connections`）；恢复 step 被拒绝或不确定的标记置上之后、下一个 tick 判定之前，它是 `limit` 而不是 `limit + 1`。所以 `Doubling` 可以用 step 的试探位置开一个连接，但不会在已被标记的 step 上再开。上限不再每 15 s 加 1，而是 step 被接受才加 1：试探连接要连上并交付 15 s。
+    - 重排到 PR-6a 之后（§8.3）：`Doubling` 的上限是 `min(max_concurrency, refill_cap)`，`refill_cap` 即 `cap = min(limit_cap, want, max_connections)`（`want` 当时恒为 `max_connections`；C40 起见 §14.33：`Doubling` 的上限只取 `limit_cap` 这一边，保持数和试探目标由它自己算）；恢复 step 被拒绝或不确定的标记置上之后、下一个 tick 判定之前，它是 `limit` 而不是 `limit + 1`。所以 `Doubling` 可以用 step 的试探位置开一个连接，但不会在已被标记的 step 上再开。上限不再每 15 s 加 1，而是 step 被接受才加 1：试探连接要连上并交付 15 s。
   - 速度窗口：
     - 每个策略 tick 采样一次，时间用 tick 传进来的 `now`，策略里不调用 `Instant::now()`。
     - 任务速度 = 这个 tick 里 planner 接受的字节数 ÷ tick 的时长。比较的是整个任务的速度，不是每个 runner 的速度。
     - 扩张前的窗口，是决定扩张的那个 tick；扩张后的窗口，是之后第一个通过检查 1–6 的 tick。两个窗口都是一个 tick 长（1.5 s）。
   - 停滞：
-    - 只判断完整的翻倍，也就是这次扩张加的 runner 数等于扩张前的活跃数。扩张后窗口的速度低于扩张前的 1.10 倍，就是停滞。停滞之后，这次下载不再扩张。
+    - 只判断完整的翻倍，也就是这次扩张加的 runner 数等于扩张前的活跃数。扩张后窗口的速度低于扩张前的 1.10 倍，就是停滞。停滞之后，这次下载不再扩张。（已被 §14.33 取代：停滞之后保持翻倍前的连接数，再试探。）
     - 被上限截断、或者有切分被拒绝的扩张，照样算扩张，2 s 的间隔从它算起，但不判断，也不会解除已有的停滞。连接数只多一小步，本来就不能指望总速度多 10%。比如并发控制把上限一格一格地恢复（11 到 12），每条连接各 1 MiB/s 时增益只有 9%，判断的话就会永久停在 12。
     - 每次翻倍只判断一次。判断时，如果活跃 runner 比翻倍刚完成时少（有 runner 下完了或者失败了），这个窗口就量不出这次翻倍的效果。这时不下结论，这次判断作废，可以继续扩张。C28 起，翻到上限的翻倍改为：不下结论，也不扩张，等到活跃数回到翻倍后的数再判；上限以下的翻倍不变（§14.18）。
     - 翻倍到上限之后，检查 3 先拦住，所以这次翻倍不会被判断。等 runner 下完、活跃数降下来，判断作废，`Doubling` 会再切分，补回到上限。C28 起改为：上限处照样判断，没判断的翻倍不补位（§14.18）。
@@ -2020,7 +2045,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - `Legacy` 不变：`planned_chunk_size` 仍然是 `current_speed * 2.0`，`get_incomplete_states` 里 `2 × min_chunk_size` 的下限也不变。
 - **与 §9.2、§9.3 的偏差。**
   - 上限用下载循环当前的 `max_concurrency`，不是 `max_connections`。没有降级时两者相等；降级之后，`Doubling` 不会越过降级后的上限（见上）。
-  - §9.2 没说停滞什么时候判、判几次。这里每次翻倍只判一次；判的时候活跃 runner 少于翻倍刚完成时的数，就不判。停滞之后不再恢复。
+  - §9.2 没说停滞什么时候判、判几次。这里每次翻倍只判一次；判的时候活跃 runner 少于翻倍刚完成时的数，就不判。停滞之后不再恢复（已被 §14.33 取代）。
   - §9.2 对每次扩张都要求 10% 的增益，这个数是按翻倍定的。这里只判断完整的翻倍；被上限或拒绝截断的扩张只加了一小步，不能指望多 10%，所以不判断（2026-11-07 与 lead 确认）。
   - 每次扩张只看剩余最多的那个 chunk。它不够大就停下，不再去找别的 chunk。
   - §9.3 的 `clamp(donor_speed × 2 s, min_chunk_size, remaining / 2)` 改为 `max(donor_speed × 2 s, min_chunk_size)`，并且只当门槛用（2026-11-06 与 lead 确认）：
@@ -2029,7 +2054,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 85% 的限速闸门：限速还没有实现，只留了接口。
 - **已知限制。**
   - 节奏是 3 s，不是 2 s：tick 是 1.5 s，扩张要等上次扩张之后至少 2 s 的第一个 tick。第一个 tick 在开始时立即触发，由并发控制建第一个 runner；之后最快在 1.5 s、4.5 s、7.5 s 翻倍，7.5 s 才到 8 条连接。`Legacy` 的 QuickStart 每个 tick 都可以翻倍，最快 4.5 s 到 8 条。T14 的基准测试会量出差别。
-  - 停滞之后不再扩张，下完的 runner 也不补。收尾阶段，连接数会随着 runner 下完逐渐减少。没停滞时，下完的 runner 会通过正常的扩张补上。
+  - （已被 §14.33 取代，C40 起停滞之后保持翻倍前的连接数、补到它、按退避再试探。）停滞之后不再扩张，下完的 runner 也不补。收尾阶段，连接数会随着 runner 下完逐渐减少。没停滞时，下完的 runner 会通过正常的扩张补上。
   - 只判断完整的翻倍，所以扩张如果一直只是部分的，就永远不会下结论：比如上限一格一格地恢复，或者在上限处反复 8 → 7 → 8（一个 runner 下完、再切一个补上）。这时即使真的停滞了（总速度不再变化）也发现不了，循环会一直切分补位。这是接受了的盲区：连接数不超过当前上限，每次补位之间至少隔 2 s。T14 要量它的代价。`test_refills_at_the_limit_are_never_judged` 和 `doubling_refills_a_step_at_a_time_without_any_gain` 把这个行为固定下来。C28 起，到上限的完整翻倍会被判断，盲区只剩被截断的扩张，前一个测试改为 `test_refills_after_a_truncated_growth_are_never_judged`（§14.18）。
   - 剩余最多的 chunk 优先：它不到自己的门槛就停下，不再看别的 chunk。别的 chunk 剩得少一些、但 runner 更慢，门槛更低，本来可以切，也不会被选上。T14 要测连接速度不一的场景。
   - 速率只看一个 tick（1.5 s）。runner 攒满 32 KiB 才交一帧，所以慢于约 21 KiB/s（32 KiB ÷ 1.5 s）的 runner，有的 tick 里看起来没有数据，那个 tick 就不扩张。C29 起静默满 2 s 的 runner 不再挡住扩张，但这样的 tick 不判断翻倍（§14.19）。
@@ -2331,8 +2356,40 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
     - s4b `s4b_two_runners`（M1 的第二种）：`max_connections = 2`，每条连接 2 MiB/s，32 MiB，第一个读到 28 MiB 的流停住。拥有后一半的 runner 停住时还剩 4 MiB（≥ `2 × min_chunk_size`），任务里只有两个 runner。
   - s4c `s4c_stall_midway`（额外加的）：和 s4 一样，但停在 40 MiB，剩下的远多于 `2 × min_chunk_size`，任务里有 4 个 runner。这是 T13 低速重启本该管的情况，用来校准 `slow_window`。
   - 无停顿的对照：`s4_nostall`、`s4a_nostall`、`s4b_nostall` 是去掉停顿的同一设置（s4c 的对照就是 `s4_nostall`）。
-- **重排说明（2026-11-14）。** 下面的数字是在 PR-6a 的并发控制（§8.3）之前测得的：那时降级按失败率，恢复每 15 s 加 1；现在恢复要经过验证的 step，并按退避拉开，s3 这类遇到 429 的场景受影响最大。重排时没有重跑，这些表要在 C41 里重测，在那之前只作参考。
-- **结果。** 一次完整的运行，每组 10 次，中位数 / p90。时间单位 s，取消延迟 ms；“停顿等待”见上；`n/a` 是没有这一项的样本。所有运行的 `unmatched` 都是 0，败方的迟到帧都是 0，低速重启都是 0 次。
+- **C41 加的场景（PR-7e，2026-11-16）。**
+  - `s1_max32_long`：`s1_max32` 的设置，256 MiB，长到 16 → 32 的翻倍能被判断（§14.18、§14.33）。`s1_max32` 保持 128 MiB 不变，和以前的数字可比。
+  - `s6_plateau_then_more_bandwidth`：每条连接 1 MiB/s，总带宽前 20 s 是 2 MiB/s、之后 8 MiB/s，`max_connections = 8`，160 MiB。2 → 4 的翻倍没有增益，保持 2；带宽在保持期间涨上来（§14.33）。新的服务器选项 `raise_max_speed(after, rate)`：从 adapter 第一个 body 流起 `after` 之后，总限速换成 `rate`；`clone_reset_count` 出来的副本从自己的第一个流起算。单元测试 `test_raise_max_speed`。
+  - `s5_silent_limit_4`：走 HTTP，`reqwest` adapter 对 `bolt-load-tests` 的 `create_limited_range_server`（C36）：每条连接 1 MiB/s，同时最多服务 4 条，多出来的在 accept 时关掉（`Close`）或者一直不应答（`Hang`，由默认 30 s 的连接超时结束），默认 `max_connections = 8`，192 MiB。它有自己的表：完成时间、服务器同时服务的最多连接数、被拒的连接数、第一个和最后一个被拒的时刻（从开始算）。`GROWTH_SCENARIOS` 里写 `s5_silent_limit_4` 才跑它（不写就全跑）。
+  - 主表加了两列：保持（没有增益的翻倍或试探开始保持的次数）和试探（保持的试探次数），探针读 `doubling_strategy` 的两条 debug 消息，启动时的源码检查和解析样本也加上了它们。`GROWTH_TRACE` 也打印 s5 每次运行的事件。
+- **结果（C41 重测，2026-11-16）。** `cargo bench -p bolt-load --bench growth_strategy`，全部场景各 10 次，中位数 / p90；“§14.20”一栏是 §14.20 那一轮（PR-6a 之前）的中位数 / p90。一次完整的运行，代码是最终的 C40（D31、稳定 tick 的要求、`population` 计数和找稳定 tick 的时限都在内）。所有运行的 `unmatched`、败方迟到帧都是 0。
+
+  | 场景 | 完成时间 s | §14.20 | 峰值连接 | 429 | 对冲 | 停顿等待 s | 重启 / 静默停止请求 | 保持 / 试探 |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | s1_max32 | 16.00 / 16.10 | 15.95 / 16.01 | 32 | 0 | 0 | n/a | 0 / 0 | 0 / 0 |
+  | s1_max8 | 21.10 / 21.12 | 21.10 / 21.12 | 8 | 0 | 0 | n/a | 0 / 0 | 0 / 0 |
+  | s2 | 4.27 / 4.47 | 5.56 / 6.95 | 2 / 2 | 0 | 0 | n/a | 0 / 0 | 0 / 0 |
+  | s3 | 15.57 / 15.59 | 15.57 / 15.58 | 4 | 4 | 0 | n/a | 0 / 0 | 0 / 0 |
+  | s4 | 11.04 / 12.54 | 11.07 / 12.56 | 8 | 0 | 1 | 2.07 / 3.57 | 0 / 0 | 0 / 0 |
+  | s4_nostall | 9.09 / 9.11 | 9.08 / 9.09 | 8 | 0 | 0 | n/a | 0 / 0 | 0 / 0 |
+  | s4a | 12.36 / 12.37 | 12.36 / 12.38 | 8 | 0 | 1 | 6.97 / 6.98 | 0 / 0 | 0 / 0 |
+  | s4a_nostall | 11.78 / 11.80 | 11.78 / 11.79 | 6 | 0 | 0 | n/a | 0 / 0 | 0 / 0 |
+  | s4b | 13.85 / 13.96 | 13.75 / 13.96 | 2 | 0 | 0 | 6.23 / 6.32 | 1 / 1 | 0 / 0 |
+  | s4b_nostall | 8.73 / 8.74 | 8.73 / 8.74 | 2 | 0 | 0 | n/a | 0 / 0 | 0 / 0 |
+  | s4c | 13.18 / 13.25 | 13.14 / 13.18 | 8 | 0 | 0 | 6.68 / 6.81 | 1 / 1 | 0 / 0 |
+  | s1_max32_long | 24.28 / 24.37 | 新 | 32 | 0 | 0 | n/a | 0 / 0 | 1 / 0 |
+  | s6 | 44.16 / 44.20 | 新 | 8 | 0 | 0 | n/a | 0 / 0 | 1 / 1 |
+
+  | 场景 | 方式 | 完成时间 s | 同时服务最多 | 被拒连接 | 第一个被拒 s | 最后一个被拒 s |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | s5_silent_limit_4 | `Close` | 53.04 / 53.06 | 4 | 13 | 7.55 / 7.58 | 48.26 / 48.28 |
+  | s5_silent_limit_4 | `Hang` | 84.99 / 85.13 | 4 | 8 | 7.55 / 7.56 | 48.26 / 48.30 |
+
+  - 已有的场景和 §14.20 比，都在原来的散布之内：s4 是 §14.17 记过的“对冲落在哪个 tick”，两档：这次 10 次里 6 次 11.02–11.04 s、4 次 12.52–12.57 s（同一天前两次完整运行快的只有 3 次，中位数因此是 12.5 s），p90 和 §14.20 一样；s2 快了 1.3 s，仍是 s2 已知的噪声（4.15–4.63 s，峰值 1 或 2）。同一天另外两次完整运行（D31 和稳定 tick 之前、只有稳定 tick 的端点比较时），s1、s3、s4a–s4c、对照和 s5 的中位数都在这次的 ±0.15 s 以内；s2 是 4.32、4.64 s，`s1_max32_long` 是 24.05、24.23 s，s6 见下。s3 的行为没变：4 → 8 的 4 个新连接拿到 429，之后一直 4 条。
+  - `s1_max32_long`：16 → 32 被判断，没有增益，保持 16（每次都是 1 次保持）；多开的 16 个下完自己的块，峰值仍是 32。保持之后 30 s 才试探，下载在 24 s 左右就结束了，所以没有试探。按 16 条连接 16 MiB/s 估，翻到 16 之前约下了 45 MiB，其余约 13 s，合计约 23.7 s，实测 24.3 s。
+  - s6：1 → 2 有增益，2 → 4 没有（7.5 s 判断），保持 2；4 个 runner 是对半切出来的，各自的块一样长，一直跑。20 s 带宽涨到 8 MiB/s，4 个 runner 各 1 MiB/s。约 37.5 s（判断之后 30 s，按时间推算，没有 trace）从这 4 个试探到 8，有增益，回到扩张，峰值 8，44.2 s 完成（44.07–44.33）。C40 的第一版要求活跃数回到 2 才试探，同一个场景 10 次都是 50.6 / 50.7 s（50.38–50.72）、峰值 4、试探 0：4 个 runner 一直跑到下载结束，活跃数到不了 2。这个测量是 D31 的由来（§14.33）。带宽一涨上来就用满 8 条的话约 35 s；差的这几秒是 30 s 的等待（试探在 37.5 s 而不是 20 s）。
+  - s5 `Close`：用 `GROWTH_TRACE` 看了一次。7.5 s 翻到 8，多出的 4 个在 accept 时被关掉，退避重试又被关掉，10.5 s 上限降到 4（§8.3）；30 s 前后最早的 4 个下完，空出来的 4 个区间被领取；40.7 s（降下来之后 30 s）step 到 5，试探连接在 48.2 s 被关掉（最后一个被拒），49.7 s step 被拒、回到 4。完成时间 53.0 s；按 4 条连接估算，理想值约 50.6 s。服务器同时服务的从没超过 4。
+  - s5 `Hang`：同样看了一次。7.5 s 翻到 8 的 4 个连接一直挂着，到 37.6 s 才因连接超时失败；30 s 前后最早的 4 个已经下完，这时没有已连接的 runner，上限没有降（推断：§8.3 降到已连接的数，0 不降）。38 s 区间被重新领取、连上；48.2 s 又按上限 8 翻倍，4 个新连接再挂 30 s，78.2 s 失败、重领，85 s 完成。也就是两次各付了一个连接超时（约 +32 s）。这是静默上限（A）的行为，不是 C40 的范围，记在这里，没有改。
+- **C13 时的结果（含 `Legacy`）。** 下面这张表是 C13 时测的（PR-6a 的并发控制之前，那时降级按失败率，恢复每 15 s 加 1），下面的分析、G7 结论和校准建议都按这张表。一次完整的运行，每组 10 次，中位数 / p90。时间单位 s，取消延迟 ms；“停顿等待”见上；`n/a` 是没有这一项的样本。所有运行的 `unmatched` 都是 0，败方的迟到帧都是 0，低速重启都是 0 次。
 
   | 场景 | 策略 | 完成时间 | 峰值连接 | 429 | 对冲（分出胜负） | 重复 KiB | 取消延迟 | 停顿等待 |
   | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -2400,7 +2457,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   3. `slow_window` 的缩短，见校准建议。已决定（2026-11-08）：`slow_window` 和 `slow_ratio` 不变，改用第 2 项的静默路径（§14.19）。
   4. 已决定（2026-11-08）：修上限处的判断，见 §14.18。原来的说明：在上限处的翻倍不被判断：s1_max32 里 16 到 32 的翻倍没有增益，但活跃数等于上限时控制器不判断；降到上限以下时活跃数又少于翻倍刚完成时的数，判断作废、按两倍补位。长一些的下载里，连接数会一直被补回上限。可以接受（连接数不超过 `max_connections`），也可以改成在上限处也判断，或者停滞之后收回多开的那一步。
 - **已知限制。**
-  - 服务器在进程内，没有网络、TCP 慢启动和连接建立的延迟；HTTP 的情况（`reqwest`、`ureq2`）没有量。
+  - 服务器在进程内，没有网络、TCP 慢启动和连接建立的延迟；HTTP 的情况（`reqwest`、`ureq2`）没有量。C41 起只有 s5 走 HTTP（`reqwest`，本机回环）。
   - 一台机器、一个时间段；s2 受写盘影响大，结果不稳。
   - 停顿是“完全不发也不关”。慢但还在发的连接、反复短暂停顿的连接都没有量（`slow_ratio` 因此没有校准）。
   - 取消延迟只量到了败方是停住的原 runner 的情况（每次都是）；对冲 runner 输掉、败方还在读流时的延迟没有出现。
@@ -2430,7 +2487,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
   - 判断时打一条 debug 日志（有增益、停滞两种），`GROWTH_TRACE` 能看到。
 - **现在哪些扩张会被判断。**
   - 完整的翻倍：在之后第一个通过第 2、4 步、并且活跃数不少于翻倍后的数的 tick 判断，到了上限也判断，并发控制把上限降到翻倍后的数以下时也判断。
-  - 翻到上限、还没判断时活跃数降下来（runner 下完、失败、对冲败方让出）：不判断，也不扩张，直到活跃数回来。被 T13 停掉时例外，见 §14.19（C29）。失败或被停掉的 runner 的区间冷却结束、被重新领取后，活跃数就回来了；下完的 runner 不会回来，所以这样的下载此后不再扩张，连接数随 runner 下完逐渐减少。
+  - 翻到上限、还没判断时活跃数降下来（runner 下完、失败、对冲败方让出）：不判断，也不扩张，直到活跃数回来。被 T13 停掉时例外，见 §14.19（C29）。失败或被停掉的 runner 的区间冷却结束、被重新领取后，活跃数就回来了；下完的 runner 不会回来，所以这样的下载此后不再扩张，连接数随 runner 下完逐渐减少。（已被 §14.33 取代：C40 起翻倍最多等到截止时间，`connect_timeout + 5 × grow_interval`，之后不下结论、丢掉，照常扩张。）
   - 上限以下的完整翻倍、判断前活跃数降下来：不下结论，丢掉，照常扩张，和 C11 一样。下完的 chunk 没有留下可领取的区间，只有切分能把连接数补回来，这一步不能挡。
   - 被上限或拒绝的切分截断的扩张：仍然不判断（§14.14，`on_grown` 没改），之后照样补位。§14.14 的盲区只剩这一种：比如上限 6 时从 4 扩到 6，或者上限一格一格地恢复。
   - 判断过、有增益的翻倍：之后在上限处有 runner 下完，照样补位。
@@ -2438,7 +2495,7 @@ C23 按 §4.5 的表搬迁，有两处表里没有写到：
 - **已知限制。**
   - 翻倍是先开连接再判断，所以峰值仍可能是用满带宽所需的两倍（s1_max32 的 16 到 32）。新的 G7 正好允许两倍。
   - 判断要等 2 s：翻到上限之后不到 2 s 下载就结束，这次翻倍就不会被判断（见下面的 s1_max32）。
-  - 翻到上限、待判断时活跃数回不到翻倍后的数，就再也不扩张，上限恢复了也一样。这是“到了上限不补位”的代价。2026-11-08 维护者决定（C29，§14.19）收窄了这一条：低速或静默重启停掉 runner 时，待判断的翻倍直接丢掉，重启的区间可以再切；runner 正常下完、失败、对冲败方让出时仍按这一条等着。
+  - （已被 §14.33 取代：C40 起等到截止时间为止。）翻到上限、待判断时活跃数回不到翻倍后的数，就再也不扩张，上限恢复了也一样。这是“到了上限不补位”的代价。2026-11-08 维护者决定（C29，§14.19）收窄了这一条：低速或静默重启停掉 runner 时，待判断的翻倍直接丢掉，重启的区间可以再切；runner 正常下完、失败、对冲败方让出时仍按这一条等着。
   - 被截断的扩张仍不判断，盲区还在（见上）。
 - **结果。** s1_max32、s1_max8、s2、s3 各 10 次，两种策略交替，中位数 / p90（最小–最大）。G7 一栏是 bench 打印的：逐轮差（`Doubling` − `Legacy`）的中位数、它占 `Legacy` 中位数的百分比，以及 `Doubling` 所有运行里的最大峰值对“两倍所需连接数”。
 
@@ -3255,3 +3312,68 @@ G1a–G1c 是 IDM 的做法。改进方案 P2（§10）在它之上的扩展—�
 不算缺口的：IDM 的常量（Q 的两档 11680/116800、`2Q+3`、按 MSS 对齐、30/120/300 s 的超时）、每片一个临时文件再合并、注册表 journal、`JoinWithNext` 尾片合并，都是改进方案 §7 明确不做的；IDM 不读 `Retry-After`、重连零退避，bolt-load 读 `Retry-After`、有退避（§8），这两处 bolt-load 有意不同。
 
 请用户决定要不要补，补哪几项、放在哪一层。
+
+### 14.33 停滞之后保持并再试探（PR-7e，C40）
+
+- **决定**（维护者，2026-11-13，D28–D30，G11）：没有增益的翻倍不再让这次下载永久停止扩张（§14.14 的停滞），改为保持翻倍前的连接数、按退避再试探。没有增益的翻倍多开的 runner **不停掉**，下完自己的块就结束（D28）；停掉它们是以后的改进，需要的东西见“不做的事”。被上限截短的试探至少加上保持数的一半才做（D29）。试探和翻倍一样只看一个 tick（D30）。2026-11-16 维护者又决定（D31）：试探从那一刻的活跃数开始，不等多开的 runner 下完。
+- **做法。**
+  - `DoublingStrategy` 增加 `Mode::{Ramp, Hold { h, reprobe_at }}` 和 `reprobe_wait`，去掉 `plateau: bool`。扩张中（`Ramp`）照旧：完整的翻倍在之后第一个通过检查的 tick 判断，增益不到 10% 就进入 `Hold { h: 翻倍前的活跃数, reprobe_at: now + reprobe_wait }`。
+  - 两个控制器之间的 `want`（§8.3）由 `DoublingStrategy::want` 给出：`Ramp` 时是 `max_connections`；`Hold` 时是 `h`；试探待判断（或刚提出、还没报回加了几个）时是试探的目标。`StrategyControl::execute` 先把它交给并发控制，所以补建 runner（`create_tasks` 和 tick 上的补位）只补到 `min(limit_cap, want)`；`want > limit` 时并发控制照常 step，保持数在上限之上时就这样一步一步升上去。
+  - `Doubling` 拿到的上限改为并发控制这一边的 `min(max_concurrency, limit_cap)`（`StrategyControl::limit_cap`，不看 `want`），保持数和试探目标由它自己按这个上限算：补位到 `min(h, 上限)`，试探到 `min(2b, 上限)`。收尾对冲也只看 `limit_cap`（§9.6），所以可以在保持之上多开一个连接，和 §8.3 的说法一致。
+  - `Hold` 里没有待判断的试探时，`runners_to_add` 在间隔、活跃数为 0、拥塞这三项检查之后：
+    1. 活跃数少于 `min(h, 上限)`、没有可领取的区间时，发出 `Grow(差额)`，用切分补位，不判断（`Ask::Refill`）。有可领取的区间时什么也不做：并发控制会为它建 runner。补位不要求所有 runner 都在交数据：活跃数里已经算上了在连接的。
+    2. 活跃数 `b` 不少于 `h`、`now ≥ reprobe_at`，并且通过别的检查（全部交数据、有速度、限速）时，算 `goal = min(2b, 上限)`；`goal − b ≥ ⌈b/2⌉` 才试探，发出 `Grow(goal − b)`，翻倍前的速度是这个 tick 在 `b` 个 runner 上的速度（D31）。所以这个 tick 必须**稳定**（`TickSample::stable`）：上一次采样和这一次运行的是同一批尝试（同样的 runner、同样的 generation），两次都没有别的活跃 runner，并且两次之间谁在跑什么没有变过：planner 的 `population` 计数在两次采样时相同。这个计数在每次分出或切出 chunk、runner 连上、下完、失败、chunk 下完、对冲分叉、连上、丢掉、交接、分出胜负时加一，所以在两次采样之间来了又走的 runner（比如冷却在两个 tick 之间结束、重试很快下完）也会让 tick 不稳定，只比较两端的集合发现不了它，而它的字节在 tick 的速度里。计数可以多加（不变也加），只会让 tick 偏保守。另外这个 tick 不能有被放过的静默 runner。tick 的速度是整个任务的字节差，有 runner 在 tick 里下完、失败、新加或者刚连上时，它不是这 `b` 个 runner 的速度：下完的会把速度抬高（试探被误判为没有增益），刚连上的会把速度压低（误判为有增益）。不稳定的 tick 不试探，等下一个稳定的 tick。只比较个数、只看全部交数据都不够：个数可以一减一加正好相等，刚连上的 runner 在 tick 里交过数据也算交数据。
+       等多久有上限：试探到期之后，第一个因为没有稳定的 tick 而没做的 tick 记为 `baseline_since`；从它起过了 `growth_deadline`（`connect_timeout + 5 × GROW_INTERVAL`，默认 40 s，和待判断扩张的截止时间同一个值）还没有稳定的 tick，这次试探算不确定：`reprobe_wait` 不变，`reprobe_at` 从这一刻起算。这个时限和待判断扩张的截止时间在同一处检查（`DoublingStrategy::expire`，`StrategyControl::execute` 在并发控制之前就调用），所以即使之后每个 tick 并发控制都有动作、`Doubling` 一直不走，时限也在到期之后的第一个 tick 生效。每次改变模式都清掉 `baseline_since`。所以一直在变动的下载（每个 tick 都有 runner 来去）只在出现稳定的 tick 时才试探：每一轮最多找 40 s，之后等一个 `reprobe_wait` 再找；从不拿不稳定的 tick 判断。上限离 `b` 不到 `⌈b/2⌉`（D29）时不找，也不计时。C40 的第一版要求活跃数正好是 `h`，见下面“D31 的由来”。
+    3. 别的情况（还没到时间，或者活跃数少于 `h` 而补位被挡住）不加 runner。
+  - `on_grown`：试探加上至少 `⌈b/2⌉` 个才记成待判断的试探，否则立即算不确定；一个都没加（切分被拒绝）也算不确定，不更新上次扩张的时间。补位从不判断。
+  - 判断沿用原来的规则：活跃数不少于试探后的数、没有静默的 runner 时判断；有增益回到 `Ramp`、`reprobe_wait` 恢复为 30 s，同一个 tick 接着按 `min(2 × 活跃数, 上限)` 翻倍；没有增益保持 `b`（试探之前的活跃数，`Growth::runners_before`），`reprobe_wait` 加倍，最多 300 s。活跃数不够或有静默的 runner 时，试探和翻到上限的翻倍一样等着。tick 不稳定时，任何待判断的扩张（扩张中的翻倍、试探）都不判断，等下一个稳定的 tick，最多等到截止时间。
+  - 截止时间：待判断的扩张记下做出它的 tick（`Growth::started_at`），截止时间是 `growth_deadline(connect_timeout) = connect_timeout + 5 × GROW_INTERVAL`（默认 40 s，饱和加法；时刻加不上时永不到期）。`DoublingStrategy::expire(now)` 在 `runners_to_add` 开头调用，`StrategyControl::execute` 在并发控制之前也调用，所以即使这个 tick 并发控制有动作、`Doubling` 不走，截止时间也在截止之后第一个 tick 生效，过期试探的目标也不再作为 `want`。扩张中的翻倍到期不下结论、丢掉，接着扩张；试探到期算不确定。
+  - 不确定（截止时间、加的不到一半、低速或静默重启）：保持 `h`，`reprobe_wait` 不变，`reprobe_at` 从这一刻算起。`StrategyControl::on_restarted` 因此多了 `now` 参数。
+  - 没有增益的试探之后，多开的 runner 下完自己的块；`want` 回到新的保持数 `b`，活跃数多于它时什么也不加，但下一次试探不等它们下完：到时间就从当时的活跃数试探。
+  - D31 的由来（2026-11-16）：C40 的第一版要求活跃数正好是 `h` 才试探。C41 的 s6（§14.17）里 2 → 4 没有增益、保持 2，多开的 2 个是对半切出来的，块和留下的一样长，4 个一直跑到下载结束，试探一次也没有发生，带宽在 20 s 时涨到 8 MiB/s 也只用了 4 条连接（50.6 s，峰值 4）。切分总是对半，速度均匀时所有 runner 差不多同时下完，所以这不是 s6 特有的。维护者决定从当时的活跃数试探。
+  - `strategy/` 里没有 `Instant::now()`，没有新的计时器：等待和截止时间都在策略 tick 上用传入的 `now` 检查。
+- **常量。**
+
+  | 常量 | 值 |
+  | --- | --- |
+  | 再试探的等待 | 30 s 起，每次没有增益的试探加倍，最多 300 s；有增益恢复为 30 s；不确定时不变 |
+  | `GROWTH_DEADLINE` | `connect_timeout + 5 × GROW_INTERVAL`，默认 40 s |
+  | 最小的试探 | 至少加试探时活跃数 `b` 的一半，`⌈b/2⌉` 个 |
+  | 判断 | 一个 tick，10% |
+
+  都没有校准（D23 的同一条），C41 的基准测试只是第一组数字。
+- **现在会发生什么。**
+  - 增益不到 10% 的翻倍 `n → 2n`：保持 `n`，多开的 `n` 个下完就结束，不补位；30 s 后从当时的活跃数 `b`（`n` 到 `2n` 之间）试探 `b → min(2b, 上限)`；有增益就接着翻倍，没有就保持 `b`，等 60 s、120 s……最多 300 s 再试。
+  - `h = 4`、上限 6，活跃数 4：试探到 6，多 2 个正好是 4 的一半，照常判断。`h = 8`、上限 9 或 11，活跃数 8：不试探（D29）。`h = 4`、上限 8：活跃数 5 时试探到 8（多 3 个，不少于 `⌈5/2⌉`），6 或 8 时不试探。
+  - `h = 8`、上限 6：`want = 8 > 6`，并发控制到期就 step，每个 step 的试探连接由补位切分出来，上限一步一步升到 8，不再往上。
+  - `h = 8`、上限降到 4、还有 6 个在跑：`free = 4.saturating_sub(6) = 0`，什么也不加；到期时 step 不新开连接，直接计入在跑的连接。
+- **不做的事。**
+  - 不停掉没有增益的翻倍多开的 runner（D28）。停掉要：一个停止原因；只把不在停止中的 runner 算作留下的；一种不算失败的释放；一个把区间连同它自己的计数原样放回、不和相邻的冷却合并的 planner 操作（`cool_down` 现在会合并相邻的冷却，取较大的计数和较晚的截止），并对照 `take_cooldowns` 检查。
+  - 上限比试探时的活跃数 `b` 多不到 `⌈b/2⌉` 时不试探（D29、D31），直到活跃数降下来、上限变了或下载结束。让试探按 step 越过上限需要更长的截止时间，留作以后的改进。
+  - 一直在变动的下载（每个 tick 都有 runner 下完、失败、新加或连上）找不到稳定的 tick，就不试探：每一轮最多找 `growth_deadline`，之后等一个 `reprobe_wait`。拿不稳定的 tick 判断会把来去的 runner 的字节算成增益或者停滞，所以不这样做。
+  - 已经翻上去以后带宽下降，检测不到：没有往下的试探。
+  - 被截断的扩张仍不判断（§14.14 的盲区不变）；补位也不判断。
+- **与设计的偏差。**
+  - 补位要过“间隔”这一项检查（距上次扩张至少 2 s）：每次补位都会更新上次扩张的时间，补位之后的试探也要等 2 s。
+  - 补位不要求全部 runner 都在交数据（翻倍和试探要求）：补的是已经下完或失败的 runner 留下的位置。
+  - 试探遇到可领取的区间时照样切分：并发控制只补到 `want`，而试探提出时 `want` 还是 `h`；区间等到活跃数降到 `want` 以下再被领取。
+  - 找稳定 tick 的时限（`baseline_since` 加 `growth_deadline`）是 codex 第二轮审查之后加的（2026-11-16），设计里没有：没有它，一直在变动的下载永远不试探，也永远不算不确定。时限到了算不确定而不是接着找：每一轮的状态有界，日志里看得到；代价是时限之后、下一次到期之前出现的稳定 tick 不用。
+  - 稳定的要求只加在判断和试探上。扩张中没有待判断的扩张时（第一次翻倍、待判断的翻倍被丢掉之后、截断的扩张之后），翻倍前的速度仍取当时的 tick，不要求稳定：第一次翻倍的 tick 里第一个 runner 刚连上，要求稳定会把整个扩张推迟一个 tick。这样的速度偏低时，之后的判断偏向有增益，和 C40 之前一样。
+- **测试。**
+  - 改写的测试（固定了“停滞是永久的”），旧断言 → 新断言：
+    - `test_growth_stops_below_a_ten_percent_gain` → `test_growth_holds_below_a_ten_percent_gain`：增益 1.0999 之后，旧：“之后速度再高也不扩张（永久）”；新：保持 2，`want = 2`，4 个在跑时速度再高也不加（到试探之前）。
+    - `test_no_growth_when_the_speed_drops`：旧：之后速度再高也不扩张；新：同样不加，另加活跃数回到 2 时，`reprobe_at − 1 ns` 不加、`reprobe_at` 试探 2 个。
+    - `test_a_doubling_to_the_limit_waits_for_its_runners`：原有断言不变（“停滞不补位”改为“保持 4，不补 4 之上的位置”）；新加：只剩 7 个时等到截止时间，`截止 − 1 ns` 不加，截止时丢掉、补 1 个。
+    - `test_a_doubling_to_the_limit_is_judged_there`：旧：“停滞，上限升到 16 也不扩张，有 runner 下完也不补”；新：同样的三条断言改称保持 4，另加 `want = 4`，活跃数回到 4、到了试探时间时，按升高后的上限试探到 8。
+    - `doubling_stops_at_a_plateau` → `doubling_holds_at_a_plateau`：原有断言不变（之后速度再高也是 2 个），另加 `want = 1`。
+    - `doubling_judges_the_doubling_at_the_limit`：旧：一个 runner 下完之后，6 个 tick 里剩下的一个都不被切分；新：判断之后 30 s 内（19 个 tick）都是 1 个，判断之后 30 s 的 tick 试探到 2（上限），`want = 2`。每 tick 交的字节从 50 MiB 改为 20 MiB，块在 30 s 里不会下完。
+    - 只改注释或传参：`test_a_doubling_below_the_limit_that_loses_runners_is_not_judged`（“停滞”改称保持）、`test_a_truncated_growth_is_not_judged`（同）、`test_a_restart_drops_the_doubling_it_waits_for`（`on_restarted` 传入 `now`）。
+  - 新的单元测试（`doubling_strategy.rs`，注入 `now`）：`test_a_plateau_is_probed_again`（4 → 8 没有增益，活跃数降到 4 之间不加，`reprobe_at − 1 ns` 不试探，`reprobe_at` 试探）、`test_a_probe_without_gain_backs_off`（等待依次 30、60、120、240、300、300 s）、`test_a_gain_resumes_the_ramp`（有增益接着翻到上限，下一次停滞的等待回到 30 s）、`test_an_inconclusive_probe_keeps_its_wait`（加 0 或 1 个、截止时间、重启都不确定，等待保持 60 s；加 2 个照常判断）、`test_a_hold_refills_up_to_its_target_and_adds_nothing_above_it`（有可领取的区间或拥塞时不补，不全在交数据时也补，补位后 2 s 的间隔，补位从不判断，4 个及以上不加）、`test_a_hold_below_the_limit_probes_up_to_it`（`h = 4`、上限 6）、`test_a_hold_above_the_limit_asks_for_steps`（`h = 8`、上限 6，`want = 8`，step 的试探位置补 1 个）、`test_a_lowered_limit_under_running_runners_adds_nothing`（`h = 8`、上限 4、6 个在跑）、`test_a_hold_too_close_to_the_limit_is_not_probed`（上限 9、11 不试探，12 试探）、`test_a_growth_that_cannot_fill_ends_at_its_deadline`（翻到上限的翻倍到期丢掉、切分被拒绝时下一个 tick 再要；试探到期不确定、不加）、`test_a_hold_is_probed_from_the_runners_active_then`（D31：保持 4、8 个在跑，`reprobe_at − 1 ns` 不加，`reprobe_at` 从 8 试探到 16；有增益回到扩张，没有增益保持 8、等 60 s；上限 8 时 8 个、6 个在跑不试探，5 个在跑试探 3 个）。
+  - 新的并发控制单元测试 `test_a_lowered_limit_under_running_runners_adds_nothing`：上限 4、6 个已连接、`want = 8`：到期前不建 runner；到期时 step 不新开连接，15 s 后接受，再一个 step 接受，上限到 6，下一个 step 等试探连接。
+  - 新的下载循环测试（`download_loop/tests/growth.rs`）：`a_long_download_grows_again_when_capacity_returns`（2 → 4 没有增益，两个下完，30 s 后试探到 4，这时带宽翻倍，有增益，接着翻到 8）、`a_hold_leaves_unassigned_ranges_above_its_runners`（4 个里两个失败、区间空出来，保持 2 时不领取；再失败一个，领取一个区间，不切分）、`a_hold_above_the_limit_climbs_by_steps`（503 把上限降到 6，保持 8，300 s 里上限依次是 6、7、8，不再往上，`max_connections = 16`）、`a_hold_is_probed_from_the_runners_still_running`（D31：2 → 4 没有增益，4 个一直在跑，30 s 后从 4 试探到上限 8；每个 runner 一个 tick 1 MiB 时有增益、`want` 回到 8，仍是 2 MiB 时保持 4）。计划里的 `a_hold_on_a_fragmented_resume` 改成了 `a_hold_leaves_unassigned_ranges_above_its_runners`：保持是任务内的状态，续传开始时不会处在保持中；区间空出来的情况用失败的 runner 构造。
+  - 性质测试 `the_limit_moves_only_on_its_evidence` 的不变量 1 改为：`cap = min(limit_cap, want)`；新增的 runner 不超过 `cap` 加上这一步新开的对冲数，也不超过 `limit_cap`；循环的上限等于 `limit_cap`（原来比较的是 `cap`，保持时两者不同）。
+  - 变异检查（`concurrent_task` 的全部 lib 测试），每种都有测试失败：`want` 恒为 `max_connections`（16 个）；没有截止时间（3 个单元测试）；没有增益不加倍等待（3 个）；不要求至少加一半（`test_a_hold_too_close_to_the_limit_is_not_probed`）；改回活跃数正好是 `h` 才试探（D31 的两个新测试）；试探不要求稳定的 tick（`test_an_unstable_tick_judges_and_probes_nothing` 和下面两个下载循环测试）；判断不要求稳定的 tick（`test_an_unstable_tick_judges_and_probes_nothing`）。
+  - 稳定的 tick（codex 审查，2026-11-16）：`throughput.rs` 的 `test_a_tick_is_stable_while_its_runners_stay`（runner 下完、新加、连上、失败后同一个 ID 重领的 tick 都不稳定，下一个 tick 稳定）；`test_an_unstable_tick_judges_and_probes_nothing`（翻到上限的翻倍、试探的判断都等到稳定的 tick；试探本身也是）；下载循环测试 `a_probe_waits_out_a_tick_in_which_runners_finished`（保持 2、4 个在跑、每个 1 MiB 一个 tick，到试探时间的那个 tick 里两个下完：这个 tick 不试探，下一个 tick 从 2 个试探到 4，有增益，翻到 8；不等的话，翻倍前的速度算上了下完的两个块的最后一段，判成没有增益、保持 2、等 60 s）、`a_probe_waits_out_a_tick_in_which_a_runner_connected`（保持 2，补位切出的 runner 在到试探时间的那个 tick 里才连上、只交了 64 KiB：这个 tick 不试探，下一个 tick 从 2 个试探到 4，带宽没变，没有增益，保持 2，下一次试探在 60 s 之后；不等的话，翻倍前的速度约 1 MiB 一个 tick，判成有增益、翻到 8）。`doubling_counts_only_the_splits_a_slot_took` 加了一个 tick：原来跳过了新 runner 连上的那个 tick，判断落在不稳定的 tick 上。
+  - codex 第二轮审查（2026-11-16）：`throughput.rs` 的 `test_a_runner_that_came_and_went_unsettles_the_tick`（另一个 runner 在两次采样之间分到 8 MiB、下完、释放：两端的 runner 一样，速度里有它的 8 MiB，tick 不稳定；下一个 tick 稳定）；下载循环测试 `a_runner_that_came_and_went_defers_the_verdict`（2 → 4 待判断时，从 runner 0 的末尾切下 8 MiB，另一个 runner 在两个 tick 之间下完它：这个 tick 不判断，`want` 仍是 8；下一个 tick 没有增益，保持 2，30 s 后试探；按端点比较会把多出的 8 MiB 判成增益、翻到 8）、`churn_defers_a_probe_for_a_bounded_time`（保持 2，从试探时间起每隔一个 tick 有一个 runner 失败、它的区间被重新领取、下一个 tick 连上：一直不试探、不超过 2 个、`want` 一直是 2，到期之后 40 s 起、3 s 之内算不确定，`reprobe_at` 是那一刻加 30 s；之后不再变动，到期那个 tick 试探到 4）。变异：去掉 `population` 的比较，前两个测试失败；去掉找稳定 tick 的时限，第三个失败。
+  - codex 第三轮审查（2026-11-16）：时限原来只在 `hold()` 里检查，并发控制每个 tick 都有动作时 `Doubling` 走不到那里，时限就一直不生效。改为在 `expire` 里检查。下载循环测试 `controller_actions_do_not_hold_off_the_end_of_a_search`（保持 2，替补的 runner 在到试探时间的那个 tick 里才连上，开始找稳定的 tick；之后每个 tick 之前都有一个 runner 失败，并发控制每个 tick 都为它的区间建 runner：到期之后第一个 tick 算不确定，`reprobe_at` 是那一刻加 30 s，一直不超过 2 个、`want` 是 2）。变异：时限改回只在 `hold()` 里检查，这个测试失败。
+- **基准测试**（C41，§14.17）。s6：没有增益的 2 → 4 之后保持 2，37.5 s 从仍在跑的 4 个试探到 8，有增益，44.2 s 完成（D31 之前 50.6 s、峰值 4、没有试探）。`s1_max32_long`：16 → 32 没有增益，保持 16，下载在下一次试探之前结束。
