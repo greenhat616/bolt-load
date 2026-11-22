@@ -643,9 +643,9 @@ async fn test_adapter_failure_handling() {
     );
 }
 
+/// An empty body of unknown size is an empty file (#153).
 #[tokio::test(flavor = "multi_thread")]
 #[n0_tracing_test::traced_test]
-#[ignore = "an empty stream of unknown size fails with `Empty`, see #153"]
 async fn test_zero_size_file_handling() {
     let temp_dir = TempDir::new().unwrap();
     let save_path = temp_dir.path().join("zero_size_test.bin");
@@ -657,6 +657,7 @@ async fn test_zero_size_file_handling() {
     let output = watchdog(task).await.expect("should be ok");
 
     assert_eq!(output.mode, DownloadMode::Singleton);
+    assert_eq!(output.progress.total, Some(0));
     let content = std::fs::read(&save_path).unwrap();
     assert!(content.is_empty(), "Zero-size file should be empty");
 }

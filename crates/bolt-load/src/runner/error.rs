@@ -12,9 +12,6 @@ pub enum TaskError {
     /// The task is timeout, only happen when a stream is not sent in a period
     #[snafu(display("task is timeout"))]
     Timeout,
-    /// The task is empty
-    #[snafu(display("task is empty"))]
-    Empty,
     /// The channel is closed
     #[snafu(display("channel is closed"))]
     ChannelClosed,
@@ -65,10 +62,5 @@ impl TaskError {
     #[inline]
     pub const fn is_stream_error(&self) -> bool {
         matches!(self, Self::StreamError { .. })
-    }
-
-    #[inline]
-    pub const fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty)
     }
 }

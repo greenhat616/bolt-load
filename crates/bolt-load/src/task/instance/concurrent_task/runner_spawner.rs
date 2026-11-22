@@ -530,13 +530,11 @@ mod tests {
         assert!(matches!(msg, LifecycleEvent::Started));
 
         // Should finish immediately without downloading any data
-        // Zero-length range may result in Empty error
         let msg = lifecycle_rx.next().await;
-        match msg {
-            Some(LifecycleEvent::Stopped(StoppedReason::Finished)) => {}
-            Some(LifecycleEvent::Stopped(StoppedReason::Failed(e))) if e.is_empty() => {}
-            other => panic!("Expected immediate finish for zero-length range, got: {other:?}"),
-        }
+        assert!(
+            matches!(msg, Some(LifecycleEvent::Stopped(StoppedReason::Finished))),
+            "Expected immediate finish for zero-length range, got: {msg:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

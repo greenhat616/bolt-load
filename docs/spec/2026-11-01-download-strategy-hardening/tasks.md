@@ -30,6 +30,7 @@
 | | C24 `refactor(http): parse content codings into ContentCoding` | | |
 | PR-3b 内容解码 | C21 `feat(decode): add a streaming content decoder crate` | T23 | PR-3a |
 | | C22 `feat(task)!: decode content-coded full downloads` | | |
+| PR-3c 空 body | C25 `fix(runner)!: finish an empty body of unknown size` | T25 | PR-3b |
 | PR-4 写错误 | C6 `feat(task)!: keep the io error kind and range of write failures` | T6 | — |
 | PR-5 连接上限 | C7 `feat(task): make the connection limit configurable` | T7 | — |
 | | C8 `fix(task): reserve a runner slot before splitting a chunk` | T8 | |
@@ -210,6 +211,18 @@
 - 内存：解压比很高的输入，输出块的大小不超过 `buffer_size`。
 - 基准测试：同一份数据，吞吐不低于 reqwest 自带解码的 90%（criterion）。
 - `range_faults.rs` 的 `EncodedRepresentation`：两个客户端都完成，hash 正确。
+
+## T25 — 空 body（C25）
+
+编号接在 T24 之后，顺序上紧跟 T23。修复 [#153](https://github.com/greenhat616/bolt-load/issues/153)，也解除 design §14.6 记下的已知限制。
+
+- [x] runner 在 `total` 未知时接受任何长度，包括 0；删除 `TaskError::Empty`（design §14.7、STATUS-11）。
+- [x] 取消 `test_zero_size_file_handling` 的 ignore。
+
+**验证**
+
+- `tests/empty_body.rs`：`Content-Length: 0`、空的 chunked、靠关连接结束的空 body，gzip 编码的空内容（带长度、chunked），以及 `204 No Content`，三个客户端都以 0 字节文件和 `total == Some(0)` 完成。
+- 把旧规则放回去，这些测试失败。
 
 ## T6 — 写错误结构化（C6）
 
