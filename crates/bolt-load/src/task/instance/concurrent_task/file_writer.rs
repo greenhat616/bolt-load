@@ -328,8 +328,18 @@ pub struct FileWriter {
 
 impl FileWriter {
     pub async fn new(path: &Path, size: u64) -> Result<Self, FileWriterBuilderError> {
+        Self::new_drained(path, size, WaitGroup::new()).await
+    }
+
+    /// [`Self::new`], with every worker that holds the file keeping a clone
+    /// of `drain` until it closed the file.
+    pub async fn new_drained(
+        path: &Path,
+        size: u64,
+        drain: WaitGroup,
+    ) -> Result<Self, FileWriterBuilderError> {
         let kind = FileRangeWriterKind::suggest_kind(size);
-        Self::new_with_kind(path, size, kind).await
+        Self::new_with_kind_drained(path, size, kind, drain).await
     }
 
     pub async fn new_with_kind(
@@ -337,17 +347,32 @@ impl FileWriter {
         size: u64,
         kind: FileRangeWriterKind,
     ) -> Result<Self, FileWriterBuilderError> {
+        Self::new_with_kind_drained(path, size, kind, WaitGroup::new()).await
+    }
+
+    async fn new_with_kind_drained(
+        path: &Path,
+        size: u64,
+        kind: FileRangeWriterKind,
+        drain: WaitGroup,
+    ) -> Result<Self, FileWriterBuilderError> {
         let path = path.to_path_buf();
 
         let inner = match kind {
             #[cfg(feature = "mmap")]
             FileRangeWriterKind::Mmap => {
                 let file = open_file(path.clone(), size).await?;
-                FileRangeWriterImpl::Mmap(MmapWriterBuilder::new().file(file).build().await?)
+                FileRangeWriterImpl::Mmap(
+                    MmapWriterBuilder::new()
+                        .file(file)
+                        .drain(drain)
+                        .build()
+                        .await?,
+                )
             }
             FileRangeWriterKind::Pool => {
                 let file = open_file(path.clone(), size).await?;
-                FileRangeWriterImpl::Pool(PoolWriterBuilder::new().file(file).build()?)
+                FileRangeWriterImpl::Pool(PoolWriterBuilder::new().file(file).drain(drain).build()?)
             }
             FileRangeWriterKind::Null => {
                 // For null writer, we don't need a file - just create the writer
@@ -359,6 +384,7 @@ impl FileWriter {
                 FileRangeWriterImpl::Compio(
                     CompioWriterBuilder::new()
                         .path(path.clone())
+                        .drain(drain)
                         .build()
                         .await?,
                 )
@@ -438,6 +464,41 @@ mod tests {
         *,
     };
     use crate::runtime::ThreadedRuntimeImpl;
+
+    /// Every kind of writer that holds the file keeps the drain group open
+    /// until its workers exited, whichever kind the features would suggest.
+    #[tokio::test]
+    async fn test_every_writer_kind_holds_the_drain_group() {
+        let kinds = [
+            FileRangeWriterKind::Pool,
+            #[cfg(feature = "mmap")]
+            FileRangeWriterKind::Mmap,
+            #[cfg(feature = "compio")]
+            FileRangeWriterKind::Compio,
+        ];
+        for kind in kinds {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("file.tmp");
+            let drain = WaitGroup::new();
+            let writer = FileWriter::new_with_kind_drained(&path, 4, kind, drain.clone())
+                .await
+                .unwrap();
+            writer
+                .write_range(0..4, Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+            let mut wait = std::pin::pin!(drain.wait());
+            assert!(
+                futures::poll!(wait.as_mut()).is_pending(),
+                "{kind:?}: the workers are still running"
+            );
+            writer.finalize().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), wait)
+                .await
+                .unwrap_or_else(|_| panic!("{kind:?}: the workers did not exit"));
+            assert_eq!(std::fs::read(&path).unwrap(), b"data", "{kind:?}");
+        }
+    }
 
     #[test]
     #[cfg(feature = "compio")]

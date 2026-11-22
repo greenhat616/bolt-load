@@ -5,10 +5,13 @@ use super::DownloadError;
 
 /// Concurrent download task implementation.
 pub mod concurrent_task;
+pub(crate) mod destination_lock;
+pub(crate) mod drained_file;
 pub(crate) mod drive;
 mod full_body;
 mod id;
 mod output_file;
+mod ownership;
 mod sampler;
 mod singleton_task;
 
